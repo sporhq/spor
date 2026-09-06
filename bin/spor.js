@@ -7642,7 +7642,8 @@ function nodeUnreadable(node) {
 // art-verify-run-resolution-jsonerror-fix already closed elsewhere). Local mode
 // has no such body to fail to parse — a read either succeeds or ENOENTs — so it
 // never returns the marker.
-async function resolveNode(cfg, id) {
+async function resolveNode(cfg, id, out = null) {
+  if (out) out.unreadable = false;
   let raw = "";
   // The server's get(node) hook attaches read-time enrichment as additive
   // top-level keys (API.md §3): `resolution` is the live inbound resolves/answers
@@ -7678,7 +7679,10 @@ async function resolveNode(cfg, id) {
   let supersededBy = null;
   if (cfg.mode() === "remote") {
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
-    if (!r.ok) return null;
+    if (!r.ok) {
+      if (out) out.unreadable = r.status !== 404;
+      return null;
+    }
     // A 2xx with an unparseable (or non-object) body is a FAILED read, not a
     // node whose enrichment keys all happen to be absent — falling through to
     // `r.json && ...` used to read every one of resolution/held/inert/
@@ -7686,7 +7690,10 @@ async function resolveNode(cfg, id) {
     // that genuinely carries none of them. Surface it as the distinguished
     // unreadable marker instead so a caller that skips checking for it fails
     // loudly in review rather than quietly trusting a read that never happened.
-    if (r.jsonError || !r.json || typeof r.json !== "object") return { unreadable: true, id };
+    if (r.jsonError || !r.json || typeof r.json !== "object") {
+      if (out) out.unreadable = true;
+      return { unreadable: true, id };
+    }
     raw = r.json.raw || r.text || "";
     resolution = r.json.resolution || null;
     held = r.json.held || null;
@@ -7698,7 +7705,8 @@ async function resolveNode(cfg, id) {
     try {
       raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`), "utf8");
       revision = gitBlobSha(Buffer.from(raw, "utf8"));
-    } catch {
+    } catch (e) {
+      if (out) out.unreadable = !(e && e.code === "ENOENT");
       return null;
     }
   }
@@ -12354,7 +12362,12 @@ async function writeGateNode(cfg, id, markdown) {
       // ignores `date:` drift (see stripFrontmatterDate) so it stays keyed on
       // the fact itself, not the calendar day it was re-filed on.
       const same = stripFrontmatterDate(fs.readFileSync(file, "utf8")) === stripFrontmatterDate(markdown);
-      return same ? { ok: true, id, existing: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
+      // `identical` is the local door's own proof (F10): it COMPARED this
+      // markdown against the occupant, so an `existing` it reports is this
+      // record — edges and all — and the caller needs no read to know it.
+      // The remote door cannot say that (`if_exists: skip` compares nothing),
+      // so it omits the flag and the caller reconciles by reading.
+      return same ? { ok: true, id, existing: true, identical: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
     }
     // The same validation the local `put-node` door runs: a malformed gate node
     // written straight to disk would break loadGraph for everything downstream.
@@ -12368,6 +12381,65 @@ async function writeGateNode(cfg, id, markdown) {
     return { ok: false, reason: e.message };
   }
 }
+
+// Add ONE typed edge to a node a gate already wrote — the paying half of the
+// flake occurrence debt (F13), through the same add_edge micro-mutation
+// `spor edge` uses (POST /v1/nodes/{id}/edges remotely, an in-place validated
+// append locally). Idempotent on both sides: the server reports an edge that
+// is already there as `skipped` and this reads it as the success it is, and
+// locally the edge set is checked before the append — so a second worker (or
+// this one, after a crash between the edge landing and the state that records
+// it) can never double-count one occurrence. A missing source or a dangling
+// target is a REFUSAL, never a silent write: an occurrence edge that points at
+// nothing is worse than one still owed.
+function withoutFlakeEdges(markdown, issues) {
+  const families = new Set(issues.map((id) => String(id).replace(/-r[2-4]$/, "")));
+  const text = String(markdown || "");
+  const end = text.startsWith("---\n") ? text.indexOf("\n---", 4) : -1;
+  if (end < 0) return text;
+  return text.slice(0, end).split("\n").filter((line) => {
+    const m = /^\s*- \{type: relates-to, to: ([^} ,]+)\}$/.exec(line);
+    return !m || !families.has(m[1].replace(/-r[2-4]$/, ""));
+  }).join("\n") + text.slice(end);
+}
+
+async function addGateEdge(cfg, id, type, to) {
+  if (cfg.mode() === "remote") {
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/edges/live`, { type, to, require_live_target: true }, { timeoutMs: 8000 });
+    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (!r.ok) {
+      const e = (r.json && r.json.error) || {};
+      return { ok: false, code: e.code || null, reason: `edge error ${r.status}${e.message ? `: ${e.message}` : ""}` };
+    }
+    if (!r.json || r.json.target_guard !== "live") return { ok: false, reason: "the server did not acknowledge live-target enforcement" };
+    return { ok: true, id };
+  }
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const dir = cfg.nodesDir();
+  try {
+    const file = path.join(dir, `${id}.md`);
+    let raw;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      return { ok: false, reason: `no such node: ${id}` };
+    }
+    const g = graphLib.loadGraph(dir);
+    if (!g.nodes[to]) return { ok: false, reason: `edge target '${to}' does not exist` };
+    if (((g.nodes[id] && g.nodes[id].edges) || []).some((e) => e.type === type && e.to === to)) return { ok: true, id };
+    // No local transaction is shared by every status/resolution writer. An
+    // optimistic snapshot cannot authorize a fresh occurrence across processes.
+    return { ok: false, code: "local_atomic_unavailable", reason: "fresh local flake occurrence payment requires an atomic graph mutation door; evidence remains pending (use the team server)" };
+  } catch (e) {
+    return { ok: false, reason: e.message };
+  }
+}
+
+// How many recurrence rungs the per-file flake id may climb past a SETTLED
+// occupant before the gate gives up and charges the failure (fileFlakeItem).
+// Small on purpose: a file whose flake issue has been closed and reopened four
+// times is not a convergence problem, it is a test that needs a person.
+const FLAKE_ID_RUNGS = 4;
 
 function gateStem(nodeId) {
   return String(nodeId || "item")
@@ -12396,7 +12468,7 @@ const { gateIdSuffix, fenceSafe, capBytes: gateCapBytes, NODE_BODY_CAP_BYTES } =
 // (work.accept ready, dec-spor-work-accept-policy-configurable) would leave it
 // unworked forever. The consent the stamp records is real, just upstream: the
 // operator declared the lane's profile in the factory definition.
-function buildGateWorkNode({ id, title, summary, body, project, date, edges = [], requiresHuman = false, profile = null }) {
+function buildGateWorkNode({ id, type = "task", title, summary, body, project, date, edges = [], requiresHuman = false, profile = null }) {
   // The frontmatter parser is line-based: a title or summary carrying a newline
   // (a git message, a suite's first failing line) would truncate the node. Flatten
   // and cap both, the same discipline the dispatch report artifact keeps.
@@ -12407,7 +12479,7 @@ function buildGateWorkNode({ id, title, summary, body, project, date, edges = []
   const lines = [
     "---",
     `id: ${id}`,
-    "type: task",
+    `type: ${type}`,
     ...(project ? [`project: ${project}`] : []),
     `title: ${flat(title, 120)}`,
     `summary: ${flat(summary, 460)}`,
@@ -13982,6 +14054,26 @@ function makeGateDeps(
     // pretending to a verdict nobody gave.
     stopping,
     loadGateProgress,
+    checkEvidenceOrigins: () => {
+      const r = readRecordNow();
+      const progress = r && r.gate_progress;
+      if (!progress || progress.key !== runKey) return { ok: true };
+      const saved = Object.values(progress.gates || {});
+      const evidence = saved.flatMap((p) => p ? [p.evidence, p.filingIntent] : []).filter(Boolean);
+      // Enumerate the journal, not the current gate list: removing/renaming a
+      // declaration must not make an existing graph obligation unreachable.
+      const current = new Set((factory.gates || []).map((g) => g.id));
+      const orphan = saved.flatMap((p) => p ? [p.filingIntent, p.evidence && !p.evidence.complete ? p.evidence : null] : [])
+        .filter(Boolean).find((e) => !e.gate || !current.has(e.gate.id));
+      if (orphan) return { ok: false, reason: "pending flake evidence belongs to a removed or renamed gate; restore its original declaration and settle its obligation before changing the factory" };
+      if (!evidence.every((e) => attestationOriginMatches(cfg, e.origin))) return { ok: false, reason: "pending flake evidence belongs to a different or unknown graph; resume against its original graph" };
+      const pending = Object.entries(progress.gates || {}).filter(([, p]) => p && (p.filingIntent || p.evidence && !p.evidence.complete)).map(([key, p]) => ({
+        gate: (p.filingIntent || p.evidence).gate,
+        rescue: Number((/#x(\d+)$/.exec(key) || [])[1]) || 0,
+        progress: p,
+      }));
+      return pending.length ? { ok: true, pending } : { ok: true };
+    },
     saveGateProgress,
     loadRescueState,
     saveRescueState,
@@ -14343,7 +14435,11 @@ function makeGateDeps(
       return {
         ok: true,
         dir: tree.dir,
-        run: async (attempt = 1) => {
+        // `command` overrides the gate's declared one for THIS run only — the
+        // door the off-diff isolation pass uses (WORKERS.md §10.3 `isolate`)
+        // to re-run just the failing files on this same prepared tree. Absent,
+        // the run is the declared suite, byte-identical to before.
+        run: async (attempt = 1, command = null) => {
           // What the suite is judging, in its env (task-spor-gate-command-
           // change-env): a script can `git diff $SPOR_GATE_BASE..$SPOR_GATE_HEAD`
           // inside the tree and decide what to run, the way a CI job reads the
@@ -14358,8 +14454,11 @@ function makeGateDeps(
             // 1 for the declared run, N+1 for the Nth same-tree rerun — a
             // suite can log or tighten itself on a rerun.
             SPOR_GATE_ATTEMPT: String(attempt),
+            // Set only for the isolation run, so a suite that wants to skip its
+            // own setup for a single-file re-run can tell the two apart.
+            ...(command ? { SPOR_GATE_ISOLATE: "1" } : {}),
           };
-          return await runGateCommand(gate, tree.dir, { env });
+          return await runGateCommand(command ? { ...gate, command } : gate, tree.dir, { env });
         },
         // Called by the runner only after the LAST run has returned (its loop
         // awaits each run), never under a running suite.
@@ -14383,7 +14482,86 @@ function makeGateDeps(
     releaseGateLease: (token) => releaseIntegrationLease(cfg, token),
     review,
     fix,
-    recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
+    evidenceOrigin: () => attestationGraphOrigin(cfg),
+    acceptsEvidenceOrigin: (origin) => attestationOriginMatches(cfg, origin),
+    recordFact: async ({ id, markdown, flakeIssues = [], origin }) => {
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : flakeIssues.length ? null : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake evidence belongs to a different or unknown graph" };
+      // Occurrence edges use the guarded micro-mutation even on fresh facts:
+      // issue selection is not a liveness guarantee at publication time.
+      const bare = withoutFlakeEdges(markdown, flakeIssues);
+      const wrote = await writeGateNode(publicationCfg, id, bare);
+      return { ...wrote, linked: [] };
+    },
+    // Reconcile the complete evidence identity, ignoring only this flake's
+    // occurrence edges (including recurrence rungs). Those edges are separate
+    // guarded payments; title equality alone cannot vouch for a judged head,
+    // gate definition, or evidence body. Return typed edges so mentions never
+    // discharge occurrence debt.
+    readFact: async ({ id, markdown, flakeIssues = [], origin }) => {
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake evidence belongs to a different or unknown graph" };
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+      const read = {};
+      let node = null;
+      try {
+        node = await resolveNode(publicationCfg, id, read);
+      } catch (e) {
+        return { ok: false, reason: `${id} could not be read (${(e && e.message) || e})` };
+      }
+      if (!node || nodeUnreadable(node)) return (read.unreadable || (node && nodeUnreadable(node))) ? { ok: false, reason: `${id} could not be read` } : { ok: true, same: false, edges: [] };
+      let edges = [];
+      try {
+        edges = graphLib.parseFrontmatter(node.raw || "", `${id}.md`).edges || [];
+      } catch (e) {
+        return { ok: false, reason: `${id}'s frontmatter could not be parsed (${(e && e.message) || e})` };
+      }
+      let mine = "";
+      try {
+        mine = String(graphLib.parseFrontmatter(String(markdown || ""), `${id}.md`).title || "").trim();
+      } catch {
+        mine = "";
+      }
+      const theirs = String(node.title || "").trim();
+      return {
+        ok: true,
+        // An unreadable title on either side is not a match: `same` is a
+        // POSITIVE reading or nothing.
+        same: !!(mine && theirs && gateNodeEquivalent(withoutFlakeEdges(node.raw, flakeIssues), withoutFlakeEdges(markdown, flakeIssues))),
+        edges: edges.filter((e) => e && e.to).map((e) => ({ type: String((e && e.type) || ""), to: String(e.to) })),
+      };
+    },
+    // Pay a flake occurrence edge the FACT itself could not carry (F13). The
+    // fact's id was already occupied, so this markdown — and the edges in its
+    // frontmatter — did not land, and for a PASSING gate or the final refusal
+    // there is no later fact of this pass to carry them: without this door the
+    // occurrence is a permanent debt sink, an issue no fact names. Written
+    // through the same add_edge micro-mutation `spor edge` uses, which is
+    // IDEMPOTENT on both sides (the server answers `skipped`, local dedups
+    // against the edges already on the node), so two workers paying the same
+    // occurrence cannot double-count it — and which REFUSES a dangling target,
+    // so a flake issue that vanished leaves the debt logged unpaid rather than
+    // an edge pointing at nothing.
+    linkFact: async function ({ id, type, to, gate, file, files, origin }) {
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : file ? null : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake evidence belongs to a different or unknown graph" };
+      const first = await addGateEdge(publicationCfg, id, type, to);
+      if (first.ok || !["target_not_live", "local_atomic_unavailable"].includes(first.code) || !file || !gate) return first;
+      // A settled selection owes a recurrence. Before selecting another rung,
+      // recover a payment that landed before a process died: it remains paid
+      // even when that recurrence itself has since been settled.
+      const source = await resolveNode(publicationCfg, id);
+      if (!source || nodeUnreadable(source)) return { ok: false, reason: "the occurrence fact could not be read before recurrence selection" };
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+      const family = (target) => String(target).replace(/-r[2-4]$/, "");
+      const edges = graphLib.parseFrontmatter(source.raw, `${id}.md`).edges || [];
+      const paid = edges.find((e) => e.type === type && family(e.to) === family(to));
+      if (paid) return { ok: true, id, to: paid.to };
+      if (first.code === "local_atomic_unavailable") return first;
+      const next = await this.fileFlakeItem({ gate, file, files, command: gate.command, isolate: gate.isolate, origin });
+      if (!next || !next.ok) return next || { ok: false, reason: "recurrence selection returned no answer" };
+      return { ...await addGateEdge(publicationCfg, id, type, next.id), to: next.id };
+    },
     fileTestLaneItem: async ({ gate, paths, profile, rescue = 0 }) => {
       const k = keysFor(rescue);
       const id = `task-test-lane-${stem}-${k.short}-${gateIdSuffix("test-lane", gate.id, entry.node_id, k.runKey)}`;
@@ -14422,8 +14600,166 @@ function makeGateDeps(
         })
       );
     },
+    // The off-diff FLAKE report (task-spor-factory-flake-rescue-should-not-
+    // burn-when-failure-is-off-diff): a whole-suite failure in files the change
+    // never touched, which passed alone on the same tree. Filed as an ISSUE —
+    // a defect in the suite, not work the gated item owes — and routed to the
+    // same `test_lane_profile` the protected-path lane uses, because fixing a
+    // flaky test IS a test change and must not come from the implementer.
+    //
+    // Alone among the nodes a gate files, its id and its BODY are keyed on ONE
+    // failing FILE rather than on the run — the runner calls this once per file
+    // the failure named. A flake is a property of the file, not of the set it
+    // happened to fail beside (a set that changes with load and ordering, and
+    // whose every permutation would otherwise be its own issue), and the same
+    // file flaking on ten dispatches must converge on ONE issue
+    // (writeGateNode's `if_exists: skip` remotely, and its identical-content
+    // adoption locally, both then read the repeat as a no-op) instead of ten
+    // near-duplicates nobody triages. The occurrence count is the inbound
+    // `relates-to` edges from the `art-gate-*` facts, which each carry the run,
+    // the item and the evidence — so nothing run-specific is lost by leaving
+    // it out here, and there is no per-run content to make the write diverge.
+    //
+    // The convergence is RECONCILED against settled state, never taken on the
+    // strength of the id (the stale-flag failure mode): the same file can flake
+    // again months after its issue was fixed and closed, and a fresh occurrence
+    // attached to a terminal node is no signal at all — nothing resurfaces it,
+    // nobody triages it, and the gate would have passed a red suite against a
+    // record that reads "already handled". So each candidate id is READ first
+    // and only an id that is free (create) or occupied by LIVE work (link) is
+    // taken; a settled occupant advances to the next rung (`-r2`, `-r3`, …),
+    // which is a live issue for the recurrence that also points back at the
+    // one that was closed. All rungs settled — a file closed and reopened four
+    // times — is reported unfiled, which the runner turns into a charged
+    // failure and a person, the right answer for a file that keeps coming back.
+    //
+    // And a read that could not be MADE decides nothing at all: it is neither
+    // absence (which would write) nor liveness (which would link) nor
+    // settledness (which would climb), so it is reported unfiled and the
+    // failure is charged. The write is not a second chance at that question —
+    // its door reports an occupied id as a SUCCESS, so believing it would adopt
+    // whatever is there unread, which for a resolved occupant is the very
+    // "fresh occurrence attached to a terminal node" this reconciliation
+    // exists to prevent. That is why a write that did not create anything
+    // (`existing`, in either mode) sends the id back through the read once,
+    // instead of being returned as a filing.
+    fileFlakeItem: async ({ gate, file, files, command, isolate, origin }) => {
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : origin === null ? null : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake filing belongs to a different or unknown graph" };
+      const list = (files || []).map(String);
+      // ONE issue per FILE, keyed on that file and nothing else. Keying it on
+      // the whole co-failing SET would mint a fresh issue for the same flaky
+      // file every time its companions — or their order — changed, which is
+      // exactly the near-duplicate a convergent id exists to prevent: the file
+      // is what someone fixes, so the file is the key. The rest of the
+      // failure's files are context in the body, never in the id.
+      const target = String(file || list[0]);
+      const others = list.filter((f) => f !== target);
+      const stem = target.replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 34).replace(/-+$/, "") || "suite";
+      const base = `issue-flake-${stem}-${gateIdSuffix("flake", gate.id, slug || "", target)}`;
+      const profile = factory.testLaneProfile || null;
+      const markdown = (id, priorId, priorWhy) =>
+        buildGateWorkNode({
+          id,
+          type: "issue",
+          title: `Flaky under the ${gate.id} gate — ${target} fails the full suite and passes alone`,
+          summary: `${target} failed factory \`${factory.id}\`'s \`${gate.id}\` gate (\`${command}\`) and passed when re-run alone on the same tree — an off-diff flake, not a failure of any change under judgement.`,
+          body: [
+            `The \`${gate.id}\` command gate of factory \`${factory.id}\` failed its whole-suite run \`${command}\`,`,
+            "in this file, which the change under judgement did not touch and which references nothing it edits:",
+            "",
+            `- \`${target}\``,
+            ...(others.length ? ["", `It failed alongside ${others.map((f) => `\`${f}\``).join(", ")}, each of which carries its own issue — the`, "companion set is context here, not part of this issue's identity, so the same file converges on this", "node however it fails next time."] : []),
+            "",
+            `Re-running the failure's files alone on that same tree (\`${isolate}\`) PASSED, so the failure was the`,
+            "suite's scheduling — load, ordering, a shared fixture — and not the change. An off-diff flake costs",
+            "this issue rather than the item's fix cycles, its rescue lane and finally a person, all spent on",
+            "work that was never wrong (WORKERS.md §10.3).",
+            "",
+            "Fix the flake in the file itself: make it independent of what else is running. Every `art-gate-*`",
+            "fact that relates to this issue is one occurrence — the inbound edges are the count, and each",
+            "carries the run, the item and the whole-suite failure it saw as evidence.",
+            ...(priorId ? ["", `This is a RECURRENCE: \`${priorId}\` holds the earlier occurrences of the same flake and is`, `already settled (${priorWhy}), so this file carries the ones since.`] : []),
+            ...(profile ? ["", `Test changes belong in the \`${profile}\` lane, not an implementer's branch.`] : []),
+          ].join("\n"),
+          project: slug,
+          date: date(),
+          profile,
+          edges: [
+            ...(factory.id ? [{ type: "relates-to", to: factory.id }] : []),
+            ...(profile ? [{ type: "relates-to", to: profile }] : []),
+            ...(priorId ? [{ type: "relates-to", to: priorId }] : []),
+          ],
+        });
+      // The occupant of one candidate id, as the FOUR answers the adoption rule
+      // needs rather than the two a null carries. "Could not look" is the one
+      // the old reading collapsed into "absent": a read that timed out was
+      // followed by a write, the write's door reported the id already taken as
+      // a success (`if_exists: skip` remotely, identical-content adoption
+      // locally), and a RESOLVED occupant was adopted unread — the stale-flag
+      // failure exactly. It is now its own answer and it settles nothing.
+      const occupantOf = async (id) => {
+        const read = {};
+        let node = null;
+        try {
+          node = await resolveNode(publicationCfg, id, read);
+        } catch (e) {
+          return { state: "unknown", why: `${id} could not be read (${(e && e.message) || e})` };
+        }
+        if (node && !nodeUnreadable(node)) {
+          const settled = dispatchResolutionReason(publicationCfg, node);
+          return settled ? { state: "settled", why: settled } : { state: "live" };
+        }
+        return (read.unreadable || (node && nodeUnreadable(node))) ? { state: "unknown", why: `${id} could not be read` } : { state: "absent" };
+      };
+      let prior = null;
+      let priorWhy = "";
+      let rung = 0;
+      let raced = false;
+      while (rung < FLAKE_ID_RUNGS) {
+        const id = rung === 0 ? base : `${base}-r${rung + 1}`;
+        const occupant = await occupantOf(id);
+        // Nothing is concluded from a read that failed. Climbing to the next
+        // rung would mint a duplicate beside a live issue; adopting would link
+        // a possibly-settled one. Both are answers about state we did not see,
+        // so the filing is refused — which the runner turns into a charged
+        // failure, the same direction every other unreadable answer takes here.
+        if (occupant.state === "unknown") return { ok: false, reason: `the flake's issue ${occupant.why}, so whether it is still live could not be decided` };
+        if (occupant.state === "live") return { ok: true, id, existing: true };
+        if (occupant.state === "settled") {
+          prior = id;
+          priorWhy = occupant.why;
+          rung += 1;
+          raced = false;
+          continue;
+        }
+        const written = await writeGateNode(publicationCfg, id, markdown(id, prior, priorWhy));
+        // Created it: this filing IS the record.
+        if (written.ok && !written.existing) return written;
+        // The id was occupied between the read and the write — another worker
+        // filed the same flake first (its content is this flake's by
+        // construction, the id being keyed on the file and nothing else), or
+        // the same-content door adopted it. Either way this markdown did not
+        // land, so the occupant is read back ONCE and the same live/settled/
+        // unknown rule decides, rather than adopted on the strength of the id.
+        if (written.existing && !raced) {
+          raced = true;
+          continue;
+        }
+        // Occupied by content that is not this flake's, or occupied again after
+        // a re-read that said absent: the id is not usable, climb a rung.
+        if (written.existing) {
+          rung += 1;
+          raced = false;
+          continue;
+        }
+        return written;
+      }
+      return { ok: false, reason: `every candidate id for this flake (${base}, +${FLAKE_ID_RUNGS - 1} recurrence rungs) is already settled — the file has been closed and reopened too often to file another` };
+    },
     fileHumanItem: async ({ gate, classes, head, rescue = 0 }) => {
       if (!head || !/^[0-9a-f]{40,64}$/i.test(head)) return { ok: false, reason: "the judged commit is unknown; approval cannot be bound to a candidate" };
+
       const k = keysFor(rescue);
       const id = `task-approve-${gate.id.slice(0, 24)}-${stem}-${k.short}-${gateIdSuffix("approve", gate.id, entry.node_id, `${k.runKey}@${head}`)}`.toLowerCase();
       const body = [

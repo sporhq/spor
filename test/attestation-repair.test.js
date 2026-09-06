@@ -314,6 +314,20 @@ test("re-gating cannot overwrite an unpaid signed outbox; matching-origin replay
   assert.equal(runner.readJson(f.file).gate_regate_count, 1);
 });
 
+test("re-gating cannot clear incomplete flake evidence under the record claim lock", () => {
+  const f = fixture();
+  const record = { ...runner.readJson(f.file), gate_state: "failed", gate_settle_id: "prior", gate_regate_count: 0, gate_progress: { key: "attempt-0", gates: { acceptance: { evidence: { complete: false, origin: { mode: "local", nodes: "original" }, outcome: { flake: { issues: ["issue-flake-one"] } } } } } } };
+  runner.atomicJson(f.file, record);
+  const reopen = { settleId: "prior", regateCount: 0, state: "failed" };
+  const before = fs.readFileSync(f.file, "utf8");
+  assert.match(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen }).refused, /flake occurrence publication is still owed/);
+  assert.equal(fs.readFileSync(f.file, "utf8"), before, "claim refusal preserves attempt, nonce and exact obligation bytes");
+  record.gate_progress.gates.acceptance.evidence.complete = true;
+  runner.atomicJson(f.file, record);
+  assert.equal(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen }).ok, true);
+  assert.equal(runner.readJson(f.file).gate_regate_count, 1);
+});
+
 test("effective token override cannot replay another credential's outbox despite matching stored tenant metadata", async () => {
   const f = fixture();
   const auth = require("../lib/auth.js");

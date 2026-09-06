@@ -105,8 +105,23 @@ Keys by kind (`lib/kernel/gates.js` is the authority):
   fact WITH the first failure as evidence, so flakes stay countable). Declare
   `reruns: 1` only where the operator says the full suite is known to flake
   under load; a rerun also hides a genuine intermittent defect one more time.
-  Deliberately *no* ref or protected-path key: those belong to the factory, so
-  one shared gate can never relax another team's trusted boundary.
+  Optionally `isolate` — a command template carrying a `{files}` token, e.g.
+  `node --test {files}` — the OFF-DIFF flake pass: after the reruns, a failure
+  naming only files the change does not touch has those test files re-run
+  alone on the same tree, and passing there makes the whole-suite failure a
+  flake (the gate passes, and each failing file is filed as its own convergent
+  `issue-flake-*`) instead of costing a fix cycle, the rescue lane and finally
+  a person.
+  Propose it wherever the operator's whole-suite command is the same one a
+  single file can be run through — a repo whose suite cannot name a file
+  should declare nothing. Set expectations when you propose it: the pass is
+  narrow on purpose (the failing tests must also reference nothing the change
+  edits — checked by reading them and, transitively, everything they import),
+  so in a repo whose tests all drive one
+  large entry point it will rarely fire and `reruns` stays the flake
+  mitigation that does the work. Deliberately *no* ref or protected-path key: those
+  belong to the factory, so one shared gate can never relax another team's
+  trusted boundary.
 - **agent-review** — `profile` (required), `instructions`, `await_ms` (default
   3600000), `risk` (the factory-declared classes that arm it; empty means
   always — the same predicate a command or human gate takes, and the biggest
