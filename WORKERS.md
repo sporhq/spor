@@ -1597,7 +1597,9 @@ outside git (a database on a fixed port, a `db reset`):
     that pass to carry it, so a debt deferred there is a debt that sinks. The
     payment is recorded only from the door's own success. Before any fact
     publication, the exact outcome and judged head are saved in the gate's
-    `gate_progress` evidence entry. A failed fact write, edge payment, or
+    `gate_progress` evidence entry, bound to the original graph server and
+    tenant (or canonical local nodes directory). A missing or mismatched
+    origin refuses replay and leaves the obligation intact. A failed fact write, edge payment, or
     receipt save leaves the attempt **interrupted**, with its debt retained.
     Resume retries that evidence without running commands or spending another
     fix or rescue cycle. A completed receipt is reused, including across a
@@ -1609,8 +1611,10 @@ outside git (a database on a fixed port, a `db reset`):
     occurrence is paid through the guarded edge door, including fresh facts:
     remotely `POST /v1/nodes/:id/edges/live`, with a `target_guard: live`
     acknowledgement. An older server returns 404 without mutating the graph.
-    The server tests liveness inside its mutation queue; the local graph door
-    checks its current snapshot synchronously before appending. A target that
+    The server tests liveness inside its mutation queue. Local mode refuses
+    fresh payments because its graph writers share no atomic mutation door;
+    the attempt remains interrupted with its evidence intact. Existing local
+    historical receipts can still be acknowledged. A target that
     settled after selection advances to a live recurrence rung. A historical
     edge remains paid after its target settles, so replay never manufactures
     another occurrence on the next rung. The fact's body, head and gate
@@ -4242,16 +4246,30 @@ plus the local end-to-end attestation check in test/integration-step.test.js.
 
 The run-record claim precedes every pipeline mutation. The work loop does not
 pre-stamp `gate_worker`: a losing adopter must not overwrite the live owner's
-nonce before the claim check. Native and supervised judged children both strip
+nonce before the claim check. Proposal pushes and trusted-ref re-gate merges disable repository hooks.
+Native and supervised judged children both strip
 `SPOR_ATTESTATION_KEY` and `SUBSTRATE_ATTESTATION_KEY` from their environments.
 
 Settlement atomically writes the verdict and `gate_attestation_pending`, an
 outbox containing the exact artifact bytes and signature (never the signing
 key). `gate_attestation_missing` remains true until publication succeeds.
 Subsequent worker passes replay this debt without rerunning the gates or
-resigning evidence. A parked proposal retains its debt until its PR body is
+resigning evidence. Replay requires the original server and organization, or
+the canonical local nodes directory. An old outbox without an origin binding
+is retained for manual reconciliation and is never published through an ambient
+graph selection. A parked proposal retains its debt until its PR body is
 refreshed successfully. Pending debt prevents run retention from pruning the
-record. Gate, implementation and completion stamps share the same record lock.
+record. Gate, implementation, completion, native/contract settlement and final
+run bookkeeping all share the same record lock, including their read/merge.
+
+A re-gate publishes its PID and process start ticks before atomically reopening
+the prior verdict. Reopening refuses while the prior judgement still owes an
+attestation outbox; replay that evidence through its original graph first.
+Other workers therefore recognize its live ownership. Its
+final bookkeeping and recovery mutations retain the same ownership nonce; a
+losing re-gate cannot overwrite the successor. Human approval requests name
+and key their identity on the exact judged commit, so a fix that changes the
+candidate requires a fresh approval even when its risk paths stay unchanged.
 
 A stale breaker lock is deliberately fail-closed: age alone cannot authorize
 unlinking its pathname because that pathname may already name a live successor.

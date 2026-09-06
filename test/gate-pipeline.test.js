@@ -8521,11 +8521,18 @@ test("makeGateDeps pays a flake occurrence edge onto an existing fact — idempo
   node("issue-flake-one", "issue", ["status: open"]);
   const read = () => fs.readFileSync(path.join(home, "nodes", "art-gate-fact.md"), "utf8");
 
+  const beforePayment = read();
   const paid = await deps.linkFact({ id: "art-gate-fact", type: "relates-to", to: "issue-flake-one" });
-  assert.strictEqual(paid.ok, true, paid.reason);
-  assert.match(read(), /- \{type: relates-to, to: issue-flake-one\}/);
+  assert.strictEqual(paid.ok, false);
+  assert.match(paid.reason, /atomic graph mutation/);
+  assert.strictEqual(read(), beforePayment, "fresh local refusal changes no node bytes");
+  assert.doesNotMatch(read(), /relates-to, to: issue-flake-one/);
+  // Seed an existing historical receipt; replay may acknowledge it even when
+  // fresh local payments cannot be made atomically.
+  fs.writeFileSync(path.join(home, "nodes", "art-gate-fact.md"), read().replace("edges:\n", "edges:\n  - {type: relates-to, to: issue-flake-one}\n"));
 
-  // Again: the same occurrence, not a second one.
+  // Again: the same occurrence, including after its target was settled.
+  node("issue-flake-one", "issue", ["status: resolved"]);
   assert.strictEqual((await deps.linkFact({ id: "art-gate-fact", type: "relates-to", to: "issue-flake-one" })).ok, true);
   assert.strictEqual((read().match(/relates-to, to: issue-flake-one/g) || []).length, 1, "one occurrence, one edge, however many payers");
 
@@ -8932,20 +8939,34 @@ test("unpaid flake evidence survives a process restart without rerunning command
   fs.writeFileSync(path.join(dir, "test", "off.test.js"), 'require("node:assert");\n');
   const journal = path.join(dir, "progress.json");
   const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }], rescue: RESCUE });
+  factory.implementation = {};
+  let currentCandidate = "cand-original";
+  const factCandidates = [];
   let writable = false;
   let failFactCreate = true;
   let failReceipt = false;
+  const remoteOrigin = (server, org) => ({ mode: () => "remote", server: () => server, tenant: () => ({ org }) });
+  const originalCfg = remoteOrigin("https://graph-a.example", "team-a");
+  let currentCfg = originalCfg;
   const facts = new Map();
   const edges = new Set();
   const worker = () => {
     const f = withRescue(treeFakes({ dir, changed: ["lib/x.js"], run: (n, command) => command ? { ok: true } : { ok: false, code: 1, output: "✖ flakes\n at TestContext.<anonymous> (test/off.test.js:4:2)" } }));
     f.deps.fileFlakeItem = async () => ({ ok: true, id: "issue-flake-one" });
+    f.deps.pinCandidate = async () => ({ ok: true, candidate: { candidate_id: currentCandidate, reference: { verified_at: "2026-09-06" } } });
+    f.deps.evidenceOrigin = () => sporCli.attestationGraphOrigin(currentCfg);
+    f.deps.acceptsEvidenceOrigin = (origin) => sporCli.attestationOriginMatches(currentCfg, origin);
+    f.deps.checkEvidenceOrigins = () => {
+      const progress = fs.existsSync(journal) ? JSON.parse(fs.readFileSync(journal, "utf8")) : null;
+      return { ok: !progress || !progress.evidence || sporCli.attestationOriginMatches(currentCfg, progress.evidence.origin) };
+    };
     f.deps.loadGateProgress = async () => fs.existsSync(journal) ? JSON.parse(fs.readFileSync(journal, "utf8")) : null;
     f.deps.saveGateProgress = async ({ progress }) => {
       if (failReceipt && progress.evidence && progress.evidence.complete) throw new Error("process lost before receipt save");
       fs.writeFileSync(journal, JSON.stringify(progress));
     };
-    f.deps.recordFact = async ({ id, markdown }) => {
+    f.deps.recordFact = async ({ id, markdown, candidate_id, head }) => {
+      factCandidates.push({ candidate_id, head });
       if (failFactCreate) return { ok: false, reason: "graph write unavailable" };
       const existing = facts.has(id);
       facts.set(id, markdown);
@@ -8960,8 +8981,27 @@ test("unpaid flake evidence survives a process restart without rerunning command
   const debt = JSON.parse(fs.readFileSync(journal, "utf8"));
   assert.deepStrictEqual(debt.evidence.outcome.flake.issues, ["issue-flake-one"]);
   assert.strictEqual(debt.evidence.complete, false);
+  assert.strictEqual(debt.evidence.candidate_id, "cand-original");
+  currentCandidate = "cand-repin-tip";
   assert.strictEqual(a.seen.fixes.length, 0);
   assert.strictEqual(facts.size, 0, "the refused fact write did not discard its debt");
+  const savedBytes = fs.readFileSync(journal, "utf8");
+  for (const cfg of [remoteOrigin("https://graph-b.example", "team-a"), remoteOrigin("https://graph-a.example", "team-b"), { mode: () => "local", nodesDir: () => dir }]) {
+    currentCfg = cfg;
+    const other = worker();
+    assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: other.deps })).state, "interrupted");
+    assert.deepStrictEqual(other.seen.suites, []);
+    assert.strictEqual(other.seen.reads, 0, "origin refusal precedes candidate pinning and dirty-tree recovery");
+    assert.strictEqual(fs.readFileSync(journal, "utf8"), savedBytes, "origin refusal preserves the original obligation");
+    assert.strictEqual(facts.size, 0);
+  }
+  currentCfg = originalCfg;
+  const unbound = JSON.parse(savedBytes);
+  delete unbound.evidence.origin;
+  fs.writeFileSync(journal, JSON.stringify(unbound));
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: worker().deps })).state, "interrupted");
+  assert.strictEqual(facts.size, 0, "an unbound legacy debt cannot be inferred to belong here");
+  fs.writeFileSync(journal, savedBytes);
   failFactCreate = false;
   const edgeFailure = worker();
   assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: edgeFailure.deps })).state, "interrupted");
@@ -8980,6 +9020,7 @@ test("unpaid flake evidence survives a process restart without rerunning command
   assert.deepStrictEqual(b.seen.suites, [], "replay the exact evidence, never rerun the suite");
   assert.deepStrictEqual([...facts.keys()], [originalFact]);
   assert.strictEqual(edges.size, 1);
+  assert.ok(factCandidates.every((entry) => entry.candidate_id === "cand-original" && entry.head === debt.evidence.change.head), "replayed evidence carries its original candidate and commit, never the current pin");
   const c = worker();
   c.deps.recordFact = async () => { throw new Error("completed evidence should not be rewritten"); };
   assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps })).state, "passed");
@@ -9000,16 +9041,50 @@ test("a flake evidence journal write failure stops before graph publication", as
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("settlement after flake selection routes payment to a live recurrence and recovers its historical receipt", async () => {
+test("settlement after flake selection routes payment to a live recurrence and recovers its historical receipt", async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-debt-settled-"));
   fs.mkdirSync(path.join(home, "nodes"));
-  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      const send = (status, json) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(json)); };
+      const id = decodeURIComponent(req.url.split("/")[3] || "");
+      const file = path.join(home, "nodes", `${id}.md`);
+      if (req.method === "GET") {
+        if (!fs.existsSync(file)) return send(404, {});
+        return send(200, { raw: fs.readFileSync(file, "utf8") });
+      }
+      const payload = JSON.parse(body);
+      if (req.url === "/v1/nodes") {
+        const raw = payload.nodes[0].node;
+        const putId = /^id: (\S+)$/m.exec(raw)[1];
+        const dest = path.join(home, "nodes", `${putId}.md`);
+        const existing = fs.existsSync(dest);
+        if (!existing) fs.writeFileSync(dest, raw);
+        return send(200, { results: [{ status: existing ? "skipped" : "created" }] });
+      }
+      assert.match(req.url, /\/edges\/live$/);
+      const edge = `  - {type: ${payload.type}, to: ${payload.to}}`;
+      const raw = fs.readFileSync(file, "utf8");
+      if (raw.split("\n").includes(edge)) return send(200, { status: "skipped", target_guard: "live" });
+      const target = fs.readFileSync(path.join(home, "nodes", `${payload.to}.md`), "utf8");
+      if (/^status: resolved$/m.test(target)) return send(409, { error: { code: "target_not_live", message: "target settled" } });
+      fs.writeFileSync(file, raw.replace("edges:\n", `edges:\n${edge}\n`));
+      return send(200, { status: "updated", target_guard: "live" });
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${server.address().port}`, SPOR_TOKEN: "fake" } });
   const deps = flakeDeps(cfg, home);
   const call = { gate: { id: "acceptance", command: "npm test", isolate: "node --test {files}" }, file: "test/off.test.js", files: ["test/off.test.js"] };
   const selected = await deps.fileFlakeItem({ ...call, command: call.gate.command, isolate: call.gate.isolate });
   assert.ok(selected.ok);
   const fact = gateRunner.buildGateFact({ gate: call.gate, nodeId: "task-p", runId: "run-abcdef12", project: "demo", verdict: "passed", detail: "isolated green", factory: "factory-demo", flake: { files: call.files, issues: [selected.id] } });
-  assert.ok((await deps.recordFact({ ...fact, flakeIssues: [selected.id] })).ok);
+  assert.strictEqual((await deps.recordFact({ ...fact, flakeIssues: [selected.id] })).ok, false);
+  assert.strictEqual(fs.existsSync(path.join(home, "nodes", `${fact.id}.md`)), false);
+  assert.ok((await deps.recordFact({ ...fact, flakeIssues: [selected.id], origin: deps.evidenceOrigin() })).ok);
   const factPath = path.join(home, "nodes", `${fact.id}.md`);
   assert.doesNotMatch(fs.readFileSync(factPath, "utf8"), new RegExp(`relates-to, to: ${selected.id}\\}`), "fresh fact creation cannot bypass the live-target door");
   const settle = (id) => {
@@ -9017,7 +9092,7 @@ test("settlement after flake selection routes payment to a live recurrence and r
     fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(/^type: issue$/m, "type: issue\nstatus: resolved"));
   };
   settle(selected.id); // deterministic selection/payment interleaving
-  const payment = { id: fact.id, type: "relates-to", to: selected.id, ...call };
+  const payment = { id: fact.id, type: "relates-to", to: selected.id, ...call, origin: deps.evidenceOrigin() };
   assert.ok((await deps.linkFact(payment)).ok);
   const recurrence = `${selected.id}-r2`;
   const raw = fs.readFileSync(factPath, "utf8");
@@ -9061,4 +9136,36 @@ test("remote occurrence payments demand an acknowledged atomic live-target guard
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("a later gate fix changes the commit and requires a fresh human approval despite identical risk paths", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-human-head-"));
+  fs.mkdirSync(path.join(home, "nodes"));
+  const { loadConfig } = require("../lib/config.js");
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const h1 = "a".repeat(40), h2 = "b".repeat(40);
+  const factory = factoryOf({ ...BASE, gates: [
+    { id: "security", kind: "human", risk: ["touches:auth"], approval_timeout_ms: 1, poll_ms: 1 },
+    { id: "suite", kind: "command", command: "test", reruns: 0, cycles: 1 },
+  ] });
+  let head = h1, suites = 0;
+  const f = fakes({ suite: () => ({ ok: ++suites > 1, output: "first attempt requires a fix" }), fix: () => { head = h2; return { ok: true }; } });
+  f.deps.changedPaths = async () => ({ ok: true, paths: ["lib/auth.js"], head, base: "c".repeat(40), trustedRef: "main", trustedSha: "c".repeat(40), branch: "candidate" });
+  const real = sporCli.makeGateDeps(cfg, { entry: ITEM, factory, slug: null, log: () => {} });
+  const approvals = [];
+  f.deps.fileHumanItem = async (args) => {
+    const filed = await real.fileHumanItem(args);
+    assert.ok(filed.ok, filed.reason);
+    approvals.push({ id: filed.id, head: args.head });
+    if (args.head === h1) fs.writeFileSync(path.join(home, "nodes", "dec-first-approved.md"), `---\nid: dec-first-approved\ntype: decision\ntitle: Approved the first commit\nsummary: Approved the first candidate only.\nstatus: accepted\nedges:\n  - {type: resolves, to: ${filed.id}}\n---\n`);
+    return filed;
+  };
+  f.deps.checkApproval = ({ id }) => sporCli.gateApprovalState(cfg, id);
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+  assert.equal(result.state, "blocked", JSON.stringify(result));
+  assert.deepStrictEqual(approvals.map((a) => a.head), [h1, h2]);
+  assert.notEqual(approvals[0].id, approvals[1].id);
+  assert.match(fs.readFileSync(path.join(home, "nodes", `${approvals[1].id}.md`), "utf8"), new RegExp(h2));
+  assert.equal((await sporCli.gateApprovalState(cfg, approvals[0].id)).state, "approved");
+  assert.equal((await sporCli.gateApprovalState(cfg, approvals[1].id)).state, "pending");
 });
