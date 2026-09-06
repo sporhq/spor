@@ -46,6 +46,7 @@ const executionKernel = require(path.join(ROOT, "lib", "kernel", "execution.js")
 const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
 const candidatePublish = require(path.join(ROOT, "lib", "shell", "candidate-publish.js"));
 const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
+const implementationStage = require(path.join(ROOT, "lib", "shell", "implementation-stage.js"));
 const workerContractLib = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
 const { workerContract } = workerContractLib;
 // Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
@@ -9722,6 +9723,11 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
     if (r.impl_state) {
       out(`  stage:      ${r.impl_state}${candidateKernel.implSettled(r.impl_state) ? "" : " (unsettled — no stage verdict yet)"}${r.impl_pool ? ` — ${r.impl_pool} pool` : ""}${r.impl_attempt ? `, attempt ${r.impl_attempt}` : ""}`);
     }
+    // The attempt ledger (task-spor-factory-implementation-stage-runner): one
+    // line per implementer dispatch, the pool it charged, and why it ended.
+    if (Array.isArray(r.impl_attempts) && r.impl_attempts.length) {
+      out(`  attempts:   ${r.impl_attempts.map((a) => `${a.index}:${a.outcome}${a.pool ? `/${a.pool}` : ""}${a.run_id ? `@${String(a.run_id).slice(0, 8)}` : ""}`).join("  ")}`);
+    }
     if (r.impl_candidate) {
       out(`  candidate:  ${candidateKernel.candidateSummary(r.impl_candidate)}`);
       const chain = Array.isArray(r.impl_candidates) ? r.impl_candidates : [];
@@ -11415,11 +11421,20 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
   const out = [];
   for (const id of wanted) {
     let record = found.get(id) || null;
+    // The implementation stage's own ceilings, where a record carries them
+    // (FACTORY-IMPLEMENTATION-STAGE.md §5.1, `impl_budget` stamped at launch):
+    // a factory's lane may run longer or shorter than the worker's global
+    // --run-max/--run-idle, and the budget rides the RECORD, never a dispatch
+    // flag. A record with no stamp — every legacy run, every gate dispatch —
+    // takes the worker's ceilings exactly as before.
+    const budget = record && record.impl_budget && typeof record.impl_budget === "object" ? record.impl_budget : null;
+    const recMaxAgeMs = budget && Number.isFinite(Number(budget.run_max_ms)) && Number(budget.run_max_ms) > 0 && maxAgeMs > 0 ? Number(budget.run_max_ms) : maxAgeMs;
+    const recIdleMs = budget && Number.isFinite(Number(budget.run_idle_ms)) && Number(budget.run_idle_ms) >= 0 && idleMs > 0 ? Number(budget.run_idle_ms) : idleMs;
     const verdict = workLoop.runHarvest(record, {
       terminalStates: dispatchRuns.TERMINAL_STATES,
       alive: runSupervisorAlive,
-      maxAgeMs,
-      idleMs,
+      maxAgeMs: recMaxAgeMs,
+      idleMs: recIdleMs,
       // OBSERVED activity, never the launch fallback: a record with no output
       // channel this box can read (an unbound native-background run) must fall
       // through to the watchdog rather than read as silent since launch.
@@ -11441,7 +11456,7 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
       // did the work, and `resolved` is a graph read, never an exit code.
       const quietAt = dispatchRuns.observedActivityAt(record);
       const outcome = await verifyRunResolution(cfg, record);
-      const { record: closed, stopped } = await dispatchRuns.stopIdleRun(home, record, { idleMs, quietAt, outcome });
+      const { record: closed, stopped } = await dispatchRuns.stopIdleRun(home, record, { idleMs: recIdleMs, quietAt, outcome });
       // ENDED, not merely signalled: the record is now terminal and nothing
       // reconciles it again, so "we sent SIGTERM" is not enough to believe the
       // checkout is free.
@@ -11453,7 +11468,7 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
       const released = await releaseIdleLease(cfg, home, closed, { ended, outcome });
       warn(
         `work: ${ended ? "stopping" : "giving up following"} run ${String(id).slice(0, 8)} (${record.node_id || record.name || "?"}) — nothing written to its log or transcript for ` +
-          `${Math.max(1, Math.round((verdict.quietMs || 0) / 60000))}m (idle ceiling ${Math.max(1, Math.round(idleMs / 60000))}m)` +
+          `${Math.max(1, Math.round((verdict.quietMs || 0) / 60000))}m (idle ceiling ${Math.max(1, Math.round(recIdleMs / 60000))}m${budget && recIdleMs !== idleMs ? ", the factory's implementation budget" : ""})` +
           `${ended ? "" : `; ${stopped.alive ? "it did not die on SIGTERM/SIGKILL" : "it had no process of ours to signal"}, so something may still be running in its checkout`}` +
           `${outcome ? ". Its target reads resolved on the graph" : ""}` +
           `${released && released.lease_released === true ? `. Its lease on ${released.release_node} was released` : ""}` +
@@ -11467,7 +11482,7 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
         // and takes the watchdog's rule: cool the node for at least as long as
         // the silence we waited out, rather than re-dispatching into a checkout
         // something may still hold.
-        ...(ended ? {} : { cool_ms: idleMs }),
+        ...(ended ? {} : { cool_ms: recIdleMs }),
         record: released,
       });
       continue;
@@ -11497,8 +11512,8 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
         // Giving up on FOLLOWING a run says nothing about whether it stopped,
         // so the node is cooled for at least as long as we followed it rather
         // than for the ordinary refusal window.
-        cool_ms: maxAgeMs,
-        record: { ...record, terminal_note: `this worker stopped following the run after ${Math.round(maxAgeMs / 3600000)}h without a terminal state` },
+        cool_ms: recMaxAgeMs,
+        record: { ...record, terminal_note: `this worker stopped following the run after ${Math.round(recMaxAgeMs / 3600000)}h without a terminal state` },
       });
       continue;
     }
@@ -11549,6 +11564,15 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
 async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home = cfg.userConfigHome(), log = () => {}, cmdDispatch: cmdDispatchOverride = null } = {}) {
   const values = { ...passthrough, node: item.id };
   if (!values.profile && item.profile) values.profile = item.profile;
+  // `implementation.profile` — the factory's lane default — is the LOWEST-
+  // precedence router (FACTORY-IMPLEMENTATION-STAGE.md §2.3): an explicit
+  // --profile wins, then the item's own `profile:` frontmatter (above), then
+  // its `assigned -> agent` edge — which cmdDispatch resolves itself from the
+  // node, so an item the queue reports as assigned is left for that
+  // resolution — and only then the lane. Never a substitution: an
+  // unsatisfiable lane profile refuses loudly like any other.
+  const lane = factory && factory.implementation && factory.implementation.profile;
+  if (!values.profile && lane && !(Array.isArray(item.assigned_agents) && item.assigned_agents.length)) values.profile = lane;
   // cmdDispatchOverride: test-only seam (default null, real cmdDispatch used)
   // so a fake dispatcher can exercise dispatchThroughLocked's launch-wins-over-
   // exit-code contract without launching a real harness — see
@@ -12033,16 +12057,23 @@ const { gateChangeSet, prepareGateTree, runGateCommand } = gateRunner;
 // Follow a gate's own dispatched run (a review, a fix cycle) to its terminal
 // state. Bounded — a review that never ends must fail its gate rather than hold
 // the worker's slot for the life of the process.
-async function awaitGateRun(cfg, runId, { timeoutMs, pollMs = 5000, warn = () => {}, sleep, now = () => Date.now() }) {
+// `maxAgeMs`/`idleMs` (default 0 — off, byte-identical for the review, fix and
+// rescue callers) hand the poll the worker's ceilings, which it applies per
+// record with a stamped `impl_budget` taking precedence: the implementation
+// stage's re-dispatches are bounded by the factory's lane budget exactly as
+// the loop bounds attempt 1. A run the poll GAVE UP following (the watchdog,
+// or an idle stop that did not take) comes back `unfollowable` — terminal for
+// this worker, not evidence the agent stopped.
+async function awaitGateRun(cfg, runId, { timeoutMs, pollMs = 5000, warn = () => {}, sleep, now = () => Date.now(), maxAgeMs = 0, idleMs = 0 }) {
   const deadline = now() + timeoutMs;
   for (;;) {
     let verdict = null;
     try {
-      verdict = (await pollWorkRuns(cfg, [runId], { maxAgeMs: 0, warn }))[0];
+      verdict = (await pollWorkRuns(cfg, [runId], { maxAgeMs, idleMs, warn }))[0];
     } catch (e) {
       return { ok: false, reason: `the run record could not be read: ${e.message}` };
     }
-    if (verdict && verdict.terminal) return { ok: true, record: verdict.record };
+    if (verdict && verdict.terminal) return { ok: true, record: verdict.record, ...(verdict.cool_ms ? { unfollowable: true } : {}) };
     const at = now();
     if (at >= deadline) {
       return { ok: false, reason: `the run did not reach a terminal state within ${Math.round(timeoutMs / 60000)}m ('spor runs' still follows it)`, record: verdict && verdict.record };
@@ -12775,7 +12806,7 @@ function refuseDirtyCandidate(factory, cwd) {
 
 function makeGateDeps(
   cfg,
-  { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
+  { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, runIdleMs = workLoop.WORK_DEFAULTS.runIdleMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
 ) {
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
@@ -13676,6 +13707,148 @@ function makeGateDeps(
     return { ok: true, runId: launched.run.run_id, diagnosis: parsed.diagnosis, category: parsed.category, fixed: parsed.fixed, filed: parsed.filed, unread: !parsed.ok, record: done.record };
   };
 
+  // --- the implementation stage (task-spor-factory-implementation-stage-
+  // runner, FACTORY-IMPLEMENTATION-STAGE.md §4.2 I3-I11, WORKERS.md §10.16) ---
+  // The ledger (`impl_attempts[]`) rides the pipeline's OWN run record beside
+  // `impl_state`/`impl_attempt`, through stampImplState — read fresh, like the
+  // gate progress, so a resumed worker sees every stamp the killed one made.
+  const loadImplAttempts = async () => {
+    const r = readRecordNow();
+    return { attempts: r && Array.isArray(r.impl_attempts) ? r.impl_attempts.map((e) => ({ ...e })) : [], record: r };
+  };
+  // A stamp that did not land THROWS: the stage refuses to act on a charge
+  // nobody recorded (owe before you clear). `impl_state` writes onto a
+  // settled record are dropped by stampImplState itself, which is the
+  // settled-is-final rule, not a failure — so the verification is on the
+  // ledger, the one field this dep owns.
+  const saveImplAttempts = async ({ attempts, patch = {} }) => {
+    const stamped = dispatchRuns.stampImplState(home, entry.run_id, { ...patch, impl_attempts: attempts });
+    if (!stamped || !Array.isArray(stamped.impl_attempts) || stamped.impl_attempts.length !== attempts.length) throw new Error("the run record could not be updated");
+  };
+  // The re-dispatch: the implementer sent back into the run's OWN checkout
+  // (`--no-worktree`, the tree it left is what it continues from) under the
+  // profile the original launch resolved (`record.resolved_profile` — the same
+  // routing decision, never a substitution; the lane default where that is
+  // unknown), carrying the worker's posture exactly as the original dispatch
+  // did (§5.2 — an implementation dispatch is not read-only), the worker
+  // contract, and a preamble naming the attempt and what the prior one left.
+  // `--force` for the same reason the fix cycle passes it: the item is HELD
+  // by this pipeline's execution and the runner knows why it is not open.
+  // "no-auto-route": a pipeline-internal dispatch never re-routes. Adopted by
+  // its unique NAME on resume, like a fix cycle and a rescue.
+  // The run that actually PRODUCED the tree when nobody names one: the
+  // ledger's last settled attempt of this pipeline attempt, where it is not
+  // the pipeline's own run (a re-dispatched implementer). Read by the
+  // candidate pin's provenance and the no-code claim, so neither attributes a
+  // re-dispatched attempt's work — or reads its report — off attempt 1.
+  const stageProducerRunId = () => {
+    const r = readRecordNow();
+    const seg = gatesKernel.implAttemptsFor(r && r.impl_attempts, entry.attempt || 0).filter((e) => gatesKernel.implAttemptSettled(e) && e.run_id);
+    const last = seg.length ? seg[seg.length - 1] : null;
+    return last && last.run_id && last.run_id !== entry.run_id ? last.run_id : null;
+  };
+  const stageProducerRecord = () => {
+    const id = stageProducerRunId();
+    if (!id) return null;
+    try {
+      return dispatchRuns.readJson(dispatchRuns.runPaths(home, id).record) || null;
+    } catch {
+      return null;
+    }
+  };
+  const implement = async ({ attempt, of, name, prior = [], dirty = false, onLaunch = null }) => {
+    const cwd = (record && record.cwd) || undefined;
+    if (!cwd) return { ok: false, reason: "the run's checkout is unknown, so the implementer has nowhere to work", classification: gatesKernel.classifyExecutionOutcome(null, "the run's checkout is unknown") };
+    const last = prior.length ? prior[prior.length - 1] : null;
+    const lane = factory && factory.implementation;
+    const preamble = [
+      `This is implementation attempt ${attempt}${of ? ` of ${of}` : ""} on Spor work item ${entry.node_id} under the '${factory.id || "factory"}' factory.`,
+      last
+        ? last.outcome === "no-candidate"
+          ? `The previous attempt (run ${String(last.run_id || "?").slice(0, 8)}) ended cleanly but committed NOTHING past ${factory.trustedRef} in this checkout — the gates had no candidate to judge. Do the work here and COMMIT it.`
+          : dirty
+            ? `The previous attempt (run ${String(last.run_id || "?").slice(0, 8)}) left UNCOMMITTED changes to tracked files in this checkout: ${last.reason || "a dirty tree"}. Commit what belongs to ${entry.node_id} (a clear message), discard what does not (\`git restore\`), and leave the working tree CLEAN — a dirty tree is not a candidate.`
+            : `The previous attempt (run ${String(last.run_id || "?").slice(0, 8)}) ended ${last.outcome}${last.reason ? `: ${last.reason}` : ""}. This checkout may hold partial work — read \`git status\` and \`git log\` first, then finish the item and commit.`
+        : "",
+      `Work in THIS checkout (${cwd}) — it is the run's own; do not create a worktree or switch branches.`,
+      "",
+    ].filter((l) => l !== null);
+    const prompt = [...preamble, workerContract({ nodeId: entry.node_id, factory }), ...(lane && lane.instructions ? ["", "## Factory instructions for the implementation lane", "", lane.instructions] : [])].join("\n");
+    const already = launchedFixRun(home, entry.node_id, name);
+    const values = { ...passthrough, node: entry.node_id, dir: cwd, force: true, "no-worktree": true, "no-auto-route": true, name };
+    if (!values.profile) {
+      if (record && record.resolved_profile) values.profile = record.resolved_profile;
+      else if (lane && lane.profile) values.profile = lane.profile;
+    }
+    // The stage's per-run ceilings ride the child's record too (§5.1): the
+    // poll bounds the implementation run by the factory's budget, whichever
+    // attempt it is.
+    const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(cfg, values, [prompt], { recordFields: { ...implBudgetStamp(lane), impl_parent_run_id: entry.run_id, impl_attempt: attempt } });
+    if (!launched.ok) return { ok: false, reason: launched.reason, classification: gatesKernel.classifyExecutionOutcome(null, launched.reason) };
+    if (onLaunch) {
+      try {
+        await onLaunch({ runId: launched.run.run_id });
+      } catch (e) {
+        warn(`warning: implementation attempt ${attempt}'s launch could not be recorded on the ledger (${(e && e.message) || e})`);
+      }
+    }
+    // Followed under the worker's ceilings (the record's own `impl_budget`
+    // overriding them in the poll), so a silent attempt 2 is idle-stopped
+    // exactly as attempt 1 would be; a run the poll gave up on comes back
+    // `unfollowable` and the stage stops rather than re-dispatch into a
+    // checkout something may still hold.
+    const done = await awaitGateRun(cfg, launched.run.run_id, { timeoutMs: runMaxMs, warn, sleep, maxAgeMs: runMaxMs, idleMs: runIdleMs });
+    if (!done.ok) return { ok: true, runId: launched.run.run_id, adopted: !!launched.adopted, record: done.record || null, unfollowable: true, reason: done.reason };
+    return { ok: true, runId: launched.run.run_id, adopted: !!launched.adopted, record: done.record, ...(done.unfollowable ? { unfollowable: true, reason: (done.record && done.record.terminal_note) || "this worker stopped following the run" } : {}), classification: gatesKernel.classifyExecutionOutcome(done.record) };
+  };
+  // The escalation a spent pool files (I8, I11, M1): a `requires: [human]`
+  // item that `blocks` the work item, keyed deterministically on the
+  // pipeline's run key so a resume re-files the same node. The hold STAYS
+  // (T1) and the body says so.
+  const escalateStage = async ({ state, attempts = [], reason }) => {
+    const id = `task-impl-${state}-${stem}-${short}-${gateIdSuffix("implement", state, entry.node_id, runKey)}`.toLowerCase();
+    const cap = gatesKernel.executionPoolCap(factory.implementation, "implementation");
+    const retryCap = gatesKernel.executionPoolCap(factory.implementation, "retry");
+    const lines = attempts.map((a) => `${a.index}. run ${String(a.run_id || "?").slice(0, 8)}: ${a.outcome}${a.pool ? ` (${a.pool} pool)` : ""}${a.reason ? ` — ${String(a.reason).slice(0, 200)}` : ""}`);
+    const body = [
+      state === "escalated"
+        ? `The implementation stage on ${entry.node_id} stopped without a candidate for a reason that is not the code's: ${reason || "no detail"}. That is not a verdict on any change — an outage charges the shared infrastructure retry pool (${retryCap} declared), never an implementation attempt, and a run this box could not follow or a ledger it could not stamp charges nothing it can act on.`
+        : state === "mismatch"
+          ? `The implementation stage produced a candidate for ${entry.node_id} whose evidence does not verify: ${reason || "no detail"}. Neither pool was charged; a person settles it.`
+          : `The implementation stage spent its budget (${cap} attempt${cap === 1 ? "" : "s"}) on ${entry.node_id} without producing a candidate: ${reason || "no detail"}. A person decides what happens next — the worker has stopped re-dispatching it.`,
+      "",
+      ...(lines.length ? ["Attempts:", "", ...lines, ""] : []),
+      `This item \`blocks\` ${entry.node_id} on the graph. The run's own record is \`${entry.run_id}\` ('spor runs ${entry.run_id}').`,
+      ...(completionKernel.isControllerRecord(record)
+        ? [
+            "",
+            `${entry.node_id} is HELD by execution \`${record.impl_claim.execution_id}\` (this factory completes items itself, at its`,
+            `'${record.impl_claim.completion.after}' boundary): no resolving edge and no terminal status retires it while the hold stands, and a`,
+            "fresh worker never takes a held item. The doors back are 'spor work --regate " + entry.run_id + "' (re-judge this run under",
+            `the same execution) or 'spor release ${entry.node_id} --execution ${record.impl_claim.execution_id}' (end the execution; the item then`,
+            "returns to the pool, or is resolved by hand as usual).",
+          ]
+        : []),
+    ].join("\n");
+    return writeGateNode(
+      cfg,
+      id,
+      buildGateWorkNode({
+        id,
+        title: state === "escalated" ? `Implementation stage escalation — the implementer could not finish on ${entry.node_id} (not a code verdict)` : state === "mismatch" ? `Implementation stage escalation — candidate evidence mismatch on ${entry.node_id}` : `Implementation stage exhausted — no candidate for ${entry.node_id} after ${cap} attempt${cap === 1 ? "" : "s"}`,
+        summary:
+          state === "escalated"
+            ? `The implementation stage on ${entry.node_id} stopped without a candidate: ${String(reason || "no detail").slice(0, 240)}. No code was judged wrong. Needs a person, or 'spor work --regate ${entry.run_id}' once the cause is cleared.`
+            : `The implementation stage on ${entry.node_id} settled ${state}: ${String(reason || "no detail").slice(0, 300)}. A person decides what happens next.`,
+        body,
+        project: slug,
+        date: date(),
+        edges: [{ type: "blocks", to: entry.node_id }],
+        requiresHuman: true,
+      })
+    );
+  };
+
   return {
     now: () => Date.now(),
     sleep,
@@ -13690,6 +13863,10 @@ function makeGateDeps(
     loadGatePools,
     saveGatePools,
     rescue,
+    implement,
+    loadImplAttempts,
+    saveImplAttempts,
+    escalateStage,
     changedPaths: async ({ trustedRef }) => {
       change = null;
       const c = gateChangeSet(record, trustedRef);
@@ -13732,7 +13909,7 @@ function makeGateDeps(
       // left on the graph. Mixing the two would describe a run that never
       // existed. The implementation stage's own pin is the case where the
       // producer IS this pipeline's record.
-      const producerId = runId || entry.run_id;
+      const producerId = runId || stageProducerRunId() || entry.run_id;
       let producer = current;
       if (producerId !== entry.run_id) {
         try {
@@ -13964,7 +14141,11 @@ function makeGateDeps(
     // one (unlike a rescue's diagnosis, which the stream may legitimately
     // carry) — and any node by id, so the runner can check what the claim
     // names against the graph in either mode.
-    noCodeClaim: () => gatesKernel.parseNoCodeReport(gateRunReportText(record)),
+    // The claim is read off the run that PRODUCED the empty diff: the record
+    // the stage hands over (`record`), else the ledger's last settled attempt,
+    // else the pipeline's own run — a re-dispatched implementer that scoped
+    // the item out is not read through attempt 1's report.
+    noCodeClaim: ({ record: r } = {}) => gatesKernel.parseNoCodeReport(gateRunReportText(r || stageProducerRecord() || record)),
     // The read behind a STALE-PREMISE verdict (task-spor-factory-skip-
     // resolved-items-with-empty-diff): the item's `commits:` stamps AS
     // CLAIMED — `record.item_commits`, captured at launch — checked against
@@ -14327,20 +14508,25 @@ async function retryOneEscalation(
   // `stage`, never its `gateId` — a declared gate may be named `integration`.
   const fromIntegration = !!(payload && payload.stage === integrationRunner.INTEGRATION_STAGE_ID);
   const fromCandidate = !!(payload && payload.stage === gatesKernel.CANDIDATE_GATE_ID);
-  const gate = payload && !fromIntegration
+  // An IMPLEMENTATION-stage refusal (implementation-stage.js escalate(),
+  // `stage: "implementation"`) replays through makeGateDeps' own
+  // `escalateStage`; its give-up is a factory that no longer declares the
+  // stage. Same rule: routed on `stage`, never on a gate id.
+  const fromImplementation = !!(payload && payload.stage === "implementation");
+  const gate = payload && !fromIntegration && !fromImplementation
     ? fromCandidate
       ? { id: gatesKernel.CANDIDATE_GATE_ID, kind: gatesKernel.CANDIDATE_GATE_ID }
       : factory && Array.isArray(factory.gates)
       ? factory.gates.find((g) => g.id === payload.gateId)
       : null
     : null;
-  if (!payload || (fromIntegration ? !(factory && factory.integration) : fromCandidate ? !(factory && factory.implementation) : !gate)) {
+  if (!payload || (fromIntegration ? !(factory && factory.integration) : fromCandidate || fromImplementation ? !(factory && factory.implementation) : !gate)) {
     giveUp(
       !payload
         ? "no retry payload was recorded for this refusal"
         : fromIntegration
         ? `factory '${(factory && factory.id) || "?"}' no longer declares an integration stage`
-        : fromCandidate
+        : fromCandidate || fromImplementation
         ? `factory '${(factory && factory.id) || "?"}' no longer declares an implementation stage`
         : `gate '${payload.gateId}' is no longer declared by factory '${(factory && factory.id) || "?"}'`
     );
@@ -14371,11 +14557,13 @@ async function retryOneEscalation(
   // reached for, and a person reads one escalation shape per refusal kind.
   const deps = fromIntegration
     ? makeIntegrationDeps(cfg, { record, entry, factory, slug: project, log, warn, home })
-    : makeGateDeps(cfg, { entry, factory, slug: project, log });
+    : makeGateDeps(cfg, { record, entry, factory, slug: project, log, home });
   let esc;
   try {
     esc = fromIntegration
       ? await deps.escalate({ attempts: payload.attempts || [], detail: payload.detail || "", evidence: payload.evidence || "" })
+      : fromImplementation
+      ? await deps.escalateStage({ state: payload.state, attempts: payload.attempts || [], reason: payload.reason || "" })
       : await deps.escalate({
           gate,
           attempts: payload.attempts || [],
@@ -14441,9 +14629,11 @@ async function retryOneEscalation(
   // crash or a failed write here loses only this record (logged), and a
   // replay of a landed retry — possible when the stamp itself did not land —
   // finds every write idempotent, this one included.
-  const closed = await writeEscalationRetryArtifact(cfg, { entry, payload, gate, factory, escalatedTo: esc.id, demoted, project });
+  // The implementation stage files no refusal fact of its own, so there is
+  // nothing to close over.
+  const closed = fromImplementation ? { ok: false, reason: "the implementation stage files no refusal fact to close" } : await writeEscalationRetryArtifact(cfg, { entry, payload, gate, factory, escalatedTo: esc.id, demoted, project });
   log(
-    `work: ${fromIntegration ? "integration" : "gate"} escalation for ${record.node_id} landed on retry ${nextAttempt} (${esc.id})` +
+    `work: ${fromIntegration ? "integration" : fromImplementation ? "implementation stage" : "gate"} escalation for ${record.node_id} landed on retry ${nextAttempt} (${esc.id})` +
       (demoted.note ? `; ${demoted.note}` : demoted.reason ? ` — the item could not be demoted (${demoted.reason})` : "") +
       (closed.ok ? `; closed ${payload.factId || "the refusal's fact"} with ${closed.id}` : `; the closing artifact over ${payload.factId || "the refusal's fact"} could not be written (${closed.reason})`)
   );
@@ -15538,6 +15728,17 @@ function makeCompletionDeps(cfg, { home = cfg.userConfigHome(), runId = null, ex
   };
 }
 
+// The `impl_budget` stamp a stage launch rides (§5.1): only the ceilings the
+// factory actually DECLARED (`null` = inherit) — an inherited ceiling is not
+// written, so the poll falls through to the worker's own.
+function implBudgetStamp(impl) {
+  if (!impl || !impl.budget) return {};
+  const b = {};
+  if (Number.isFinite(impl.budget.runMaxMs) && impl.budget.runMaxMs > 0) b.run_max_ms = impl.budget.runMaxMs;
+  if (Number.isFinite(impl.budget.runIdleMs) && impl.budget.runIdleMs >= 0) b.run_idle_ms = impl.budget.runIdleMs;
+  return Object.keys(b).length ? { impl_budget: b } : {};
+}
+
 // H1 (FACTORY-IMPLEMENTATION-STAGE.md §4.2): the execution hold, stamped on
 // the item BEFORE the implementer is dispatched, and the claim pins the run
 // record is created with (`ctx.recordFields`). Returns the recordFields, or a
@@ -15627,6 +15828,18 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
     },
     impl_state: "dispatched",
     impl_attempt: 1,
+    // I1 (§4.2): the first implementation attempt is RESERVED on the record's
+    // creation write — `outcome: "pending", pool: null`, charging nothing —
+    // and settled by the stage runner at classification
+    // (lib/shell/implementation-stage.js, task-spor-factory-implementation-
+    // stage-runner). The run id is the record's own and is filled in by the
+    // stage when it reads the ledger back.
+    impl_attempts: gatesKernel.reserveImplAttempt([], { index: 1, startedAt: held.pins.claimed_at }),
+    // The stage's per-RUN ceilings (§5.1): the loop's poll reads them off the
+    // record in place of the worker-global --run-max/--run-idle. Absent when
+    // the factory inherits both — a record with no stamp takes the worker's
+    // ceilings, which is the shipped behavior and the safe direction.
+    ...implBudgetStamp(impl),
   };
   // The first attempt row — §7.3's `stage.started`. Fail-soft: the run
   // record above is the client's evidence; the store's copy is owed, and a
@@ -16215,7 +16428,45 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       return { state: "blocked", reason, facts: [], gates: [], demoted: false, noRescue: true };
     }
   }
-  const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: reportingGateDeps(makeGateDeps(cfg, dctx), reporter) });
+  const gateDeps = reportingGateDeps(makeGateDeps(cfg, dctx), reporter);
+  // THE IMPLEMENTATION STAGE (task-spor-factory-implementation-stage-runner,
+  // §4.2 I3-I11): before any gate, read what the implementer's run produced,
+  // settle its attempt on the ledger, and re-dispatch while the budget or the
+  // retry pool allow. Only a CANDIDATE reaches the gates; every other verdict
+  // is a refusal of the stage — escalated (the hold stays, T1), or
+  // `unroutable`, which clears the hold since nothing is judging the item.
+  // Gated on a DECLARED stage under controller completion, so a factory
+  // without an `implementation:` block is byte-identical.
+  if (controller && ctx.factory.implementation) {
+    const stage = await implementationStage.runImplementationStage({ item, factory: ctx.factory, record, log: ctx.log, deps: gateDeps });
+    if (stage.state !== "candidate") {
+      if (stage.state === "unroutable") {
+        const cleared = await completionShell.clearHold({ nodeId: entry.node_id, executionId: record.impl_claim.execution_id, deps: makeCompletionDeps(cfg, { home }) });
+        if (!cleared.ok) ctx.log(`work: ${entry.node_id} — the implementer could not be re-dispatched and its execution hold ${record.impl_claim.execution_id} could not be cleared (${cleared.reason}); release it with 'spor release ${entry.node_id} --execution ${record.impl_claim.execution_id}'`);
+      }
+      // `interrupted` is left UNSETTLED on the record (not in the settled gate
+      // states), so the resume scan re-offers it and the ledger picks up where
+      // it stopped; everything else settles the pipeline as a refusal.
+      const state = stage.state === "interrupted" ? "interrupted" : "failed";
+      return {
+        state,
+        gates: [],
+        facts: [],
+        reason: `implementation stage ${stage.state}: ${stage.reason || ""}`.trim(),
+        stage: stage.state,
+        escalated_to: stage.escalated_to || null,
+        demoted: false,
+        demote_reason: null,
+        ...(stage.escalation_failed ? { escalation_failed: true } : {}),
+        // The replayable payload the bounded escalation auto-retry re-files
+        // from (retryOneEscalation's `stage: "implementation"` arm), so a
+        // held item whose blocker never landed is not left for `--regate`.
+        ...(stage.escalation_retry ? { escalation_retry: stage.escalation_retry } : {}),
+      };
+    }
+    if (stage.handoff) ctx.log(`work: ${entry.node_id} — implementation stage hands the run to the gates: ${stage.handoff}`);
+  }
+  const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: gateDeps });
   // The SPLIT verdict of the gate list alone (task-spor-factory-controller-
   // completion-boundary, §6.5): `gates_state` says what the gates said, and
   // `integration_state` below what the integration stage said, so the
@@ -16780,6 +17031,18 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // attempt may now write and then owe.
   if (completionKernel.isControllerRecord(record) && record.completion_consumed_at) {
     dispatchRuns.stampCompletionState(home, record.run_id, { completion_consumed_at: null, completion_note: null });
+  }
+  // ...and a settled implementation-stage REFUSAL (task-spor-factory-
+  // implementation-stage-runner): `exhausted`/`escalated`/`unroutable`/
+  // `mismatch` are the stage's "could not finish" verdicts, and a re-gate is
+  // the documented door back from them. Reopened to `running` under the new
+  // attempt key, so the stage re-judges the run in a fresh ledger segment
+  // (a fresh code pool beside the fresh infrastructure pool). A settled
+  // `candidate` or `declined` is a verdict on what the run produced and is
+  // left alone — the gates re-judge the candidate as before.
+  if (["exhausted", "escalated", "unroutable", "mismatch"].includes(String(record.impl_state || ""))) {
+    dispatchRuns.stampImplState(home, record.run_id, { impl_state: "running", impl_attempt: 1 }, { force: true });
+    out(`work: re-gating ${record.node_id} — its implementation stage had settled '${record.impl_state}'; re-judging the run under attempt ${attempt}`);
   }
   const entry = { run_id: record.run_id, node_id: record.node_id, harness: record.harness || null, project, attempt };
   // A single-shot identity for THIS invocation — --regate has no work-loop
@@ -17766,6 +18029,7 @@ async function cmdWork(cfg, { values }) {
                 passthrough,
                 warn,
                 runMaxMs,
+                runIdleMs,
                 home,
                 // Provenance only: which worker on this box pinned the
                 // candidate (task-spor-factory-candidate-record §3.1).
@@ -20672,7 +20936,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS };
 
 if (require.main === module) {
   main()

@@ -930,3 +930,39 @@ test("the CLI: `spor get` notes a HELD node (stale when its worker is gone), and
   const again = spawnSync(process.execPath, [CLI, "get", "task-x"], { encoding: "utf8", env });
   assert.doesNotMatch(again.stderr, /HELD/);
 });
+
+// ---------- the implementation stage's launch stamps (I1, §5.1, §6.5) ----------
+// task-spor-factory-implementation-stage-runner: the record a stage launch is
+// CREATED with reserves attempt 1 on the ledger (pending, charging nothing)
+// and carries the factory's declared per-run ceilings, or none when it
+// inherits the worker's.
+
+test("claimExecutionHold reserves implementation attempt 1 on the record's creation write and stamps only the DECLARED budget ceilings", async () => {
+  const t = tmpGraph(Object.fromEntries([node("task-x", "task", { status: "open" })]));
+  const cfg = localCfg(t.dir);
+  const declared = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], implementation: { budget: { run_max_ms: 3600000, run_idle_ms: 0, attempts: 2 } } });
+  declared.id = "factory-t";
+  const held = await spor.claimExecutionHold(cfg, { id: "task-x" }, declared, { home: t.dir });
+  assert.equal(held.ok, true);
+  const rf = held.recordFields;
+  assert.deepEqual(rf.impl_attempts.map((a) => [a.index, a.outcome, a.pool, a.run_id]), [[1, "pending", null, null]], "reserved, not charged (I1)");
+  assert.equal(rf.impl_attempts[0].started_at, rf.impl_claim.claimed_at);
+  assert.deepEqual(rf.impl_budget, { run_max_ms: 3600000, run_idle_ms: 0 }, "a declared 0 idle IS the disable and rides through");
+  assert.equal(spor.implBudgetStamp(declared.implementation).impl_budget.run_max_ms, 3600000);
+
+  const t2 = tmpGraph(Object.fromEntries([node("task-y", "task", { status: "open" })]));
+  const inherits = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], implementation: {} });
+  inherits.id = "factory-t";
+  const held2 = await spor.claimExecutionHold(localCfg(t2.dir), { id: "task-y" }, inherits, { home: t2.dir });
+  assert.equal(held2.ok, true);
+  assert.equal(held2.recordFields.impl_budget, undefined, "a factory that inherits both ceilings stamps none — the poll falls through to the worker's");
+  assert.deepEqual(spor.implBudgetStamp(null), {});
+
+  const t3 = tmpGraph(Object.fromEntries([node("task-z", "task", { status: "open" })]));
+  const agentOnly = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller" } });
+  agentOnly.id = "factory-t";
+  const held3 = await spor.claimExecutionHold(localCfg(t3.dir), { id: "task-z" }, agentOnly, { home: t3.dir });
+  assert.equal(held3.ok, true);
+  assert.equal(held3.recordFields.impl_attempts.length, 1, "the boundary alone still reserves the attempt — the ledger is the record's shape under controller completion");
+  assert.equal(held3.recordFields.impl_budget, undefined);
+});

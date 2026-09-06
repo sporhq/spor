@@ -3432,18 +3432,14 @@ submission, the candidate pin and the controller's completion write (§10.12,
 above, and the `publish_pending` debt of an outage), `candidate.require_clean`
 (issue-spor-candidate-require-clean-parsed-never-read: the pin itself refuses,
 with its own reason, on a checkout with uncommitted tracked changes — see
-above), and gate start being CONDITIONAL on that submission — a candidate
-that could not be pinned, or whose publish never verified, starts no gate; it
-is refused, escalated and demoted exactly like any other gate failure
-(§10.12's exception to fail-soft pinning) — are shipped. The rest of the
-stage is declared and validated but not yet executed: no dispatch is routed by
-`implementation.profile`, no budget or retry pool is spent
-(task-spor-factory-implementation-stage-runner, on the outcome classifier that
-separates the two pools, task-spor-factory-execution-outcome-classifier), and
-`rejudge_on_repin` is parsed onto the gate and read by nobody. Declaring those
-keys today is a DECLARATION of intent that the runner already validates and
-will honor when those items land; nothing about them changes what a worker
-does now.
+above), and the STAGE RUNNER itself (§10.16: `implementation.profile` routing,
+`budget.attempts`, `retry.attempts`/`backoff_ms`, `budget.run_max_ms`/
+`run_idle_ms`, and the dirty-tree round-trip the stage re-dispatches under
+`require_clean` before the pin ever refuses) are shipped. The one key still
+declared and validated but read by nobody is `rejudge_on_repin` (parsed onto
+the gate; issue-spor-gate-rejudge-on-repin-parsed-never-read). Declaring it
+today is a DECLARATION of intent the runner validates and will honor when that
+item lands; nothing about it changes what a worker does now.
 
 See test/gates.test.js (the validation table), test/worker-contract.test.js,
 test/candidate.test.js and test/completion-boundary.test.js.
@@ -3564,3 +3560,149 @@ the fence on every transition, the outbox on a partition, in-order replay,
 idempotent re-delivery, a takeover refusing the resolving edge through the
 completion write's fence check; the CLI claim in both modes and the unserved
 fallback; the legacy no-op).
+### 10.16 The implementation stage runner — spending the budget and the retry pool
+
+§10.14 declares the stage; this is what `spor work` DOES with it
+(task-spor-factory-implementation-stage-runner, FACTORY-IMPLEMENTATION-STAGE.md
+§4.2 rows I2-I11, §5.3, §6.5; `lib/shell/implementation-stage.js`, its
+launcher and stamps in `bin/spor.js` `makeGateDeps` beside the fix cycle's and
+the rescue's). Under `completion.by: controller` every terminal implementer run
+is gated (§10.2), and the stage runs FIRST — between the loop's harvest and the
+first gate — inside the same pipeline promise, so the slot-holding, cooldown
+and resume machinery of §10.8 need no changes: only a CANDIDATE reaches the
+gates, and everything else is a refusal of the stage. A factory that declares
+no `implementation:` block never enters it and is byte-identical.
+
+**The ledger.** The pipeline's run record carries `impl_attempts[]`, one entry
+per implementer dispatch: `{index, run_id, outcome, pool, started_at,
+finished_at, reason}`. Attempt 1 is the run the loop dispatched, RESERVED on
+the record's creation write (`claimExecutionHold`: `outcome: "pending", pool:
+null` — a reservation charges nothing, I1). Every entry is SETTLED in one
+stamp at classification, outcome and pool together (`kernel/gates.js`
+`settleImplAttempt`), and a settled entry is never re-settled — so a resumed
+worker beside a not-quite-dead one charges once, and a stamp that did not
+land leaves the entry `pending` for the next pass to re-classify (the
+classifier is pure over the run record, which is the debt). The pool caps are
+read against SETTLED entries, never against launches: `implementation.budget.
+attempts` against the entries whose `pool` is `implementation`, and the
+shared infrastructure pool against the SAME `gate_progress.pools.retry`
+counter the review and fix gates' outage retries spend (§10.4) — one pool per
+pipeline, so a retry the implementation took is not available to a review.
+
+**The classification.** The one shared `classifyExecutionOutcome` reads the
+run first: `declined` (I6 — triage, neither pool, no escalation),
+`infrastructure` (an environment termination, a harness dead at boot, a
+vanished supervisor, an unreachable terminal contract — the RETRY pool),
+`cancelled` (the idle stop — the code pool), `failed` (a nonzero exit for no
+recognized reason, and every ambiguity — the code pool). A run that ended
+CLEANLY is then judged on what it produced, through the same `changedPaths`
+read the gates make in the run's own checkout: a commit past the trusted ref
+is a `candidate` (I3 — the attempt was used, whatever the publish then costs,
+and the entry settles BEFORE any pin or publish); an empty diff is
+`no-candidate` (I5); a tree with uncommitted TRACKED changes under
+`require_clean` is `failed` with the dirty-tree flag (I4). Four readings are
+HANDED to the pipeline as a candidate rather than settled here, because the
+pipeline already settles them deterministically before any gate and can only
+ever remove a wrong refusal: an empty diff whose item's recorded commits
+already landed on the trusted ref (the stale-premise route, §10.11's
+sibling), an empty diff the run DECLARED as a no-code outcome (`SCOPED:`,
+verified there whichever way it comes out), a dirty tree the factory
+tolerates (`require_clean: false` — the pipeline's commit-or-discard
+round-trip is the declared remedy), and a checkout that is gone or unreadable
+(re-dispatching into a tree this box cannot read would spend an attempt at
+the same tree).
+
+**The loop.** After each settle the stage decides (`implAttemptDecision`):
+`candidate` hands to the gates; `declined` stops; a code outcome with attempts
+left RE-DISPATCHES the implementer (I4, I5, I9, I10) and with none left
+settles `exhausted` (I11); an outage with headroom on the shared pool charges
+it, waits out `retry.backoff_ms` (sliced, so a stop is answered inside the
+wait) and re-dispatches (I7), and with none settles `escalated` (I8). A
+re-dispatch is reserved on the ledger BEFORE it is launched (owe before you
+clear), stamps `impl_attempt` and `impl_state: running`, and goes through the
+same `dispatchThrough` door as everything else: into the run's OWN checkout
+(`--no-worktree` — the tree the prior attempt left is what it continues
+from), under the profile the original launch resolved
+(`record.resolved_profile`, the lane default where that is unknown — the same
+routing decision, never a substitution), carrying the worker's own posture
+(§5.2: an implementation dispatch is not read-only), `--force` for the
+reason the fix cycle passes it (the item is held by this pipeline's
+execution), `--no-auto-route`, the worker contract, the lane's
+`instructions`, and a preamble naming the attempt and what the prior one left
+(nothing committed; a dirty tree to commit-or-discard; a harness that ended
+`<outcome>`). It is NAMED `impl-<short>-<n>` (`shortRunAttempt`'s key, so a
+`--regate` keys one segment deeper) and ADOPTED by that name on resume, exactly
+as `fix-…` and `rescue-…` runs are: a worker killed between the launch and its
+durable record joins the run rather than dispatching a second implementer into
+one checkout. A re-dispatch the box REFUSES before any run record (an
+unsatisfiable profile, a launcher that does not resolve) is `unroutable` (I2):
+the reservation is withdrawn — a refusal is not an attempt — nothing is
+escalated, and the caller CLEARS the execution hold, since nothing is judging
+the item (T1). On the retry pool the order is charge, then RESERVE the next
+attempt, then wait out the backoff — so a worker stopped during the wait
+leaves a pending reservation the resume launches, never a charge with nothing
+behind it. A worker asked to stop reports `interrupted` with the ledger
+standing; the record stays unsettled, so the §10.8 resume scan re-offers it
+and the ledger picks up where it stopped. `interrupted` is reserved for a
+STOP: a re-dispatched attempt this box could not follow to its end (the
+watchdog gave up, an idle stop did not take) is settled `cancelled` and the
+stage ESCALATES rather than dispatch another agent into a checkout something
+may still hold, and a ledger stamp that fails escalates too (the gate
+runner's rule for a pool charge that could not land: an uncounted attempt is
+an unbounded one) — on a live worker there is no later pass to re-classify
+it, so the item is never parked on a promise. The re-dispatched attempts are
+followed under the worker's own `--run-max`/`--run-idle` (with the record's
+`impl_budget` overriding them, below), so a silent attempt 2 is idle-stopped
+exactly as attempt 1 is. The no-code claim (`SCOPED:`) and the candidate
+pin's provenance are read off the attempt that actually RAN — the ledger's
+last settled entry — never off attempt 1's report.
+
+**What a refusal writes.** `exhausted`, `escalated` and `mismatch` settle
+`impl_state` on the record and file ONE `requires: [human]` item that `blocks`
+the work item — `task-impl-<state>-<stem>-<short>-<suffix>`, deterministic on
+the pipeline's run key and composed from the ledger (never from the pass that
+happened to file it; a non-pool reason rides the segment's last entry as
+`stop_reason`), so a settled stage re-entered by a resume re-files the
+identical node and never a second one. The body says which pool ran out, lists
+every attempt with its outcome and pool, and — the `escalated` case — that no
+code was judged wrong. A write that fails leaves the same replayable payload a
+gate refusal does (`escalation_retry`, `stage: "implementation"`), and the
+bounded escalation auto-retry re-files it through the stage's own door. The
+hold STAYS (T1): the item is neither completed nor released, and the doors
+back are `spor work --regate <run>` or `spor release <item> --execution
+<exec>`. **A re-gate is a new segment of the ledger**: `cmdWorkRegate`
+reopens a settled stage refusal (`exhausted`/`escalated`/`unroutable`/
+`mismatch` — never `candidate` or `declined`) to `running`, and the stage
+re-judges the run under the new attempt key with a fresh code pool beside
+the fresh infrastructure pool; the earlier segment stays as history (each
+entry carries its `attempt`), the caps read only the current one, and the
+re-dispatch names key one segment deeper (`impl-<short>-r2-<n>`). The one
+exception: an earlier segment that still OWES a launched attempt its
+classification (a worker killed while following `impl-<short>-2`, the entry
+pending with its run id) is ADOPTED under its original key and name — the
+agent behind it may still be editing the checkout, and a fresh segment there
+would put a second one in it. The loop
+cools the item on the same window a gate refusal gets, `--status` shows the
+stage verdict beside the gate's, and `spor runs <id>` prints the ledger as
+an `attempts:` line.
+
+**The per-run budget** (§5.1). A stage launch stamps `impl_budget:
+{run_max_ms, run_idle_ms}` on the record — only the ceilings the factory
+DECLARED; an inherited one is not written — and the loop's poll
+(`pollWorkRuns`) reads them per record in place of the worker's own
+`--run-max`/`--run-idle`. A record with no stamp (every legacy run, every gate
+dispatch) takes the worker's ceilings exactly as before, and a stamp NARROWS a
+ceiling, never arms one the operator disabled. The re-dispatched attempts ride
+the same stamp, so the whole lane is bounded by its budget whichever attempt
+is running.
+
+**Routing** (§2.3). `implementation.profile` is applied by `dispatchWorkItem`
+at the LOWEST precedence: only when no `--profile` was passed, the item
+carries no `profile:` of its own, and the queue reports no `assigned -> agent`
+edge (which `cmdDispatch` resolves itself). It is never a substitution — an
+unsatisfiable lane profile refuses loudly like any other.
+
+See test/gate-pipeline.test.js ("the implementation stage": every row with a
+fake dispatcher, plus the real doors end to end), test/completion-boundary.
+test.js (the claim-time reservation and budget stamp) and
+test/work-loop.test.js (the per-record ceiling).

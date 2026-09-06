@@ -6826,3 +6826,520 @@ test("the gate FACT carries the outage and why the gate stopped asking, not just
   assert.match(seen.facts[0].markdown, /Outage: the dispatch never answered \(the harness ended on an environment failure \(credit-exhausted\)\)/);
   assert.match(seen.facts[0].markdown, /declares no infrastructure retry pool/);
 });
+
+// ------------------------------------------------ the implementation stage --
+//
+// task-spor-factory-implementation-stage-runner: the loop that spends the
+// attempt budget and the infrastructure retry pool
+// (lib/shell/implementation-stage.js, FACTORY-IMPLEMENTATION-STAGE.md §4.2
+// rows I2-I11, §5.3, §6.5). Driven with a fake dispatcher: what the
+// implementer's run ENDED as (a run record the shared classifier reads), what
+// its tree holds (the same changedPaths read the gates make), and what the
+// ledger stamps and the escalation writes actually carry.
+
+const implementationStage = require("../lib/shell/implementation-stage.js");
+
+// A run record in the shape the classifier reads.
+const implRecord = (termination_class, extra = {}) => ({ run_id: extra.run_id || "run-impl-child", node_id: ITEM.node_id, state: "exited", termination_class, terminal_state: "reported", started_at: "2026-09-06T00:00:00.000Z", ...extra });
+
+function stageFakes({ changedSeq = [{ ok: true, paths: ["lib/x.js"], head: "a".repeat(40) }], implement = null, pools = null, record = null, attempts = null, implState = null, noCodeClaim = null, commitsLanded = null, saveThrows = 0, stopping = () => false } = {}) {
+  const seen = { attempts: attempts ? attempts.map((e) => ({ ...e })) : [], patches: [], implements: [], escalations: [], reads: 0, pools: pools ? { ...pools } : null, poolSaves: 0, slept: 0, saves: 0 };
+  let clock = 1_700_000_000_000;
+  const deps = {
+    now: () => clock,
+    sleep: async (ms) => {
+      clock += ms;
+      seen.slept += 1;
+    },
+    stopping,
+    changedPaths: async () => {
+      seen.reads += 1;
+      return changedSeq[Math.min(seen.reads - 1, changedSeq.length - 1)];
+    },
+    loadImplAttempts: async () => ({ attempts: seen.attempts.map((e) => ({ ...e })), record: { ...(record || implRecord("completed", { run_id: ITEM.run_id })), ...(implState ? { impl_state: implState } : {}), impl_attempts: seen.attempts } }),
+    saveImplAttempts: async ({ attempts: next, patch }) => {
+      seen.saves += 1;
+      if (seen.saves <= saveThrows) throw new Error("the run record could not be updated");
+      seen.attempts = next.map((e) => ({ ...e }));
+      seen.patches.push({ ...patch });
+    },
+    implement: async (args) => {
+      seen.implements.push({ attempt: args.attempt, name: args.name, prior: args.prior, dirty: args.dirty, of: args.of });
+      if (args.onLaunch) await args.onLaunch({ runId: `run-impl-${args.attempt}` });
+      return implement ? implement(args, seen) : { ok: true, runId: `run-impl-${args.attempt}`, record: implRecord("completed", { run_id: `run-impl-${args.attempt}` }) };
+    },
+    escalateStage: async (args) => {
+      seen.escalations.push(args);
+      return { ok: true, id: `task-impl-${args.state}-demo` };
+    },
+    ...(noCodeClaim ? { noCodeClaim: async () => noCodeClaim } : {}),
+    ...(commitsLanded ? { commitsLanded: async () => commitsLanded } : {}),
+    ...(pools
+      ? {
+          loadGatePools: async () => seen.pools,
+          saveGatePools: async ({ pools: next }) => {
+            seen.poolSaves += 1;
+            seen.pools = next;
+          },
+        }
+      : {}),
+  };
+  return { deps, seen };
+}
+
+const stageFactory = (implementation = {}, extra = {}) => factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }], implementation, ...extra });
+const runStage = (factory, fakes, item = ITEM) => implementationStage.runImplementationStage({ item, factory, record: implRecord("completed", { run_id: item.run_id }), deps: fakes.deps });
+const ledger = (seen) => seen.attempts.map((e) => `${e.index}:${e.outcome}/${e.pool}`);
+
+test("implementation stage — the kernel ledger: reserve is idempotent, settle is one stamp and refused twice, the caps read settled charges only", () => {
+  let a = gates.reserveImplAttempt([], { index: 1, runId: "run-1", startedAt: "t0" });
+  assert.deepStrictEqual(a, [{ index: 1, run_id: "run-1", outcome: "pending", pool: null, started_at: "t0", finished_at: null, reason: null }]);
+  assert.deepStrictEqual(gates.reserveImplAttempt(a, { index: 1 }), a, "a second reservation of the same index is the same ledger");
+  assert.strictEqual(gates.implAttemptsSpent(a, "implementation"), 0, "a pending entry charges nothing (I1)");
+  const s1 = gates.settleImplAttempt(a, { index: 1, outcome: "failed", reason: "exit 1", finishedAt: "t1" });
+  assert.strictEqual(s1.settled, true);
+  assert.deepStrictEqual(s1.attempts[0], { index: 1, run_id: "run-1", outcome: "failed", pool: "implementation", started_at: "t0", finished_at: "t1", reason: "exit 1" }, "outcome and pool land together");
+  const s2 = gates.settleImplAttempt(s1.attempts, { index: 1, outcome: "infrastructure" });
+  assert.strictEqual(s2.settled, false, "a settled entry is never re-settled (§6.5 (c))");
+  assert.deepStrictEqual(s2.attempts, s1.attempts);
+  assert.strictEqual(gates.settleImplAttempt(s1.attempts, { index: 7, outcome: "failed" }).settled, false, "no reservation, no settle");
+  a = gates.reserveImplAttempt(s1.attempts, { index: 2 });
+  a = gates.settleImplAttempt(a, { index: 2, outcome: "infrastructure", reason: "credit-exhausted" }).attempts;
+  assert.strictEqual(gates.implAttemptsSpent(a, "implementation"), 1);
+  assert.strictEqual(gates.implAttemptsSpent(a, "retry"), 1, "an outage settles on the retry pool, not the code pool (F15)");
+  for (const o of ["candidate", "no-candidate", "failed", "cancelled"]) assert.strictEqual(gates.implAttemptPool(o), "implementation", o);
+  assert.strictEqual(gates.implAttemptPool("infrastructure"), "retry");
+  assert.strictEqual(gates.implAttemptPool("declined"), null);
+  assert.strictEqual(gates.implAttemptPool("candidate-mismatch"), null);
+  assert.strictEqual(gates.implAttemptPool("pending"), null);
+});
+
+test("implementation stage — the decision table (I3-I11): which pool, retry or stop", () => {
+  const impl = stageFactory({ budget: { attempts: 2 }, retry: { attempts: 1 } }).implementation;
+  const d = (o, spent) => gates.implAttemptDecision(impl, o, spent);
+  assert.deepStrictEqual(d("candidate", {}), { action: "candidate", pool: null });
+  assert.deepStrictEqual(d("declined", {}), { action: "declined", pool: null });
+  assert.deepStrictEqual(d("candidate-mismatch", {}), { action: "mismatch", pool: null });
+  assert.deepStrictEqual(d("failed", { implementationSpent: 1 }), { action: "retry", pool: "implementation" }, "I9: attempts left");
+  assert.deepStrictEqual(d("no-candidate", { implementationSpent: 2 }), { action: "exhausted", pool: "implementation" }, "I11: the code pool is spent");
+  assert.deepStrictEqual(d("cancelled", { implementationSpent: 2 }), { action: "exhausted", pool: "implementation" }, "I10 at the cap");
+  assert.deepStrictEqual(d("infrastructure", { retrySpent: 0 }), { action: "retry", pool: "retry" }, "I7: the retry pool has headroom");
+  assert.deepStrictEqual(d("infrastructure", { retrySpent: 1 }), { action: "escalated", pool: "retry" }, "I8: the retry pool is spent");
+  assert.deepStrictEqual(d("infrastructure", { implementationSpent: 5, retrySpent: 0 }), { action: "retry", pool: "retry" }, "the code pool never gates an outage retry");
+  assert.deepStrictEqual(d("something-new", {}), { action: "exhausted", pool: "implementation" }, "an unknown word takes the bounded side");
+  const none = stageFactory({ budget: { attempts: 1 }, retry: { attempts: 0 } }).implementation;
+  assert.deepStrictEqual(gates.implAttemptDecision(none, "infrastructure", { retrySpent: 0 }), { action: "escalated", pool: "retry" }, "no declared retry pool: an outage escalates at once");
+});
+
+test("I3: a run that ended cleanly with a commit past the trusted ref is a CANDIDATE — attempt 1 settles {candidate, implementation}, nothing is re-dispatched", async () => {
+  const f = stageFakes();
+  const res = await runStage(stageFactory({ budget: { attempts: 3 } }), f);
+  assert.strictEqual(res.state, "candidate");
+  assert.deepStrictEqual(ledger(f.seen), ["1:candidate/implementation"]);
+  assert.strictEqual(f.seen.attempts[0].run_id, ITEM.run_id, "attempt 1 IS the pipeline's own run");
+  assert.strictEqual(f.seen.implements.length, 0);
+  assert.strictEqual(f.seen.escalations.length, 0);
+  assert.deepStrictEqual(f.seen.patches, [{ impl_attempt: 1 }], "the settle stamps the attempt index and touches no stage verdict — the pin owns `candidate`");
+});
+
+test("I5 + I11: an empty diff is `no-candidate`; with `budget.attempts: 1` that is the whole budget — exactly one dispatch, then `exhausted` with one escalation that blocks the item", async () => {
+  const f = stageFakes({ changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }] });
+  const res = await runStage(stageFactory({ budget: { attempts: 1 } }), f);
+  assert.strictEqual(res.state, "exhausted");
+  assert.deepStrictEqual(ledger(f.seen), ["1:no-candidate/implementation"]);
+  assert.strictEqual(f.seen.implements.length, 0, "no re-dispatch: the one attempt was the budget");
+  assert.strictEqual(f.seen.escalations.length, 1);
+  assert.strictEqual(f.seen.escalations[0].state, "exhausted");
+  assert.strictEqual(f.seen.escalations[0].attempts.length, 1, "the escalation carries the ledger");
+  assert.strictEqual(res.escalated_to, "task-impl-exhausted-demo");
+  assert.ok(f.seen.patches.some((p) => p.impl_state === "exhausted"), "the stage settles `exhausted` on the record");
+  assert.match(res.reason, /budget is spent \(1\/1 attempts\)/);
+});
+
+test("I5 -> I10 -> I11: with `attempts: 2`, a no-candidate then a cancelled run is two dispatches then exhausted — the re-dispatch is named impl-<short>-2 and carries the prior attempt", async () => {
+  const f = stageFakes({
+    changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }],
+    implement: (args) => ({ ok: true, runId: `run-impl-${args.attempt}`, record: implRecord("idle", { run_id: `run-impl-${args.attempt}`, termination_signal: "idle-timeout" }) }),
+  });
+  const res = await runStage(stageFactory({ budget: { attempts: 2 } }), f);
+  assert.strictEqual(res.state, "exhausted");
+  assert.deepStrictEqual(ledger(f.seen), ["1:no-candidate/implementation", "2:cancelled/implementation"]);
+  assert.strictEqual(f.seen.implements.length, 1, "attempt 1 was the loop's own dispatch; the stage made exactly one more");
+  assert.strictEqual(f.seen.implements[0].attempt, 2);
+  assert.strictEqual(f.seen.implements[0].of, 2);
+  assert.strictEqual(f.seen.implements[0].name, `impl-${gateRunner.shortRunAttempt(ITEM.run_id, 0)}-2`, "adopted by this name on resume");
+  assert.deepStrictEqual(f.seen.implements[0].prior.map((p) => p.outcome), ["no-candidate"]);
+  assert.strictEqual(f.seen.attempts[1].run_id, "run-impl-2", "the launch stamped its run id onto the reservation");
+  assert.ok(f.seen.patches.some((p) => p.impl_attempt === 2 && p.impl_state === "running"), "the reservation moves the stage to attempt 2, running");
+  assert.strictEqual(f.seen.escalations.length, 1);
+  assert.strictEqual(f.seen.escalations[0].state, "exhausted");
+});
+
+test("I9 -> I3: a failed harness exit spends the code pool, the re-dispatch produces the candidate — the ledger reads failed then candidate, both on the implementation pool", async () => {
+  const f = stageFakes({ changedSeq: [{ ok: true, paths: ["lib/x.js"], head: "b".repeat(40) }] });
+  const failed = implRecord("failed", { run_id: ITEM.run_id, termination_reason: "exit 1" });
+  const res = await implementationStage.runImplementationStage({ item: ITEM, factory: stageFactory({ budget: { attempts: 2 } }), record: failed, deps: { ...f.deps, loadImplAttempts: async () => ({ attempts: [], record: failed }) } });
+  assert.strictEqual(res.state, "candidate");
+  assert.deepStrictEqual(ledger(f.seen), ["1:failed/implementation", "2:candidate/implementation"]);
+  assert.strictEqual(f.seen.attempts[0].reason, "exit 1");
+  assert.strictEqual(f.seen.reads, 1, "the failed run's tree is never read — the classifier settled it; only the clean re-dispatch is judged on its product");
+  assert.strictEqual(f.seen.implements.length, 1);
+  assert.strictEqual(f.seen.escalations.length, 0);
+});
+
+test("I4: a dirty tree under `require_clean` is a code outcome — the re-dispatch is told to commit-or-discard, and the clean tree it leaves is the candidate; with `require_clean: false` the pipeline's own round-trip judges it instead", async () => {
+  const dirty = { ok: false, dirty: true, reason: "the run left uncommitted changes to tracked files" };
+  const f = stageFakes({ changedSeq: [dirty, { ok: true, paths: ["lib/x.js"], head: "c".repeat(40) }] });
+  const res = await runStage(stageFactory({ budget: { attempts: 2 } }), f);
+  assert.strictEqual(res.state, "candidate");
+  assert.deepStrictEqual(ledger(f.seen), ["1:failed/implementation", "2:candidate/implementation"]);
+  assert.strictEqual(f.seen.attempts[0].dirty, true);
+  assert.strictEqual(f.seen.implements[0].dirty, true, "the launcher is told this is the commit-or-discard round-trip");
+
+  const g = stageFakes({ changedSeq: [dirty] });
+  const tolerant = await runStage(stageFactory({ budget: { attempts: 2 }, candidate: { require_clean: false } }), g);
+  assert.strictEqual(tolerant.state, "candidate");
+  assert.match(tolerant.handoff, /require_clean: false/);
+  assert.strictEqual(g.seen.implements.length, 0, "the factory tolerates it: no attempt is spent, the pipeline's round-trip is the remedy");
+  assert.deepStrictEqual(ledger(g.seen), ["1:candidate/implementation"], "the attempt was still used");
+});
+
+test("I7 -> I3: an OUTAGE spends the shared infrastructure pool, not the code pool — retry spent 1, budget.attempts spent 0 — waits out the backoff, and the re-dispatch's candidate is judged", async () => {
+  const f = stageFakes({ pools: { retry: { spent: 0 } } });
+  const outage = implRecord("environment", { run_id: ITEM.run_id, termination_signal: "credit-exhausted" });
+  const res = await implementationStage.runImplementationStage({ item: ITEM, factory: stageFactory({ budget: { attempts: 1 }, retry: { attempts: 1, backoff_ms: 5000 } }), record: outage, deps: { ...f.deps, loadImplAttempts: async () => ({ attempts: [], record: outage }) } });
+  assert.strictEqual(res.state, "candidate");
+  assert.deepStrictEqual(ledger(f.seen), ["1:infrastructure/retry", "2:candidate/implementation"]);
+  assert.strictEqual(gates.implAttemptsSpent(f.seen.attempts, "implementation"), 1, "the CODE pool was charged once — for the candidate, never for the outage (F15)");
+  assert.deepStrictEqual(f.seen.pools, { retry: { spent: 1 } }, "the SHARED pool the gate runner reads was charged");
+  assert.strictEqual(f.seen.poolSaves, 1);
+  assert.ok(f.seen.slept > 0, "the declared backoff was waited out");
+  assert.strictEqual(f.seen.implements.length, 1);
+  assert.strictEqual(f.seen.escalations.length, 0);
+});
+
+test("I8: an outage with the shared pool already spent ESCALATES — no dispatch, the code pool untouched, the escalation names the outage", async () => {
+  const f = stageFakes({ pools: { retry: { spent: 1 } } });
+  const outage = implRecord("environment", { run_id: ITEM.run_id, termination_signal: "credit-exhausted" });
+  const res = await implementationStage.runImplementationStage({ item: ITEM, factory: stageFactory({ budget: { attempts: 3 }, retry: { attempts: 1 } }), record: outage, deps: { ...f.deps, loadImplAttempts: async () => ({ attempts: [], record: outage }) } });
+  assert.strictEqual(res.state, "escalated");
+  assert.deepStrictEqual(ledger(f.seen), ["1:infrastructure/retry"]);
+  assert.strictEqual(f.seen.implements.length, 0, "three code attempts left, and none is spent on an outage");
+  assert.strictEqual(f.seen.poolSaves, 0);
+  assert.strictEqual(f.seen.escalations.length, 1);
+  assert.strictEqual(f.seen.escalations[0].state, "escalated");
+  assert.match(res.reason, /retry pool is spent \(1\/1\)/);
+  assert.ok(f.seen.patches.some((p) => p.impl_state === "escalated"));
+
+  // ...and a factory that declares NO retry pool escalates on the first outage,
+  // saying so.
+  const g = stageFakes({ pools: { retry: { spent: 0 } } });
+  const none = await implementationStage.runImplementationStage({ item: ITEM, factory: stageFactory({ retry: { attempts: 0 } }), record: outage, deps: { ...g.deps, loadImplAttempts: async () => ({ attempts: [], record: outage }) } });
+  assert.strictEqual(none.state, "escalated");
+  assert.match(none.reason, /declares no infrastructure retry pool/);
+  assert.strictEqual(g.seen.implements.length, 0);
+});
+
+test("the pool is SHARED: a retry the implementation stage took is not available to a review gate on the same pipeline", async () => {
+  // The stage charges the same `gate_progress.pools` the gate runner's
+  // spendOutage reads: after the stage spent the one retry, a review outage
+  // in the pipeline stops rather than retrying.
+  const f = stageFakes({ pools: { retry: { spent: 0 } } });
+  const outage = implRecord("environment", { run_id: ITEM.run_id, termination_signal: "credit-exhausted" });
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }], implementation: { retry: { attempts: 1, backoff_ms: 1000 } } });
+  const stage = await implementationStage.runImplementationStage({ item: ITEM, factory, record: outage, deps: { ...f.deps, loadImplAttempts: async () => ({ attempts: [], record: outage }) } });
+  assert.strictEqual(stage.state, "candidate");
+  assert.deepStrictEqual(f.seen.pools, { retry: { spent: 1 } });
+  const { deps, seen } = fakes({ pools: f.seen.pools, review: () => outageReview() });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.reviews.length, 1, "the review's own outage is not retried: the pool the stage spent is the pipeline's one pool");
+  assert.match(seen.escalations[0].outage.notRetried, /retry pool is spent \(1\/1\)/);
+});
+
+test("I6: a re-dispatched implementer that DECLINES the item ends the stage `declined` — triage, no escalation, neither pool", async () => {
+  const f = stageFakes({
+    changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }],
+    implement: (args) => ({ ok: true, runId: `run-impl-${args.attempt}`, record: implRecord("completed", { run_id: `run-impl-${args.attempt}`, terminal_state: "declined", declined_reason: "the item is already done upstream" }) }),
+  });
+  const res = await runStage(stageFactory({ budget: { attempts: 3 } }), f);
+  assert.strictEqual(res.state, "declined");
+  assert.deepStrictEqual(ledger(f.seen), ["1:no-candidate/implementation", "2:declined/null"]);
+  assert.strictEqual(f.seen.implements.length, 1, "two attempts were left and neither is spent on a decline");
+  assert.strictEqual(f.seen.escalations.length, 0);
+  assert.ok(f.seen.patches.some((p) => p.impl_state === "declined"));
+  assert.match(res.reason, /already done upstream/);
+});
+
+test("I2 on a re-dispatch: a launcher that refuses before any run record is `unroutable` — the reservation is withdrawn, neither pool moves, nothing is escalated", async () => {
+  const f = stageFakes({
+    changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }],
+    implement: () => ({ ok: false, reason: "cannot dispatch task-demo: this box cannot satisfy profile-implementer", classification: { outcome: "unroutable", pool: null, reason: "cannot dispatch" } }),
+  });
+  const res = await runStage(stageFactory({ budget: { attempts: 3 } }), f);
+  assert.strictEqual(res.state, "unroutable");
+  assert.match(res.reason, /cannot satisfy profile-implementer/);
+  assert.strictEqual(res.classification.outcome, "unroutable");
+  assert.deepStrictEqual(ledger(f.seen), ["1:no-candidate/implementation"], "the refused attempt's reservation is gone — a refusal is not an attempt");
+  assert.strictEqual(f.seen.escalations.length, 0);
+  assert.ok(f.seen.patches.some((p) => p.impl_state === "unroutable"));
+});
+
+test("a run that ended cleanly with an empty diff is HANDED to the pipeline, not re-dispatched, when a deterministic route can settle it: landed commits (stale premise), a declared no-code claim, a gone checkout", async () => {
+  const empty = { ok: true, paths: [], head: "a".repeat(40) };
+  const landed = stageFakes({ changedSeq: [empty], commitsLanded: { known: true, landed: true, checked: ["abc1234"], unlanded: [] } });
+  const a = await runStage(stageFactory({ budget: { attempts: 1 } }), landed);
+  assert.strictEqual(a.state, "candidate");
+  assert.match(a.handoff, /stale-premise/);
+  assert.strictEqual(landed.seen.escalations.length, 0, "not exhausted: the pipeline's scoping route settles it");
+
+  const claimed = stageFakes({ changedSeq: [empty], noCodeClaim: { ok: true, outcome: "premise-stale", resolver: "dec-x" } });
+  const b = await runStage(stageFactory({ budget: { attempts: 1 } }), claimed);
+  assert.strictEqual(b.state, "candidate");
+  assert.match(b.handoff, /no-code outcome/);
+
+  const gone = stageFakes({ changedSeq: [{ ok: false, gone: true, reason: "the run's working directory is gone" }] });
+  const c = await runStage(stageFactory({ budget: { attempts: 3 } }), gone);
+  assert.strictEqual(c.state, "candidate");
+  assert.match(c.handoff, /superseded check/);
+  assert.strictEqual(gone.seen.implements.length, 0, "never re-dispatch into a checkout that is not there");
+
+  // ...but a claim that is NOT there, and no landed commits, is a no-candidate.
+  const plain = stageFakes({ changedSeq: [empty], commitsLanded: { known: true, landed: false, checked: ["abc1234"], unlanded: ["abc1234"] } });
+  const d = await runStage(stageFactory({ budget: { attempts: 1 } }), plain);
+  assert.strictEqual(d.state, "exhausted");
+});
+
+test("resume: a settled ledger is read back, never re-classified — a settled `candidate` stage hands to the gates with no read, and a pending re-dispatch is driven under its original name with the prior entries intact", async () => {
+  // (d) a settled stage.
+  const settled = stageFakes({ implState: "candidate", attempts: [{ index: 1, run_id: ITEM.run_id, outcome: "candidate", pool: "implementation" }] });
+  const a = await runStage(stageFactory({ budget: { attempts: 2 } }), settled);
+  assert.strictEqual(a.state, "candidate");
+  assert.strictEqual(a.resumed, true);
+  assert.strictEqual(settled.seen.reads, 0, "nothing re-read");
+  assert.strictEqual(settled.seen.saves, 0, "nothing re-stamped");
+
+  // A killed worker left attempt 2 reserved (pending, no run id): the resume
+  // drives it — by NAME, which the launcher adopts if the launch had landed.
+  const pending = stageFakes({ implState: "running", attempts: [{ index: 1, run_id: ITEM.run_id, outcome: "failed", pool: "implementation", reason: "exit 1" }, { index: 2, run_id: null, outcome: "pending", pool: null }] });
+  const b = await runStage(stageFactory({ budget: { attempts: 2 } }), pending);
+  assert.strictEqual(b.state, "candidate");
+  assert.strictEqual(pending.seen.implements.length, 1);
+  assert.strictEqual(pending.seen.implements[0].attempt, 2);
+  assert.strictEqual(pending.seen.implements[0].name, `impl-${gateRunner.shortRunAttempt(ITEM.run_id, 0)}-2`);
+  assert.deepStrictEqual(ledger(pending.seen), ["1:failed/implementation", "2:candidate/implementation"], "attempt 1's charge is carried, not re-taken (§6.5 (c))");
+
+  // A settled `exhausted` re-files its idempotent escalation and stops.
+  const done = stageFakes({ implState: "exhausted", attempts: [{ index: 1, run_id: ITEM.run_id, outcome: "no-candidate", pool: "implementation" }] });
+  const c = await runStage(stageFactory({ budget: { attempts: 1 } }), done);
+  assert.strictEqual(c.state, "exhausted");
+  assert.strictEqual(done.seen.escalations.length, 1);
+  assert.strictEqual(done.seen.implements.length, 0);
+
+  // A re-gate is a NEW attempt and keys its run names one segment deeper.
+  const regate = stageFakes({ changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }] });
+  await runStage(stageFactory({ budget: { attempts: 2 } }), regate, { ...ITEM, attempt: 2 });
+  assert.strictEqual(regate.seen.implements[0].name, `impl-${gateRunner.shortRunAttempt(ITEM.run_id, 2)}-2`);
+});
+
+test("a stop is answered, never spent: a worker asked to stop before the next attempt reports `interrupted` with the ledger standing and nothing reserved; a ledger stamp that fails stops the stage before it acts on an unrecorded charge", async () => {
+  const stopped = stageFakes({ changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }], stopping: () => true });
+  const a = await runStage(stageFactory({ budget: { attempts: 2 } }), stopped);
+  assert.strictEqual(a.state, "interrupted");
+  assert.deepStrictEqual(ledger(stopped.seen), ["1:no-candidate/implementation"], "settled, but no second attempt reserved");
+  assert.strictEqual(stopped.seen.implements.length, 0);
+  assert.strictEqual(stopped.seen.escalations.length, 0, "a stop is not an exhaustion");
+
+  // (a) on a LIVE worker: a settle that could not be stamped is not parked on
+  // a promise nobody keeps — the stage stops and a person is told, the same
+  // rule the gate runner keeps for a pool charge that could not land.
+  const unwritable = stageFakes({ changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }], saveThrows: 1 });
+  const b = await runStage(stageFactory({ budget: { attempts: 2 } }), unwritable);
+  assert.strictEqual(b.state, "escalated");
+  assert.match(b.reason, /could not be stamped/);
+  assert.strictEqual(unwritable.seen.implements.length, 0, "no dispatch on a charge nobody recorded");
+  assert.strictEqual(unwritable.seen.escalations.length, 1);
+  assert.strictEqual(unwritable.seen.escalations[0].state, "escalated");
+  assert.match(unwritable.seen.escalations[0].reason, /could not be stamped/);
+});
+
+test("the retry pool: the reservation lands BEFORE the backoff wait, so a stop during the wait leaves a pending attempt a resume launches — never a charge with nothing behind it", async () => {
+  let stopAfter = 0;
+  const f = stageFakes({ pools: { retry: { spent: 0 } }, stopping: () => stopAfter > 0 && f.seen.slept >= stopAfter });
+  stopAfter = 2;
+  const outage = implRecord("environment", { run_id: ITEM.run_id, termination_signal: "credit-exhausted" });
+  const res = await implementationStage.runImplementationStage({ item: ITEM, factory: stageFactory({ budget: { attempts: 1 }, retry: { attempts: 1, backoff_ms: 60000 } }), record: outage, deps: { ...f.deps, loadImplAttempts: async () => ({ attempts: [], record: outage }) } });
+  assert.strictEqual(res.state, "interrupted");
+  assert.match(res.reason, /attempt 2 is reserved/);
+  assert.deepStrictEqual(f.seen.pools, { retry: { spent: 1 } }, "the retry was charged");
+  assert.deepStrictEqual(ledger(f.seen), ["1:infrastructure/retry", "2:pending/null"], "...and the attempt it paid for is RESERVED, not lost");
+  assert.strictEqual(f.seen.implements.length, 0, "nothing dispatched under a stop");
+  assert.strictEqual(f.seen.escalations.length, 0);
+  // The resume: the pending reservation is launched, and the pool is NOT
+  // charged again.
+  const g = stageFakes({ pools: { retry: { spent: 1 } }, implState: "running", attempts: f.seen.attempts, record: outage });
+  const resumed = await runStage(stageFactory({ budget: { attempts: 1 }, retry: { attempts: 1, backoff_ms: 60000 } }), g);
+  assert.strictEqual(resumed.state, "candidate");
+  assert.strictEqual(g.seen.implements.length, 1);
+  assert.strictEqual(g.seen.implements[0].attempt, 2);
+  assert.strictEqual(g.seen.poolSaves, 0, "the charge the first pass made is not made again");
+  assert.deepStrictEqual(ledger(g.seen), ["1:infrastructure/retry", "2:candidate/implementation"]);
+});
+
+test("a re-dispatched attempt the worker could not FOLLOW to its end is settled `cancelled` and the stage stops for a person — never a further dispatch into a checkout something may still hold", async () => {
+  const f = stageFakes({
+    changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }],
+    implement: (args) => ({ ok: true, runId: `run-impl-${args.attempt}`, record: null, unfollowable: true, reason: "the run did not reach a terminal state within 1440m" }),
+  });
+  const res = await runStage(stageFactory({ budget: { attempts: 3 } }), f);
+  assert.strictEqual(res.state, "escalated");
+  assert.match(res.reason, /could not be followed to its end/);
+  assert.match(res.reason, /something may still be running/);
+  assert.deepStrictEqual(ledger(f.seen), ["1:no-candidate/implementation", "2:cancelled/implementation"], "the attempt is used (I10)");
+  assert.strictEqual(f.seen.attempts[1].unfollowed, true);
+  assert.strictEqual(f.seen.implements.length, 1, "one attempt was left and it is NOT spent into a checkout that may be busy");
+  assert.strictEqual(f.seen.escalations.length, 1);
+  assert.strictEqual(f.seen.escalations[0].state, "escalated");
+  // A resume of the settled stage re-files the same reason — it rides the ledger,
+  // and it is capped ONCE, so a long reason re-files byte-identically too.
+  const longF = stageFakes({ changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }], implement: (args) => ({ ok: true, runId: `run-impl-${args.attempt}`, record: null, unfollowable: true, reason: "x".repeat(700) }) });
+  const longRes = await runStage(stageFactory({ budget: { attempts: 3 } }), longF);
+  assert.strictEqual(longRes.state, "escalated");
+  const longG = stageFakes({ implState: "escalated", attempts: longF.seen.attempts });
+  await runStage(stageFactory({ budget: { attempts: 3 } }), longG);
+  assert.strictEqual(longG.seen.escalations[0].reason, longF.seen.escalations[0].reason, "the body on re-file equals the body first filed, whatever the reason's length");
+  assert.strictEqual(longF.seen.escalations[0].reason.length, longF.seen.attempts[1].stop_reason.length);
+  const g = stageFakes({ implState: "escalated", attempts: f.seen.attempts });
+  const again = await runStage(stageFactory({ budget: { attempts: 3 } }), g);
+  assert.strictEqual(again.state, "escalated");
+  assert.strictEqual(g.seen.escalations[0].reason, f.seen.escalations[0].reason, "identical body on re-file, or the idempotent write would refuse it as a collision");
+});
+
+test("a re-gate is a NEW segment of the ledger: the settled segment stays as history, the run is re-judged under the new attempt key with a fresh code pool, and the re-dispatch is named under that key", async () => {
+  const history = [{ index: 1, run_id: ITEM.run_id, outcome: "no-candidate", pool: "implementation", reason: "nothing committed" }];
+  // cmdWorkRegate reopened the stage to `running`; the loop hands the pipeline
+  // entry with attempt 2.
+  const f = stageFakes({ implState: "running", attempts: history, changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }] });
+  const res = await runStage(stageFactory({ budget: { attempts: 1 } }), f, { ...ITEM, attempt: 2 });
+  assert.strictEqual(res.state, "exhausted");
+  assert.deepStrictEqual(f.seen.attempts.map((e) => `${e.attempt || 0}/${e.index}:${e.outcome}`), ["0/1:no-candidate", "2/1:no-candidate"], "attempt 0's segment is history; the re-gate re-judged the same run in segment 2");
+  assert.strictEqual(f.seen.reads, 1, "the tree was re-read — a person may have fixed it by hand");
+  assert.deepStrictEqual(res.attempts.map((e) => e.attempt), [2], "the result reports the current segment only");
+  assert.strictEqual(gates.implAttemptsSpent(f.seen.attempts, "implementation", { attempt: 2 }), 1, "a fresh code pool: one attempt spent in this segment, not two");
+  assert.strictEqual(gates.implAttemptsSpent(f.seen.attempts, "implementation"), 1, "...and segment 0 still reads its own one");
+
+  // With attempts left in the fresh segment, the re-dispatch is keyed -r2.
+  const g = stageFakes({ implState: "running", attempts: history, changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }, { ok: true, paths: ["lib/x.js"], head: "b".repeat(40) }] });
+  const more = await runStage(stageFactory({ budget: { attempts: 2 } }), g, { ...ITEM, attempt: 2 });
+  assert.strictEqual(more.state, "candidate");
+  assert.strictEqual(g.seen.implements[0].name, `impl-${gateRunner.shortRunAttempt(ITEM.run_id, 2)}-2`);
+  assert.deepStrictEqual(g.seen.implements[0].prior.map((p) => p.outcome), ["no-candidate"], "the prior list is this segment's, not the whole history");
+
+  // A re-gate while an EARLIER segment still owes a launched attempt its
+  // classification (a worker killed following `impl-<short>-2`) adopts that
+  // attempt under its ORIGINAL name — never a second agent into the checkout.
+  const owed = [{ index: 1, run_id: ITEM.run_id, outcome: "failed", pool: "implementation" }, { index: 2, run_id: "run-impl-2", outcome: "pending", pool: null }];
+  const h = stageFakes({ implState: "running", attempts: owed, changedSeq: [{ ok: true, paths: ["lib/x.js"], head: "c".repeat(40) }] });
+  const adopted = await runStage(stageFactory({ budget: { attempts: 2 } }), h, { ...ITEM, attempt: 2 });
+  assert.strictEqual(adopted.state, "candidate");
+  assert.strictEqual(h.seen.implements.length, 1);
+  assert.strictEqual(h.seen.implements[0].name, `impl-${gateRunner.shortRunAttempt(ITEM.run_id, 0)}-2`, "the ORIGINAL segment's name, which the launcher adopts");
+  assert.deepStrictEqual(h.seen.attempts.map((e) => `${e.attempt || 0}/${e.index}:${e.outcome}`), ["0/1:failed", "0/2:candidate"], "settled in the segment that owed it; no fresh segment opened");
+
+  // The journal's force arm cmdWorkRegate uses: a settled refusal reopens, a
+  // settled candidate never does, and without force nothing moves.
+  const dr = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-impl-force-"));
+  dr.atomicJson(dr.runPaths(home, "run-x").record, { run_id: "run-x", impl_state: "exhausted" });
+  assert.strictEqual(dr.stampImplState(home, "run-x", { impl_state: "running" }).impl_state, "exhausted", "settled stays settled");
+  assert.strictEqual(dr.stampImplState(home, "run-x", { impl_state: "running" }, { force: true }).impl_state, "running", "...unless forced (the re-gate door)");
+});
+
+test("the no-code claim is read off the attempt that RAN, and the escalation payload rides a failed write so the bounded auto-retry can re-file it", async () => {
+  // Attempt 1 committed nothing and declared nothing; attempt 2 scoped the
+  // item out. The claim must be asked of attempt 2's record.
+  const asked = [];
+  const f = stageFakes({ changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }] });
+  f.deps.noCodeClaim = async ({ record }) => {
+    asked.push(record && record.run_id);
+    return record && record.run_id === "run-impl-2" ? { ok: true, outcome: "premise-stale", resolver: "dec-x" } : null;
+  };
+  const res = await runStage(stageFactory({ budget: { attempts: 2 } }), f);
+  assert.strictEqual(res.state, "candidate");
+  assert.match(res.handoff, /no-code outcome/);
+  assert.deepStrictEqual(asked, [ITEM.run_id, "run-impl-2"], "each attempt's own report");
+  assert.deepStrictEqual(ledger(f.seen), ["1:no-candidate/implementation", "2:candidate/implementation"]);
+
+  const failing = stageFakes({ changedSeq: [{ ok: true, paths: [], head: "a".repeat(40) }] });
+  failing.deps.escalateStage = async () => ({ ok: false, reason: "the graph refused the write" });
+  const r = await runStage(stageFactory({ budget: { attempts: 1 } }), failing);
+  assert.strictEqual(r.state, "exhausted");
+  assert.strictEqual(r.escalated_to, null);
+  assert.strictEqual(r.escalation_failed, true);
+  assert.strictEqual(r.escalation_retry.stage, "implementation");
+  assert.strictEqual(r.escalation_retry.state, "exhausted");
+  assert.strictEqual(r.escalation_retry.attempts.length, 1);
+  assert.match(r.escalation_retry.reason, /budget is spent/);
+});
+
+test("a factory with no `implementation:` block never enters the stage", async () => {
+  const f = stageFakes();
+  const res = await implementationStage.runImplementationStage({ item: ITEM, factory: factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] }), record: implRecord("failed"), deps: f.deps });
+  assert.strictEqual(res.state, "candidate");
+  assert.strictEqual(res.skipped, true);
+  assert.strictEqual(f.seen.reads + f.seen.saves + f.seen.implements.length, 0);
+});
+
+// The real doors: makeGateDeps' `implement`/ledger/escalation closures and
+// runGateAndIntegration's stage-before-gates against a scratch graph home and a
+// real checkout whose branch carries NOTHING past the trusted ref — the
+// no-candidate shape. `budget.attempts: 1` means the whole budget was the
+// loop's own dispatch, so the stage exhausts without launching a harness; what
+// is proved is that the ledger lands on the record, the escalation lands on
+// disk with the right shape, NO gate ran, and the hold stayed (T1).
+test("real doors: runGateAndIntegration runs the implementation stage before any gate — an exhausted budget files the escalation, stamps the ledger, runs no gate, and keeps the hold", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-impl-stage-real-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  fs.writeFileSync(path.join(nodes, "task-demo.md"), "---\nid: task-demo\ntype: task\nproject: demo\ntitle: Add bounded retry to the sync worker\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\ndate: 2026-09-06\nexecution: exec-0123456789abcdef\nexecution_at: 2026-09-06T00:00:00Z\n---\n\nBody.\n");
+  const repo = repoWithBranch({ weakenTest: false, regress: false });
+  git(repo, "checkout", "-q", "main");
+  git(repo, "checkout", "-q", "-b", "empty"); // a branch with nothing past main
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "node test/acceptance.js" }], implementation: { budget: { attempts: 1 } } });
+  factory.id = "factory-test";
+  const runId = "run-impl-real-1";
+  const record = {
+    run_id: runId, node_id: "task-demo", name: "task-demo", harness: "fake", cwd: repo, state: "exited", termination_class: "completed", terminal_state: "reported", terminal_enforced: true,
+    started_at: "2026-09-06T00:00:00.000Z",
+    impl_claim: { execution_id: "exec-0123456789abcdef", claimed_at: "2026-09-06T00:00:00.000Z", completion: { by: "controller", after: "gates" }, publish: { kind: "bundle", bundle_store: null, remote: null }, factory: { node_id: "factory-test", revision: null }, resolving_snapshot: [], status_snapshot: "open" },
+    impl_state: "dispatched", impl_attempt: 1,
+    impl_attempts: gates.reserveImplAttempt([], { index: 1, startedAt: "2026-09-06T00:00:00.000Z" }),
+  };
+  const dispatchRunsLib = require("../lib/shell/agent-dispatch-runner.js");
+  dispatchRunsLib.atomicJson(dispatchRunsLib.runPaths(home, runId).record, record);
+  const lines = [];
+  const entry = { run_id: runId, node_id: "task-demo", project: "demo" };
+  const res = await sporCli.runGateAndIntegration(cfg, entry, record, { factory, slug: "demo", passthrough: {}, warn: () => {}, runMaxMs: 1000, home, log: (l) => lines.push(l), stopping: () => false, sleep: async () => {} });
+  assert.strictEqual(res.state, "failed", lines.join("\n"));
+  assert.strictEqual(res.stage, "exhausted");
+  assert.deepStrictEqual(res.gates, [], "no gate ran");
+  assert.ok(res.escalated_to && res.escalated_to.startsWith("task-impl-exhausted-"), res.escalated_to);
+  const escMd = fs.readFileSync(path.join(nodes, `${res.escalated_to}.md`), "utf8");
+  assert.match(escMd, /^requires: \[human\]$/m);
+  assert.match(escMd, /- \{type: blocks, to: task-demo\}/, "the escalation blocks the work item (§10.7's fail-closed half)");
+  assert.match(escMd, /^project: demo$/m);
+  assert.match(escMd, /HELD by execution `exec-0123456789abcdef`/, "the body says the hold stays (T1)");
+  assert.match(escMd, /1\. run run-impl: no-candidate \(implementation pool\)/);
+  const after = JSON.parse(fs.readFileSync(dispatchRunsLib.runPaths(home, runId).record, "utf8"));
+  assert.strictEqual(after.impl_state, "exhausted");
+  assert.deepStrictEqual(after.impl_attempts.map((a) => `${a.index}:${a.outcome}/${a.pool}`), ["1:no-candidate/implementation"]);
+  assert.strictEqual(after.impl_attempts[0].run_id, runId);
+  assert.strictEqual(after.gates_state, undefined, "the gate list never settled — nothing to stamp");
+  assert.ok(fs.readdirSync(nodes).every((f) => !f.startsWith("art-gate-")), "no gate fact: no gate ran");
+  assert.match(fs.readFileSync(path.join(nodes, "task-demo.md"), "utf8"), /^execution: exec-0123456789abcdef$/m, "the hold stays on an exhausted item (T1)");
+  // Idempotent: a second pass over the settled stage re-files the same node.
+  const again = await sporCli.runGateAndIntegration(cfg, entry, JSON.parse(fs.readFileSync(dispatchRunsLib.runPaths(home, runId).record, "utf8")), { factory, slug: "demo", passthrough: {}, warn: () => {}, runMaxMs: 1000, home, log: () => {}, stopping: () => false, sleep: async () => {} });
+  assert.strictEqual(again.escalated_to, res.escalated_to);
+  assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("task-impl-")).length, 1, "one escalation, however many times the settled stage is re-entered");
+});

@@ -3712,3 +3712,30 @@ test("outcomeOf carries the execution CLASS, and only when it says something", (
   assert.strictEqual(clean.execution_class, undefined);
   assert.strictEqual(workLoop.outcomeOf(null).execution_class, undefined);
 });
+
+// ------------------------------------------------ pollWorkRuns: the stage budget --
+// task-spor-factory-implementation-stage-runner (§5.1): a record stamped with
+// `impl_budget` is bounded by the FACTORY's ceilings in place of the worker's
+// --run-max/--run-idle; a record with no stamp takes the worker's exactly as
+// before.
+
+test("pollWorkRuns: a run record's `impl_budget.run_max_ms` replaces the worker-global watchdog for THAT record only", async () => {
+  const { home, cfg } = pollFixture();
+  const proc = liveProcess();
+  try {
+    const started = new Date(Date.now() - 2 * 3600 * 1000).toISOString(); // 2h ago
+    writeRecord(home, "run-budgeted", { state: "running", launch_mode: "supervised-jsonl", runner_pid: proc.pid, runner_started_ticks: proc.ticks, started_at: started, impl_budget: { run_max_ms: 3600 * 1000 } });
+    writeRecord(home, "run-plain", { state: "running", launch_mode: "supervised-jsonl", runner_pid: proc.pid, runner_started_ticks: proc.ticks, started_at: started });
+    const out = await sporCli.pollWorkRuns(cfg, ["run-budgeted", "run-plain"], { maxAgeMs: 24 * 3600 * 1000, idleMs: 0, warn: () => {} });
+    const byId = Object.fromEntries(out.map((o) => [o.run_id, o]));
+    assert.equal(byId["run-budgeted"].terminal, true, "2h old against the factory's 1h ceiling: the watchdog fires");
+    assert.equal(byId["run-plain"].terminal, false, "the same age against the worker's 24h ceiling: still followed");
+    // A worker with the watchdog OFF (maxAgeMs 0) stays off: the stamp
+    // narrows a ceiling, it never arms one the operator disabled.
+    const off = await sporCli.pollWorkRuns(cfg, ["run-budgeted"], { maxAgeMs: 0, idleMs: 0, warn: () => {} });
+    assert.equal(off[0].terminal, false);
+  } finally {
+    proc.kill();
+    delete process.env.SPOR_FAKE_AGENTS_JSON;
+  }
+});

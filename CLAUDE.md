@@ -1181,13 +1181,37 @@ gate's own dirty-tree failure, which every caller here already routes through
 before reaching a pin, so the default is byte-identical; only an explicit
 `false` relaxes the check at the pin (the underlying gate-1 dirty refusal is
 unconditional regardless, so `false` does not yet let a dirty tree reach a
-gate). The REST — `profile` routing, `budget`, `retry`,
-`gates[].rejudge_on_repin` — is validated but not yet spent: the stage's
-dispatch loop (task-spor-factory-implementation-stage-runner, on
-task-spor-factory-execution-outcome-classifier) is still to land, so a declared
-key there is intent the runner validates and does not act on. A factory
-declaring neither block is byte-identical. See test/completion-boundary.test.js
-+ test/candidate.test.js + test/candidate-publish.test.js.
+gate). **The stage
+RUNNER (task-spor-factory-implementation-stage-runner, WORKERS.md §10.16,
+`lib/shell/implementation-stage.js`)** spends the two pools the classifier
+names: it runs FIRST inside `runGateAndIntegration` (before any gate, gated on
+a declared `implementation:` block under controller completion, so a factory
+without one is byte-identical), reads the implementer's run through
+`classifyExecutionOutcome` and then — for a clean run — the tree, settles the
+attempt on the record's `impl_attempts[]` ledger (reserved `pending` at launch
+by `claimExecutionHold`, settled outcome+pool in ONE stamp, never re-settled;
+kernel helpers `reserveImplAttempt`/`settleImplAttempt`/`implAttemptsSpent`/
+`implAttemptDecision` in lib/kernel/gates.js), and re-dispatches the
+implementer into the run's own checkout (`deps.implement` in `makeGateDeps`
+beside `fix`/`rescue`: named `impl-<short>-<n>`, adopted by name on resume,
+`--no-worktree --force --no-auto-route`, the worker's posture, the original
+`resolved_profile`) while `budget.attempts` (code outcomes: failed /
+cancelled / no-candidate / dirty-under-`require_clean`) or the SHARED
+`gate_progress.pools.retry` counter (outages, after `retry.backoff_ms`)
+allow; a spent pool settles `exhausted` (I11) / `escalated` (I8) and files a
+deterministic `task-impl-<state>-…` `requires: [human]` item that `blocks`
+the work item, the hold KEPT (T1); a re-dispatch refused pre-record is
+`unroutable` — reservation withdrawn, hold cleared. Empty diffs the pipeline
+settles deterministically (landed commits, a declared `SCOPED:` claim), a
+tolerated dirty tree and a gone/unreadable checkout are HANDED to the
+pipeline, not re-dispatched. `implementation.profile` routes at lowest
+precedence in `dispatchWorkItem`; `impl_budget` (declared `run_max_ms`/
+`run_idle_ms` only) rides the record and `pollWorkRuns` reads it per record in
+place of the worker-global ceilings. The one declared key still read by nobody
+is `gates[].rejudge_on_repin`. A factory declaring neither block is
+byte-identical. See test/completion-boundary.test.js + test/candidate.test.js
++ test/candidate-publish.test.js + test/gate-pipeline.test.js ("the
+implementation stage").
 **The execution store adapter (task-spor-client-execution-store-adapter,
 WORKERS.md §10.15):** a controller pipeline's coordination state — one
 execution per (item, factory, pipeline attempt), a fenced lease, an ordered
