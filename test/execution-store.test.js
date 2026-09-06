@@ -675,7 +675,7 @@ test("reporter emits publication for an unchanged pin and settles only persisted
   assert.equal(observed[2].attempt, 1, "refused writes do not spend settlement keys");
 });
 
-for (const failure of ['before-release', 'lost-ack', 'before-report']) test(`withdrawal persists execution release debt across ${failure}`, async t => {
+for (const failure of ['before-release', 'lost-ack', 'before-report', 'released-item-before-report']) test(`withdrawal persists execution release debt across ${failure}`, async t => {
   const fake = await startFakeExecutionServer({ nodes: { 'task-x': itemNode('task-x'), 'factory-t': itemNode('factory-t') } });
   const home = tmp('release-debt');
   t.after(async () => { spor.LIVE_EXECUTIONS.clear(); await fake.close(); fs.rmSync(home, { recursive: true, force: true }); });
@@ -699,10 +699,14 @@ for (const failure of ['before-release', 'lost-ack', 'before-report']) test(`wit
     return result;
   };
   const execution = spor.executionCompletionDeps(reporter);
-  if (failure === 'before-report') execution.ended = async () => { throw new Error('crash before report'); };
+  if (failure.endsWith('before-report')) execution.ended = async () => { throw new Error('crash before report'); };
   const deps = spor.makeCompletionDeps(cfg, { home, runId: record.run_id, execution });
-  const withdrawn = await completionShell.withdrawCompletion({ record, deps, why: 'person abandoned item' });
-  assert.equal(withdrawn.settled, 'withdrawn');
+  const releasedItem = failure === 'released-item-before-report';
+  if (releasedItem) fake.state.nodes.set('task-x', itemNode('task-x'));
+  const withdrawn = releasedItem
+    ? await completionShell.writeCompletion({ record, deps, boundary: 'gates' })
+    : await completionShell.withdrawCompletion({ record, deps, why: 'person abandoned item' });
+  assert.equal(withdrawn.settled, releasedItem ? 'released' : 'withdrawn');
   let saved = dispatchRuns.readJson(p.record);
   assert.ok(saved.completion_withdrawn_at);
   assert.ok(saved.completion_execution_end, 'settled completion must retain store debt');

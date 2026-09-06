@@ -250,7 +250,9 @@ test('trusted historical gates and completion replay without publication while n
   fs.appendFileSync(log, JSON.stringify({ ...gate, execution_id: id, seq: 2, fence: opened.fence, at: T0 }) + '\n');
   assert.equal((await e.get(id)).execution.gate_results[0].state, 'passed');
   assert.equal((await e.event(id, { fence: opened.fence, event: { type: 'completion.written', resolver: 'art-legacy' } })).code, 'boundary_not_reached');
-  fs.appendFileSync(log, JSON.stringify({ type: 'completion.written', resolver: 'art-legacy', execution_id: id, seq: 3, fence: opened.fence, at: T0 }) + '\n');
+  fs.appendFileSync(log, JSON.stringify({ type: 'gate.started', gate_id: 'review', attempt: 2, execution_id: id, seq: 3, fence: opened.fence, at: T0 }) + '\n');
+  assert.equal((await e.get(id)).execution.gate_results[0].state, 'passed', 'historical gate restart preserved its prior verdict');
+  fs.appendFileSync(log, JSON.stringify({ type: 'completion.written', resolver: 'art-legacy', execution_id: id, seq: 4, fence: opened.fence, at: T0 }) + '\n');
   assert.equal((await e.get(id)).execution.stage, 'completed');
 });
 
@@ -267,4 +269,23 @@ test('trusted historical post-repin omitted candidate binding replays while new 
   const got = await e.get(id);
   assert.equal(got.ok, true, got.message);
   assert.equal(got.execution.gate_results[0].candidate_id, b.candidate_id);
+});
+
+test('new gate restart overrides caller admission metadata and rebuilds the exact invalidated verdict', async t => {
+  const { home, engine } = setup(t), e = engine();
+  const opened = await e.open(args), id = opened.execution.execution_id;
+  const candidate = { candidate_id: 'cand-restart', commit: 'a'.repeat(40), tree: 'b'.repeat(40), reference: { verified_at: T0 }, provenance: { attempt: 1 } };
+  const send = event => e.event(id, { fence: opened.fence, event });
+  assert.equal((await send({ type: 'candidate.submitted', candidate })).ok, true);
+  for (const admission_version of [undefined, 1, null]) {
+    const attempt = (await e.get(id)).execution.seq + 1;
+    assert.equal((await send({ type: 'gate.settled', gate_id: 'review', attempt, state: 'passed' })).ok, true);
+    const restarted = await send({ type: 'gate.started', gate_id: 'review', attempt: attempt + 1, admission_version });
+    assert.equal(restarted.ok, true, restarted.message);
+    assert.equal(restarted.execution.gate_results[0].state, null);
+    assert.equal(restarted.execution.gate_results[0].candidate_id, null);
+    assert.deepEqual((await e.get(id)).execution, restarted.execution);
+    assert.equal(store.readEvents(home, 'local', id).at(-1).admission_version, 2);
+    assert.equal((await send({ type: 'completion.written', resolver: 'art-not-yet' })).code, 'boundary_not_reached');
+  }
 });
