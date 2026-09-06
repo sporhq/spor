@@ -807,6 +807,63 @@ test("dispatchWorkItem under `completion.by: controller`: a fake dispatcher that
   assert.doesNotMatch(raw, /^execution:/m, "a launch-free refusal still clears the hold it just claimed");
 });
 
+// issue-spor-remove-edge-line-flow-form-only-retract-never-converges: the
+// same real-doors path as the test above, but the premature `resolves` edge
+// is authored in YAML BLOCK form ("- type: resolves" / indented "to: task-x"
+// — a shape a human or an LLM distiller might hand-write, and one
+// parseFrontmatter has always accepted). Before the fix, removeEdgeLine only
+// matched the flow-form "- {type: X, to: Y}" line, so the retract inside
+// writeCompletion failed and the pipeline would re-log the same retype on
+// every pass without ever converging.
+test("local mode, end to end through the real doors: a premature `resolves` edge authored in BLOCK form is retracted just as cleanly as flow form", async () => {
+  const t = tmpGraph(Object.fromEntries([
+    node("task-x", "task", { status: "open", edges: [["blocks", "task-down"]] }),
+    node("task-down", "task", { status: "open" }),
+  ]));
+  const cfg = localCfg(t.dir);
+  const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller" } });
+  factory.id = "factory-t";
+  const lines = [];
+  const held = await spor.claimExecutionHold(cfg, { id: "task-x" }, factory, { home: t.dir, log: (l) => lines.push(l) });
+  assert.equal(held.ok, true);
+  // The premature edge, hand-authored in block form rather than flow form.
+  fs.writeFileSync(path.join(t.nodesDir, "dec-early.md"), `---
+id: dec-early
+type: decision
+project: spor
+title: Title of dec-early
+summary: Standalone summary for dec-early used by the completion-boundary tests.
+date: 2026-09-01
+edges:
+  - type: resolves
+    to: task-x
+---
+Body of dec-early.
+`);
+  let g = graphLib.loadGraph(t.nodesDir);
+  assert.deepEqual(g.nodes["dec-early"].edges, [{ type: "resolves", to: "task-x" }], "fixture sanity: block-form edge parses");
+  const home = t.dir;
+  const p = dispatchRuns.runPaths(home, "run-1");
+  fs.mkdirSync(path.dirname(p.record), { recursive: true });
+  const rec = { run_id: "run-1", node_id: "task-x", state: "done", item_repo: "spor", ...held.recordFields, impl_state: "candidate", impl_candidate: { candidate_id: "cand-1111222233334444", commit: "b".repeat(40), tree: "a".repeat(40) }, gates_state: "passed" };
+  fs.writeFileSync(p.record, JSON.stringify(rec));
+  const deps = spor.makeCompletionDeps(cfg, { home, runId: "run-1" });
+  const res = await shell.writeCompletion({ record: rec, deps, boundary: "gates", facts: [], log: (l) => lines.push(l) });
+  assert.equal(res.settled, "written", lines.join("\n"));
+  g = graphLib.loadGraph(t.nodesDir);
+  assert.equal(g.nodes["task-x"].status, "done");
+  assert.equal(resolution.resolutionMap(g)["task-x"].by, "art-completion-x-111122223333");
+  const dec = g.nodes["dec-early"].edges;
+  assert.deepEqual(dec, [{ type: "relates-to", to: "task-x" }], "the block-form premature edge was retyped as evidence, not left dangling");
+  const written = JSON.parse(fs.readFileSync(p.record, "utf8"));
+  assert.equal(written.completion_debt, null, "converges: nothing left owed");
+  assert.deepEqual(written.completion_premature, ["dec-early"]);
+  // The reconciler finds nothing left to do — a second pass must not re-log
+  // the same retract as a failure.
+  await spor.reconcileCompletions(cfg, { home, log: (l) => lines.push(l) });
+  assert.equal(JSON.parse(fs.readFileSync(p.record, "utf8")).completion_written_at, written.completion_written_at);
+});
+
 test("local mode: a refused pipeline's record is NOT consumed while the item still carries its hold (a later abandon must still be seen), and is consumed once the person's door ended the execution", async () => {
   const t = tmpGraph(Object.fromEntries([node("task-x", "task", { status: "open", extra: "execution: exec-refused\n" })]));
   const cfg = localCfg(t.dir);

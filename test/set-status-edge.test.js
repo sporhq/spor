@@ -709,6 +709,61 @@ test("edge --remove (local) on a missing edge is an idempotent no-op, never an e
   assert.strictEqual(readNode(nodes, "dec-y"), before, "node untouched");
 });
 
+// issue-spor-remove-edge-line-flow-form-only-retract-never-converges:
+// removeEdgeLine used to match only the flow-form "- {type: X, to: Y}" line;
+// a hand-authored block-form entry ("- type: X" / indented "to: Y", which
+// parseFrontmatter has always accepted) was never matched, so removal
+// reported failure. Match by parsed edge identity regardless of spelling.
+test("edge --remove (local) removes a block-form edge entry (all of its lines), authored by hand", () => {
+  const { home, nodes } = fixtureGraph();
+  fs.writeFileSync(path.join(nodes, "dec-y.md"), `---
+id: dec-y
+type: decision
+project: demo
+title: A demo decision
+summary: A decision node used as a resolves-edge target in the local edge test.
+date: 2026-06-01
+edges:
+  - type: resolves
+    to: task-x
+---
+Body about the decision.
+`);
+  const r = run(["edge", "dec-y", "resolves", "task-x", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge removed: dec-y -\[resolves\]-> task-x/);
+  const md = readNode(nodes, "dec-y");
+  assert.doesNotMatch(md, /type: resolves/);
+  assert.doesNotMatch(md, /to: task-x/);
+  const v = validateGraph(nodes);
+  assert.strictEqual(v.status, 0, v.stdout);
+  assert.match(v.stdout, /0 errors/);
+});
+
+test("edge --remove (local) removes a block-form edge entry alongside a surviving flow-form one under the same 'edges:' key", () => {
+  const { home, nodes } = fixtureGraph();
+  fs.writeFileSync(path.join(nodes, "dec-y.md"), `---
+id: dec-y
+type: decision
+project: demo
+title: A demo decision
+summary: A decision node used as a resolves-edge target in the local edge test.
+date: 2026-06-01
+edges:
+  - type: resolves
+    to: task-x
+  - {type: relates-to, to: task-x2}
+---
+Body about the decision.
+`);
+  fs.writeFileSync(path.join(nodes, "task-x2.md"), `---\nid: task-x2\ntype: task\nproject: demo\ntitle: A second demo task\nsummary: A second demo task whose id shares a prefix with task-x.\ndate: 2026-06-01\n---\nBody.\n`);
+  const r = run(["edge", "dec-y", "resolves", "task-x", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = readNode(nodes, "dec-y");
+  assert.doesNotMatch(md, /type: resolves/);
+  assert.match(md, /- \{type: relates-to, to: task-x2\}/, "the flow-form sibling survives");
+});
+
 test("edge --remove (local) never removes a longer id sharing the same prefix", () => {
   const { home, nodes } = fixtureGraph();
   fs.writeFileSync(path.join(nodes, "task-x2.md"), `---\nid: task-x2\ntype: task\nproject: demo\ntitle: A second demo task\nsummary: A second demo task whose id shares a prefix with task-x.\ndate: 2026-06-01\n---\nBody.\n`);

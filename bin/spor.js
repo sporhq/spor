@@ -4320,26 +4320,88 @@ function appendEdgeLine(raw, type, to, attrs) {
   return `---\n${lines.join("\n")}\n---\n${body}`;
 }
 
-// Remove a `  - {type: T, to: TO[, k: v]}` line matching (type, to) exactly —
-// the withdrawal twin of appendEdgeLine (local `spor edge --remove`, the
-// remove_edge micro-mutation, API.md §1/§3). `type` and `to` are pre-validated
-// [\w-]+ tokens (NODE_ID_RE / reg.isKnownEdge), so no regex-escaping is needed.
-// The lookahead after `to` requires the token to END there (a comma or the
-// closing brace) so removing `agent-x` can never eat a longer `agent-x-2`.
-// Only matches the FLOW form appendEdgeLine (and every machine writer) always
-// produces; a hand-authored block-form entry isn't addressed here. Returns the
-// new raw, or null when no matching line exists (the caller reports an
-// idempotent skip, mirroring the server's remove_edge contract) or the
-// frontmatter can't be located.
+// Remove an edge entry matching (type, to) exactly — the withdrawal twin of
+// appendEdgeLine (local `spor edge --remove`, the remove_edge micro-mutation,
+// API.md §1/§3, and the controller-completion retract of a premature
+// `resolves` edge, lib/shell/completion.js retractPremature). `type` and `to`
+// are pre-validated [\w-]+ tokens (NODE_ID_RE / reg.isKnownEdge), so no
+// regex-escaping is needed.
+//
+// Matches BOTH edge spellings parseFrontmatter accepts (issue-spor-remove-
+// edge-line-flow-form-only-retract-never-converges): the flow form
+// `- {type: T, to: TO[, k: v]}` every machine writer (including
+// appendEdgeLine) produces, and the YAML block form `- type: T` / indented
+// `to: TO` a hand-authored node may carry — a premature `resolves` edge is
+// exactly the kind of edge a human or an LLM distiller might author by hand,
+// so retract must be able to withdraw either spelling or it fails and
+// re-logs on every completion pass without ever converging. The scan mirrors
+// parseFrontmatter's own edge recognition (flow-form single line; block-form
+// entries opened by `- key: value` and folded onto by subsequent indented
+// `key: value` lines, `target:` accepted as an alias for `to:`, closed by the
+// next top-level key or EOF) closely enough to track each entry's exact line
+// RANGE, so a matched block-form entry is removed in full — every one of its
+// indented lines, not just the one that happens to carry `to:`. The lookahead
+// after `to` in the flow-form match requires the token to END there (a comma
+// or the closing brace) so removing `agent-x` can never eat a longer
+// `agent-x-2`; the block-form match compares the fully-folded entry, so no
+// such lookahead is needed there.
+//
+// Returns the new raw, or null when no matching entry exists (the caller
+// reports an idempotent skip, mirroring the server's remove_edge contract) or
+// the frontmatter can't be located.
 function removeEdgeLine(raw, type, to) {
   const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
   if (!m) return null;
   const body = m[2];
   const lines = m[1].split("\n");
-  const EDGE_LINE = new RegExp(`^\\s*-\\s*\\{type:\\s*${type}\\s*,\\s*(?:to|target):\\s*${to}(?=[,}])`);
-  const idx = lines.findIndex((l) => EDGE_LINE.test(l));
-  if (idx === -1) return null;
-  lines.splice(idx, 1);
+  const FLOW_EDGE_RE = /-\s*\{type:\s*([\w-]+)\s*,\s*(?:to|target):\s*([\w-]+)(?=[,}])/;
+
+  let inEdgesBlock = false;
+  let edgeBuf = null;
+  let edgeStart = -1;
+  let match = null; // {start, end} once the target entry is located
+
+  const flushEdgeBuf = (end) => {
+    if (edgeBuf && !match && edgeBuf.type === type && edgeBuf.to === to) match = { start: edgeStart, end };
+    edgeBuf = null;
+    edgeStart = -1;
+  };
+
+  for (let i = 0; i < lines.length && !match; i++) {
+    const line = lines[i];
+    const kv = line.match(/^(\w[\w-]*):\s*(.*)$/);
+    if (kv) {
+      flushEdgeBuf(i);
+      inEdgesBlock = kv[1] === "edges";
+      continue;
+    }
+    const flow = line.match(FLOW_EDGE_RE);
+    if (flow) {
+      flushEdgeBuf(i);
+      if (!match && flow[1] === type && flow[2] === to) match = { start: i, end: i + 1 };
+      continue;
+    }
+    if (inEdgesBlock) {
+      const open = line.match(/^\s*-\s+(\w[\w-]*):\s*(.*)$/);
+      if (open) {
+        flushEdgeBuf(i);
+        edgeStart = i;
+        edgeBuf = {};
+        edgeBuf[open[1] === "target" ? "to" : open[1]] = open[2].trim().replace(/^["']|["']$/g, "");
+        continue;
+      }
+      const cont = edgeBuf && line.match(/^\s+(\w[\w-]*):\s*(.*)$/);
+      if (cont) {
+        edgeBuf[cont[1] === "target" ? "to" : cont[1]] = cont[2].trim().replace(/^["']|["']$/g, "");
+        continue;
+      }
+      if (line.trim() === "" || line.trim().startsWith("#")) continue;
+      flushEdgeBuf(i);
+    }
+  }
+  if (!match) flushEdgeBuf(lines.length);
+  if (!match) return null;
+  lines.splice(match.start, match.end - match.start);
   return `---\n${lines.join("\n")}\n---\n${body}`;
 }
 
@@ -4467,8 +4529,8 @@ async function cmdEdge(cfg, { values, positionals }) {
     }
     const newRaw = removeEdgeLine(raw, edgeType, target);
     if (newRaw == null) {
-      err(`could not remove ${srcId} -[${edgeType}]-> ${target}: no matching flow-form "- {type: ..., to: ...}" line found`);
-      err(`  (a hand-authored block-form edge entry can't be removed by this local-mode verb today — rewrite the node with 'spor put-node' instead)`);
+      err(`could not remove ${srcId} -[${edgeType}]-> ${target}: no matching edge entry found in the frontmatter`);
+      err(`  (the edge is present per the parsed graph but its line(s) could not be located — rewrite the node with 'spor put-node' instead)`);
       return 1;
     }
     let node;
