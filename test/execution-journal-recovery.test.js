@@ -193,3 +193,20 @@ test('historical replay does not re-adjudicate the already accepted event timest
   assert.equal(replayed.ok, true);
   assert.equal(replayed.execution.seq, 1);
 });
+
+test('new local publication logs normalized clocks and replays the exact returned record', async t => {
+  for (const alreadyPublished of [false, true]) {
+    const { home, engine } = setup(t), e = engine();
+    const opened = await e.open(args), id = opened.execution.execution_id;
+    const reference = { kind: 'branch', commit: 'a'.repeat(40), ref: 'refs/spor/candidates/one', locator: 'https://example.com/repo.git', verified_at: T0 };
+    const candidate = { candidate_id: 'cand-one', commit: 'a'.repeat(40), tree: 'b'.repeat(40), ...(alreadyPublished ? { reference } : {}) };
+    assert.equal((await e.event(id, { fence: opened.fence, event: { type: 'candidate.submitted', candidate } })).ok, true);
+    const accepted = await e.event(id, { fence: opened.fence, event: { type: 'candidate.published', candidate_id: candidate.candidate_id, reference, verified_at: 'invalid-discordant-top-level' } });
+    assert.equal(accepted.ok, true, accepted.message);
+    const logged = store.readEvents(home, 'local', id).at(-1);
+    assert.equal(logged.reference.verified_at, T0);
+    assert.equal(logged.verified_at, T0, 'new journal rows have one unambiguous normalized publication clock');
+    fs.rmSync(store.recordPath(home, 'local', id));
+    assert.deepEqual((await engine().get(id)).execution, accepted.execution, 'same-reference publication metadata is replay-identical');
+  }
+});
