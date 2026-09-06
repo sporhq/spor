@@ -14,6 +14,7 @@ const path = require("node:path");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const runner = require("../lib/shell/agent-dispatch-runner.js");
+const gates = require("../lib/kernel/gates.js");
 const { writeSpawnableNodeStub, pathWithOnlyGit } = require("./helpers/portable");
 
 // Isolated env: no SPOR_*/SUBSTRATE_* leakage, local mode, and a scratch
@@ -141,6 +142,33 @@ test("classifyTerminalText: usage limits, rate limits and rejected auth are envi
   // conflation this incident forbids.
   assert.strictEqual(runner.classifyTerminalText("npm test failed: 3 assertions"), null);
   assert.strictEqual(runner.classifyTerminalText(""), null);
+});
+
+// issue-spor-codex-usage-limit-outage-read-as-a-code-failure: the rows are
+// per-PROVIDER wordings of one classification, and Codex's phrasing matched no
+// row — so a credit-dead reviewer settled `failed`/`nonzero-exit`, the review
+// gate read it as a run that merely wrote no report, and the fix cycle it
+// charged told the implementer to route to a supervised harness for a run that
+// already was one.
+test("classifyTerminalText: a provider's OWN wording of exhaustion is environment, not a code failure", () => {
+  const codex = '{"type":"error","message":"You\'ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 13th, 2026 11:45 AM."}';
+  const c = runner.classifyTerminalText(codex);
+  assert.ok(c, "Codex's usage-limit wording is recognized at all");
+  assert.strictEqual(c.class, "environment", "an outage, not the agent's failure");
+  assert.match(c.reason, /hit your usage limit/, "the provider's own line is retained as the reason");
+  // Both spellings the row now carries, and the possessive anchor that keeps it
+  // off prose: a line ABOUT usage limits is not this run hitting one.
+  assert.strictEqual(runner.classifyTerminalText("you have reached your usage limit").signal, "usage-limit");
+  assert.strictEqual(runner.classifyTerminalText("Claude AI usage limit reached").signal, "usage-limit");
+  assert.strictEqual(runner.classifyTerminalText("the usage limit table lives in agent-dispatch-runner.js"), null);
+  // The end of the chain: a record classified this way is an INFRASTRUCTURE
+  // outage to the gate pipeline, so it charges the retry pool instead of a fix
+  // cycle. Both rows Codex's wording can land on say the same thing here.
+  for (const signal of ["usage-limit", "credit-exhausted"]) {
+    const read = gates.classifyExecutionOutcome({ state: "failed", termination_class: "environment", termination_signal: signal });
+    assert.strictEqual(read.outcome, "infrastructure", `${signal} is an outage`);
+    assert.strictEqual(read.pool, "retry", `${signal} charges the shared retry pool, never a fix cycle`);
+  }
 });
 
 test("transcriptOutcome: a mid-turn stop is 'vanished' and names the last record; a clean turn is 'done'", () => {

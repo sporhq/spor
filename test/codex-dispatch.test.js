@@ -17,6 +17,7 @@ const { getHarness, harnesses, codexPrepareRun } = require("../lib/shell/dispatc
 const { writeSpawnableNodeStub, writeNodeScript } = require("./helpers/portable.js");
 const { waitFor, awaitJson, awaitRecord, stubExitTail } = require("./helpers/launch.js");
 const runner = require("../lib/shell/agent-dispatch-runner.js");
+const gates = require("../lib/kernel/gates.js");
 
 function cleanEnv(extra = {}) {
   const env = {};
@@ -698,4 +699,58 @@ poll();
   fs.writeFileSync(release, "");
   const record = await awaitRecord(home, (r) => /stub, delayed write/.test(r.error || ""));
   assert.ok(record, "the withheld record write lands once released");
+});
+
+// --- provider outage on the stream -------------------------------------------
+// issue-spor-codex-usage-limit-outage-read-as-a-code-failure. The whole chain
+// that misfired, end to end: Codex hits its usage limit, declares it on the
+// stream and exits 1, and the run must settle as an ENVIRONMENT outage the gate
+// pipeline charges to the retry pool — not as a nonzero exit the review gate
+// then reads as "the reviewer wrote no report, route to a supervised harness"
+// (the run that produced that advice was supervised).
+test("a supervised Codex run cut off by the provider settles ENVIRONMENT, writes no report, and reads as an outage", async () => {
+  const { home, repo } = fixture();
+  const outfile = path.join(home, "codex-invocation.json");
+  const limit =
+    "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits " +
+    "or try again at Sep 13th, 2026 11:45 AM.";
+  // The stub writes the --output-last-message file BEFORE it fails, exactly as
+  // the real CLI does: the report file's existence must not be what decides
+  // this run reported something.
+  const stub = writeSpawnableNodeStub(home, "codex-limit-stub", `
+const fs = require("node:fs");
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const args = process.argv.slice(2);
+  const reportAt = args.indexOf("--output-last-message");
+  if (reportAt >= 0) fs.writeFileSync(args[reportAt + 1], "a report the failed turn never earned\\n");
+  fs.writeFileSync(process.env.OUTFILE, JSON.stringify({ args }, null, 2));
+  const w = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+  w({ type: "thread.started", thread_id: "codex-limit-thread" });
+  w({ type: "turn.started" });
+  w({ type: "error", message: ${JSON.stringify(limit)} });
+  w({ type: "turn.failed", error: { message: ${JSON.stringify(limit)} } });
+  setTimeout(() => process.exit(1), 50);
+});
+`);
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.ok(await awaitJson(outfile), "the detached stub ran");
+
+  const settled = await awaitRecord(home, (record) => record.contract_pending === false);
+  assert.ok(settled, "the run settled");
+  assert.strictEqual(settled.state, "failed");
+  assert.strictEqual(settled.termination_class, "environment", "the provider cut the run off — not the agent's failure");
+  assert.match(settled.termination_reason, /hit your usage limit/, "the provider's own line is the retained reason");
+  assert.notStrictEqual(settled.termination_signal, "nonzero-exit", "a declared outage is never a bare nonzero exit");
+  assert.notStrictEqual(settled.terminal_state, "reported", "a failed turn's --output-last-message file is not a report");
+
+  // The reading the review gate takes: an outage charges the shared retry pool,
+  // so no fix cycle is spent and no implementer is sent at a finding nobody made.
+  const read = gates.classifyExecutionOutcome(settled);
+  assert.strictEqual(read.outcome, "infrastructure");
+  assert.strictEqual(read.pool, "retry");
 });
