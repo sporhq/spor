@@ -13499,7 +13499,7 @@ function makeGateDeps(
       // re-dispatch the implementer.
       let publishPending = null;
       if (!candidateKernel.candidateSubmitted(folded.candidate)) {
-        const policy = factory.implementation.candidate || {};
+        const policy = (factory.implementation && factory.implementation.candidate) || {};
         const kinds = candidatePublish.publishKinds(policy.publish);
         let store = null;
         let storeReason = "";

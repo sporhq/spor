@@ -204,18 +204,38 @@ test("a candidate whose pinned tree is not what the store returns is a candidate
 
 test("a store that answers with bytes we did not publish is a candidate-mismatch, caught at submission", async (t) => {
   const repo = producerRepo(t);
-  // The store ACCEPTS the put and then serves something else — a truncated
-  // write, a wrong object. The producer's own round trip is the only thing
-  // between that and a controller fetching evidence that describes nothing.
+  // The store ACCEPTS the put and then serves something else — a wrong object
+  // entirely. The producer's own round trip is the only thing between that and
+  // a controller fetching evidence that describes nothing.
   const http = {
     put: async () => ({ ok: true, status: 201 }),
-    get: async () => ({ ok: true, status: 200, buffer: Buffer.from("truncated") }),
+    get: async () => ({ ok: true, status: 200, buffer: Buffer.from("not a bundle at all") }),
   };
   const r = await publisher.publishCandidate(mintFor(repo), { cwd: repo.dir, publish: "bundle", bundleStore: "https://api.example/candidates", http });
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.classification, "candidate-mismatch");
-  assert.match(r.reason, /does not verify/);
   assert.strictEqual(r.candidate.publish_attempts.at(-1).pool, null, "a mismatch consumes no pool");
+});
+
+test("a TRUNCATED object we just published is a candidate-mismatch, not an outage that drains the retry pool", async (t) => {
+  const repo = producerRepo(t);
+  // The nastier shape: a bundle whose header and prerequisite list are intact,
+  // so `git bundle verify` exits 0 and only the fetch fails. Without the
+  // published-arm byte check that reads as "the store is down" and is retried
+  // against a store that is up and holding something that will never fetch.
+  let full = null;
+  const http = {
+    put: async (_url, bytes) => {
+      full = Buffer.from(bytes);
+      return { ok: true, status: 201 };
+    },
+    get: async () => ({ ok: true, status: 200, buffer: full.subarray(0, full.length - 40) }),
+  };
+  const r = await publisher.publishCandidate(mintFor(repo), { cwd: repo.dir, publish: "bundle", bundleStore: "https://api.example/candidates", http });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.classification, "candidate-mismatch");
+  assert.match(r.reason, /did not keep what it was given/);
+  assert.strictEqual(r.candidate.publish_attempts.at(-1).pool, null);
 });
 
 test("an unwritable store is an outage — re-attemptable from the workspace, charged to the retry pool", async (t) => {
