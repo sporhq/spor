@@ -9809,22 +9809,31 @@ test("rescue publication reports execution history after its fact is confirmed",
 });
 
 
-test("integration escalation retry preserves completed-at-gates posture across declaration changes", async (t) => {
-  for (const legacy of [false, true]) await t.test(legacy ? "legacy written boundary" : "explicit captured posture", async () => {
+test("integration escalation retry preserves captured posture and refuses ambiguous legacy chronology", async (t) => {
+  for (const posture of [true, false, "legacy"]) await t.test(String(posture), async () => {
     const { home, cfg, dispatchRuns } = scratchGraphForRetry();
     t.after(() => fs.rmSync(home, { recursive: true, force: true }));
     const record = pendingRecord(dispatchRuns, home, "post-completion-retry", { pending: {
       stage: "integration", gateId: "integration", attempts: [{ verdict: "failed", detail: "suite failed" }], detail: "suite failed", evidence: "", factId: "art-merge-original",
-      ...(legacy ? {} : { completedBeforeIntegration: true }),
+      ...(posture === "legacy" ? {} : { completedBeforeIntegration: posture }),
     } });
-    if (legacy) { record.completion_written_at = "2026-09-06T12:00:00Z"; record.completion_boundary = "gates"; }
+    // Reconciliation may have completed the item during escalation backoff.
+    // This late stamp cannot change the original posture or reconstruct one.
+    record.completion_written_at = "2026-09-06T12:00:00Z"; record.completion_boundary = "gates";
     await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, {
       factory: { ...RETRY_INTEGRATION_FACTORY, completion: { by: "controller", after: "integration" } }, home, log: () => {},
     });
     const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, record.run_id).record);
-    assert.equal(after.gate_demoted, false);
+    const item = fs.readFileSync(path.join(home, "nodes", "task-demo.md"), "utf8");
+    if (posture === "legacy") {
+      assert.equal(after.gate_escalation_retry_exhausted, true);
+      assert.ok(after.gate_escalation_pending, "original evidence remains available for reconciliation");
+      assert.equal(after.gate_escalated_to, undefined); assert.match(item, /status: done/);
+      return;
+    }
+    assert.equal(after.gate_demoted, !posture);
     const escalation = fs.readFileSync(path.join(home, "nodes", `${after.gate_escalated_to}.md`), "utf8");
-    assert.match(escalation, /relates-to, to: task-demo/); assert.doesNotMatch(escalation, /type: blocks/);
-    assert.match(fs.readFileSync(path.join(home, "nodes", "task-demo.md"), "utf8"), /status: done/);
+    assert.match(escalation, posture ? /relates-to, to: task-demo/ : /blocks, to: task-demo/);
+    assert.match(item, posture ? /status: done/ : /status: open/);
   });
 });

@@ -14992,6 +14992,17 @@ async function retryOneEscalation(
     );
     return;
   }
+  // Historical payloads did not capture this posture. A completion stamp
+  // visible now may have been written during the retry backoff, so it cannot
+  // establish whether the item was already complete when integration ran.
+  // Keep that ambiguous obligation for explicit reconciliation, never infer
+  // chronology from the current factory or a later materialized stamp.
+  if (fromIntegration && typeof payload.completedBeforeIntegration !== "boolean"
+    && (record.completion_written_at || record.completion_consumed_at
+      || record.impl_claim?.completion?.after === "gates")) {
+    giveUp("the legacy integration refusal did not record its completion posture; reconcile whether completion preceded the original integration attempt");
+    return;
+  }
   // `attempt` travels with the payload, not recomputed: it keys the
   // escalation's deterministic id (gateRunKey/shortRunAttempt), and getting it
   // wrong here would mint a SECOND escalation instead of finishing the first.
@@ -15017,10 +15028,7 @@ async function retryOneEscalation(
   // reached for, and a person reads one escalation shape per refusal kind.
   const deps = fromIntegration
     ? makeIntegrationDeps(cfg, { record, entry, factory, slug: project, log, warn, home,
-        completedBeforeIntegration: typeof payload.completedBeforeIntegration === "boolean"
-          ? payload.completedBeforeIntegration
-          : !!((record.completion_boundary === "gates" && record.completion_written_at)
-            || (record.impl_claim?.completion?.after === "gates" && record.completion_consumed_at)),
+        completedBeforeIntegration: payload.completedBeforeIntegration === true,
       })
     : makeGateDeps(cfg, { record, entry, factory, slug: project, log, home });
   let esc;
