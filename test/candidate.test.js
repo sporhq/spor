@@ -783,6 +783,119 @@ test("REGRESSION issue-spor-pin-candidate-silent-stamp-failure: makeIntegrationD
   assert.match(res.reason, /could not be stamped/);
 });
 
+// --------- candidate.require_clean, wired at the pin (issue-spor-candidate- --
+// --------- require-clean-parsed-never-read) ----------------------------------
+//
+// The key was parsed onto every implementation stage (lib/kernel/gates.js)
+// but read by nobody: a dirty tree was refused only one step later, as an
+// ordinary gate-1 failure via gateChangeSet's own (unconditional) dirty
+// check — which every OTHER test above already routes through before
+// reaching a pin. These call the real bin/spor.js closures directly,
+// WITHOUT calling changedPaths/changedTree first, to prove the pin refuses
+// on its own rather than merely inheriting an upstream verdict.
+
+test("trackedTreeDirty catches a tracked edit and ignores untracked residue", (t) => {
+  const { dir } = realRepo();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  assert.deepStrictEqual(gateRunner.trackedTreeDirty(dir), { ok: true, dirty: false });
+  fs.writeFileSync(path.join(dir, "untracked.txt"), "residue\n");
+  assert.deepStrictEqual(gateRunner.trackedTreeDirty(dir), { ok: true, dirty: false }, "untracked residue is exempt, same rule as gateChangeSet");
+  fs.writeFileSync(path.join(dir, "a.txt"), "edited\n");
+  assert.deepStrictEqual(gateRunner.trackedTreeDirty(dir), { ok: true, dirty: true });
+});
+
+test("makeGateDeps' pinCandidate refuses a dirty tree on its own, with a require_clean reason, before any change read", async (t) => {
+  const { dir } = realRepo();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "a.txt"), "uncommitted\n");
+  const home = scratchHome(t);
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const entry = { run_id: "33333333-4444-5555-6666-000000000001", node_id: "task-x", project: "demo", attempt: 1 };
+  const record = { cwd: dir };
+  const factory = { trustedRef: "main", implementation: { candidate: { requireClean: true } } };
+  const deps = sporCli.makeGateDeps(cfg, { record, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home });
+
+  // No deps.changedPaths() call at all — this closure must not depend on it.
+  const res = await deps.pinCandidate({ submittedBy: { stage: "implementation", cycle: 0, rescue: 0 } });
+  assert.strictEqual(res.ok, false);
+  assert.match(res.reason, /candidate\.require_clean/);
+  assert.strictEqual(dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record), null, "a refused pin stamps nothing");
+});
+
+test("makeGateDeps' pinCandidate refuses a dirty tree the same way when require_clean is left at its default", async (t) => {
+  const { dir } = realRepo();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "a.txt"), "uncommitted\n");
+  const home = scratchHome(t);
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const entry = { run_id: "33333333-4444-5555-6666-000000000002", node_id: "task-x", project: "demo", attempt: 1 };
+  const record = { cwd: dir };
+  // No `implementation` block at all — the default parseImplementation gives
+  // the key (`true`) must still be honored here, not just when declared.
+  const factory = { trustedRef: "main" };
+  const deps = sporCli.makeGateDeps(cfg, { record, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home });
+
+  const res = await deps.pinCandidate({ submittedBy: { stage: "implementation", cycle: 0, rescue: 0 } });
+  assert.strictEqual(res.ok, false);
+  assert.match(res.reason, /candidate\.require_clean/);
+});
+
+test("an explicit candidate.require_clean: false skips the pin's own dirty check", async (t) => {
+  const { dir } = realRepo();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "a.txt"), "uncommitted\n");
+  const home = scratchHome(t);
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const entry = { run_id: "33333333-4444-5555-6666-000000000003", node_id: "task-x", project: "demo", attempt: 1 };
+  const record = { cwd: dir };
+  const factory = { trustedRef: "main", implementation: { candidate: { requireClean: false } } };
+  const deps = sporCli.makeGateDeps(cfg, { record, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home });
+
+  // The require_clean check is skipped, but there is still no `change` to
+  // pin from (changedPaths was never called) — the kernel's own pinCandidate
+  // refuses that, with a DIFFERENT reason, proving this closure's own check
+  // stood down rather than papering over the dirty tree.
+  const res = await deps.pinCandidate({ submittedBy: { stage: "implementation", cycle: 0, rescue: 0 } });
+  assert.strictEqual(res.ok, false);
+  assert.doesNotMatch(res.reason, /require_clean/);
+  assert.match(res.reason, /no committed tree to pin/);
+});
+
+test("candidate.require_clean does not fire on untracked residue alone — the pin succeeds", async (t) => {
+  const { dir } = realRepo();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "untracked.txt"), "residue\n");
+  const home = scratchHome(t);
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const entry = { run_id: "33333333-4444-5555-6666-000000000004", node_id: "task-x", project: "demo", attempt: 1 };
+  writeRecord(home, entry.run_id);
+  const record = { cwd: dir };
+  const factory = { trustedRef: "main", implementation: { candidate: { requireClean: true } } };
+  const deps = sporCli.makeGateDeps(cfg, { record, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home });
+
+  const changed = await deps.changedPaths({ trustedRef: "main" });
+  assert.strictEqual(changed.ok, true, changed.reason);
+  const res = await deps.pinCandidate({ submittedBy: { stage: "implementation", cycle: 0, rescue: 0 } });
+  assert.strictEqual(res.ok, true, res.reason);
+  assert.strictEqual(res.change, "created");
+});
+
+test("makeIntegrationDeps' pinCandidate refuses a dirty tree on its own, with a require_clean reason, before any tree read", async (t) => {
+  const { dir } = realRepo();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "a.txt"), "uncommitted\n");
+  const home = scratchHome(t);
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const entry = { run_id: "33333333-4444-5555-6666-000000000005", node_id: "task-x", project: "demo", attempt: 1 };
+  const record = { cwd: dir };
+  const factory = { integration: { targetRef: "main" }, trustedRef: "main", implementation: { candidate: { requireClean: true } } };
+  const deps = sporCli.makeIntegrationDeps(cfg, { record, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home });
+
+  const res = await deps.pinCandidate({ submittedBy: { stage: "integration-fix", cycle: 1, rescue: 0 } });
+  assert.strictEqual(res.ok, false);
+  assert.match(res.reason, /candidate\.require_clean/);
+});
+
 // ------------------------------------------------------ the CLI surfaces --
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");

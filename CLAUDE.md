@@ -1155,10 +1155,22 @@ prompt. Candidate publication (`bundle` | `branch` | `both`, per
 (`lib/shell/candidate-publish.js`): a candidate with a commit and no verified
 reference is published at every pin, `spor work` startup refuses to run a
 factory this box cannot publish from (§2.4 E9/E14), and a publish failure
-leaves `publish_pending` owed rather than refusing the pin. The REST —
-`profile` routing, `budget`, `retry`, `require_clean`, `gates[].rejudge_on_repin`
-— is validated but not yet spent: the stage's dispatch loop
-(task-spor-factory-implementation-stage-runner, on
+leaves `publish_pending` owed rather than refusing the pin.
+`candidate.require_clean` (default true) is shipped too
+(issue-spor-candidate-require-clean-parsed-never-read): the two `pinCandidate`
+closures in bin/spor.js (`makeGateDeps` and its `makeIntegrationDeps` twin)
+refuse the pin with a reason distinct from an ordinary gate failure when a
+checkout has uncommitted TRACKED changes (untracked residue exempt, the same
+rule `gateChangeSet`'s own dirty check uses — both share
+`gateRunner.trackedTreeDirty`) — moving the refusal to candidate submission
+itself rather than leaving it to arrive one step later as the first command
+gate's own dirty-tree failure, which every caller here already routes through
+before reaching a pin, so the default is byte-identical; only an explicit
+`false` relaxes the check at the pin (the underlying gate-1 dirty refusal is
+unconditional regardless, so `false` does not yet let a dirty tree reach a
+gate). The REST — `profile` routing, `budget`, `retry`,
+`gates[].rejudge_on_repin` — is validated but not yet spent: the stage's
+dispatch loop (task-spor-factory-implementation-stage-runner, on
 task-spor-factory-execution-outcome-classifier) is still to land, so a declared
 key there is intent the runner validates and does not act on. A factory
 declaring neither block is byte-identical. See test/completion-boundary.test.js

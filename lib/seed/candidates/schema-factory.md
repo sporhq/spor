@@ -179,8 +179,12 @@ convention schema nodes use:
   Candidate publication also runs: `candidate.publish`/`remote`/`bundle_store`
   govern how the pinned commit is made reachable (`bundle` | `branch` | `both`),
   `spor work` refuses to start a factory this box cannot publish from, and a
-  publish failure owes `publish_pending` rather than refusing the pin. The rest
-  of the stage — `profile` routing, `budget`, `retry`, `require_clean` and
+  publish failure owes `publish_pending` rather than refusing the pin.
+  `candidate.require_clean` also runs (issue-spor-candidate-require-clean-
+  parsed-never-read): the pin itself refuses, with its own reason, on a
+  checkout with uncommitted tracked changes — moved to submission rather than
+  left to the first command gate's own (still-unconditional) dirty-tree
+  refusal. The rest of the stage — `profile` routing, `budget`, `retry` and
   `gates[].rejudge_on_repin` — is validated but not yet spent: the stage's own
   dispatch loop lands with the remaining items of FACTORY-IMPLEMENTATION-
   STAGE.md §8 (task-spor-factory-implementation-stage-runner,

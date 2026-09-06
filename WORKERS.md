@@ -3283,7 +3283,10 @@ path, the run record and the idle-stop that already own them.
   plus the next poll is the honest remedy.
 - **`candidate.require_clean`** (default true) — refuse a dirty tree at
   submission rather than inside the first gate, where the round-trip already
-  lives.
+  lives. Only an explicit `false` relaxes the pin's own check; the first
+  command gate's dirty-tree refusal is unconditional regardless (§10.3), so
+  `false` does not (yet) let a dirty tree reach a gate — it only removes the
+  earlier, more specific refusal at the pin.
 - **`candidate.publish`** (`bundle` | `branch` | `both`, default `bundle`) —
   how the pinned commit is made reachable to a controller that does not share a
   filesystem with the implementer. **A candidate always carries a portable
@@ -3352,18 +3355,19 @@ floor, because a typo must never read as "no retries", "retry in a second", or
 `instructions` in the worker contract (`lib/shell/worker-contract.js`),
 everything `completion` governs — the execution hold, the `CANDIDATE:`
 submission, the candidate pin and the controller's completion write (§10.12,
-§10.13) — and candidate publication (`lib/shell/candidate-publish.js`: `bundle`
+§10.13) — candidate publication (`lib/shell/candidate-publish.js`: `bundle`
 | `branch` | `both`, the `spor work`-startup `publishSatisfiability` refusal
-above, and the `publish_pending` debt of an outage) are shipped. The rest of
-the stage is declared and validated but not yet executed: no dispatch is
-routed by `implementation.profile`, no budget or retry pool is spent
-(task-spor-factory-implementation-stage-runner, on the outcome classifier that
-separates the two pools, task-spor-factory-execution-outcome-classifier),
-`require_clean` is still enforced one step later by the first command gate's
-own dirty-tree refusal, and `rejudge_on_repin` is parsed onto the gate and read
-by nobody. Declaring those keys today is a DECLARATION of intent that the
-runner already validates and will honor when those items land; nothing about
-them changes what a worker does now.
+above, and the `publish_pending` debt of an outage), and `candidate.require_clean`
+(issue-spor-candidate-require-clean-parsed-never-read: the pin itself refuses,
+with its own reason, on a checkout with uncommitted tracked changes — see
+above) are shipped. The rest of the stage is declared and validated but not
+yet executed: no dispatch is routed by `implementation.profile`, no budget or
+retry pool is spent (task-spor-factory-implementation-stage-runner, on the
+outcome classifier that separates the two pools,
+task-spor-factory-execution-outcome-classifier), and `rejudge_on_repin` is
+parsed onto the gate and read by nobody. Declaring those keys today is a
+DECLARATION of intent that the runner already validates and will honor when
+those items land; nothing about them changes what a worker does now.
 
 See test/gates.test.js (the validation table), test/worker-contract.test.js,
 test/candidate.test.js and test/completion-boundary.test.js.

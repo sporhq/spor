@@ -12657,6 +12657,32 @@ function launchedFixRun(home, nodeId, name) {
   }
 }
 
+// implementation.candidate.require_clean (§2.1,
+// issue-spor-candidate-require-clean-parsed-never-read): parsed onto every
+// declared implementation stage but, until now, read by nobody — an
+// uncommitted tracked change was refused only one step later, as an ordinary
+// gate-1 failure via gateChangeSet's own (unconditional) dirty check, which
+// every caller of pinCandidate in this file already routes through before
+// ever reaching it. Reading the key HERE, at the candidate PIN itself —
+// where FACTORY-IMPLEMENTATION-STAGE.md §3 places submission — refuses with
+// a reason attributable to the declared knob instead of a generic gate
+// failure, and covers a future submission path that reaches a pin without
+// first routing through gateChangeSet. Only an explicit `false` relaxes it
+// (parseImplementation's own default is `true`); untracked residue is
+// exempt, the same rule gateChangeSet's own dirty check uses
+// (trackedTreeDirty, shared with it). A factory with no `implementation:`
+// block is byte-identical: its pinCandidate closure is never called
+// (runGatePipeline/runIntegrationStage guard on `factory.implementation`).
+function refuseDirtyCandidate(factory, cwd) {
+  if (!cwd) return null;
+  const requireClean = !(factory.implementation && factory.implementation.candidate && factory.implementation.candidate.requireClean === false);
+  if (!requireClean) return null;
+  const dirty = gateRunner.trackedTreeDirty(cwd);
+  if (!dirty.ok) return { ok: false, reason: `candidate.require_clean could not confirm ${cwd} is clean: ${dirty.reason}` };
+  if (dirty.dirty) return { ok: false, reason: `candidate.require_clean refused the pin — ${cwd} has uncommitted changes to tracked files` };
+  return null;
+}
+
 function makeGateDeps(
   cfg,
   { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
@@ -13595,6 +13621,11 @@ function makeGateDeps(
     // pipeline's own guard) — a factory that declares none pins nothing, stamps
     // nothing, and is byte-identical to before the stage existed.
     pinCandidate: async ({ submittedBy, runId = null }) => {
+      // candidate.require_clean, checked before anything else here — see
+      // refuseDirtyCandidate's own comment for why this is a distinct,
+      // earlier check rather than a duplicate of gateChangeSet's.
+      const refused = refuseDirtyCandidate(factory, (change && change.cwd) || (record && record.cwd));
+      if (refused) return refused;
       // The pipeline's OWN record, re-read: the `impl_` stamps are written out
       // of band from the two in-process record writers, so the copy this
       // closure captured at pipeline start is not authoritative about anything
@@ -14846,6 +14877,10 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     // integration. Reusing it here would pin whatever tree the gate pipeline
     // last read, not the tree this stage's own fix cycle just committed.
     pinCandidate: async ({ submittedBy, runId = null }) => {
+      // candidate.require_clean — see makeGateDeps' own pinCandidate above and
+      // refuseDirtyCandidate's comment.
+      const refused = refuseDirtyCandidate(factory, (change && change.cwd) || (record && record.cwd));
+      if (refused) return refused;
       let current = record;
       try {
         current = dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record) || record;

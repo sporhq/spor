@@ -397,9 +397,11 @@ submission, the controller's completion write), the two contract keys above —
 `instructions`, appended to the worker contract — and candidate publication
 (`candidate.publish`/`remote`/`bundle_store`: `bundle` | `branch` | `both`,
 `spor work` refuses to start on a box that cannot publish, a publish failure
-owes `publish_pending` rather than refusing the pin). Parsed and validated but
-**not yet executed**: `profile`, `budget`, `retry` and
-`candidate.require_clean`/`gates[].rejudge_on_repin`. Writing those is a
+owes `publish_pending` rather than refusing the pin), and
+`candidate.require_clean` (default true: the pin itself refuses, with its own
+reason, on a checkout with uncommitted tracked changes). Parsed and validated
+but **not yet executed**: `profile`, `budget`, `retry` and
+`gates[].rejudge_on_repin`. Writing those is a
 declaration of intent the runner already validates and will honor when the
 stage runner lands — legitimate if the operator wants the lane recorded, but
 say plainly that nothing about them changes what a worker does now, or they
