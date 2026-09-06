@@ -41,6 +41,8 @@ const gatesKernel = require(path.join(ROOT, "lib", "kernel", "gates.js"));
 const candidateKernel = require(path.join(ROOT, "lib", "kernel", "candidate.js"));
 const completionKernel = require(path.join(ROOT, "lib", "kernel", "completion.js"));
 const completionShell = require(path.join(ROOT, "lib", "shell", "completion.js"));
+const executionStore = require(path.join(ROOT, "lib", "shell", "execution-store.js"));
+const executionKernel = require(path.join(ROOT, "lib", "kernel", "execution.js"));
 const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
 const candidatePublish = require(path.join(ROOT, "lib", "shell", "candidate-publish.js"));
 const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
@@ -4676,6 +4678,12 @@ async function cmdLease(cfg, action, { positionals, values = {} }) {
       return 1;
     }
     out(cleared.cleared ? `released execution ${cleared.holder} on ${id} — the hold is cleared; a resolving edge now retires it as usual` : cleared.note);
+    // ...and the execution STORE's copy (task-spor-client-execution-store-
+    // adapter): the record this box holds for it names the store and the
+    // fence; the execution is re-claimed (a dead worker's lease has expired)
+    // and ended, so the item pointer — and a server's resolving-edge gate —
+    // let go with the hold. Best effort, reported.
+    await endReleasedExecution(cfg, id, executionId, { home: cfg.userConfigHome() });
     return 0;
   }
 
@@ -9563,6 +9571,67 @@ async function launchSupervisedHarness(cfg, {
 // record's `contract_pending` flag, cleared by the settle — and it is skipped
 // entirely for a record that owes nothing, so a store of supervised runs makes
 // no calls at all.
+// `spor executions [<exec-id>] [--node <id>] [--stage <s>] [--events] [--json]`
+// (task-spor-client-execution-store-adapter): the read surface over the
+// execution store this box drives — the hosted `/v1/executions` in remote
+// mode (the last server-confirmed copy when the server is unreachable), the
+// local store otherwise. `--local` reads the machine-local store in either
+// mode (the fallback a claim takes when a server does not serve the surface).
+async function cmdExecutions(cfg, { values, positionals: pos }) {
+  const home = cfg.userConfigHome();
+  const store = openExecutionStoreFor(cfg, { home, mode: values.local ? "local" : null, log: (l) => err(`note: ${l}`) });
+  const id = pos[0] || null;
+  const json = !!values.json;
+  const short = (v) => String(v || "").slice(0, 12);
+  if (id) {
+    const r = values.events ? await store.events(id) : await store.get(id);
+    if (!r.ok) {
+      err(r.transport ? `offline — ${r.message}` : `${r.code}: ${r.message}`);
+      return 1;
+    }
+    if (json) {
+      out(JSON.stringify(r, null, 2));
+      return 0;
+    }
+    if (values.events) {
+      for (const ev of r.events) out(`${ev.at || "-"}  seq ${ev.seq != null ? ev.seq : "-"}  ${ev.type}${ev.gate_id ? ` ${ev.gate_id}` : ""}${ev.state ? ` ${ev.state}` : ""}${ev.attempt != null ? ` attempt ${ev.attempt}` : ""}${ev.idempotency_key ? `  [${ev.idempotency_key}]` : ""}`);
+      out(`${r.count} event(s)`);
+      return 0;
+    }
+    const x = r.execution;
+    out(`${x.execution_id}  ${x.stage}${x.boundary_reached ? " (boundary reached)" : ""}${x.terminal ? " (terminal)" : ""}${r.cached ? "  [cached copy — the server was unreachable]" : ""}`);
+    out(`  item ${x.item.node_id}${x.item.repo ? ` (${x.item.repo})` : ""} rev ${short(x.item.revision) || "-"}; factory ${x.factory.node_id} rev ${short(x.factory.revision) || "-"}; tenant ${x.tenant}; attempt ${x.pipeline_attempt}; boundary ${x.completion.boundary}`);
+    out(`  owner ${x.owner ? `${x.owner.worker}${x.owner.machine ? ` on ${x.owner.machine}` : ""} until ${x.owner.lease_expires_at}, fence ${x.owner.fence}` : "none"}; seq ${x.seq}; updated ${x.updated_at || "-"}`);
+    if (x.candidate) out(`  candidate ${x.candidate.candidate_id || "?"}  tree ${short(x.candidate.tree)}  commit ${short(x.candidate.commit)}${x.premature_resolution ? "  (premature resolution recorded)" : ""}`);
+    for (const g of x.gate_results || []) out(`  gate ${g.id}: ${g.state || "pending"}${g.attempt ? ` (attempt ${g.attempt})` : ""}${g.settled_at ? ` at ${g.settled_at}` : ""}`);
+    for (const a of x.attempts || []) out(`  attempt ${a.index} [${a.pool}]: ${a.state || "-"}${a.outcome ? ` -> ${a.outcome}` : ""}${a.run_id ? ` run ${short(a.run_id)}` : ""}`);
+    if (x.integration) out(`  integration ${x.integration.state}${x.integration.ref ? ` onto ${x.integration.ref}` : ""}${x.integration.commit ? ` at ${short(x.integration.commit)}` : ""}`);
+    for (const e of x.escalations || []) out(`  escalation ${e.node_id}${e.reason ? `: ${e.reason}` : ""}`);
+    if (x.completion.written_at) out(`  completed ${x.completion.written_at} by ${x.completion.resolver || "?"}`);
+    const owed = store.outbox ? store.outbox(x.execution_id) : [];
+    if (owed.length) out(`  outbox: ${owed.length} event(s) owed to the server — replayed on the pipeline's next call`);
+    return 0;
+  }
+  const r = await store.list({ node_id: values.node || null, stage: values.stage || null, limit: Math.max(1, parseInt(values.limit, 10) || 50) });
+  if (!r.ok) {
+    err(r.transport ? `offline — ${r.message}` : `${r.code}: ${r.message}`);
+    return 1;
+  }
+  if (json) {
+    out(JSON.stringify(r, null, 2));
+    return 0;
+  }
+  if (!r.executions.length) {
+    out(`no executions${values.node ? ` for ${values.node}` : ""} in the ${store.mode} store${r.cached ? " (cached copies — the server was unreachable)" : ""}`);
+    return 0;
+  }
+  for (const x of r.executions) {
+    out(`${x.execution_id}  ${x.stage.padEnd(14)} ${x.item.node_id}  attempt ${x.pipeline_attempt}  ${x.owner ? `${x.owner.worker} fence ${x.owner.fence} until ${x.owner.lease_expires_at}` : "unowned"}${x.boundary_reached ? "  boundary reached" : ""}`);
+  }
+  out(`${r.count} execution(s)${r.cached ? " (cached copies — the server was unreachable)" : ""}`);
+  return 0;
+}
+
 async function cmdRuns(cfg, { values, positionals: pos }) {
   const home = cfg.userConfigHome();
   const { agents, enumerated } = nativeAgentEvidence(cfg, dispatchRuns.readRunRecords(home));
@@ -9676,6 +9745,7 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
               ? `owed (${r.completion_debt})`
               : "pending";
       out(`  completion: by ${c.by} at '${c.after}' — ${state}${r.impl_claim.execution_id ? `; execution ${r.impl_claim.execution_id}` : ""}`);
+      if (r.impl_claim.store) out(`              execution store ${r.impl_claim.store}${r.impl_claim.tenant ? ` (${r.impl_claim.tenant})` : ""}, attempt ${r.impl_claim.pipeline_attempt || "?"}, fence ${r.impl_claim.fence != null ? r.impl_claim.fence : "?"}${r.impl_claim.lease_expires_at ? `, lease until ${r.impl_claim.lease_expires_at}` : ""}`);
       if (r.gates_state || r.integration_state) out(`              gates ${r.gates_state || "-"}, integration ${r.integration_state || "-"}`);
       if (Array.isArray(r.completion_premature) && r.completion_premature.length) out(`              premature resolution retyped: ${r.completion_premature.join(", ")}`);
     }
@@ -11497,9 +11567,27 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
   const held = await claimExecutionHold(cfg, item, factory, { home, log });
   if (!held.ok) return { ok: false, reason: held.reason };
   const launched = await dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { recordFields: held.recordFields, ...dispatchOpts });
+  // The store's copy of the launch (task-spor-client-execution-store-adapter):
+  // the attempt row learns its run id, or — I2 — the execution is ended with
+  // the hold, so neither the item pointer nor a server's resolving-edge gate
+  // keeps holding an item nothing will run under.
+  const store = held.store ? openExecutionStoreFor(cfg, { home, mode: held.store, log }) : null;
   if (!launched.ok) {
     const cleared = await completionShell.clearHold({ nodeId: item.id, executionId: held.executionId, deps: makeCompletionDeps(cfg, { home }) });
     if (!cleared.ok) log(`work: ${item.id} — the dispatch was refused and its execution hold ${held.executionId} could not be cleared (${cleared.reason}); release it with 'spor release ${item.id} --execution ${held.executionId}'`);
+    if (store) {
+      try {
+        await store.terminate(held.executionId, { fence: held.fence, reason: launched.reason || "the dispatch was refused" });
+      } catch {
+        /* best effort */
+      }
+    }
+  } else if (store && launched.run && launched.run.run_id) {
+    try {
+      await store.event(held.executionId, { fence: held.fence, event: { type: "stage.observed", attempt: 1, state: "dispatched", run_id: launched.run.run_id } });
+    } catch {
+      /* fail-soft */
+    }
   }
   return launched;
 }
@@ -15422,8 +15510,12 @@ function completionStatusFor(cfg, type) {
 
 // The deps one completion write runs on. `runId` names the record the
 // stamps land on (the pipeline's own run).
-function makeCompletionDeps(cfg, { home = cfg.userConfigHome(), runId = null } = {}) {
+function makeCompletionDeps(cfg, { home = cfg.userConfigHome(), runId = null, execution = null } = {}) {
   return {
+    // The execution store's doors (task-spor-client-execution-store-adapter):
+    // the fence confirmation before the resolving edge, the completion event
+    // after the CAS, the end on a withdraw. Null for a legacy record.
+    ...(execution ? { execution } : {}),
     readItem: (nodeId) => completionReadItem(cfg, nodeId),
     casWrite: (args) => completionCasWrite(cfg, args, { home }),
     writeNode: (id, markdown) => writeGateNode(cfg, id, markdown),
@@ -15446,13 +15538,64 @@ function makeCompletionDeps(cfg, { home = cfg.userConfigHome(), runId = null } =
 // record is created with (`ctx.recordFields`). Returns the recordFields, or a
 // refusal — an unroutable item (H2): no hold, no launch, cooled by the loop.
 async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHome(), log = () => {} } = {}) {
-  const claimedAt = new Date().toISOString();
-  const tenant = cfg.mode() === "remote" ? remote.base(cfg) : "local";
-  const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
-  const executionId = completionKernel.executionIdFor({ tenant, nodeId: item.id, factoryId: factory.id, claimedAt }, sha256);
+  // The EXECUTION STORE (task-spor-client-execution-store-adapter,
+  // EXECUTION-STATE.md §8): the execution is OPENED there first — the hosted
+  // `POST /v1/executions` in remote mode (the server pins the definition,
+  // derives the tenant from the identity, and hands back the fence every
+  // later transition carries), the shape-compatible local store in personal
+  // mode — and the id the store minted is what the item's hold names. The id
+  // is content-addressed the same way in both (tenant, item, factory, pipeline
+  // attempt), so a local execution and a hosted one describe the same thing.
+  let store = openExecutionStoreFor(cfg, { home, log });
+  const gates = (factory.gates || []).map((g) => ({ id: g.id, node_id: g.source && g.source !== "inline" ? String(g.source) : null }));
+  const openArgs = { node_id: item.id, factory: factory.id, gates, boundary: factory.completion.after, repo: item.project || null };
+  let opened = await store.open(openArgs);
+  // A server that does not serve the surface (an older version, or one with
+  // no execution store configured) is not a refusal: coordination state for
+  // this execution is kept machine-local instead, and the claim STAMPS which
+  // store it opened so a resume goes back to the same one. A server that is
+  // merely unreachable is a refusal — nothing authoritative starts without an
+  // execution nobody else can be holding (§8 rule 3).
+  if (!opened.ok && opened.unserved && store.mode === "remote") {
+    log(`work: ${item.id} — the server does not serve /v1/executions (${opened.message}); this execution's coordination state is machine-local`);
+    store = openExecutionStoreFor(cfg, { home, log, mode: "local" });
+    opened = await store.open(openArgs);
+  }
+  if (!opened.ok) {
+    const foreign = opened.code === "execution_open";
+    return { ok: false, kind: foreign ? "foreign-hold" : "store", reason: `execution store refused ${item.id}: ${opened.code}: ${opened.message}${foreign && opened.execution ? ` (execution ${opened.execution.execution_id})` : ""}` };
+  }
+  let fence = opened.fence;
+  let execution = opened.execution;
+  if (fence == null) {
+    // An existing live execution this caller does not own (a replayed open
+    // echoes the fence only to its owner): a plain claim takes it when the
+    // lease has EXPIRED (a dead worker's orphan — the fence advances, fencing
+    // that worker out for good) and loses to a live one, which is exactly the
+    // foreign hold H2 refuses. An unexpired lease is never stolen.
+    const claimed = await store.claim(execution.execution_id, {});
+    if (!claimed.ok) {
+      const h = claimed.holder || (execution.owner || null);
+      const who = h ? `${h.worker}${h.machine ? ` on ${h.machine}` : ""} until ${h.lease_expires_at}` : "another worker";
+      return { ok: false, kind: claimed.code === "already_owned" || claimed.code === "lease_live" ? "foreign-hold" : "store", reason: `execution ${execution.execution_id} on ${item.id} is held by ${who} (${claimed.code}: ${claimed.message})` };
+    }
+    fence = claimed.fence;
+    execution = claimed.execution;
+  }
+  const executionId = execution.execution_id;
   const deps = makeCompletionDeps(cfg, { home });
   const held = await completionShell.stampHold({ nodeId: item.id, executionId, deps });
-  if (!held.ok) return { ok: false, reason: `execution hold refused on ${item.id}: ${held.reason}`, kind: held.kind };
+  if (!held.ok) {
+    // Nothing will run under this execution: end it, so the item pointer —
+    // and, on a server, the resolving-edge gate keyed on it — is freed rather
+    // than left holding the item closed for an execution nobody advances.
+    try {
+      await store.terminate(executionId, { fence, reason: held.reason });
+    } catch {
+      /* best effort — the lease lapses on its own */
+    }
+    return { ok: false, reason: `execution hold refused on ${item.id}: ${held.reason}`, kind: held.kind };
+  }
   const impl = factory.implementation || null;
   const recordFields = {
     impl_claim: {
@@ -15464,12 +15607,455 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
       item_revision: held.pins.revision,
       resolving_snapshot: held.pins.resolving_snapshot,
       status_snapshot: held.pins.status_snapshot,
+      // The store half (additive): which store holds the execution, the
+      // partition it lives in, the attempt its id is addressed by, the fence
+      // this worker holds and the lease it was handed. A record without
+      // `store` was claimed before the adapter existed and reports nothing.
+      store: store.mode,
+      tenant: execution.tenant,
+      pipeline_attempt: execution.pipeline_attempt,
+      fence,
+      lease_expires_at: execution.owner ? execution.owner.lease_expires_at : null,
+      worker: execution.owner ? execution.owner.worker : null,
+      machine: execution.owner ? execution.owner.machine : null,
+      gates: gates.map((g) => g.id),
     },
     impl_state: "dispatched",
     impl_attempt: 1,
   };
-  log(`work: ${item.id} — held by execution ${executionId} (completion by controller at the '${factory.completion.after}' boundary)${held.restamped ? " (re-stamped)" : ""}`);
-  return { ok: true, executionId, recordFields };
+  // The first attempt row — §7.3's `stage.started`. Fail-soft: the run
+  // record above is the client's evidence; the store's copy is owed, and a
+  // remote miss is spooled to the outbox and replayed by the pipeline.
+  try {
+    await store.event(executionId, { fence, event: { type: "stage.started", attempt: 1, pool: "implementation", stage: "implementation" } });
+  } catch {
+    /* fail-soft */
+  }
+  log(`work: ${item.id} — held by execution ${executionId} (completion by controller at the '${factory.completion.after}' boundary; ${store.mode} store, fence ${fence})${held.restamped ? " (re-stamped)" : ""}`);
+  return { ok: true, executionId, fence, store: store.mode, recordFields };
+}
+
+// ---- the execution store's CLI wiring (task-spor-client-execution-store-adapter) ----
+
+// The worker PRINCIPAL a local execution is owned by: this box's default
+// dispatch agent when one is configured (the same identity the hosted store
+// derives from an agent token), else the user. Remote mode never sends it as
+// its own name — the server derives the principal from the authenticated
+// identity and reads a body `worker` only as the fallback label for an
+// unbound token.
+function executionWorkerPrincipal(cfg) {
+  const agent = cfg.get("dispatch.agent", null);
+  if (agent) return String(agent);
+  try {
+    return os.userInfo().username || "local";
+  } catch {
+    return "local";
+  }
+}
+
+// The local store's definition PIN: the item's, the factory's and each gate
+// node's current revision (the git blob sha `spor get --json` reports, byte-
+// identical to the server's for the same content) plus the item's repo,
+// read out of the local graph at open time and frozen into the record.
+function executionPinRead(cfg) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  return (id) => {
+    if (cfg.mode() === "remote" || !/^[a-z0-9][a-z0-9-]*$/.test(String(id || ""))) return null;
+    let raw;
+    try {
+      raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`));
+    } catch {
+      return null;
+    }
+    let fm = {};
+    try {
+      fm = graphLib.parseFrontmatter(raw.toString("utf8"), `${id}.md`);
+    } catch {
+      fm = {};
+    }
+    return { revision: gitBlobSha(raw), repo: fm.repo || fm.project || null };
+  };
+}
+
+// The store bin/spor.js opens: the hosted adapter in remote mode, the local
+// engine otherwise, or the one a claim STAMPED (`impl_claim.store`) so a
+// resume drives the store the pipeline was opened in.
+function openExecutionStoreFor(cfg, { home = cfg.userConfigHome(), mode = null, tenant = null, log = () => {} } = {}) {
+  return executionStore.openExecutionStore(cfg, {
+    home,
+    mode,
+    tenant,
+    worker: executionWorkerPrincipal(cfg),
+    machine: os.hostname(),
+    pinRead: executionPinRead(cfg),
+    log,
+  });
+}
+
+// The gate verdict words the pipeline records (gate-runner.js's facts) mapped
+// onto the store's fixed `gate.settled` states. `blocked` is not a settled
+// state — a human gate awaiting its approval has not settled — so it reports
+// nothing; `unrun` is the outage lane.
+const GATE_VERDICT_TO_STATE = Object.freeze({
+  passed: "passed",
+  skipped: "skipped",
+  failed: "failed",
+  "fail-closed": "failed",
+  "dirty-tree": "failed",
+  scoped: "failed",
+  unrun: "infrastructure",
+  // The outcome classifier's two outage words (lib/kernel/gates.js
+  // classifyExecutionOutcome): the harness died on the environment, or this
+  // box refused the dispatch before it started — neither charges the code.
+  infrastructure: "infrastructure",
+  unroutable: "infrastructure",
+});
+
+// The executions this process holds, keyed by execution id — the per-pass
+// heartbeat renews each one's lease so a pipeline that runs for hours never
+// lets its owner read as dead (a lease is 15min by default; a pass is 30s
+// to 5min). A reporter registers itself when it resumes and leaves when its
+// pipeline settles.
+const LIVE_EXECUTIONS = new Map();
+
+// One REPORTER per pipeline, bound to a record's claim: the fence-bearing
+// door every §7.3 event and every ownership check goes through. Returns null
+// for a legacy run (no `impl_claim`) and for a controller record claimed
+// before the adapter existed (no `impl_claim.store`) — both then run exactly
+// as before, with no store traffic at all (§8 rule 2).
+//
+// Fail-soft on the STORE side by design: a report that cannot be delivered is
+// spooled (remote) or logged, and never changes what the pipeline does with
+// the tree. The one place the store's answer DOES gate the pipeline is
+// `confirm()` — the completion write's ownership check — where "cannot
+// confirm" means "do not write the resolving edge" (§8 rule 3).
+function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () => {}, store = null } = {}) {
+  if (!completionKernel.isControllerRecord(record)) return null;
+  const claim = record.impl_claim;
+  if (!claim.store || !claim.execution_id) return null;
+  const id = claim.execution_id;
+  // The store is opened the way the CLAIM opened it — the mode the claim
+  // stamped, the partition label derived from the config — so the outbox the
+  // claim spooled `stage.started` into is the one this reporter replays.
+  const st = store || openExecutionStoreFor(cfg, { home, mode: claim.store, log });
+  let fence = claim.fence != null ? Number(claim.fence) : null;
+  let owned = fence != null;
+  let last = null; // the latest execution record any store answer carried
+  const pinned = new Set(Array.isArray(claim.gates) ? claim.gates.map(String) : []);
+  // Attempt counters, ADVANCED LOCALLY on every report whether or not it was
+  // delivered: the idempotency key of a gate verdict or an integration
+  // outcome is `<execution>:<gate>:<attempt>`, so two settlements of one
+  // gate under a partition (a failure, a fix cycle, a pass) or a re-gate's
+  // second landing must not reuse a key the first already spent — a reused
+  // key replays as a no-op and the server never reaches the boundary. Seeded
+  // from the store's own record at resume(), so a fresh pass continues from
+  // the attempt the server last recorded rather than from 1.
+  const gateAttempts = new Map();
+  let integrationAttempt = 0;
+  const seedAttempts = (rec) => {
+    if (!rec) return;
+    for (const g of Array.isArray(rec.gate_results) ? rec.gate_results : []) {
+      if (g && g.id && Number(g.attempt) > (gateAttempts.get(String(g.id)) || 0)) gateAttempts.set(String(g.id), Number(g.attempt));
+    }
+    if (rec.integration && Number(rec.integration.attempt) > integrationAttempt) integrationAttempt = Number(rec.integration.attempt);
+  };
+  // ...and from the OUTBOX: an earlier pass may have spooled verdicts the
+  // server never saw (a partition it ended inside), and their keys are spent
+  // just the same — a successor that seeded from the server alone would mint
+  // them again, and its own verdict would replay as a no-op behind the old.
+  const seedFromOutbox = () => {
+    let owed = [];
+    try {
+      owed = typeof st.outbox === "function" ? st.outbox(id) : [];
+    } catch {
+      owed = [];
+    }
+    for (const line of owed) {
+      const ev = line && line.event;
+      if (!ev) continue;
+      if (ev.type === "gate.settled" && ev.gate_id != null && Number(ev.attempt) > (gateAttempts.get(String(ev.gate_id)) || 0)) gateAttempts.set(String(ev.gate_id), Number(ev.attempt));
+      if ((ev.type === "integration.started" || ev.type === "integration.settled") && Number(ev.attempt) > integrationAttempt) integrationAttempt = Number(ev.attempt);
+    }
+  };
+  const noted = new Set();
+  const note = (key, line) => {
+    if (noted.has(key)) return;
+    noted.add(key);
+    log(line);
+  };
+
+  const stampFence = (f, expires) => {
+    fence = f;
+    owned = true;
+    try {
+      const fresh = dispatchRuns.readJson(dispatchRuns.runPaths(home, record.run_id).record);
+      const cur = (fresh && fresh.impl_claim) || claim;
+      dispatchRuns.stampImplState(home, record.run_id, { impl_claim: { ...cur, fence: f, ...(expires ? { lease_expires_at: expires } : {}) } });
+    } catch {
+      /* the fence is held in-process; the record's copy is best effort */
+    }
+  };
+
+  async function send(event) {
+    if (fence == null) return { ok: false, code: "not_owned", message: "no fence" };
+    let r;
+    try {
+      r = await st.event(id, { fence, event });
+    } catch (e) {
+      r = { ok: false, code: "error", message: String((e && e.message) || e) };
+    }
+    if (r.ok) {
+      if (r.execution) last = r.execution;
+      return r;
+    }
+    if (r.ownership === false || executionKernel.OWNERSHIP_CODES.includes(r.code)) {
+      owned = false;
+      note(`lost:${r.code}`, `work: ${record.node_id} — execution ${id} is no longer held by this worker (${r.code}: ${r.message}${r.holder ? `; held by ${r.holder.worker}` : ""}); the pipeline continues but writes no completion under this fence`);
+    } else if (r.deferred) {
+      note("deferred", `work: ${record.node_id} — execution ${id}: the store is unreachable (${r.message}); ${r.pending} event(s) spooled to the outbox and replayed on the next call`);
+    } else if (r.code === "execution_terminal") {
+      note("terminal", `work: ${record.node_id} — execution ${id} is terminal in the store; no further events are recorded`);
+    } else {
+      log(`work: ${record.node_id} — execution ${id}: ${event.type} not recorded (${r.code}: ${r.message})`);
+    }
+    return r;
+  }
+
+  const gateAttempt = (gateId) => {
+    seedAttempts(last);
+    const next = (gateAttempts.get(gateId) || 0) + 1;
+    gateAttempts.set(gateId, next);
+    return next;
+  };
+
+  const reporter = {
+    id,
+    store: st,
+    get fence() {
+      return fence;
+    },
+    get owned() {
+      return owned;
+    },
+    get record() {
+      return last;
+    },
+    // Re-take the lease at the start of every pipeline pass (a fresh launch,
+    // a resumed orphan, a re-gate): a same-owner claim keeps its fence, an
+    // expired dead worker's lease advances it, a live foreign lease refuses.
+    // A store that cannot be reached leaves the recorded fence in force
+    // UNCONFIRMED — events spool, and `confirm()` is what refuses the edge.
+    async resume() {
+      let r;
+      try {
+        r = await st.claim(id, {});
+      } catch (e) {
+        r = { ok: false, code: "error", message: String((e && e.message) || e) };
+      }
+      if (r.ok) {
+        last = r.execution || last;
+        seedAttempts(last);
+        seedFromOutbox();
+        // Drain what an earlier pass left owed, now that the fence is ours:
+        // the record then reflects the backlog, and a verdict this pass mints
+        // lands behind nothing stale. Best effort — a failure just leaves it
+        // for the next event's own replay.
+        try {
+          const drained = await st.reconcile(id, { fence: r.fence });
+          if (drained && drained.replayed && typeof st.cached === "function") last = st.cached(id) || last;
+          seedAttempts(last);
+        } catch {
+          /* replayed on the next event */
+        }
+        if (r.fence !== fence) log(`work: ${record.node_id} — execution ${id} re-claimed at fence ${r.fence}${fence != null ? ` (was ${fence})` : ""}`);
+        stampFence(r.fence, r.execution && r.execution.owner ? r.execution.owner.lease_expires_at : null);
+        LIVE_EXECUTIONS.set(id, reporter);
+        return { ok: true, fence: r.fence };
+      }
+      if (r.transport || r.transient) {
+        note("resume-offline", `work: ${record.node_id} — execution ${id}: the store is unreachable (${r.message}); continuing under the recorded fence ${fence}, unconfirmed`);
+        LIVE_EXECUTIONS.set(id, reporter);
+        return { ok: true, unconfirmed: true, fence };
+      }
+      owned = false;
+      const h = r.holder;
+      log(`work: ${record.node_id} — execution ${id} could not be claimed (${r.code}: ${r.message}${h ? `; held by ${h.worker}${h.machine ? ` on ${h.machine}` : ""} until ${h.lease_expires_at}` : ""})`);
+      return { ok: false, code: r.code, message: r.message, holder: h || null };
+    },
+    async renew() {
+      if (fence == null) return { ok: false };
+      const r = await st.renew(id, { fence, ttl_ms: st.ttlMs });
+      if (r.ok && r.execution) last = r.execution;
+      else if (!r.ok && executionKernel.OWNERSHIP_CODES.includes(r.code)) {
+        owned = false;
+        note(`lost:${r.code}`, `work: ${record.node_id} — execution ${id} lease lost on renew (${r.code}: ${r.message})`);
+      }
+      return r;
+    },
+    // The ownership check the completion write runs before its resolving
+    // edge: flush what is owed, renew under the fence, and only an `ok`
+    // confirms. Never "probably still mine".
+    async confirm() {
+      if (fence == null || !owned) return { ok: false, confirmed: false, reason: `execution ${id} is not held by this worker` };
+      const r = await st.confirmOwnership(id, fence);
+      if (!r.confirmed && r.ownership === false) owned = false;
+      if (r.execution) last = r.execution;
+      return r;
+    },
+    stageObserved: (attempt, state, extra = {}) => send({ type: "stage.observed", attempt, state, ...extra }),
+    candidateSubmitted: (candidate, { premature = false } = {}) =>
+      send({ type: "candidate.submitted", candidate, ...(premature ? { premature_resolution: true } : {}) }),
+    gateSettled: (gateId, verdict) => {
+      const state = GATE_VERDICT_TO_STATE[String(verdict || "")] || null;
+      if (!state) return Promise.resolve({ ok: true, skipped: true });
+      if (pinned.size && !pinned.has(String(gateId))) return Promise.resolve({ ok: true, skipped: true }); // a synthetic gate (scoping, no-code) is not in the pinned list
+      const attempt = gateAttempt(String(gateId));
+      return send({ type: "gate.settled", gate_id: String(gateId), attempt, state });
+    },
+    rescueStarted: (attempt) => send({ type: "rescue.started", attempt }),
+    escalationFiled: (nodeId, reason, { terminal = false } = {}) => send({ type: "escalation.filed", node_id: nodeId, reason: reason || null, ...(terminal ? { terminal: true } : {}) }),
+    integrationStarted: () => {
+      seedAttempts(last);
+      integrationAttempt += 1;
+      return send({ type: "integration.started", attempt: integrationAttempt });
+    },
+    integrationSettled: (state, { ref = null, commit = null } = {}) =>
+      send({ type: "integration.settled", attempt: integrationAttempt || 1, state, ...(ref ? { ref } : {}), ...(commit ? { commit } : {}) }),
+    completionWritten: (resolver) => send({ type: "completion.written", resolver }),
+    // The pipeline produces nothing further under this execution: the
+    // pool-spent terminal (the one non-escalation door to `refused`), which
+    // frees the item pointer for the next attempt. Then the reporter leaves.
+    async end(reason, { outcome = "cancelled" } = {}) {
+      const attempt = last && Array.isArray(last.attempts) && last.attempts.length ? last.attempts[last.attempts.length - 1].index : 1;
+      const r = await send({ type: "stage.observed", attempt, state: "exhausted", outcome, ...(reason ? { reason } : {}) });
+      LIVE_EXECUTIONS.delete(id);
+      return r;
+    },
+    async release() {
+      LIVE_EXECUTIONS.delete(id);
+      if (fence == null) return { ok: false };
+      return st.release(id, { fence });
+    },
+    leave() {
+      LIVE_EXECUTIONS.delete(id);
+    },
+  };
+  return reporter;
+}
+
+// The per-pass heartbeat: renew every execution this process holds. Runs in
+// the same per-pass slot as the proposal check and the completion reconciler,
+// so a worker whose gates run for hours keeps its lease without a timer.
+async function renewLiveExecutions(log = () => {}) {
+  for (const [id, rep] of [...LIVE_EXECUTIONS.entries()]) {
+    try {
+      const r = await rep.renew();
+      if (!r.ok && !r.transport && !r.transient && r.code !== "not_owned" && !rep.owned) {
+        LIVE_EXECUTIONS.delete(id);
+      }
+    } catch (e) {
+      log(`work: execution ${id} heartbeat threw (${(e && e.message) || e})`);
+    }
+  }
+}
+
+// Wrap a gate-deps object so the reporter sees the seams the pipeline
+// already has — the candidate pin, the recorded fact, the escalation, the
+// human-gate approval item — without gate-runner.js learning about the store.
+// Each wrapper calls the original first (the pipeline's own verdict is never
+// held up by a report) and reports fail-soft afterwards.
+function reportingGateDeps(deps, reporter) {
+  if (!reporter) return deps;
+  const wrapped = { ...deps };
+  if (deps.pinCandidate) {
+    wrapped.pinCandidate = async (args) => {
+      const r = await deps.pinCandidate(args);
+      try {
+        if (r && r.ok && r.candidate && (r.change === "created" || r.change === "superseded")) {
+          await reporter.candidateSubmitted(r.candidate, { premature: !!(r.candidate.resolver && r.candidate.resolver.resolves_edge) });
+        }
+      } catch {
+        /* fail-soft */
+      }
+      return r;
+    };
+  }
+  if (deps.recordFact) {
+    wrapped.recordFact = async (args) => {
+      const r = await deps.recordFact(args);
+      try {
+        const gate = args && args.gate;
+        if (gate && gate.kind === "rescue") await reporter.rescueStarted(Number(args.rescue) || 1);
+        else if (gate && gate.id) await reporter.gateSettled(gate.id, args.verdict);
+      } catch {
+        /* fail-soft */
+      }
+      return r;
+    };
+  }
+  if (deps.escalate) {
+    wrapped.escalate = async (args) => {
+      const r = await deps.escalate(args);
+      try {
+        if (r && r.ok && r.id) await reporter.escalationFiled(r.id, `gate ${args && args.gate ? args.gate.id : "?"} refused the candidate; escalated to a person`);
+      } catch {
+        /* fail-soft */
+      }
+      return r;
+    };
+  }
+  if (deps.fileHumanItem) {
+    wrapped.fileHumanItem = async (args) => {
+      const r = await deps.fileHumanItem(args);
+      try {
+        if (r && r.ok && r.id) await reporter.escalationFiled(r.id, `human gate ${args && args.gate ? args.gate.id : "?"} awaits approval`);
+      } catch {
+        /* fail-soft */
+      }
+      return r;
+    };
+  }
+  return wrapped;
+}
+
+// The person's door out of an execution, store side: after `spor release
+// <id> --execution <exec>` cleared the hold, find the record this box holds
+// for the execution (it names the store and the fence), re-claim it — the
+// worker that held it is gone, so its lease has expired or was ours — and end
+// it. A box that never held it, or a store that cannot be reached, says so;
+// the lease then lapses on its own and a later `spor executions` shows it.
+async function endReleasedExecution(cfg, nodeId, executionId, { home = cfg.userConfigHome() } = {}) {
+  let rec = null;
+  try {
+    rec = dispatchRuns.readRunRecords(home).find((r) => r.impl_claim && r.impl_claim.execution_id === executionId && r.impl_claim.store) || null;
+  } catch {
+    rec = null;
+  }
+  if (!rec) return { ok: false, reason: "no record" }; // a legacy hold, or one another box holds: nothing store-side to end here
+  const reporter = executionReporter(cfg, rec, { home, log: (l) => err(`note: ${l}`) });
+  if (!reporter) return { ok: false, reason: "no reporter" };
+  const resumed = await reporter.resume();
+  if (!resumed.ok) {
+    err(`note: execution ${executionId} could not be re-claimed in the ${rec.impl_claim.store} store (${resumed.code}: ${resumed.message}); it is left as it stands`);
+    return { ok: false, reason: resumed.message };
+  }
+  const ended = await reporter.end(`released by a person on ${nodeId}`);
+  if (ended && ended.ok) out(`ended execution ${executionId} in the ${rec.impl_claim.store} store`);
+  else err(`note: execution ${executionId} could not be ended in the ${rec.impl_claim.store} store (${(ended && ended.message) || (ended && ended.code) || "no answer"})${ended && ended.deferred ? " — spooled; the next pass replays it" : ""}`);
+  return ended;
+}
+
+// The completion-side deps a reporter supplies (lib/shell/completion.js
+// `deps.execution`): the fence confirmation before the resolving edge, the
+// `completion.written` event after the CAS, and the end of the execution on
+// a withdraw/consume/release.
+function executionCompletionDeps(reporter) {
+  if (!reporter) return null;
+  return {
+    confirm: () => reporter.confirm(),
+    completed: (resolver) => reporter.completionWritten(resolver),
+    ended: (why) => reporter.end(why),
+  };
 }
 
 // Fill the candidate's `resolver` from the run's OWN report (the `CANDIDATE:`
@@ -15530,7 +16116,20 @@ async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = ()
         landedFactPresent = false;
       }
     }
-    const deps = makeCompletionDeps(cfg, { home, runId: r.run_id });
+    // The store's doors for THIS record's completion (task-spor-client-
+    // execution-store-adapter): a re-driven write confirms the fence first,
+    // so a pipeline resumed on this box after another worker took the
+    // execution over never writes the edge. Resumed only when a completion
+    // is actually about to be worked — a running pipeline holds its own.
+    let reporter = null;
+    if (!running && completionKernel.isControllerRecord(r) && r.impl_claim.store) {
+      reporter = executionReporter(cfg, r, { home, log });
+      if (reporter) {
+        const resumed = await reporter.resume();
+        if (!resumed.ok) log(`work: ${r.node_id} — its execution ${reporter.id} is not held by this worker (${resumed.code}); the completion is left owed`);
+      }
+    }
+    const deps = makeCompletionDeps(cfg, { home, runId: r.run_id, execution: executionCompletionDeps(reporter) });
     try {
       const facts = Array.isArray(r.completion_facts) ? r.completion_facts : [];
       const res = running
@@ -15560,6 +16159,8 @@ async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = ()
       }
     } catch (e) {
       log(`work: ${r.node_id} — completion reconciliation threw (${(e && e.message) || e}); re-examined next pass`);
+    } finally {
+      if (reporter) reporter.leave();
     }
   }
 }
@@ -15589,7 +16190,27 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // The boundary is the CLAIM's (pinned at H1), never the factory node's
   // current text — an edit mid-pipeline changes nothing (§7.2).
   const boundary = controller ? record.impl_claim.completion.after : null;
-  const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
+  // The execution store's REPORTER (task-spor-client-execution-store-adapter):
+  // re-takes the execution lease for this pass (a fresh launch keeps its
+  // fence; a resumed orphan or a re-gate advances a dead worker's), reports
+  // every §7.3 event through the gate-deps seams, and is the completion
+  // write's fence check. Null for a legacy run or a pre-adapter claim, in
+  // which case nothing below touches a store.
+  const reporter = controller ? executionReporter(cfg, record, { home, log: ctx.log }) : null;
+  if (reporter) {
+    const resumed = await reporter.resume();
+    if (!resumed.ok) {
+      // A LIVE lease held by another worker: the execution — and the
+      // completion — is theirs. This pass judges nothing, files nothing, and
+      // settles `blocked` naming the holder, so the record says why and a
+      // person (or that worker's own completion) decides what happens next.
+      const h = resumed.holder;
+      const reason = `execution ${reporter.id} is held by ${h ? `${h.worker}${h.machine ? ` on ${h.machine}` : ""} until ${h.lease_expires_at}` : "another worker"} (${resumed.code}); this worker does not judge an execution it does not own`;
+      ctx.log(`work: ${entry.node_id} — ${reason}`);
+      return { state: "blocked", reason, facts: [], gates: [], demoted: false, noRescue: true };
+    }
+  }
+  const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: reportingGateDeps(makeGateDeps(cfg, dctx), reporter) });
   // The SPLIT verdict of the gate list alone (task-spor-factory-controller-
   // completion-boundary, §6.5): `gates_state` says what the gates said, and
   // `integration_state` below what the integration stage said, so the
@@ -15604,12 +16225,18 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // writes the terminal status and clears the hold in one write. A refusal
   // writes nothing and clears nothing — the item stays held, open, blocked by
   // the escalation the gate filed (§4.4).
+  // The reporter leaves the heartbeat set when the pass returns: a completion
+  // still owed is re-driven by reconcileCompletions under its own resume.
+  const leave = (r) => {
+    if (reporter) reporter.leave();
+    return r;
+  };
   let completed = null;
   if (controller && boundary === "gates" && gateResult.state === "passed") {
-    completed = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: makeCompletionDeps(cfg, { home, runId: entry.run_id }), log: ctx.log, facts: gateResult.facts || [], boundary: "gates" });
+    completed = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: makeCompletionDeps(cfg, { home, runId: entry.run_id, execution: executionCompletionDeps(reporter) }), log: ctx.log, facts: gateResult.facts || [], boundary: "gates" });
     if (!completed.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the gates boundary (${completed.reason}); the debt stands and the next pass retries it`);
   }
-  if (gateResult.state !== "passed" || !ctx.factory.integration) return gateResult;
+  if (gateResult.state !== "passed" || !ctx.factory.integration) return leave(gateResult);
   // Post-completion integration (C2-C4): the item is already completed by
   // declaration, so a failure here files a `relates-to` item and never
   // demotes — the operator chose `after: gates` with integration declared.
@@ -15617,21 +16244,25 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // earlier pass) and stays so — a landing failure must not demote it.
   const intCtx = completed && completed.ok && (completed.settled === "written" || completed.settled === "consumed") ? { ...dctx, completedBeforeIntegration: true } : dctx;
   dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: "running" });
+  if (reporter) await reporter.integrationStarted();
   const intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, deps: makeIntegrationDeps(cfg, intCtx) });
   const intState = completionKernel.INTEGRATION_STATES.includes(intResult.state) ? intResult.state : intResult.state === "passed" ? "landed" : "failed";
   const allFacts = [...(gateResult.facts || []), ...(intResult.facts || [])];
   dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: intState, ...(allFacts.length ? { completion_facts: allFacts } : {}) });
+  // The store's integration verdict: landed and parked are its own words; a
+  // failure or a refusal is `failed` (a fix cycle or a refusal follows).
+  if (reporter) await reporter.integrationSettled(intState === "landed" || intState === "parked" ? intState : "failed", { ref: intResult.ref || (ctx.factory.integration && ctx.factory.integration.targetRef) || null, commit: intResult.commit || intResult.sha || null });
   // The completion at the `integration` boundary (N7): only a LANDED
   // candidate completes; a parked proposal completes when checkProposals sees
   // the merge (N8), a refusal never does.
   if (controller && boundary === "integration" && intState === "landed") {
-    const written = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: makeCompletionDeps(cfg, { home, runId: entry.run_id }), log: ctx.log, facts: allFacts, boundary: "integration" });
+    const written = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: makeCompletionDeps(cfg, { home, runId: entry.run_id, execution: executionCompletionDeps(reporter) }), log: ctx.log, facts: allFacts, boundary: "integration" });
     if (!written.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the integration boundary (${written.reason}); the debt stands and the next pass retries it`);
   }
   if (intCtx.completedBeforeIntegration && intResult.state !== "passed" && intResult.state !== "parked") {
-    return { ...intResult, gates: gateResult.gates, facts: allFacts, demoted: false, demote_reason: null, reason: `${intResult.reason || intResult.state} (the item was completed at the 'gates' boundary and stays completed; the landing is a person's to finish)` };
+    return leave({ ...intResult, gates: gateResult.gates, facts: allFacts, demoted: false, demote_reason: null, reason: `${intResult.reason || intResult.state} (the item was completed at the 'gates' boundary and stays completed; the landing is a person's to finish)` });
   }
-  return { ...intResult, gates: gateResult.gates, facts: allFacts };
+  return leave({ ...intResult, gates: gateResult.gates, facts: allFacts });
 }
 
 // The run record as it reads NOW — the pipeline's captured copy predates every
@@ -15707,11 +16338,25 @@ async function restoreProposal(cfg, { blockerId, nodeId, record = null, home = c
   // the boundary, and the COMPLETION is written here — edge, then the CAS that
   // clears the hold with the status. Idempotent on a re-run.
   if (record && completionKernel.isControllerRecord(record)) {
-    const written = await completionShell.writeCompletion({
-      record, deps: makeCompletionDeps(cfg, { home, runId: record.run_id }), log: () => {},
-      facts: [...(Array.isArray(record.gate_facts) ? record.gate_facts : []), integrationRunner.integrationFactId(nodeId, record.run_id, "landed")],
-      boundary: "integration",
-    });
+    // The execution store's doors (task-spor-client-execution-store-adapter):
+    // a parked proposal's completion is written a pass — or days — after the
+    // pipeline parked, so the fence is re-claimed and CONFIRMED here exactly
+    // as the reconciler does, never on the record's word alone.
+    const reporter = executionReporter(cfg, record, { home, log: () => {} });
+    if (reporter) {
+      const resumed = await reporter.resume();
+      if (!resumed.ok) return { ok: false, reason: `execution ${reporter.id} is not held by this worker (${resumed.code}); the completion is left owed` };
+    }
+    let written;
+    try {
+      written = await completionShell.writeCompletion({
+        record, deps: makeCompletionDeps(cfg, { home, runId: record.run_id, execution: executionCompletionDeps(reporter) }), log: () => {},
+        facts: [...(Array.isArray(record.gate_facts) ? record.gate_facts : []), integrationRunner.integrationFactId(nodeId, record.run_id, "landed")],
+        boundary: "integration",
+      });
+    } finally {
+      if (reporter) reporter.leave();
+    }
     if (!written.ok) return { ok: false, reason: written.reason };
     const closedC = await gateWriteStatus(cfg, blockerId, "done");
     if (!closedC.ok) return { ok: true, restored: written.settled === "written", note: `${nodeId} completed by the controller (${written.settled}); ${blockerId} could not be closed (${closedC.reason})` };
@@ -17181,6 +17826,11 @@ async function cmdWork(cfg, { values }) {
             // completion is the agent's has no controller records, so the
             // journal read finds nothing and the pass is unchanged.
             checkProposals: async () => {
+              // ...and the execution-lease HEARTBEAT (task-spor-client-
+              // execution-store-adapter): renew every execution this process
+              // holds, so a pipeline whose gates run for hours keeps its
+              // fence without a timer (a pass is 30s-5min; a lease 15min).
+              await renewLiveExecutions((line) => out(line));
               if (factory.integration && factory.integration.mode === "propose") await checkProposals(cfg, { home, log: (line) => out(line) });
               if (factory.completion && factory.completion.by === "controller") await reconcileCompletions(cfg, { home, log: (line) => out(line) });
             },
@@ -19602,6 +20252,35 @@ const COMMANDS = {
     examples: ["spor work", "spor work --project spor --concurrency 2", "spor work --factory factory-spor-default", "spor work --once --max 1 --print", "spor work --status --json"],
     run: (cfg, p) => cmdWork(cfg, p),
   },
+  executions: {
+    group: "Dispatch (background agents)", parse: "strict", args: "[<exec-id>]",
+    summary: "the factory execution store: the pipelines this box drives, their owners, gates and boundary",
+    help:
+      "The coordination state of a factory pipeline (task-spor-client-execution-\n" +
+      "store-adapter; EXECUTION-STATE.md in spor-server is the contract): one\n" +
+      "execution per (item, factory, pipeline attempt), pinned at open, leased with\n" +
+      "a fence, moved by an ordered idempotent event log, and reaching a completion\n" +
+      "boundary at which the controller writes the resolving edge.\n\n" +
+      "In remote mode this reads the server's /v1/executions surface (the store the\n" +
+      "server's own resolving-edge gate consults); when the server is unreachable\n" +
+      "it prints the last server-confirmed copy and says so. In personal mode it\n" +
+      "reads the shape-compatible local store under $SPOR_HOME/journal/executions/.\n" +
+      "--local reads the machine-local store in either mode.\n\n" +
+      "  spor executions                 every execution, newest first\n" +
+      "  spor executions --node <id>     the executions of one item\n" +
+      "  spor executions <exec-id>       one execution: owner, gates, candidate, boundary\n" +
+      "  spor executions <exec-id> --events   its durable event log, oldest first",
+    options: {
+      node: { type: "string", value: "id", desc: "only the executions of this work item" },
+      stage: { type: "string", value: "stage", desc: "only executions at this stage (implementation|gating|integration|completed|refused)" },
+      limit: { type: "string", value: "N", desc: "how many to list (default 50)" },
+      events: { type: "boolean", desc: "with <exec-id>: print its durable event log instead of the record" },
+      local: { type: "boolean", desc: "read the machine-local store even in remote mode" },
+      json: { type: "boolean", desc: "machine-readable JSON (the raw records)" },
+    },
+    examples: ["spor executions", "spor executions --node task-x", "spor executions exec-4da6d4763543a301 --events"],
+    run: (cfg, p) => cmdExecutions(cfg, p),
+  },
   runs: {
     group: "Dispatch (background agents)", parse: "strict", args: "[<run-id>]",
     summary: "what happened to the runs this machine dispatched",
@@ -19988,7 +20667,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS };
 
 if (require.main === module) {
   main()

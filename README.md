@@ -446,6 +446,26 @@ nodes. It also maintains one from its own telemetry ("why did the last three
 fail review"), and seeds a test-writer lane when there is no acceptance suite
 to gate on yet. It authors data only; enforcement stays in `spor work`.
 
+A factory that completes items itself (`completion: {by: controller}`) keeps
+its coordination state in an **execution store**: one execution per item and
+pipeline attempt, pinned to the definition it was opened under, leased with a
+fence, moved by an ordered idempotent event log, and completed only at its
+declared boundary. On a team server that store is the server's own
+(`/v1/executions`, where a resolving edge into a held item is refused at the
+door); in personal mode it is a shape-compatible local store under your Spor
+home. `spor executions` reads either:
+
+```bash
+spor executions                      # every execution this box drives
+spor executions --node task-x        # one item's executions
+spor executions exec-4da6d4763543a301 --events
+```
+
+A worker that loses its lease — its box went quiet and another took the
+execution over — never writes the resolving edge on the strength of its local
+state; what it recorded while partitioned is replayed idempotently when it
+reconnects. [WORKERS.md](WORKERS.md) §10.15 has the contract.
+
 ### Choosing a harness
 
 By default, `spor dispatch` launches a Claude Code agent in headless print mode

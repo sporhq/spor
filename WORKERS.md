@@ -1058,6 +1058,8 @@ it, and §10.7 still demotes it on a refusal. No record is ever rewritten, and
 | `impl_candidate` | object | the **tip** candidate: the pinned commit plus the tree it resolves to, plus provenance and a portable reference. See the table below |
 | `impl_candidates` | object[] | the **chain** of pins, oldest first, **ending at the tip**. A fix cycle or a rescue moves HEAD, and each re-pin onto a new tree appends here; a re-pin onto the SAME tree updates the last entry in place (it is the same candidate — the new commit joins its `commits_seen`). A tree can come back (a fix that reverts a one-hunk change reproduces it exactly), so **one `candidate_id` may appear more than once** — read the chain as an ordered list of pin events, never as a map keyed by id (§10.12) |
 | `impl_claim` | object | **controller completion only** (§10.13) — the claim pins, riding the record's CREATION write in ONE stamp with the initial `impl_state: "dispatched"`, so a record either has all of it or was not created by a stage launch: `{execution_id, claimed_at, completion: {by, after}, publish: {kind, bundle_store, remote}, factory: {node_id, revision}, item_revision, resolving_snapshot, status_snapshot}`. Everything the pipeline enforces is pinned HERE — an edit to the factory node mid-pipeline changes nothing. **A record with no `impl_claim` is a legacy run and reads as `completion.by: agent`.** |
+| `impl_claim.store` | string | **controller completion only, additive** (§10.15) — which EXECUTION STORE holds this pipeline's execution: `"remote"` (the server's `/v1/executions`) or `"local"` (the machine-local store under `journal/executions/`). Stamped by the claim, read by every resume so the pipeline drives the store it was opened in. **A controller record with no `store` was claimed before the adapter existed and reports nothing to any store** — it runs exactly as before |
+| `impl_claim.tenant` `.pipeline_attempt` `.fence` `.lease_expires_at` `.worker` `.machine` `.gates` | mixed | the execution's partition, the attempt its id is addressed by, the FENCE this worker holds (re-stamped on every re-claim that advances it), the lease it was handed, the owner principal the store derived, and the pinned gate ids the reporter filters on (a synthetic scoping gate is never reported) |
 | `gates_state` | string | `"passed"` \| `"failed"` \| `"blocked"` — the settled verdict of the gate LIST alone, stamped when the list settles and before the integration stage starts. Stamped for every gated run; the fold into `gate_state` stays for legacy readers, but `gate_state: passed` cannot say WHICH boundary was passed and the completion predicate must (§10.13) |
 | `integration_state` | string | `"running"` \| `"landed"` \| `"parked"` \| `"failed"` \| `"refused"` \| `"mismatch"` — the integration stage's own verdict, stamped as it runs and settles. `mismatch` is the one that spent nothing: the branch no longer carries the pinned candidate, so no worktree was cut and no fix cycle ran (§10.9) |
 | `completion_debt` | string \| null | **controller completion only** — ONE field, never a set of booleans: `"write"` (the boundary was reached and the edge + status are owed), `"retract"` (a premature resolving edge is owed its retype), `"withdraw"` (our edge stands on an item abandoned under us and is owed its retype back), or `null`. Every transition is a single overwriting stamp (owe-first), and every pass RE-DERIVES the debt from `impl_claim.completion.after` against `gates_state`/`integration_state` and the graph rather than trusting the flag (§10.13) |
@@ -3428,3 +3430,120 @@ does now.
 
 See test/gates.test.js (the validation table), test/worker-contract.test.js,
 test/candidate.test.js and test/completion-boundary.test.js.
+
+### 10.15 The execution store — server-authoritative in team mode, a compatible local store in personal mode
+
+§10.13's hold and completion write are the client's half of a two-sided
+contract. The other half shipped in spor-server (`EXECUTION-STATE.md`,
+dec-spor-hosted-execution-state-server-authoritative): a versioned,
+tenant-partitioned EXECUTION record per (item, factory, pipeline attempt) with
+the definition PINNED at open, a lease with a FENCE, a durable ordered event
+log, and the one refusal a client structurally cannot make — a `resolves`/
+`answers` edge into an item whose live execution has not reached its pinned
+boundary does not land (`409 execution_boundary`). This section is the
+client adapter (task-spor-client-execution-store-adapter): how `spor work`
+drives that store in remote mode, what it keeps instead in personal mode, and
+what it never does while it cannot confirm it still owns the execution.
+
+**One contract, two homes.** `lib/kernel/execution.js` is a port of the
+server's reducer — the same `spec_version: 1` record shape, the same
+content-addressed ids byte-for-byte (`exec-<16 hex>` of the NUL-joined
+`(tenant, node_id, factory, pipeline_attempt)`; a local execution's tenant is
+the literal `local`, the word the server falls back to for an identity with no
+org), the same event vocabulary and idempotency keys, the same fence
+arithmetic and the same `boundary_reached` predicate — with the hash injected
+like every kernel module. `lib/shell/execution-store.js` is one interface
+with two backings, and `openExecutionStore` picks by mode:
+
+- **Remote** drives `/v1/executions` (API.md §3): `POST` opens (or
+  idempotently re-reads) the execution and hands back the fence; the fenced
+  `claim`/`renew`/`release`/`events` verbs move it; the `GET`s read it. The
+  server pins the definition and derives the tenant and the worker principal
+  from the identity — the client never names itself, only its machine.
+- **Local** keeps the server's own layout under
+  `$SPOR_HOME/journal/executions/<tenant>/` (`exec/<id>.json`,
+  `exec/<id>.events.jsonl`, `item/<node_id>.json`), the same log-BEFORE-record
+  discipline (a torn write is repairable by replay, never a view of an event
+  nobody recorded), the item pointer that makes "does this item have a live
+  execution?" one read, and the same engine the server runs — so a record
+  written here can be READ by anything that reads the hosted one, and the
+  log rebuilds it byte-for-byte. `journal/` is machine-local and never
+  enters the graph's commit history.
+
+**Where the pipeline touches it.** The claim (`claimExecutionHold`, H1) opens
+the execution FIRST and stamps the store's id on the item's hold — the same id
+in both modes — then records the claim on the run record additively
+(`impl_claim.store`, `.tenant`, `.pipeline_attempt`, `.fence`,
+`.lease_expires_at`, `.worker`, `.machine`, `.gates`; §8). An existing live
+execution this caller does not own is claimed plainly: an EXPIRED lease (a
+dead worker's orphan) is taken and the fence advances, fencing that worker
+out; a live one loses with `already_owned` — exactly the foreign hold H2
+refuses — and an unexpired lease is never stolen. A hold refused after the
+open ENDS the execution (the pool-spent terminal, `stage.observed:
+exhausted`), so neither the item pointer nor the server's write gate keeps
+holding an item nothing will run under. Every pipeline pass (a launch, a
+resumed orphan, a `--regate`) RE-CLAIMS at its start — a same-owner claim
+keeps its fence — and a pass that cannot claim (a live foreign lease) judges
+nothing: it settles `blocked` naming the holder. The §7.3 events ride the
+seams the pipeline already has, wrapped in `bin/spor.js`
+(`reportingGateDeps`) so gate-runner.js and integration-runner.js learn
+nothing about the store: `stage.started` at the claim, `stage.observed`
+with the run id at launch, `candidate.submitted` on a created/superseded pin,
+`gate.settled` per recorded gate fact (verdict → state: passed, skipped,
+failed/fail-closed/dirty-tree/scoped → `failed`, unrun/infrastructure/unroutable → `infrastructure`;
+`blocked` is not settled; a synthetic scoping gate is not in the pinned list
+and is not reported), `rescue.started` per rescue fact, `escalation.filed`
+for a gate escalation and a human-gate approval item (never `terminal`: a
+refusal leaves the item HELD under the same execution, which is what
+`--regate` re-judges), `integration.started`/`.settled` around the
+integration stage, and `completion.written` after the completion CAS. A
+withdrawn, consumed or person-released completion ENDS the execution the same
+way the refused hold does. The lease is renewed once per `spor work` pass
+for every execution this process holds (`renewLiveExecutions`, the same slot
+as the proposal check and the completion reconciler) — a pass is 30s to 5min,
+a lease 15min (`execution.leaseTtlMs`), so no timer is needed. `spor
+executions` reads the store (`--node`, `--stage`, one id, `--events`,
+`--json`; `--local` reads the machine-local store in either mode), and `spor
+runs` prints the store, attempt, fence and lease on the completion line.
+
+**Partitions (EXECUTION-STATE.md §8 rule 3).** A remote event is spooled to a
+per-execution OUTBOX (`exec/<id>.outbox.jsonl`) BEFORE the attempt — the
+durable local evidence — and un-spooled only once the server answered for it
+(recorded or replayed). Every event carries the deterministic idempotency key
+its first attempt carried, so re-delivery after a crash between the answer
+and the un-spool is a no-op. The outbox is replayed IN ORDER ahead of every
+later event, so the reducer's own ordering rules (a gate cannot settle before
+its candidate, integration cannot start before the gates) hold across the
+outage; a permanent refusal of one spooled event (`422`, an off-state `409`)
+drops that event with a log line and keeps replaying, a terminal execution
+drops the rest, and an ownership refusal (`fence_stale`, `not_owned`,
+`lease_expired`) KEEPS the spool as evidence and stops. What the client never
+does is write the resolving edge on the strength of local state:
+`writeCompletion` runs the store's `confirm` between the premature-edge
+retype and step (1) — flush the outbox, then `renew` under the fence — and
+only an `ok` confirms. Unreachable, taken over, expired: the completion stays
+OWED (`completion_debt: write`) for a later pass, whose reconciler re-claims
+and tries again. In local mode the same check runs against the local engine,
+so a second worker on one box that took over an expired execution is refused
+identically.
+
+**What stays as it was.** A run record with no `impl_claim` is a legacy run
+(`completion.by: agent`) and opens no execution; a controller record claimed
+before this adapter (an `impl_claim` with no `store`) reports nothing and
+completes exactly as §10.13 describes; no record is rewritten and
+`journal/work/*.work.json` does not change shape. A remote server that does
+not serve `/v1/executions` (an older version) or has no store configured
+(`503 unavailable`) is not a refusal: the claim falls back to the local store
+and stamps `store: local`, with one log line; a server that is merely
+unreachable IS a refusal (nothing authoritative starts without an execution
+nobody else can be holding), and the loop cools the item like any other.
+Local-main integration stays on its owning machine: the store holds
+coordination state and the candidate's portable reference, and never merges.
+
+See test/execution-store.test.js (the kernel's id pinned against the literal
+the server's reducer mints; the local store's durability and rebuild; the
+remote adapter against a `node:http` fake whose oracle is the request bodies —
+the fence on every transition, the outbox on a partition, in-order replay,
+idempotent re-delivery, a takeover refusing the resolving edge through the
+completion write's fence check; the CLI claim in both modes and the unserved
+fallback; the legacy no-op).
