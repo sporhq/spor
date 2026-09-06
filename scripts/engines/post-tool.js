@@ -198,6 +198,30 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   if (asyncMode) {
     const spoolDir = path.join(graph, "journal", "pending-nudges", session);
     if (!u.ensureDir(spoolDir)) return null;
+    // Who this spool belongs to (task-spor-nudge-async-cross-session-spool-sweep).
+    // A session that ends without draining its own spool leaves findings only a
+    // cross-session sweep can reach, and that sweep must capture them under the
+    // ORIGIN's tenant and project rather than its own — which it can only do if
+    // the origin was recorded while the owning session was still here. First
+    // write wins and a failure is swallowed: a spool with no origin is simply
+    // not eligible for that sweep (retained and reported instead), so this can
+    // withhold a recovery but never misdirect one, and it owes nothing to a
+    // later pass.
+    try {
+      let org = "";
+      try {
+        org = u.config()?.tenant?.()?.org || "";
+      } catch {}
+      require("./spool-sweeper").writeSpoolOrigin(spoolDir, {
+        session,
+        slug,
+        cwd: input.cwd ?? "",
+        server: u.serverBase(),
+        org,
+      });
+    } catch {
+      /* best effort — see above */
+    }
     const hash = `${Date.now()}-${u.bashRandom()}`;
     const inFile = path.join(spoolDir, `${hash}.in.json`);
     // Write the job spool FIRST; only reserve the file once the input is durable.

@@ -873,12 +873,17 @@ const SPOOL_COLLECT_MAX = 5; // bounded work per SessionEnd: this runs in a hook
 const SPOOL_PHASE_BUDGET_MS = 20000; // wall clock for the whole SessionEnd spool phase
 const SPOOL_COLLECT_RESULT_MAX = 10; // total FOREIGN results captured per pass
 
-function makeSpoolBudget(now = Date.now()) {
-  const deadline = now + SPOOL_PHASE_BUDGET_MS;
+// The bounds are overridable because the same drain has a second caller with a
+// different budget to spend: the detached cross-session sweeper
+// (spool-sweeper.js) runs off the hook path entirely, so it may spend more wall
+// clock than a SessionEnd hook may. Defaulted to this phase's own numbers, so
+// every call already in this file is unchanged.
+function makeSpoolBudget(now = Date.now(), { budgetMs = SPOOL_PHASE_BUDGET_MS, resultMax = SPOOL_COLLECT_RESULT_MAX } = {}) {
+  const deadline = now + budgetMs;
   let collected = 0;
   return {
     expired: () => Date.now() >= deadline,
-    collectExhausted: () => collected >= SPOOL_COLLECT_RESULT_MAX,
+    collectExhausted: () => collected >= resultMax,
     countCollected: () => {
       collected += 1;
     },
@@ -1299,4 +1304,10 @@ module.exports = {
   graphInsideCodeRepo,
   sessionEndLease,
   sessionEndPendingNudges,
+  // The one-spool drain and its budget, shared with the detached cross-session
+  // sweeper (spool-sweeper.js) so a stranded spool is recovered by the SAME
+  // consume/claim/attribution rules a SessionEnd collection uses — there is one
+  // implementation of "capture a pending finding", not two that can drift.
+  drainPendingNudgeSpool,
+  makeSpoolBudget,
 };

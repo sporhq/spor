@@ -297,6 +297,31 @@ async function sessionStart(input) {
     /* best effort — GC never blocks session-start */
   }
 
+  // Cross-session stranded-spool sweep (task-spor-nudge-async-cross-session-
+  // spool-sweep). The async capture nudge's two drains are both anchored on the
+  // OWNING session — its next prompt, or its own SessionEnd — so a dispatched
+  // agent session that fires neither strands classifier-verified findings in
+  // journal/pending-nudges/<session>/ that nothing on this box comes back for.
+  // SessionStart is the one hook such a population reliably DOES fire, so it is
+  // the door: the work itself runs DETACHED (a recovery is a capture round trip
+  // per finding — it must never ride this hook's latency budget), and the child
+  // re-resolves the same cascade from the same cwd. Gated on nudge.async first,
+  // so the shipped synchronous default costs not one syscall here; then on a
+  // cheap precheck, so a box with nothing stranded pays no spawn either. What is
+  // ELIGIBLE is decided in the sweeper, on terminal evidence
+  // (dec-spor-stranded-spool-terminal-evidence-policy), never here.
+  try {
+    if (u.cfgBool("nudge.async", "NUDGE_ASYNC", false) && u.cfgBool("nudge.enabled", "NUDGE", true)) {
+      const sweeper = require("./spool-sweeper");
+      const me = input.session_id ?? "unknown";
+      if (sweeper.shouldSweep(graph, me)) {
+        u.spawnDetached([path.join(__dirname, "spool-sweeper.js"), cwd, me]);
+      }
+    }
+  } catch {
+    /* best effort — a sweep that never starts leaves the spool exactly as it was */
+  }
+
   // Learn where this slug lives on THIS machine (slug -> checkout path), so
   // `spor dispatch` can later launch `claude --bg` in the right repo without a
   // path map in the shared graph (paths differ per teammate; repo nodes carry

@@ -318,8 +318,55 @@ re-drive signal ("no result, a stale input"), so every consume — the injected
 one and the discards (already-injected, over the fired cap) — is deferred until
 after the prune, and a result whose input survived is KEPT and reconciled next
 pass rather than destroyed.
+Both of those drains are still anchored on the OWNING session doing something —
+its next prompt, or its own SessionEnd — and the collector above only ever runs
+from some OTHER session's SessionEnd, so on a box whose sessions are all
+dispatched agents that fire neither, nothing comes back for a spool at all
+(task-spor-nudge-async-cross-session-spool-sweep). The third door depends on no
+session ending: **SessionStart** spawns a DETACHED sweeper
+(`scripts/engines/spool-sweeper.js`, spawned like nudge-worker.js) after a cheap
+precheck (`hasSweepCandidates`), because a recovery is a capture round trip per
+finding and must not ride a hook's latency budget. What it may take is decided on
+EVIDENCE, never age (dec-spor-stranded-spool-terminal-evidence-policy): the only
+terminal evidence it reads is a dispatch RUN RECORD
+(`journal/dispatch/*.run.json`, `TERMINAL_STATES` imported from
+`lib/shell/agent-dispatch-runner.js` so the vocabulary cannot drift) that BOUND
+the spool's session id and is terminal — the durable completion record dispatch
+already writes, and exactly the population the loss concentrated in. Everything
+else is retained AND REPORTED, per disposition, so retention cannot read as
+recovery: `live` (a record binds it, not terminal), `unknown` (no record — an
+idle interactive session and a dead one are indistinguishable here, and its own
+next prompt is the better home anyway), `other_tenant`, `unattributed`. The
+6h-age collector above is unchanged and remains the last resort before journal GC
+for those. Attribution is the ORIGIN's, never the sweeper's: post-tool writes an
+`origin.json` beside the spool at creation (session, slug, cwd, server, org;
+first write wins, `wx`), a recovered finding is captured through the SAME
+`drainPendingNudgeSpool` `foreign` arm (so it is keyed on the ORIGIN session and
+its id/idempotency key are the ones that session's own drain would have minted,
+stamped to the project of the FILE, with the ORIGIN's slug — not the sweeping
+session's — as the fallback), and a spool whose origin names a different
+server/org is left alone. The sweep introduces NO new durable debt flag: the
+`.out.json` is still the whole debt, `origin.json` is inert descriptive metadata
+whose absence only ever makes a spool LESS eligible (so a failed write withholds
+a recovery, never misdirects one, and owes nothing to a later pass), concurrency
+with either existing drain is their shared atomic claim, and a bound reached
+mid-pass leaves an unreached result byte-for-byte as found (bounds: 120s wall
+clock, 25 results, 10 spools per pass; a box sweeps at most once per
+`nudge.sweepIntervalMs` / `SPOR_NUDGE_SWEEP_INTERVAL`, default 30min, stamped
+`journal/spool-swept` BEFORE the spawn — a retained spool stays retained until
+GC, so without it every SessionStart on a fleet box would re-spawn and re-log the
+same tally). Gated on nudge.async + nudge.enabled. What this closes is a
+STRUCTURAL hole, not a measured loss: the residual it targets is an upper bound
+with nothing demonstrated in it, and the corpus predates both the mode and the
+origin record, so the sweep adds no HISTORICAL recovery. What WAS measured
+(`scripts/analysis/sweep-evidence-coverage-2026-09-06.json`) is that 3 of 3
+residual sessions are bound by a terminal `done` dispatch record still on disk —
+the evidence channel covers the whole residual — and that none of those records
+carries a project/server/org, which is why attribution has to come from
+`origin.json` rather than from the record.
 The default synchronous path is byte-identical (the drain and its
-syscalls are gated on the flag). See test/nudge-async.test.js.
+syscalls are gated on the flag). See test/nudge-async.test.js and
+test/nudge-sweep.test.js.
 
 The prompt-context engine's digest has the same async pattern as an INTENT GATE
 (issue-spor-user-prompt-submit-digest-noise,

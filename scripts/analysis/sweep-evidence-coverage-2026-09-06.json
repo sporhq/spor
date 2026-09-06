@@ -1,0 +1,38 @@
+{
+  "note": "What the cross-session stranded-spool sweep (task-spor-nudge-async-cross-session-spool-sweep) would have reached in the corpus the 2026-09-04 replay left indeterminate. This is a COVERAGE measurement of the sweep's evidence channel, NOT a measured production loss reduction: nudge.async is default-off, no `.out.json` has ever existed on this box (there is no journal/pending-nudges dir at all), so every number the replay produces is counterfactual and so is this. It asks one question the replay could not: for each residual `no-sessionend-observed` finding, is its session bound by a TERMINAL dispatch run record — the only evidence this sweep acts on? Method: re-run the pinned replay harness (spor 0f7abae, scripts/analysis/measure-async-nudge-loss.js, same default window), then join each residual finding's session id against journal/dispatch/*.run.json on this box. The replay's own bound is re-quoted below and is UNCHANGED by this work — the sweep adds no historical recovery, since the corpus predates both the mode and the origin record the sweep attributes from.",
+  "date": "2026-09-06",
+  "harness_commit": "0f7abae",
+  "pin": "scripts/analysis/sessionend-replay-2026-09-04.json (on branch task-spor-reevaluate-nudge-async-default-post-sessionend; not on main)",
+  "window": { "from": "2026-08-01T00:00:00.000Z", "until": "2026-09-04T00:00:00.000Z" },
+  "rerun": {
+    "pin_rows_reproduced": 53,
+    "pin_rows_total": 57,
+    "pin_rows_disagreeing": 0,
+    "drift": "4 pinned rows no longer score — their ~/.claude/projects transcripts have been pruned since 2026-09-04. Nothing disagreed.",
+    "findings": 57,
+    "facts_total": 69,
+    "scored": 53,
+    "durably_lost_facts": "0-3 (0%-4.3%)",
+    "durably_lost_facts_pinned_2026_09_04": "0-5 (0%-7.2%)",
+    "bound_moved_because": "transcript eviction shrank the scored corpus, NOT because anything was recovered. Re-pin, do not compare."
+  },
+  "evidence_coverage": {
+    "question": "Would the sweep's terminal-evidence door have reached the residual population?",
+    "residual_findings_pinned": 4,
+    "residual_findings_rerun": 3,
+    "residual_sessions": 3,
+    "residual_sessions_bound_by_a_terminal_run_record": 3,
+    "records": [
+      { "session": "76a6b3c2-510d-4bd4-8484-6a798e48cd47", "run_id": "bae610f5-7a6c-44f5-8118-0e26bdf1e194", "state": "done", "launch_mode": "native-background", "created_at": "2026-08-05T15:03:22.792Z", "project": null, "server": null, "org": null },
+      { "session": "3f477ce2-1e3c-4c26-957b-0ceabae87b69", "run_id": "346fd609-ca82-4aed-9db8-5588ff4d4858", "state": "done", "launch_mode": "native-background", "created_at": "2026-08-22T09:38:59.215Z", "project": null, "server": null, "org": null },
+      { "session": "626a5dda-3c77-42be-9522-e36876d9c6d8", "run_id": "f1c587b2-af83-4d94-8b86-b7c6eb2c16b9", "state": "done", "launch_mode": "native-background", "created_at": "2026-08-31T10:42:52.822Z", "project": null, "server": null, "org": null }
+    ],
+    "reading": "3 of 3 residual sessions (4 of 4 pinned residual findings, 5 of 5 residual facts) are bound by a terminal `done` dispatch record that is STILL on disk a month later, and every one is a native-background dispatch — the population the replay said the residual concentrated in. So the evidence channel this sweep keys on covers the whole residual, which is the structural claim; whether a given finding would then have been CAPTURED still depends on the spool surviving to be swept.",
+    "why_origin_json_and_not_the_run_record": "None of the three records carries `project`, `server` or `org` (a native-background launch stamps them only when the dispatch supplied them), so a run record proves the session ENDED but cannot say which tenant or project its findings belong to. That is why attribution is read from the `origin.json` post-tool now writes beside the spool, and why a legacy spool without one is retained and reported rather than guessed at (dec-spor-stranded-spool-terminal-evidence-policy)."
+  },
+  "unverified": [
+    "No end-to-end production recovery is demonstrated: async has never been enabled on this box, so no real stranded spool exists to sweep. The acceptance cases are exercised against synthetic fixtures in test/nudge-sweep.test.js.",
+    "The 4 pinned residual findings are INDETERMINATE, not demonstrated losses (art-spor-async-nudge-loss-remeasured-2026-09-04); recovering their sessions' spools would remove an upper bound, not a measured loss.",
+    "Evidence has a lifetime: `dispatch.runRetentionMs` (default 14d) prunes terminal records. A spool whose record has aged out reads as `unknown` and is retained. These three records outlived their nominal retention because pruning runs at launch time, not on a timer."
+  ]
+}
