@@ -134,8 +134,9 @@ convention schema nodes use:
   reference). `bundle` is the default because it needs no credential and no
   network: a `git bundle` of the candidate's commits into
   `candidate.bundle_store`, a URI PREFIX that is `file://` (the default is
-  machine-local state under the graph home, `file://<SPOR_HOME>/candidates`;
-  a shared filesystem reaches further) or `https://` (the server's candidate
+  machine-local state under the user config home — a THIRD home, separate
+  from the shared graph home — `file://<userConfigHome>/candidates`; a
+  shared filesystem reaches further) or `https://` (the server's candidate
   door, the remote-mode default) and nothing else — a zero-dependency client
   cannot sign an object-store request, so `s3://` and its kin are refused at
   parse rather than at the first publish; an `https://` store in LOCAL mode has
