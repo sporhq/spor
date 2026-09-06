@@ -9575,3 +9575,28 @@ test("all pending gate and rescue-pass evidence settles before tree reads, pins,
     assert.deepEqual(real.checkEvidenceOrigins(), { ok: true }, "paid obligations do not deadlock normal resumes");
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+test("an opted-out command skipped on the ancestor runs when a later fix introduces its risk path", async () => {
+  const f = repinWorld();
+  f.factory.gates.find((g) => g.id === "fast").risk = ["touches:auth"];
+  f.factory.definition = gates.describeDefinition(f.factory);
+  gates.stampDefinitionRevisions(f.factory, { factory: "definition-risk", gates: {} });
+  const read = f.deps.changedPaths;
+  f.deps.changedPaths = async () => {
+    const change = await read();
+    return { ...change, paths: change.head[0] === "a" ? ["lib/x.js"] : ["lib/auth.js"] };
+  };
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory: f.factory, deps: f.deps });
+  assert.equal(result.state, "passed");
+  assert.equal(f.seen.suites.filter((id) => id === "fast").length, 1, "the initial risk skip does not excuse the newly armed command");
+  const fast = result.gates.find((g) => g.gate === "fast");
+  assert.equal(fast.verdict, "passed");
+  assert.equal(fast.head, "b".repeat(40));
+  assert.equal(fast.candidate_id, "cand-b");
+  assert.equal(fast.retained, undefined);
+  assert.ok(f.seen.facts.some((fact) => fact.id.includes("fast") && /skipped/.test(fact.markdown)), "the ancestor really was unarmed");
+  const att = require("../lib/shell/attestation.js");
+  const signed = att.buildAttestationObject({ item: ITEM, factory: f.factory, gate: result, signing: { key: "k" } });
+  assert.equal(signed.passed, true);
+  assert.equal(att.verifyAttestation(signed, { key: "k" }).ok, true);
+});
