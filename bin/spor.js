@@ -14754,9 +14754,14 @@ function ghRepoSlug(top) {
 
 // Open (or update) the PR that carries `head` onto `targetRef`, from the
 // implementer's OWN branch — never the throwaway candidate merge commit,
-// which only ever proved merging would be green. Idempotent across a fix
-// cycle: a re-run pushes the branch's new tip and reuses whatever PR is
-// already open for it rather than erroring on a duplicate.
+// which only ever proved merging would be green. `head` is the caller's
+// (integration-runner.js's `integrateCommit()`): the PINNED candidate's own
+// commit whenever one is pinned, so the object this pushes onto the branch is
+// the exact commit every `art-gate-*` fact judged, not a same-tree relabel of
+// it — and the branch head only when there is no candidate to consume.
+// Idempotent across a fix cycle: a re-run pushes the branch's new tip and
+// reuses whatever PR is already open for it rather than erroring on a
+// duplicate.
 function proposeIntegrationPR({ top, head, targetRef }) {
   if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH — propose mode needs it to open pull requests" };
   const repo = ghRepoSlug(top);

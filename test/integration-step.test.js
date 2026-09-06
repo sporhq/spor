@@ -143,7 +143,7 @@ function integrationFakes({
   escalate = () => ({ ok: true, id: "task-integration-escalate-x" }),
   demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }),
 } = {}) {
-  const seen = { builds: 0, buildArgs: [], suites: 0, lands: 0, proposals: 0, parks: [], fixes: [], escalations: [], demotions: [], facts: [], cleanups: 0, leaseAcquired: 0, leaseReleased: 0 };
+  const seen = { builds: 0, buildArgs: [], suites: 0, lands: 0, proposals: 0, proposeArgs: [], parks: [], fixes: [], escalations: [], demotions: [], facts: [], cleanups: 0, leaseAcquired: 0, leaseReleased: 0 };
   let buildCalls = 0;
   const deps = {
     now: () => 1_700_000_000_000,
@@ -180,6 +180,7 @@ function integrationFakes({
     },
     propose: async (args) => {
       seen.proposals += 1;
+      seen.proposeArgs.push(args);
       return propose(args, seen);
     },
     parkForReview: async (args) => {
@@ -666,6 +667,33 @@ test("proposeIntegrationPR: an open PR whose base already matches targetRef is a
   assert.match(res.detail, /already open/);
   const calls = fs.readFileSync(callsFile, "utf8");
   assert.doesNotMatch(calls, /gh pr create/, "no new PR is opened when an existing one already targets targetRef");
+});
+
+// issue-spor-propose-mode-opens-pr-from-head-not-published-commit: the plumbing
+// pushes whatever commit the caller names, not the checked-out branch's own
+// tip — which is what lets runIntegrationStage hand it a PINNED candidate
+// commit that sits BEHIND the branch's current tip (a same-tree relabel, or a
+// candidate that predates a later, not-yet-re-pinned commit) and have the PR
+// carry exactly that object, not whatever happens to be checked out.
+test("proposeIntegrationPR pushes the COMMIT it is given, not the checked-out branch tip — the door runIntegrationStage uses to publish the pinned candidate rather than a relabeled head", () => {
+  const sporCli = require("../bin/spor.js");
+  const dir = proposeRepo("task-demo-pin");
+  const pinned = git(dir, "rev-parse", "HEAD~1").trim(); // the "base" commit, BEHIND the branch's own tip
+  const tip = git(dir, "rev-parse", "HEAD").trim();
+  assert.notStrictEqual(pinned, tip, "the fixture's pinned commit must differ from the checked-out tip for this test to mean anything");
+  const { binDir, callsFile } = proposeFakeBin({ listJson: "[]" });
+
+  const res = withFakeBin(binDir, () => sporCli.proposeIntegrationPR({ top: dir, head: pinned, targetRef: "main" }));
+
+  assert.strictEqual(res.ok, true, res.reason);
+  assert.match(res.detail, new RegExp(`for ${pinned.slice(0, 8)} onto main`), "the PR is reported as carrying the pinned commit, not the tip");
+  const calls = fs.readFileSync(callsFile, "utf8");
+  assert.match(calls, /gh pr create/, "a PR was opened, so the push below actually landed");
+  // The bare origin's branch ref is the PINNED commit — never the tip that
+  // was checked out when this ran.
+  const bareUrl = git(dir, "remote", "get-url", "--push", "origin").trim();
+  const landed = execFileSync("git", ["ls-remote", bareUrl, "refs/heads/task-demo-pin"], { encoding: "utf8" }).trim().split(/\s+/)[0];
+  assert.strictEqual(landed, pinned, "the pushed branch ref is the pinned commit, not the checked-out tip");
 });
 
 test("proposeIntegrationPR: gh's own exact-duplicate refusal on create surfaces verbatim as the stage failure", () => {
@@ -2106,6 +2134,26 @@ test("in `propose` mode a head that merely CONTAINS the candidate is a mismatch 
   const res2 = await integrationRunner.runIntegrationStage({ item: ITEM, factory: { ...FACTORY_PROPOSE, implementation: { profile: "profile-impl" } }, deps: ok.deps });
   assert.strictEqual(res2.state, "parked", res2.reason);
   assert.strictEqual(ok.seen.proposals, 1);
+});
+
+// issue-spor-propose-mode-opens-pr-from-head-not-published-commit: the PR
+// propose() opens must carry the PUBLISHED candidate commit, not a same-tree
+// relabel of it sitting at the branch head — §3.2 "everything downstream
+// consumes the PINNED commit, never the branch head … and the art-merge-*
+// fact names it" applies to propose mode exactly as it does to local/push.
+test("propose mode opens the PR from the PINNED candidate's own commit, not the branch head — even when the head is only a same-tree relabel of it", async () => {
+  const { deps, seen } = pinnedFakes({}, { standing: { known: true, contained: false, commitTreeMatches: true, headTreeMatches: true } });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: { ...FACTORY_PROPOSE, implementation: { profile: "profile-impl" } }, deps });
+  assert.strictEqual(res.state, "parked", res.reason);
+  assert.strictEqual(seen.proposals, 1);
+  assert.strictEqual(seen.proposeArgs[0].head, "pinnedcommit", "the PR is opened from the commit every art-gate-* fact judged, not the relabeled branch head");
+});
+
+test("propose mode with no candidate pinned still opens the PR from the branch head — byte-identical to before the implementation stage existed", async () => {
+  const { deps, seen } = integrationFakes();
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_PROPOSE, deps });
+  assert.strictEqual(res.state, "parked", res.reason);
+  assert.strictEqual(seen.proposeArgs[0].head, "headsha");
 });
 
 test("an integration fix cycle RE-PINS, and the rebuild merges the commit that re-pin named — not the stale tip and not the moved head", async () => {
