@@ -14136,13 +14136,21 @@ function buildProposalTrackingNode({ id, nodeId, runId, targetRef, proposal, pro
 // integration-runner.js's pure orchestration, mirroring makeGateDeps above.
 // Only ever constructed when `factory.integration` resolved, so a bare
 // factory (or one with no integration block) never touches any of this.
-function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome() }) {
+function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome() }) {
   const integration = factory.integration;
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
   const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
   const runKey = gateRunner.gateRunKey(entry.run_id, entry.attempt);
   let top = null;
+  // The change-set behind the pinCandidate dep below — kept current by
+  // `changedTree`, which integration-runner.js re-calls before every fix
+  // cycle (issue-spor-integration-fix-cycle-does-not-repin-candidate). Unlike
+  // makeGateDeps' own `change`, this one is diffed against
+  // `integration.targetRef` — the ref this stage is actually landing onto —
+  // not `factory.trustedRef`, and gate deps never refresh it once the gate
+  // pipeline hands off here.
+  let change = null;
 
   const fix = async ({ cycle, kind, detail, evidence }) => {
     const why =
@@ -14193,8 +14201,85 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     now: () => Date.now(),
     changedTree: async () => {
       const c = gateRunner.gateChangeSet(record, integration.targetRef);
-      if (c.ok) top = c.top;
+      if (c.ok) {
+        top = c.top;
+        change = c;
+      }
       return c;
+    },
+    // Re-pin the candidate for a tree THIS STAGE produced
+    // (issue-spor-integration-fix-cycle-does-not-repin-candidate,
+    // task-spor-factory-candidate-record, FACTORY-IMPLEMENTATION-STAGE.md
+    // §3.3): integration-runner.js calls this from its own per-cycle
+    // `refreshTree`, exactly where the gate pipeline's fix cycles call
+    // makeGateDeps' `pinCandidate` above, so a fix cycle here re-pins the same
+    // way — the fold in kernel/candidate.js decides whether the new commit is
+    // a relabel of the same tree (`commits_seen`) or a new candidate
+    // (`supersedes`). Fail-soft: a pin that could not be read leaves the tree
+    // judged regardless (integration-runner.js's own `pin` closure logs and
+    // swallows it), same contract as the gate pipeline's version.
+    //
+    // This mirrors makeGateDeps' `pinCandidate` rather than reusing it,
+    // because that closure folds against ITS OWN `change` — the gate
+    // pipeline's diff against `factory.trustedRef`, read once per gate
+    // fix/rescue cycle and never again once the gate pipeline hands off to
+    // integration. Reusing it here would pin whatever tree the gate pipeline
+    // last read, not the tree this stage's own fix cycle just committed.
+    pinCandidate: async ({ submittedBy, runId = null }) => {
+      let current = record;
+      try {
+        current = dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record) || record;
+      } catch {
+        /* an unreadable record folds against what we have, which is the safe direction */
+      }
+      const producerId = runId || entry.run_id;
+      let producer = current;
+      if (producerId !== entry.run_id) {
+        try {
+          producer = dispatchRuns.readJson(dispatchRuns.runPaths(home, producerId).record) || {};
+        } catch {
+          producer = {};
+        }
+      }
+      const pinned = gateRunner.pinCandidate(record, integration.targetRef, {
+        change,
+        repo: record.item_repo || entry.project || slug || null,
+        nodeId: entry.node_id,
+        submittedBy,
+        provenance: {
+          run_id: producerId,
+          attempt: current.impl_attempt || 1,
+          // An integration fix cycle spends the integration gate's own
+          // `cycles`, never one of the two code pools makeGateDeps' version
+          // accounts for — see that closure's own comment for the pool rule
+          // this mirrors.
+          pool: null,
+          harness: producer.harness || null,
+          profile: (passthrough && passthrough.profile) || null,
+          agent: dispatchAgentId(cfg),
+          worker: workerId || null,
+          machine: os.hostname(),
+          started_at: producer.started_at || producer.launched_at || producer.created_at || null,
+          finished_at: producer.finished_at || null,
+        },
+        resolver: {
+          node: producer.resolved_by || null,
+          written: !!producer.resolved_by,
+          resolves_edge: producer.resolved_edge === "resolves" || producer.resolved_edge === "answers",
+        },
+      });
+      if (!pinned.ok) return pinned;
+      const folded = candidateKernel.repinCandidate(current.impl_candidate || null, pinned.candidate);
+      // Only the `impl_candidate`/`impl_candidates` chain — never
+      // `impl_run_id`/`impl_attempt`/`impl_pool`/`impl_state`, which name the
+      // IMPLEMENTATION stage's own submission and are stamped once by
+      // makeGateDeps' pinCandidate. `stampImplState` merges additively, so
+      // leaving them out here never clobbers what that pin already wrote.
+      dispatchRuns.stampImplState(home, entry.run_id, {
+        impl_candidate: folded.candidate,
+        impl_candidates: candidateKernel.appendCandidateChain(current.impl_candidates, folded.candidate),
+      });
+      return { ok: true, candidate: folded.candidate, change: folded.change };
     },
     acquireLease: () => acquireIntegrationLease(cfg, home, top || (record && record.cwd), { slug }),
     releaseLease: (token) => releaseIntegrationLease(cfg, token),

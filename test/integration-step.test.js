@@ -1652,6 +1652,39 @@ test("issue-spor-integration-stale-head-across-fix-cycles: a fix-cycle retry reb
   assert.strictEqual(seen.fixes.length, 1);
 });
 
+// issue-spor-integration-fix-cycle-does-not-repin-candidate: refreshTree
+// re-reads the tree above (the stale-head regression this test sits beside),
+// but used to never re-pin the candidate — so it kept naming the commit the
+// gate pipeline last judged, not the one the integration fix cycle produced.
+// Pins that a fix cycle's re-read calls deps.pinCandidate at stage
+// "integration-fix", naming the cycle and the fix's own run id, and that a
+// factory with no declared implementation stage pins nothing at all —
+// byte-identical to before this stage's candidate wiring existed.
+test("a fix cycle re-pins the candidate at stage 'integration-fix', naming the cycle and the fix's run id — and pins nothing without a declared implementation stage", async () => {
+  const buildSequence = (args, s) =>
+    s.builds === 1 ? { ok: false, conflict: true, reason: "merging onto main conflicts" } : { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" };
+
+  const pins = [];
+  const { deps } = integrationFakes({ build: buildSequence, fix: () => ({ ok: true, runId: "run-fix-1" }) });
+  deps.pinCandidate = async ({ submittedBy, runId }) => {
+    pins.push({ submittedBy, runId });
+    return { ok: true, candidate: { candidate_id: "cand-x" }, change: "superseded" };
+  };
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: { ...FACTORY, implementation: { profile: "profile-impl" } }, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.deepStrictEqual(pins, [{ submittedBy: { stage: "integration-fix", cycle: 1, rescue: 0 }, runId: "run-fix-1" }]);
+
+  const pinsNoImpl = [];
+  const { deps: deps2 } = integrationFakes({ build: buildSequence, fix: () => ({ ok: true, runId: "run-fix-1" }) });
+  deps2.pinCandidate = async ({ submittedBy, runId }) => {
+    pinsNoImpl.push({ submittedBy, runId });
+    return { ok: true, candidate: { candidate_id: "cand-x" }, change: "superseded" };
+  };
+  const res2 = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps: deps2 });
+  assert.strictEqual(res2.state, "passed", res2.reason);
+  assert.deepStrictEqual(pinsNoImpl, [], "no implementation: block declared, no pin — byte-identical to before this stage's candidate wiring existed");
+});
+
 // The same regression, pinned against REAL git plumbing end to end: the fix
 // cycle's commit must actually land, not merely be visible to a fake.
 test("REGRESSION, real git: a fix cycle's commit in the implementer's checkout reaches the LANDED tree on retry", async () => {
@@ -1705,6 +1738,111 @@ test("REGRESSION, real git: a fix cycle's commit in the implementer's checkout r
   assert.strictEqual(suiteRuns, 2, "the suite ran once before the fix and once on the retried candidate");
   const landedSha = git(dir, "rev-parse", targetRef).trim();
   assert.doesNotThrow(() => git(dir, "show", `${landedSha}:lib/fix-marker.js`), "the landed tree carries the fix cycle's commit, not the stale pre-fix head");
+});
+
+// issue-spor-integration-fix-cycle-does-not-repin-candidate: the per-cycle
+// `changedTree` refresh above moves `tree`/HEAD after every fix cycle, but
+// used to never call `pinCandidate` — so `impl_candidate` kept naming the
+// pre-integration commit while the branch (and, once landed, the target ref)
+// had already moved past it. Wired against the REAL production dep
+// (bin/spor.js's makeIntegrationDeps), with only the pieces that would
+// otherwise dispatch a real agent or run a real suite faked out — exactly the
+// composition `spor work` runs.
+test("REGRESSION issue-spor-integration-fix-cycle-does-not-repin-candidate: a fix cycle re-pins impl_candidate to the fix's OWN commit, not the pre-integration tree", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const dir = integrationRepo();
+  git(dir, "checkout", "-q", "branch");
+  const targetRef = "main";
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-repin-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+
+  const factory = {
+    id: "factory-repin",
+    integration: { targetRef, mode: "local", command: "true", strategy: "merge", serialize: "repo", cycles: 1, timeoutMs: 900000 },
+    trustedRef: targetRef,
+    protectedPaths: [],
+    // pinCandidate is a no-op without a declared implementation stage —
+    // gate-runner.js's own `pin` guards on it and integration-runner.js's
+    // mirrors that guard.
+    implementation: { profile: "profile-impl" },
+  };
+  const entry = { run_id: "11111111-2222-3333-4444-000000000099", node_id: "task-demo", project: "demo", attempt: 1 };
+  const record = { cwd: dir };
+
+  // Seed the run record with the candidate the IMPLEMENTATION stage would
+  // already have pinned before integration ever ran (gate-runner.js's own
+  // pin, at stage "implementation") — the state this bug actually reproduces
+  // against, not an empty record.
+  const preFixHead = git(dir, "rev-parse", "HEAD").trim();
+  const preFixChange = gateRunner.gateChangeSet(record, targetRef);
+  assert.strictEqual(preFixChange.ok, true, preFixChange.reason);
+  const seedPinned = gateRunner.pinCandidate(record, targetRef, {
+    change: preFixChange,
+    repo: "demo",
+    nodeId: entry.node_id,
+    submittedBy: { stage: "implementation", cycle: 0, rescue: 0 },
+    provenance: { run_id: entry.run_id, attempt: 1 },
+    resolver: { node: null, written: false, resolves_edge: false },
+  });
+  assert.strictEqual(seedPinned.ok, true, seedPinned.reason);
+  assert.strictEqual(seedPinned.candidate.commit, preFixHead, "sanity: the seeded candidate names the pre-fix commit");
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "running",
+    impl_state: "candidate", impl_run_id: entry.run_id, impl_attempt: 1, impl_pool: "implementation",
+    impl_candidate: seedPinned.candidate, impl_candidates: [seedPinned.candidate],
+  });
+
+  // The REAL dep bin/spor.js builds for `spor work`; only the pieces that
+  // would otherwise dispatch a subprocess or run a real suite are replaced,
+  // exactly as the "REGRESSION, real git" test above does for the gate-only
+  // regression this one is the integration-candidate sibling of.
+  const realDeps = sporCli.makeIntegrationDeps(cfg, { record, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home });
+
+  let suiteRuns = 0;
+  const deps = {
+    ...realDeps,
+    acquireLease: async () => null,
+    releaseLease: async () => {},
+    buildCandidate: async ({ head, targetRef: t, strategy }) => integrationRunner.buildCandidateTree({ top: dir, head, targetRef: t, strategy }),
+    runSuite: async ({ dir: candidateDir }) => {
+      suiteRuns += 1;
+      return fs.existsSync(path.join(candidateDir, "lib", "fix-marker.js"))
+        ? { ok: true }
+        : { ok: false, reason: "the candidate is missing the implementer's fix", output: "" };
+    },
+    land: async (args) => integrationRunner.landCandidate(args),
+    // A REAL commit in the implementer's own checkout, exactly what a
+    // dispatched fix cycle produces.
+    fix: async () => {
+      fs.writeFileSync(path.join(dir, "lib", "fix-marker.js"), "module.exports = true;\n");
+      git(dir, "add", "-A");
+      git(dir, "commit", "-q", "-m", "fix: add the marker the suite requires");
+      return { ok: true, runId: "run-fixxxxxx" };
+    },
+    escalate: async () => ({ ok: true, id: "task-integration-escalate-x" }),
+    demote: async () => ({ ok: true, demoted: false }),
+    recordFact: async () => ({ ok: true }),
+    cleanupImplementer: async () => {},
+  };
+
+  const item = { node_id: entry.node_id, run_id: entry.run_id, project: entry.project, attempt: entry.attempt };
+  const res = await integrationRunner.runIntegrationStage({ item, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(suiteRuns, 2, "the suite ran once before the fix and once on the retried candidate");
+
+  const fixedHead = git(dir, "rev-parse", "branch").trim();
+  assert.notStrictEqual(fixedHead, preFixHead, "sanity: the fix cycle actually moved the branch tip");
+
+  const rec = dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record);
+  assert.ok(rec.impl_candidate, "the candidate is still recorded after the fix cycle");
+  assert.strictEqual(rec.impl_candidate.commit, fixedHead, "the re-pinned candidate names the fix cycle's commit — the branch tip — not the pre-integration tree");
+  assert.strictEqual(rec.impl_candidate.submitted_by.stage, "integration-fix", "the re-pin is attributed to the integration fix cycle, not the original implementation submission");
+  assert.strictEqual(rec.impl_candidate.supersedes, seedPinned.candidate.candidate_id, "the fix produced a different tree, so it supersedes the pre-fix candidate rather than relabeling it");
+  assert.strictEqual(rec.impl_candidates.length, 2, "the chain carries both the pre-fix and the re-pinned candidate");
 });
 
 test("squash and rebase strategies both produce a candidate that descends cleanly from the target ref", () => {
