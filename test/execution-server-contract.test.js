@@ -43,6 +43,10 @@ test("real server: client machine fencing, parsed factory pins, candidate repin 
     for (const r of [await b.claim(id, {}), await b.renew(id, { fence }), await b.release(id, { fence }), await b.event(id, { fence, event: { type: "stage.started", attempt: 1 } })]) {
       assert.equal(r.ok, false, JSON.stringify(r));
     }
+    const third = openClient("pair-third");
+    const confirmation = await third.confirmOwnership(id, fence);
+    assert.equal(confirmation.confirmed, false);
+    assert.equal(confirmation.ownership, false, "empty-outbox renew refusal is definitive ownership loss");
     const send = async event => {
       const r = await a.event(id, { fence, event });
       assert.equal(r.ok, true, JSON.stringify(r));

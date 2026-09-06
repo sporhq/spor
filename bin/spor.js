@@ -16301,7 +16301,7 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
       if (fence == null) return { ok: false };
       const r = await st.renew(id, { fence, ttl_ms: st.ttlMs });
       if (r.ok && r.execution) last = r.execution;
-      else if (!r.ok && executionKernel.OWNERSHIP_CODES.includes(r.code)) {
+      else if (!r.ok && (r.ownership === false || executionKernel.OWNERSHIP_CODES.includes(r.code))) {
         owned = false;
         note(`lost:${r.code}`, `work: ${record.node_id} — execution ${id} lease lost on renew (${r.code}: ${r.message})`);
       }
