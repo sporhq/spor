@@ -9497,8 +9497,8 @@ async function launchSupervisedHarness(cfg, {
       // reused the pid) can be told apart from a genuinely long-lived
       // supervisor (issue-spor-dispatch-supervisor-identity-stale-timeout).
       const startTicks = dispatchRuns.processStartTicks(child.pid);
-      dispatchRuns.atomicJson(p.record, {
-        ...record, runner_pid: child.pid,
+      dispatchRuns.stampRun(cfg.userConfigHome(), runId, {
+        runner_pid: child.pid,
         ...(startTicks != null ? { runner_started_ticks: startTicks } : {}),
       });
     }
@@ -16766,7 +16766,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // every fact write — the verdict is the enforcement, the attestation is its
   // record.
   const { attestationObject, ...attested } = await writeRunAttestation(cfg, {
-    item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token, built: pending.built,
+    item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token, built: pending.built, origin: pending.origin,
   });
   // Propose mode: the PR body written at propose time predates the graph
   // artifact it must be bound to (the artifact is minted only after the run
@@ -16987,7 +16987,18 @@ function prepareRunAttestation(cfg, { item, factory, gateResult, intResult, work
 
 // Exact publication destination; no ambient fallback for old unbound outboxes.
 function attestationGraphOrigin(cfg) {
-  if (cfg.mode() === "remote") return { mode: "remote", server: remote.base(cfg), org: String((typeof cfg.tenant === "function" && cfg.tenant()?.org) || "") };
+  if (cfg.mode() === "remote") {
+    const bearer = remote.token(cfg);
+    const server = remote.base(cfg);
+    if (!server || !bearer) throw new Error("remote attestation publication identity is unknown");
+    const org = auth.jwtOrg(bearer);
+    const selectedOrg = typeof cfg.tenant === "function" ? cfg.tenant()?.org : null;
+    if (org && selectedOrg && org !== selectedOrg) throw new Error("effective publication credential disagrees with the selected organization");
+    // Opaque credentials cannot prove an org from tenant metadata. Bind the
+    // actual credential instead; its raw bytes never enter the durable outbox.
+    const credential = crypto.createHash("sha256").update(`spor-attestation-origin\0${bearer}`).digest("hex");
+    return { mode: "remote", server, org: org || null, credential };
+  }
   const nodes = cfg.nodesDir();
   let canonical;
   try { canonical = fs.realpathSync(nodes); } catch { canonical = path.resolve(nodes); }
@@ -16995,8 +17006,26 @@ function attestationGraphOrigin(cfg) {
 }
 function attestationOriginMatches(cfg, origin) {
   if (!origin) return false;
-  try { const current = attestationGraphOrigin(cfg); return current.mode === origin.mode && (current.mode === "remote" ? !!origin.server && current.server === origin.server && current.org === origin.org : current.nodes === origin.nodes); }
+  try { const current = attestationGraphOrigin(cfg); return current.mode === origin.mode && (current.mode === "remote" ? !!origin.server && current.server === origin.server && current.org === origin.org && !!origin.credential && current.credential === origin.credential : current.nodes === origin.nodes); }
   catch { return false; }
+}
+
+// Freeze the exact bearer and server whose fingerprint was checked. Ordinary
+// HTTP requests may refresh a selected tenant's token, which is unsafe for
+// replay when its metadata disagrees with an explicit token override. Refresh
+// and credential rotation are therefore fail-closed for this publication.
+function attestationPublicationConfig(cfg, origin) {
+  if (!attestationOriginMatches(cfg, origin)) return null;
+  if (origin.mode !== "remote") return cfg;
+  const bearer = remote.token(cfg);
+  const credential = crypto.createHash("sha256").update(`spor-attestation-origin\0${bearer}`).digest("hex");
+  if (credential !== origin.credential) return null;
+  const fixed = { mode: () => "remote", server: () => origin.server, token: () => bearer, tenant: () => null };
+  return new Proxy(cfg, { get(target, key) {
+    if (Object.prototype.hasOwnProperty.call(fixed, key)) return fixed[key];
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
 }
 
 async function replayAttestationDebts(cfg, { home = cfg.userConfigHome(), log = () => {}, write = writeRunAttestation, refresh = refreshProposalAttestation } = {}) {
@@ -17019,7 +17048,7 @@ async function replayAttestationDebts(cfg, { home = cfg.userConfigHome(), log = 
 // stamp goes through stampGateState's `own` door, so it lands only while the
 // record still holds THIS pipeline's verdict — never force, which would let a
 // pipeline that lost the settle race overwrite the winner's evidence.
-async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null, settleToken = null, built: prepared = null }) {
+async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null, settleToken = null, built: prepared = null, origin = null }) {
   // `attestation_missing`/`attestation_error` ride on the result the loop
   // publishes (`--status`), the same fields the run record is stamped with —
   // a missing attestation is part of the verdict's evidence, not a log line
@@ -17041,7 +17070,9 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
     return missing(reason);
   }
   try {
-    const wrote = await writeGateNode(cfg, built.id, built.markdown);
+    const destination = attestationPublicationConfig(cfg, origin || (!prepared ? attestationGraphOrigin(cfg) : null));
+    if (!destination) return missing("publication origin is unknown or its effective credential changed; original evidence remains owed");
+    const wrote = await writeGateNode(destination, built.id, built.markdown);
     if (wrote && wrote.ok) out.attestation = built.id;
     else log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(wrote && wrote.reason) || "no response"}) — the verdict still stands`);
   } catch (e) {
@@ -21658,7 +21689,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning };
+module.exports = { launchSupervisedHarness, attestationPublicationConfig, cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning };
 
 if (require.main === module) {
   main()
