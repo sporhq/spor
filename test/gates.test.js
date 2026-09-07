@@ -613,6 +613,40 @@ test("an unrecognized or absent fix-cycle verdict carries the prior blocking set
   assert.strictEqual(first.error, "no structured verdict found in the review report");
 });
 
+// An UNAVAILABLE reviewer — one that wrote no report at all — is the case the
+// three interrupted program runs hit 16 times in a row while Codex was
+// credit-dead (task-spor-program-review-report-recovery-20260906). The gate
+// reads a report that is not there as the empty text it read, and the whole
+// recovery rests on what THAT parses to: it must never be a pass, and it must
+// never be a READABLE `changes_requested` carrying an empty findings list —
+// which is a verdict a fix cycle would act on, dispatching an implementer at
+// nothing. The prose case above pins a report that exists and says nothing;
+// this pins the report that does not exist, in every spelling the reader can
+// hand it, and states the property rather than just the return value.
+test("an absent reviewer report is unreadable — never a pass, never an actionable changes_requested with no findings", () => {
+  for (const absent of [undefined, null, "", "   \n\t "]) {
+    const r = gates.parseReviewVerdict(absent, { cycle: 0 });
+    const label = JSON.stringify(absent);
+    assert.strictEqual(r.ok, false, `${label} must not read as a verdict`);
+    assert.strictEqual(r.passed, false, `${label} must never pass the gate`);
+    assert.strictEqual(r.error, "no structured verdict found in the review report");
+    // The property the recovery turns on: `ok: false` is what keeps an empty
+    // findings list from being an answer. A reader that took `verdict`/
+    // `findings` alone would see exactly "changes_requested, nothing to fix".
+    assert.deepStrictEqual([r.findings, r.prior], [[], []], `${label} carries nothing to fix`);
+    assert.ok(!(r.ok && !r.passed && r.findings.length === 0), `${label} is not a readable empty changes_requested`);
+  }
+  // …and with a prior finding still open the same absent report answers
+  // nothing, so the whole open set is carried to the fixer — the arm that DOES
+  // have work to hand on. (The two arms are why the runner charges a fix cycle
+  // for one and refuses for the other: gate-runner.js's report-less branch.)
+  const prior = [{ id: "F1", severity: "blocking", file: "a.js", summary: "races", evidence: "node race.js", opened: 0 }];
+  const carried = gates.parseReviewVerdict("", { prior, cycle: 1 });
+  assert.strictEqual(carried.ok, false);
+  assert.strictEqual(carried.passed, false);
+  assert.deepStrictEqual(carried.findings.map((f) => [f.id, f.origin, f.blocking, f.status]), [["F1", "prior", true, "open"]]);
+});
+
 // Review finding 3 on the third cut: rolling back the cycle that UPGRADED an
 // advisory entry (demonstrated it by id) reset its status but left the
 // upgrade's evidence on it, so the rolled-back entry no longer read as
