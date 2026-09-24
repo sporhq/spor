@@ -2036,6 +2036,43 @@ Ordinary body about pricing envelopes and recovery.
   assert.equal(unrelated[0].id, "dec-plain", "the lexically-relevant node wins, not the proto-key node");
 });
 
+// Regression (issue-spor-rankagainst-tokenizer-shreds-diacritics): the
+// tokenizer split on [^a-z0-9], so å/ä/ö acted as word separators and shredded
+// Swedish words into junk fragments (åtgärd -> "tg", "rd"). Diacritics must
+// fold to their base letter (å/ä -> a, ö -> o) before splitting.
+test("rankAgainst folds diacritics so Swedish words are not shredded into junk tokens", () => {
+  const fx = tmpGraph({
+    "dec-sv.md": `---
+id: dec-sv
+type: decision
+title: Åtgärd för öppna ärenden
+summary: En åtgärd som beskriver hur vi hanterar öppna ärenden och kösystemet.
+date: 2026-09-24
+---
+Åtgärden gäller för alla öppna ärenden i kön.
+`,
+    "dec-unrelated.md": `---
+id: dec-unrelated
+type: decision
+title: Unrelated pricing catalogue
+summary: An ordinary decision about pricing and recovery objectives.
+date: 2026-09-24
+---
+Ordinary body about pricing envelopes and recovery.
+`,
+  });
+  const g = fx.load();
+  // The real regression proof: an ASCII-folded spelling of the doc's Swedish
+  // words can only match the accented doc if BOTH sides fold to the same
+  // token. Under the pre-fix tokenizer the doc's own diacritic-bearing words
+  // never produce these ASCII tokens at all (each accented letter split the
+  // word into fragments like "ppna"/"renden", never "oppna"/"atgard"/
+  // "arenden"), so this could not pass without the fold actually running.
+  const ranked = graph.rankAgainst(g, "atgard oppna arenden", new Set());
+  assert.equal(ranked[0].id, "dec-sv", "folded-ASCII query terms must match the accented doc");
+  assert.ok(ranked[0].sim > 0, "match must score a nonzero cosine, not vanish as junk fragments");
+});
+
 // ---------- neighborhood-search project controls (dec-spor-client-config-cascade) ----------
 
 function twoProjectFixture() {
