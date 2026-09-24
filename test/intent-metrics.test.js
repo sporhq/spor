@@ -322,3 +322,26 @@ test("the committed runs certify the shipped prompt, and every record names the 
       "An edited prompt must be re-scored (scripts/intent-eval/run.js --out/--json into runs/) before it ships."
   );
 });
+
+// task-spor-digest-intent-jev-gate: the held-out Jev scorer applies the
+// server's rule — heuristics THEN max(noul) >= threshold — and an errored or
+// noul-less record is NO VERDICT, never a silent inject.
+test("jev-score: heuristics then max(noul) >= threshold; a missing noul is no verdict", () => {
+  const { jevVerdict } = require("../scripts/intent-eval/jev-score");
+  const P = "what is our widget thumbnail caching strategy in redis";
+  assert.strictEqual(jevVerdict({ needs_history: 0.1, digest_helps: 0.62 }, P), "WARRANTED");
+  assert.strictEqual(jevVerdict({ needs_history: 0.49, digest_helps: 0.3 }, P), "UNWARRANTED");
+  assert.strictEqual(jevVerdict({ needs_history: 0.5, digest_helps: 0 }, P), "WARRANTED");
+  assert.strictEqual(jevVerdict({ needs_history: 0.49, digest_helps: 0.3 }, P, 0.4), "WARRANTED");
+  // The deterministic gates run first: short / continuation / slash never warrant.
+  assert.strictEqual(jevVerdict({ needs_history: 0.99, digest_helps: 0.99 }, "ok do that"), "UNWARRANTED");
+  assert.strictEqual(jevVerdict({ needs_history: 0.99, digest_helps: 0.99 }, "/spor:next show me the whole queue now"), "UNWARRANTED");
+  // An appended <system-reminder> never lifts a bare continuation over the word floor.
+  assert.strictEqual(
+    jevVerdict({ needs_history: 0.99, digest_helps: 0.99 }, "Continue\n<system-reminder>one two three four five six seven</system-reminder>"),
+    "UNWARRANTED"
+  );
+  assert.strictEqual(jevVerdict({ error: "jev 429" }, P), null);
+  assert.strictEqual(jevVerdict({ needs_history: 0.9 }, P), null);
+  assert.strictEqual(jevVerdict(undefined, P), null);
+});

@@ -307,3 +307,150 @@ test("session_id absent: spool writer and drainer agree on the 'unknown' key", a
   const out = runHook(["prompt-context", "--host", "claude-code"], JSON.stringify(second), env(home, warrantedStub(root)));
   assert.match(JSON.parse(out.stdout).hookSpecificOutput.additionalContext, /dec-widget-cache/);
 });
+
+// ---------------------------------------------------------------------------
+// Server-computed intent (task-spor-digest-intent-jev-gate): /v1/digest may
+// return `intent: {warranted, needs_history, digest_helps, source}` — the Jev
+// verdict the tenant server computed over the prompt it was already sent. The
+// client decides THIS prompt with it, synchronously, never spawning the Haiku
+// classifier. Absent/malformed intent falls through to the behavior without it.
+// ---------------------------------------------------------------------------
+const { spawnHook } = require("./helpers/portable");
+const { INTENT_GATE_DEFAULT } = require("../scripts/engines/prompt-context.js");
+
+const TEAM_TEXT =
+  "- **dec-widget-cache — Widget thumbnail caching** (decision, projx, 2026-06-20): Widget thumbnail caching in Redis uses short TTL keys.";
+
+function digestServer(intent, found = true) {
+  const http = require("node:http");
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      hits.push({ method: req.method, url: req.url, body });
+      res.writeHead(200, { "content-type": "application/json" });
+      if (req.method === "POST" && req.url === "/v1/digest") {
+        res.end(JSON.stringify({ found, ...(found ? { text: TEAM_TEXT } : {}), ...(intent === undefined ? {} : { intent }) }));
+      } else {
+        res.end(JSON.stringify({ found: false }));
+      }
+    });
+  });
+  return new Promise((resolve) =>
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` }))
+  );
+}
+
+// Remote mode, pure: no local nodes/ dir, so the only digest is the server's.
+// `asyncFlag` undefined leaves SPOR_DIGEST_ASYNC UNSET (the default).
+async function remotePrompt(intent, { asyncFlag, intentCmd = null, found = true, keepLocal = false, seed = null } = {}) {
+  const { root, home, cwd } = scratch();
+  if (!keepLocal) fs.rmSync(path.join(home, "nodes"), { recursive: true });
+  if (seed) seed(home);
+  const { srv, hits, base } = await digestServer(intent, found);
+  try {
+    const e = env(home, intentCmd, { SPOR_SERVER: base, SPOR_TOKEN: "spor_pat_test" });
+    if (asyncFlag === undefined) delete e.SPOR_DIGEST_ASYNC;
+    else e.SPOR_DIGEST_ASYNC = asyncFlag;
+    const payload = { cwd, session_id: "s1", hook_event_name: "UserPromptSubmit", prompt: PROMPT };
+    const stdout = await new Promise((resolve, reject) => {
+      const c = spawnHook(["prompt-context", "--host", "claude-code"], JSON.stringify(payload), e, {
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+      let out = "";
+      c.stdout.on("data", (d) => (out += d));
+      c.on("error", reject);
+      c.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(`exit ${code}`))));
+    });
+    return { root, home, stdout, hits };
+  } finally {
+    srv.close();
+  }
+}
+
+const JEV_NO = { warranted: false, needs_history: 0.12, digest_helps: 0.2, source: "jev" };
+const JEV_YES = { warranted: true, needs_history: 0.91, digest_helps: 0.64, source: "jev" };
+
+test("server intent, explicit async: warranted:false suppresses THIS prompt, no spool, no classifier", async () => {
+  const { root, home, stdout } = await remotePrompt(JEV_NO, { asyncFlag: "1", intentCmd: "false" });
+  assert.strictEqual(stdout.trim(), "");
+  assert.ok(!fs.existsSync(path.join(home, "journal", "s1.digest-intent")), "no classifier spawn counted");
+  assert.strictEqual(outFiles(home).length, 0);
+  assert.ok(
+    !fs.existsSync(spoolDir(home)) || fs.readdirSync(spoolDir(home)).every((f) => !f.endsWith(".in.json")),
+    "nothing spooled"
+  );
+  assert.strictEqual(llmCalls(home).length, 0);
+  assert.ok(!fs.existsSync(path.join(home, "journal", "s1.digest-injected")), "a suppressed digest records no signature");
+  const j = journal(home).filter((x) => x.tool === "digest-intent");
+  assert.strictEqual(j.length, 1);
+  assert.deepStrictEqual(
+    { source: j[0].source, warranted: j[0].warranted, needs_history: j[0].needs_history, digest_helps: j[0].digest_helps },
+    { source: "jev", warranted: false, needs_history: 0.12, digest_helps: 0.2 }
+  );
+  void root;
+});
+
+test("server intent, explicit async: warranted:true injects synchronously (no one-turn delay)", async () => {
+  const { home, stdout } = await remotePrompt(JEV_YES, { asyncFlag: "1" });
+  const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /dec-widget-cache/);
+  assert.ok(!fs.existsSync(path.join(home, "journal", "s1.digest-intent")), "no classifier spawn");
+  // Recorded for the drain dedup, exactly like a synchronous fallback injection.
+  assert.ok(fs.existsSync(path.join(home, "journal", "s1.digest-injected")));
+  assert.strictEqual(journal(home).filter((x) => x.tool === "digest-intent")[0].warranted, true);
+});
+
+test("server intent, explicit async off: the verdict is ignored and the digest injects", async () => {
+  const { home, stdout } = await remotePrompt(JEV_NO, { asyncFlag: "0" });
+  assert.match(JSON.parse(stdout).hookSpecificOutput.additionalContext, /dec-widget-cache/);
+  assert.strictEqual(journal(home).filter((x) => x.tool === "digest-intent").length, 0);
+});
+
+test("server intent, flag UNSET: honored iff INTENT_GATE_DEFAULT, never a classifier spawn", async () => {
+  const { home, stdout } = await remotePrompt(JEV_NO, {});
+  if (INTENT_GATE_DEFAULT) assert.strictEqual(stdout.trim(), "");
+  else assert.match(JSON.parse(stdout).hookSpecificOutput.additionalContext, /dec-widget-cache/);
+  assert.ok(!fs.existsSync(path.join(home, "journal", "pending-digests")), "no spool dir on the default path");
+  assert.ok(!fs.existsSync(path.join(home, "journal", "s1.digest-intent")));
+  assert.strictEqual(llmCalls(home).length, 0);
+});
+
+test("no intent field (older server), flag UNSET: synchronous injection with no async side effects", async () => {
+  const { home, stdout } = await remotePrompt(undefined, {});
+  assert.match(JSON.parse(stdout).hookSpecificOutput.additionalContext, /dec-widget-cache/);
+  assert.ok(!fs.existsSync(path.join(home, "journal", "pending-digests")));
+  assert.strictEqual(journal(home).filter((x) => x.tool === "digest-intent").length, 0);
+});
+
+test("malformed intent (non-boolean warranted) is ignored — fails open to the path without it", async () => {
+  // Explicit async + no usable verdict = the Haiku spool path, exactly as before.
+  const { home, stdout } = await remotePrompt({ warranted: "no", source: "jev" }, { asyncFlag: "1", intentCmd: "false" });
+  assert.strictEqual(stdout.trim(), "", "spooled for the classifier, injects next turn");
+  assert.strictEqual(journal(home).filter((x) => x.tool === "digest-intent-spawn").length, 1);
+  assert.strictEqual(journal(home).filter((x) => x.tool === "digest-intent").length, 0);
+});
+
+test("server intent, explicit async: a stale pending result is consumed, never injected beside the verdict", async () => {
+  const STALE = "Spor context (top matches; run /spor:brief for full):\n- dec-stale-pending: an older prompt's digest";
+  const seed = (home) => seedOut(home, "s1", "0000-old", STALE, "stale-sig", "projx");
+  for (const intent of [JEV_NO, JEV_YES]) {
+    const { home, stdout } = await remotePrompt(intent, { asyncFlag: "1", seed });
+    assert.ok(!stdout.includes("dec-stale-pending"), "the stale pending digest never injects");
+    assert.strictEqual(outFiles(home).length, 0, "the stale result was consumed");
+    if (intent.warranted) assert.match(JSON.parse(stdout).hookSpecificOutput.additionalContext, /dec-widget-cache/);
+    else assert.strictEqual(stdout.trim(), "");
+  }
+});
+
+test("server intent on found:false is ignored — it never judged the personal-graph digest", async () => {
+  // Team graph finds nothing; the local personal graph does. The verdict's
+  // digest_helps was scored against an EMPTY team digest, so it must not
+  // suppress the personal digest the server never saw.
+  const { stdout, home } = await remotePrompt(JEV_NO, { asyncFlag: "1", found: false, keepLocal: true, intentCmd: "false" });
+  assert.strictEqual(journal(home).filter((x) => x.tool === "digest-intent").length, 0);
+  // Falls through to the explicit async gate exactly as without an intent.
+  assert.strictEqual(stdout.trim(), "");
+  assert.strictEqual(journal(home).filter((x) => x.tool === "digest-intent-spawn").length, 1);
+});

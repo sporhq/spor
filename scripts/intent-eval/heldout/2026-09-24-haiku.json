@@ -1,0 +1,84 @@
+{
+  "label": "heldout-haiku",
+  "tplSha": "54377e57d385",
+  "binding": "bound",
+  "score": {
+    "n": 223,
+    "firedW": 205,
+    "firedU": 18,
+    "good": 71,
+    "goodLost": 0,
+    "goodLostIds": [],
+    "suppressedW": 7,
+    "suppressedWIds": [
+      "40c1e902f6aa",
+      "d28745a9cfd4",
+      "7c458a273aef",
+      "0f207aef1d5a",
+      "6af55fa87284",
+      "d05c9acddfb7",
+      "44f283415850"
+    ],
+    "suppressedU": 10,
+    "noVerdict": 0,
+    "noVerdictIds": [],
+    "warrantedSuppression": 0.03414634146341464,
+    "goodLoss": 0,
+    "noiseRemoved": 0.5555555555555556,
+    "precision": 0.5882352941176471,
+    "recall": 0.5555555555555556,
+    "f1": 0.5714285714285715
+  },
+  "gate": {
+    "budget": 0.06,
+    "oneCase": 0.004878048780487805,
+    "harm": {
+      "metric": "good digests lost",
+      "value": 0,
+      "pass": true
+    },
+    "integrity": {
+      "metric": "cases with no verdict",
+      "value": 0,
+      "pass": true
+    },
+    "coverage": {
+      "metric": "population cases not scored",
+      "value": 0,
+      "pass": true
+    },
+    "binding": {
+      "metric": "decisions not bound to prompt",
+      "value": 0,
+      "pass": true
+    },
+    "warranted": {
+      "metric": "warranted suppressed",
+      "value": 0.03414634146341464,
+      "pass": true,
+      "withinOneCase": false
+    },
+    "pass": true
+  },
+  "tables": {
+    "current engine": {
+      "W": 220,
+      "U": 79,
+      "fireW": 205,
+      "fireU": 18,
+      "rateW": 0.9318181818181818,
+      "rateU": 0.22784810126582278,
+      "f1": 0.9255079006772008
+    },
+    "engine+classifier": {
+      "W": 220,
+      "U": 79,
+      "fireW": 198,
+      "fireU": 8,
+      "rateW": 0.9,
+      "rateU": 0.10126582278481013,
+      "f1": 0.9295774647887324
+    }
+  },
+  "spend": null
+}

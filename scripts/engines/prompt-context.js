@@ -744,6 +744,14 @@ function classifyDigestIntent({ prompt, tplSha, session, slug, graph, timeoutMs,
   return null;
 }
 
+// Whether an UNSET digest.async honors the server-computed intent verdict
+// (task-spor-digest-intent-jev-gate). It never spawns the client-side Haiku
+// classifier — that stays behind an explicit digest.async:true — so flipping
+// this changes nothing in local mode or against a server that returns no
+// `intent`. See scripts/intent-eval/README.md "Jev (server-side)" for the
+// held-out measurement it rests on.
+const INTENT_GATE_DEFAULT = false;
+
 async function promptContext(input) {
   // Headless backend invocations (the capture ingester, the fact-finder
   // distiller, the nudge classifier — every spawn site exports the
@@ -767,16 +775,56 @@ async function promptContext(input) {
       ? drainPendingNudges(graph, input, slug)
       : "";
 
-  let digest = await computeDigest(input, graph, slug);
+  const meta = {};
+  let digest = await computeDigest(input, graph, slug, meta);
 
-  // digest.async (dec-spor-digest-noise-needs-async-semantic-intent): gate the
-  // digest behind the off-prompt-path intent classifier. The compute above ran
-  // exactly as before; here it is spooled instead of injected (spool returns
-  // the digest unchanged on the spawn cap / spool failure — synchronous
-  // fail-open), and whatever the worker cleared LAST prompt drains in with no
-  // LLM call. Both branches are gated on the flag, so the default path adds no
-  // syscall and stays byte-identical.
-  if (u.cfgBool("digest.async", "DIGEST_ASYNC", false)) {
+  // digest.async is a TRI-STATE (task-spor-digest-intent-jev-gate): explicit
+  // true is the full async gate below, explicit false is no gate at all, and
+  // unset resolves to INTENT_GATE_DEFAULT — which honors a verdict the SERVER
+  // computed but never spawns a client-side classifier.
+  const asyncFlag = u.cfgBool("digest.async", "DIGEST_ASYNC", null);
+  const intentGate = asyncFlag ?? INTENT_GATE_DEFAULT;
+
+  // The server-computed intent verdict (/v1/digest's `intent`, computed by Jev
+  // in the tenant server — dec-spor-jev-calls-proxied-through-tenant-server).
+  // It rides the response this prompt already waited for, so it decides THIS
+  // prompt synchronously: no spool, no one-turn delay, and no LLM on the client
+  // prompt path (norm-cc-no-llm-prompt-path). Only an explicit
+  // `warranted: false` suppresses; an absent or malformed field (local mode, an
+  // older server, Jev disabled/failed server-side) falls through to exactly the
+  // behavior without it.
+  if (intentGate && digest && meta.intent) {
+    const session = input.session_id ?? "unknown";
+    const it = meta.intent;
+    u.appendLine(
+      path.join(graph, "journal", `${session}.jsonl`),
+      JSON.stringify({
+        ts: u.jqNow(),
+        project: slug,
+        tool: "digest-intent",
+        source: typeof it.source === "string" ? it.source : "server",
+        warranted: it.warranted,
+        ...(typeof it.needs_history === "number" ? { needs_history: it.needs_history } : {}),
+        ...(typeof it.digest_helps === "number" ? { digest_helps: it.digest_helps } : {}),
+      })
+    );
+    if (!it.warranted) digest = "";
+    // Under the explicit async gate, a result the Haiku worker spooled for an
+    // EARLIER prompt is superseded by this fresher verdict: consume it without
+    // injecting, and record an injected digest's signature for the drain dedup
+    // — the same bookkeeping as the synchronous fallback below.
+    if (asyncFlag === true) {
+      drainPendingDigests(graph, input, slug, { suppress: true });
+      if (digest) u.appendLine(path.join(graph, "journal", `${session}.digest-injected`), digestSignature(digest));
+    }
+  } else if (asyncFlag === true) {
+    // digest.async (dec-spor-digest-noise-needs-async-semantic-intent): gate the
+    // digest behind the off-prompt-path intent classifier. The compute above ran
+    // exactly as before; here it is spooled instead of injected (spool returns
+    // the digest unchanged on the spawn cap / spool failure — synchronous
+    // fail-open), and whatever the worker cleared LAST prompt drains in with no
+    // LLM call. Both branches are gated on the EXPLICIT flag, so the default
+    // path adds no syscall and stays byte-identical.
     const fresh = digest
       ? spoolDigestIntent(graph, input, slug, stripSystemReminders(input.prompt ?? ""), digest)
       : "";
@@ -806,7 +854,7 @@ async function promptContext(input) {
 // microdigest context string, or "" when a gate suppresses it (the callers
 // combine it with any pending async nudge). Every prior `return null` here is a
 // `return ""`; every `return envelope(x)` is a `return x`.
-async function computeDigest(input, graph, slug) {
+async function computeDigest(input, graph, slug, meta = {}) {
   const prompt = stripSystemReminders(input.prompt ?? "");
 
   // Skip trivial / continuation prompts BEFORE any network call. The second
@@ -848,6 +896,14 @@ async function computeDigest(input, graph, slug) {
         const parsed = JSON.parse(resp.body);
         found = parsed.found ?? false;
         if (found === true) team = u.stripTrailingNewlines(parsed.text ?? "");
+        // The server's intent verdict for this prompt, when it computed one
+        // (API.md §3 /v1/digest `intent`). Accepted only with a boolean
+        // `warranted` AND a found team digest — its `digest_helps` noul judged
+        // THAT digest, so on `found:false` it says nothing about a personal-
+        // graph digest the server never saw. Anything else is ignored — fail
+        // open to inject.
+        const it = parsed.intent;
+        if (found === true && it && typeof it === "object" && typeof it.warranted === "boolean") meta.intent = it;
       } catch {}
       rlog(`digest ok (found=${found}, http=${resp.http})`);
     } else {
@@ -894,8 +950,10 @@ module.exports = {
   promptContext,
   mergeDigests,
   isContinuationPrompt,
+  stripSystemReminders,
   microDigest,
   drainPendingNudges,
   drainPendingDigests,
   classifyDigestIntent,
+  INTENT_GATE_DEFAULT,
 };

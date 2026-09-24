@@ -319,3 +319,95 @@ So `digest.async` stays default-off on those two, and the honest summary of
 prompt was recalibrated, and **the shipped prompt scores inside budget on two
 independent draws** — the item's inside-budget condition is met, and the flip
 is deferred for the reasons above, not for want of a passing prompt.
+
+## Jev (server-side) — the held-out re-validation, 2026-09-24
+
+`task-spor-digest-intent-jev-gate` moves the intent verdict into the tenant
+server: `/v1/digest` already receives the prompt, so the server asks Jev
+(`typesafe/jev`, `jev-1.13.0`, spor-server `server/jev.js` `digestIntent`) two
+nouls — `needs_history` and `digest_helps` — and returns
+`intent: {warranted, …}` with `warranted` = the deterministic prompt heuristics
+THEN `max(noul) >= 0.5`. `prompt-context.js` honors an explicit
+`warranted: false` with no client-side LLM call and no one-turn delay. The
+question this section answers is whether an UNSET `digest.async` should honor
+it (`INTENT_GATE_DEFAULT`). The rule for flipping it: Jev loses **0** good
+digests AND its fire-table F1 is **≥** the shipped Haiku prompt's on the same
+sample.
+
+**Verdict: not flipped.** Jev loses nothing, but it removes much less noise, and
+its F1 lands 0.0002 below Haiku's, which is a fraction of one case. Under the
+rule as written that does not flip. `INTENT_GATE_DEFAULT` stays `false`, so the
+server verdict is honored only under an explicit `digest.async: true`, where it
+replaces the Haiku spool for that prompt.
+
+**What the sample is — and is not.** The node asked for a *fresh* transcript
+window. None exists: the dev box moved to a new VM around 2026-09-15, and its
+transcripts since then hold 24 real prompts, 6 of which got a digest. The
+held-out set is therefore a **same-window (June 2026)** sample: 300 cases drawn
+from the 2026-07-06 corpus's 751 **unjudged** spor-family user-prompt cases.
+Neither the Haiku prompt family nor Jev's 0.5 rule was tuned on them, but they
+come from the same weeks, the same graph era and the same engine replay. So this
+is a weaker guard against overfitting than the fresh window the node asked for,
+and a flip resting on it would rest on that.
+
+- **Sample:** stratified by source × replay-fired × first-prompt, seeded (order
+  = `sha1("heldout-2026-09-24:" + case_id)`); the ids are
+  `heldout/2026-09-24-sample-ids.txt`. 299/300 judged (one case failed the judge
+  twice), 223 fired.
+- **Labels:** the corpus's own paired blinded judge (`judge.js`, same system
+  prompt and rubric, `claude-sonnet-4-6`), run through `claude -p` instead of the
+  raw Messages API. They are committed without any text:
+  `heldout/2026-09-24-labels.jsonl` (ids, `warranted`, per-arm
+  verdict/score/top slot).
+- **Jev decisions:** `heldout/2026-09-24-jev.jsonl`, one line per (case, qset).
+  `server` is the server's shipped `Q_DIGEST_INTENT`, verbatim, over state
+  `{prompt: clip 4000, digest: clip 12000}` (the replay's digest). `ab` is the
+  original A/B experiment's questions, for comparison. Median latency 302 ms,
+  p90 350 ms, 0 errors across 448 calls.
+- **Haiku decisions:** `heldout/2026-09-24-haiku.jsonl`, a live run of the
+  shipped template (sha `54377e57d385`) through the shipped default backend, with
+  `--timeout 180000` because the 2-CPU box was saturated. There were 0 failed
+  calls, so every case has a verdict. Median latency 15.9 s, $0.081 per call.
+
+| classifier | good lost | warranted suppressed | noise removed | fire-table F1 | gate |
+|---|---|---|---|---|---|
+| current engine (always inject on fire) | 0 | 0/205 | 0/18 | 0.9255 | n/a |
+| **Jev, server questions, ≥ 0.5** (`jev-server.json`) | **0/71** | **1/205 (0.5%)** | 3/18 (17%) | **0.9294** | PASS |
+| Jev, A/B-eval questions, ≥ 0.5 (`jev-ab.json`) | 0/71 | 3/205 (1.5%) | 4/18 (22%) | 0.9269 | PASS |
+| Haiku, shipped conjunctive prompt (`haiku.json`) | 0/71 | 7/205 (3.4%) | 10/18 (56%) | **0.9296** | PASS |
+
+All three pass the harm gate. What separates them is **noise removal**. On this
+set Jev with the server's questions is conservative: it barely moves off
+always-inject (3 of 18 noise digests removed). Raising the threshold does not
+buy that back cheaply. These rows are informational only and were not used to
+choose anything: 0.6 gives 2/205 and 4/18; 0.7 gives 7/205 and 6/18 (F1 0.921);
+0.8 gives 14/205, 10/18 **and one good digest lost** (F1 0.912). The 2026-09-24
+A/B result (F1 0.855 vs 0.839 on the 129-case tuning set) did not reproduce as a
+margin here. The held-out population fires far less noise (18/223 fired cases
+vs 18/77 on the tuning set), so there is little for any gate to win, and on that
+population Haiku's 10/18 edges Jev's 3/18 even after paying 6 more warranted
+suppressions.
+
+What the Jev route does win is untouched by this F1: **0.3 s vs 15.9 s, and no
+per-classification CLI bill**. The cost objection in the section above is the
+one Jev removes. So the open question for default-on is no longer the backend
+cost; it is whether ~17% noise removal is worth a default flip at all. A
+noise-heavier fresh window, once the new VM has accumulated one, is the
+measurement that decides it.
+
+**Reproducing.** Every number above re-derives with no backend call:
+
+```bash
+E=~/repos/spor-server/evals/digest-intent-2026-07-06   # the private corpus
+R=$(mktemp -d); mkdir -p $R/cases $R/out
+ln -s $E/cases/cases.jsonl $R/cases/; ln -s $E/out/replay-current.jsonl $R/out/
+ln -s $PWD/scripts/intent-eval/heldout/2026-09-24-labels.jsonl $R/out/judge-actual-vs-current.jsonl
+node scripts/intent-eval/run.js --labels $R --replay scripts/intent-eval/heldout/2026-09-24-haiku.jsonl
+node scripts/intent-eval/jev-score.js --labels $R --decisions scripts/intent-eval/heldout/2026-09-24-jev.jsonl --qset server
+```
+
+`jev-score.js` only scores. Jev is not callable from this public repo: the key
+lives in the tenant server (`dec-spor-jev-calls-proxied-through-tenant-server`),
+so its decisions were recorded out-of-band and are scored with the same
+`metrics.js` gate as Haiku. A record with an error or a missing noul counts as
+NO VERDICT, never as a silent inject.

@@ -402,8 +402,24 @@ shipped default `claude -p --model haiku` bills ~$0.08 and ~15s per
 classification on a cold CLI prompt cache (~$0.01 warm), ~98% of it CLI session
 boot rather than the 4.6KB classification, so a flip wants a cheaper
 `digest.intentCmd` backend first, and a different backend is a different
-classifier that must be re-scored. See test/digest-async.test.js and
-scripts/intent-eval/README.md.
+classifier that must be re-scored.
+**The server-computed verdict (task-spor-digest-intent-jev-gate):** `/v1/digest`
+may return `intent: {warranted, needs_history, digest_helps, source: "jev"}` —
+the tenant server asks Jev over the prompt it was already sent (API.md §3), so
+the cost objection above does not apply to it. `digest.async` is therefore a
+TRI-STATE: explicit `true` is the gate above, except that a prompt whose
+response carries an intent is decided by it SYNCHRONOUSLY (no spool, no
+one-turn delay, no client LLM call; only a boolean `warranted: false`
+suppresses); explicit `false` ignores the field; UNSET honors the field iff
+`INTENT_GATE_DEFAULT` in prompt-context.js and never spawns the Haiku
+classifier, so local mode / an older server stays byte-identical either way.
+`INTENT_GATE_DEFAULT` is `false`: the held-out re-validation (300
+same-window June cases the prompts were never tuned on — NOT a fresh window,
+none exists yet on the new VM; scripts/intent-eval/heldout/) had Jev lose 0/71
+good digests and suppress 1/205 warranted, but remove only 3/18 noise, fire-table
+F1 0.9294 vs the shipped Haiku prompt's 0.9296 — under the flip rule (0 lost AND
+F1 ≥ Haiku) that is not a flip. See test/digest-async.test.js and
+scripts/intent-eval/README.md "Jev (server-side)".
 
 The post-tool engine ALSO carries the coupling nudge
 (task-spor-coupling-nudge-posttool, dec-spor-coupling-norms-declared-first) —
