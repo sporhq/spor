@@ -2513,3 +2513,196 @@ Body.
   assert.ok(g.nodes["dec-corrupt"]);
   assert.deepEqual(g.skipped, []);
 });
+
+// ---------- digest rerank (task-spor-compile-jev-rerank-stage) ----------
+//
+// dec-root has four equal-weight structural children (node-a..d, declared in
+// that order — a tie the un-reranked path breaks by stable insertion order)
+// plus one unlinked content-arm match (node-e, vocabulary-only, no edge).
+// rerankScores covers a..c and deliberately omits d (unscored structural) and
+// e (unscored content), so a single fixture exercises every tier: pinned (none
+// here) -> reranked candidates -> remaining structural -> remaining content.
+function rerankFixture() {
+  return tmpGraph({
+    "dec-root.md": `---
+id: dec-root
+type: decision
+project: p
+title: Root decision token alpha
+summary: Root decision alpha bravo charlie delta rerank fixture summary.
+date: 2026-06-01
+edges:
+  - {type: relates-to, to: node-a}
+  - {type: relates-to, to: node-b}
+  - {type: relates-to, to: node-c}
+  - {type: relates-to, to: node-d}
+---
+Root decision alpha bravo charlie delta rerank fixture body text.
+`,
+    "node-a.md": `---
+id: node-a
+type: artifact
+project: p
+title: Structural child alpha
+summary: Structural child alpha node, tied weight with its siblings.
+date: 2026-06-01
+---
+Structural child alpha node.
+`,
+    "node-b.md": `---
+id: node-b
+type: artifact
+project: p
+title: Structural child bravo
+summary: Structural child bravo node, tied weight with its siblings.
+date: 2026-06-01
+---
+Structural child bravo node.
+`,
+    "node-c.md": `---
+id: node-c
+type: artifact
+project: p
+title: Structural child charlie
+summary: Structural child charlie node, tied weight with its siblings.
+date: 2026-06-01
+---
+Structural child charlie node.
+`,
+    "node-d.md": `---
+id: node-d
+type: artifact
+project: p
+title: Structural child delta
+summary: Structural child delta node, tied weight with its siblings, unscored.
+date: 2026-06-01
+---
+Structural child delta node.
+`,
+    "node-e.md": `---
+id: node-e
+type: artifact
+project: p
+title: Unlinked content match echo
+summary: Root decision alpha bravo charlie delta rerank fixture summary, unscored.
+date: 2026-06-01
+---
+Shares the root's vocabulary but carries no edge to it.
+`,
+  }).load();
+}
+
+// Node ids, in the order they appear as digest bullet lines ("- **<id> —").
+function digestOrder(text) {
+  return [...text.matchAll(/^- \*\*([\w-]+)/gm)].map((m) => m[1]);
+}
+
+test("rerank: absent opts.rerankScores is byte-identical to the pre-rerank order", () => {
+  const g = rerankFixture();
+  const r = graph.compile(g, { rootId: "dec-root", digest: true });
+  assert.deepEqual(digestOrder(r.text), ["node-a", "node-b", "node-c", "node-d", "node-e"],
+    "tied structural children keep stable insertion order; the content pick trails");
+  assert.equal(r.meta.rerank, undefined, "meta.rerank is only present when rerank actually ran");
+});
+
+test("rerank: an empty opts.rerankScores object behaves exactly like absent", () => {
+  const g = rerankFixture();
+  const r = graph.compile(g, { rootId: "dec-root", digest: true, rerankScores: {} });
+  assert.deepEqual(digestOrder(r.text), ["node-a", "node-b", "node-c", "node-d", "node-e"]);
+  assert.equal(r.meta.rerank, undefined);
+});
+
+test("rerank: orders pinned -> scored candidates (noul desc, score secondary) -> remaining structural -> remaining content", () => {
+  const g = rerankFixture();
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankScores: {
+      "node-c": { score: 3, noul: true },   // noul wins outright
+      "node-b": { score: 2, noul: false },  // higher score among the noul:false pair
+      "node-a": { score: 1, noul: false },
+      // node-d, node-e: deliberately absent (unscored)
+    },
+  });
+  assert.deepEqual(digestOrder(r.text), ["node-c", "node-b", "node-a", "node-d", "node-e"]);
+  assert.deepEqual(r.meta.rerank, { applied: true, candidates: 3 });
+});
+
+test("rerank: pinned picks still render first, ahead of every reranked candidate", () => {
+  const g = tmpGraph({
+    "corr-pin.md": `---
+id: corr-pin
+type: correction
+title: Pin node-z ahead of the reranked pool
+target: dec-root
+pin: [node-z]
+summary: Force node-z into the digest ahead of the reranked pool.
+date: 2026-06-01
+---
+Always surface node-z first for dec-root.
+`,
+    "dec-root.md": `---
+id: dec-root
+type: decision
+project: p
+title: Root decision token alpha
+summary: Root decision alpha bravo charlie delta rerank fixture summary.
+date: 2026-06-01
+edges:
+  - {type: relates-to, to: node-a}
+  - {type: relates-to, to: node-b}
+---
+Root decision alpha bravo charlie delta rerank fixture body text.
+`,
+    "node-a.md": `---
+id: node-a
+type: artifact
+project: p
+title: Structural child alpha
+summary: Structural child alpha node.
+date: 2026-06-01
+---
+Structural child alpha node.
+`,
+    "node-b.md": `---
+id: node-b
+type: artifact
+project: p
+title: Structural child bravo
+summary: Structural child bravo node.
+date: 2026-06-01
+---
+Structural child bravo node.
+`,
+    "node-z.md": `---
+id: node-z
+type: artifact
+project: p
+title: Pinned-only node zulu
+summary: Pinned-only node zulu, unrelated vocabulary widget gadget.
+date: 2026-06-01
+---
+Pinned-only node zulu.
+`,
+  }).load();
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankScores: { "node-a": { score: 1, noul: true }, "node-b": { score: 0, noul: false } },
+  });
+  assert.deepEqual(digestOrder(r.text), ["node-z", "node-a", "node-b"]);
+});
+
+test("rerank: a malformed rerankScores entry (missing fields) sorts last among scored, never throws", () => {
+  const g = rerankFixture();
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankScores: {
+      "node-a": { score: 2, noul: true },
+      "node-b": {}, // missing score/noul — must fall back to 0/false, not throw
+      "node-c": { score: 5, noul: true },
+    },
+  });
+  assert.deepEqual(digestOrder(r.text).slice(0, 3), ["node-c", "node-a", "node-b"]);
+});
