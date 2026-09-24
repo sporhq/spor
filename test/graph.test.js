@@ -2706,3 +2706,17 @@ test("rerank: a malformed rerankScores entry (missing fields) sorts last among s
   });
   assert.deepEqual(digestOrder(r.text).slice(0, 3), ["node-c", "node-a", "node-b"]);
 });
+
+test("rerank: noul is a 0-1 probability, not a boolean — a higher noul outranks a higher score", () => {
+  const g = rerankFixture();
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankScores: {
+      "node-a": { score: 3, noul: 0.3 }, // higher score, but lower noul probability
+      "node-b": { score: 1, noul: 0.9 }, // lower score, but higher noul probability wins
+    },
+  });
+  assert.deepEqual(digestOrder(r.text).slice(0, 2), ["node-b", "node-a"]);
+  assert.deepEqual(r.meta.rerank, { applied: true, candidates: 2 });
+});
