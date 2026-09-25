@@ -178,6 +178,31 @@ test("argv tokens resolve to the launcher's placeholders, and an unresolved {mod
   );
 });
 
+test("optional posture describes the fixed argv, validates on disk recovery, and never grants flags", () => {
+  const base = normalizeHarnessDeclaration(HARNESS, declarationFor("/x")).declaration;
+  assert.ok(!Object.hasOwn(base, "posture"), "old declarations keep their shape");
+  const old = declaredAdapter(base);
+  for (const posture of ["unattended", "attended", "read-only"]) {
+    const normalized = normalizeHarnessDeclaration(HARNESS, declarationFor("/x", { posture }));
+    assert.ok(normalized.ok, normalized.error);
+    const adapter = declaredAdapter(normalized.declaration);
+    assert.strictEqual(adapter.postureMeaning({}), posture);
+    assert.deepStrictEqual(adapter.buildArgs({ model: "m" }), old.buildArgs({ model: "m" }), "no permission argv invented");
+    for (const [key, value] of [["unattended", "unattended"], ["attended", "attended"], ["readOnly", "read-only"]]) {
+      assert.strictEqual(adapter[key] !== undefined, posture === value, "only the fixed posture can be expressed");
+    }
+    for (const options of [{ sandbox: "read-only" }, { approvalPolicy: "on-request" }, { permissionMode: "plan" }, { permissionMode: "bypassPermissions" }]) {
+      assert.ok(adapter.validateOptions(options).message, "foreign restrictions cannot be silently ignored or widened");
+    }
+  }
+  for (const posture of ["", "auto", "UNATTENDED", null, true, {}, []]) {
+    const normalized = normalizeHarnessDeclaration(HARNESS, declarationFor("/x", { posture }));
+    assert.strictEqual(normalized.ok, false, JSON.stringify(posture));
+    assert.match(normalized.error, /posture.*must be unattended, attended, or read-only/);
+    assert.strictEqual(declaredAdapter({ ...base, posture }), null, "malformed supervisor jobs refuse too");
+  }
+});
+
 test("report and session recovery follow the declared JSON paths", () => {
   const { declaration } = normalizeHarnessDeclaration(HARNESS, declarationFor("/x"));
   const adapter = declaredAdapter(declaration);
@@ -472,8 +497,8 @@ test("a declared harness dry-run previews the bound command, argv and session pa
   assert.match(result.stdout, /session: \(read from the declared session\.id JSON path/);
 });
 
-// A declared harness has no read-only posture (v1 scope fixes the declaration
-// to five keys), so `--read-only` — the review gate's launch — is REFUSED
+// A declared harness with no optional posture still cannot promise read-only,
+// so `--read-only` — the review gate's launch — is REFUSED
 // rather than run write-capable behind a warning (review finding 3 on
 // task-spor-review-gate-stateful-bounded's first cut).
 test("--read-only on a declared harness refuses before launch — no posture means no promise", () => {
@@ -489,6 +514,28 @@ test("--read-only on a declared harness refuses before launch — no posture mea
     assert.match(result.stderr, /opencode \(--agent plan\)/);
     assert.doesNotMatch(result.stderr, /warning: --read-only/);
     assert.doesNotMatch(result.stdout, /run:/);
+  }
+});
+
+test("declared postures reach real dispatch preflight without widening a restricted invocation", () => {
+  for (const posture of ["unattended", "attended", "read-only"]) {
+    const { home, repo, nodes } = fixture({ declaration: declarationFor(process.execPath, { posture }) });
+    const taskBefore = fs.readFileSync(path.join(nodes, "task-declared.md"), "utf8");
+    const args = ["dispatch", "task-declared", "--dir", repo, "--profile", "profile-declared", "--no-brief", "--print"];
+    const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home };
+    const interactive = run(args, env);
+    assert.strictEqual(interactive.status, 0, interactive.stderr);
+    assert.match(interactive.stdout, new RegExp(`posture: ${posture}`));
+    const review = run([...args, "--read-only"], env);
+    assert.strictEqual(review.status, posture === "read-only" ? 0 : 1, review.stderr);
+    if (posture !== "read-only") assert.match(review.stderr, /no read-only posture/);
+    for (const restriction of [["--sandbox", "read-only"], ["--approval-policy", "on-request"]]) {
+      const conflict = run([...args, ...restriction], env);
+      assert.strictEqual(conflict.status, 1, conflict.stdout);
+      assert.match(conflict.stderr, /cannot use --.*specific/);
+    }
+    assert.strictEqual(fs.readFileSync(path.join(nodes, "task-declared.md"), "utf8"), taskBefore, "preflight does not claim or alter the item");
+    assert.ok(!fs.existsSync(path.join(home, "journal", "dispatch")), "no child or run launched");
   }
 });
 

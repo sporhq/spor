@@ -249,6 +249,15 @@ test("no-candidate and cancelled are ATTEMPT outcomes, never settled stage state
   assert.ok(candidate.IMPL_ATTEMPT_OUTCOMES.includes("pending"));
 });
 
+test("publish classifications stay in the implementation-attempt vocabulary", () => {
+  for (const cls of Object.keys(gates.PUBLISH_OUTCOME_POOLS)) {
+    assert.ok(
+      candidate.IMPL_ATTEMPT_OUTCOMES.includes(cls),
+      `${cls} is emitted by candidate publishing and must stay in the attempt vocabulary`
+    );
+  }
+});
+
 // -------------------------------------------------- the reference refusals --
 
 test("a reference must be fetchable by locator, or it is refused with the reason named", () => {

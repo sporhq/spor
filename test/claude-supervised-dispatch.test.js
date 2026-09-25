@@ -215,6 +215,8 @@ test("claude-code declares a failure from an is_error result, and from nothing e
   assert.strictEqual(failureFromEvent({ type: "assistant", message: { content: [{ type: "text", text: "is_error: true" }] } }), null, "only a result event can declare it");
   assert.strictEqual(failureFromEvent({ type: "system", subtype: "init" }), null);
   assert.strictEqual(failureFromEvent(null), null);
+  // Codex declares its own (`turn.failed`, codex-dispatch.test.js); the two
+  // secondary CLIs still declare none.
   for (const id of ["opencode", "copilot"]) {
     assert.strictEqual(getHarness(id).failureFromEvent, undefined, `${id} declares no stream failure — its supervision is byte-identical`);
   }
@@ -228,7 +230,8 @@ test("codex declares a failure from turn.failed, and from nothing else", () => {
   assert.strictEqual(typeof failureFromEvent, "function");
   assert.deepStrictEqual(
     failureFromEvent({ type: "turn.failed", error: { message: "You've hit your usage limit." } }),
-    { reason: "You've hit your usage limit." }
+    { reason: "turn.failed: You've hit your usage limit." },
+    "the provider's own wording is retained (upstream's adapter prefixes the event name)"
   );
   assert.deepStrictEqual(failureFromEvent({ type: "turn.failed" }), { reason: "turn.failed" }, "a bare turn.failed still declares failure");
   assert.deepStrictEqual(failureFromEvent({ type: "turn.failed", error: {} }), { reason: "turn.failed" });

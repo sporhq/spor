@@ -257,11 +257,14 @@ exists to prevent. Three cases:
 | `attended`, or none resolved at all | **refused**, naming the flags that would fix it | proceeds — a person IS the answer to the prompt |
 | `read-only` under `--read-only` (a review gate) | proceeds — no writes were requested | proceeds |
 
-A **declared** custom harness (`dispatch.harness.<id>`) is operator-bound: v1
-scope fixes its argv and every posture flag is refused by its own
-`validateOptions`, so this client can neither express nor verify a posture for
-it. That is warned about, never refused — and as a `warning:` line, so it can
-never become a refusal reason.
+A **declared** custom harness (`dispatch.harness.<id>`) is operator-bound: its
+fixed command/argv may declare `posture: unattended|attended|read-only`. This
+metadata describes the configured launch; it does not add permission flags or
+grant access. Declared postures use the same preflight checks as built-ins:
+attended/read-only commands cannot satisfy unattended write work, and only a
+read-only declaration can satisfy `--read-only`. Omission preserves the legacy
+operator-bound warning, which never becomes a refusal reason for ordinary
+implementation dispatch. Foreign harness-specific flags remain refused.
 
 **Candidate workspace.** `dispatch.worktree` (repo `.spor.json` first, then the
 standing config, then `--worktree`/`--no-worktree`) decides whether a dispatch
@@ -1032,6 +1035,7 @@ written only after the outcome dimension exists):
 | `gate_state` | string | `"running"` \| `"interrupted"` \| `"passed"` \| `"failed"` \| `"blocked"` \| `"superseded"` \| `"scoped"` \| `"mismatch"` — the last thing a gate pipeline said about this run. The three verdicts, `superseded` (an adopted pipeline whose item was already landed by hand, §10.8 — no gate ran), `scoped` (a verified no-code outcome, §10.11 — no gate ran) and `mismatch` (the branch stopped carrying the pinned candidate its gates judged, §10.9 — nothing was built) are SETTLED; `running`/`interrupted` mean a pipeline started and never reported, which is what a later worker resumes from (§10.8). Propose-mode integration adds `parked` (§10.9) |
 | `gate_worker` | string | the worker id that last touched it |
 | `gate_at` | ISO 8601 | when that stamp was written |
+| `gate_settle_id` | string | the settler's random ownership nonce, minted with a settled verdict (§10.10); every evidence field stamped after the verdict lands only through it |
 | `gate_reason` | string | optional — the settled verdict's one-line reason |
 | `gate_fix_run_id` | string | optional — the run id of the most recent fix cycle this pipeline dispatched at the same node, stamped the moment it was dispatched (not when it finishes). If a stop lands while that fix cycle is still going, this field is what turns "the pipeline was abandoned" into "here is the run to go check" — a fix cycle's own dispatched run is detached and keeps going regardless (§10.7), and this is the only durable pointer to it. `spor runs`/`spor work --status` surface it. |
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
@@ -1148,13 +1152,20 @@ Four properties the publisher is built around:
   relative path and anything under the producing run's own working tree or
   inside a `.git` directory are still refused — they resolve only on the
   machine that is about to disappear.
-- **A worker refuses at startup what a parse could not read**: an `https://`
-  store in local mode (there is no candidate door without a server), a
-  `file://` store it cannot write, and a `branch` publish whose remote does not
-  exist — or resolves to a scheme no reader can fetch — in every checkout it
-  knows about. This is FATAL, unlike the `gh`/propose warning: a box that
-  cannot publish can submit nothing at all, so dispatching implementers there
-  burns spend to produce nothing.
+- **Invalid publication configuration is fatal; runtime unavailability skips
+  work before claim.** An unsupported store/remote scheme, invalid file URI,
+  or `https://` store in local mode refuses startup. A temporarily unwritable
+  store, missing or unreachable remote, unavailable integration target, or
+  missing `gh` leaves the worker alive. Each selected item is checked against
+  its own checkout before any dispatch lease or controller hold, so an
+  available sibling repo never masks its failure. `--print` shows those skips;
+  `--status` retains the reason and retry deadline. Failed checks back off from
+  the polling interval to `--max-interval`, with `--retry-after` as the existing
+  item cooldown floor. Recovery resumes the same profile; no fallback profile
+  or publication mode is substituted. Remote Git/HTTP probes are read-only,
+  non-interactive, and capped at five seconds each. HTTP checks establish
+  reachability/auth only (a missing probe object is expected); immutable
+  publication verification and integration checks still run at execution.
 - **A refused reference SHAPE is `unpublishable`, never `infrastructure`.**
   Every reason the shape check above can give — a locator under the
   producing run's own working tree included — is a structural fact about the
@@ -1468,12 +1479,222 @@ outside git (a database on a fixed port, a `db reset`):
   lease, when declared, is held across the reruns. The suite sees `SPOR_GATE_ATTEMPT`
   (1 for the declared run, N+1 for the Nth rerun) beside the rest of its
   environment.
+- **`isolate`** — a command template carrying a `{files}` token, e.g. `node
+  --test {files}`, and the gate's answer to a failure the change is
+  demonstrably not the cause of
+  (task-spor-factory-flake-rescue-should-not-burn-when-failure-is-off-diff).
+  After every declared rerun and before the failure is charged, the runner
+  reads the FILE PATHS the failure named and asks whether the change is
+  implicated in them at all. Only when it is demonstrably not are the failing
+  test files re-run through this template on that same prepared tree — and if
+  they pass alone, the whole-suite failure is an **off-diff flake**: the gate
+  PASSES, and the flake is filed as its own `issue-flake-*` node rather than
+  spending the item's fix cycles, its rescue lane and finally a person on work
+  that was never wrong. ONE issue per failing FILE, keyed on that file alone —
+  a flake belongs to the file that flakes, not to the set it happened to fail
+  beside (a set that shifts with load and ordering, and whose every permutation
+  would otherwise be its own near-duplicate). The pass needs every one of them
+  to land: a file with no durable record is the one thing it may not trade
+  away, and a filing that fails charges the failure as before.
+
+  "Off-diff" is TWO claims, and both must hold. First, no failed run named a
+  file the change edits — every run, not just the last, since a declared
+  `reruns` budget means a charged failure is several samples of one tree and
+  they need not fail the same way. Second, the failing tests do not
+  **reference** the change either: not appearing in a diff is a coincidence,
+  not an argument, and a test that never appears in one can still import,
+  spawn or read a file that does (the refusal that prompted this feature is
+  exactly that shape — test/codex-dispatch.test.js spawns `bin/spor.js`,
+  which the change had edited). So the files the failure named, and everything
+  reachable from them through the local files they name, are READ and asked
+  that question two ways — because one spelling misses the other's shape. TEXTUALLY: any
+  spelling of a changed path in the source — the path itself, its basename as
+  a token (what a `path.join(ROOT, "bin", "spor.js")` leaves behind), an
+  extensionless quoted specifier. And by RESOLVED IMPORT EDGE: every local file
+  the source names, resolved against its own directory and compared to the
+  change set exactly, which is what catches a segmented spelling whose text
+  contains no repo-relative path at all (`lib/index.js` requiring
+  `./kernel/queue.js` references `lib/kernel/queue.js` while spelling neither).
+  The edge question is asked of every file the walk reads, the last one
+  included.
+
+  HOW FAR it looks is the whole transitive closure, not a fixed number of hops.
+  "Imported or executed by the failing test" is a transitive claim — a test that
+  reaches the change through two helpers executes it exactly as much as one that
+  requires it directly — and a walk that simply STOPPED at a depth limit would
+  answer "no reference" in a voice indistinguishable from having looked
+  everywhere. So the frontier is followed to exhaustion, and the only bounds
+  left are read budgets that fail CLOSED: a file the walk still had to read
+  when it ran out of budget is `unknown`, and the failure is charged.
+
+  WHICH files are asked is likewise two sets. The test files the isolation
+  would re-RUN are HARD seeds: anything that stops us reading one stops the
+  pass, since we would otherwise re-run a file we could not judge. The other
+  files the failure named ride along as soft seeds — the failure went THROUGH
+  them, so what they import is as much part of the question, but a path
+  scraped out of a stack frame need not exist in this tree and one that does
+  not is importing nothing. That softness is about ABSENCE only: once a file
+  is here, not reading it leaves the question open exactly as much as for a
+  hard seed, so an existing file the walk cannot read (too large, a permission
+  error, an I/O fault) is `unknown` whichever kind of seed it is. That check is
+  deliberately over-inclusive and bounded: a reference it cannot rule out, a
+  hard seed that is not there, a file it cannot read, and a walk that would
+  exceed its budget all read as "not demonstrably off-diff". The practical
+  consequence is that the pass is NARROW — in a repo whose tests drive one
+  large entry point, most changes are implicated in most failures and the
+  failure is charged as it always was. That is the intended trade: the
+  `reruns` budget is the broad flake mitigation, and this is the one case
+  where the gate can say the change had nothing to do with it.
+
+  Bounded and conservative in every other direction too:
+
+  - it reads paths and nothing else — no verdicts, no counts, no test names.
+    A harness's RESULT structure is the harness's (that is why
+    dec-spor-command-gate-bounded-same-tree-rerun dismissed "re-run what
+    failed"); a file path is printed the same way by all of them, and the
+    verdict still comes from the isolated run's own exit code. What it does
+    read from the output's shape is only WHERE a path may be taken from: the
+    failure's own region (a `not ok`/`✖`/`FAIL`/Error/traceback line and the
+    indented block under it), never a line the run marked as a PASS — a whole
+    suite prints one line per file it ran, and a set of passing files is
+    trivially off-diff and trivially passes in isolation;
+  - a failure that named no readable path, or named one the change touches,
+    is **not** off-diff and is charged exactly as before. So is one whose
+    isolated re-run fails too — off-diff is a reason to look, never to pass;
+  - only files a harness would recognize as TESTS are re-run (a `lib/` path
+    scraped out of a stack frame handed to `node --test` would exit 0 for
+    having no tests in it), and at most five of them: six files failing at
+    once is a breakage, not a load-sensitive flake;
+  - the isolated run happens inside the SAME prepared tree, before it is torn
+    down and under the same lease, so a pass means "these files pass HERE",
+    never "on some fresh checkout at the same sha". A failure output exceeding
+    the path collection limit cannot certify off-diff isolation. Package or
+    directory entry imports whose targets were not resolved also keep the
+    failure charged, because an entry may load changed source. It sees
+    `SPOR_GATE_ISOLATE=1`;
+  - it is never a laundering step: the whole-suite failure rides the
+    `art-gate-*` fact as evidence, the outcome line names the flake, and the
+    fact carries a `relates-to` edge to the flake issue. The pass is
+    CONDITIONAL on that flake issue landing — a gate fact write is
+    best-effort, so a flake that could be filed nowhere would be a pass over a
+    red suite that nothing records; when the filing fails the failure is
+    charged instead, and the outcome says the isolated run passed and why it
+    was charged anyway. The filings that DID land before one failed still ride
+    that charged fact as `relates-to` edges: each is this run's occurrence of
+    that file's flake, and an issue no fact links to has no provenance and no
+    occurrence to its name. That edge is a DEBT, tracked PER ISSUE on the
+    flake payload itself and discharged only by a landing the pipeline
+    OBSERVED — a write that CREATED the fact, or, when the write door reported
+    the id already occupied (`if_exists: skip` remotely, identical-content
+    adoption locally, neither of which is this markdown landing), a read of
+    that occupant which saw the edge, or an edge written straight onto that
+    occupant. A write door's bare success never discharges it, and neither
+    does the mere presence of a fact id. That read-back answers TWO questions,
+    not one. Is the node under this deterministic id THIS record? Another
+    actor — a resumed pipeline, a second worker, a heal pass — can have
+    written this gate run's fact between the check and the write, and what a
+    race changes under us is the VERDICT, which is what the frontmatter
+    `title:` carries; a title that differs means this markdown did not land,
+    so the verdict is not reported as recorded and the fact is not offered to
+    the rescue as its `derived-from` anchor. (A byte compare is the wrong
+    instrument for the remote half: the server stamps `author`/`authored_via`
+    onto what it stores, and a legitimate earlier incarnation of the same
+    record — one written before a filing landed — differs in body and detail
+    while being the same verdict with a smaller debt.) And which edges are on
+    it, read TYPED: an occurrence is a `relates-to`, so a `mentions` or a
+    `derived-from` pointing at the same issue from the same fact names it
+    without recording an occurrence of it, and counting it would silently lose
+    one from the file's count. An edge the fact could not carry is then paid
+    ONTO that fact, through the idempotent add_edge door, at the moment the
+    debt is known — a PASSING gate and the final refusal have no later fact of
+    that pass to carry it, so a debt deferred there is a debt that sinks. The
+    payment is recorded only from the door's own success. Before the first
+    issue filing, the exact isolated classification and failing evidence are
+    saved as a filing intent. A failed first save writes no graph node; a
+    crash after issue filing resumes that intent without rerunning the suite.
+    The intent is replaced atomically by the exact outcome and judged head in the gate's
+    `gate_progress` evidence entry, bound to the original graph server and
+    tenant (or canonical local nodes directory). A missing or mismatched
+    origin refuses replay and leaves the obligation intact. A failed fact write, edge payment, or
+    receipt save leaves the attempt **interrupted**, with its debt retained.
+    The execution store receives `gate.settled` only after every required edge
+    payment and the complete receipt are confirmed. A bare fact cannot open
+    the completion boundary. Receipt adoption after restart reports the original
+    candidate binding; a later fix replaces the verdict for that gate and rescue
+    pass, retaining historical facts without duplicate stale-head verdicts.
+    Partial payment receipts are stored separately from the original outcome:
+    replay renders exactly the same fact body while paying only missing edges.
+    Removing or renaming a gate with an unpaid evidence entry or filing intent
+    refuses the pipeline before candidate pinning, tests, or fixes. Restore its
+    original declaration and settle the debt before changing that factory.
+    Resume retries that evidence without running commands or spending another
+    fix or rescue cycle. A completed receipt is reused, including across a
+    restart; an edge that landed just before a failed receipt save is recovered
+    by reading the fact. Legacy rescue entries still carry their per-issue
+    discharge state, so they remain resumable without double counting.
+
+    Fresh facts omit occurrence edges from their initial publication. Every
+    occurrence is paid through the guarded edge door, including fresh facts:
+    remotely `POST /v1/nodes/:id/edges/live`, with a `target_guard: live`
+    acknowledgement. An older server returns 404 without mutating the graph.
+    The server tests liveness inside its mutation queue. Local mode refuses
+    fresh payments because its graph writers share no atomic mutation door;
+    the attempt remains interrupted with its evidence intact. Existing local
+    historical receipts can still be acknowledged. A target that
+    settled after selection advances to a live recurrence rung. A historical
+    edge remains paid after its target settles, so replay never manufactures
+    another occurrence on the next rung. The fact's body, head and gate
+    definition must still match; only the known occurrence edges are ignored
+    when reconciling that evidence identity.
+
+  The flake issue is the one node a gate files whose id and body are keyed on
+  the failing FILES rather than on the run — a flake is a property of the
+  file, so the same file flaking on ten dispatches converges on ONE issue
+  instead of ten near-duplicates. The occurrence count is that issue's inbound
+  `relates-to` edges from the gate facts, each of which carries the run, the
+  item and the evidence. It is routed to the factory's `test_lane_profile`,
+  because fixing a flaky test is a test change and must not come from the
+  implementer's lane. The convergence is RECONCILED against settled state
+  rather than taken on the strength of the id: the candidate is read first,
+  and an id occupied by LIVE work is linked (never rewritten — for every other
+  node a gate files an occupied id is a refusal, since adopting a stranger's
+  approval item would pass a gate nobody looked at, but this id is keyed on
+  the failing files and on nothing else, so the occupant is this flake's issue
+  by construction), while an id whose occupant is already RESOLVED or CLOSED
+  advances to a recurrence rung (`…-r2`, `…-r3`) that links back to it — a
+  fresh occurrence hung on a terminal node is no signal at all. A file that
+  has been closed and reopened past every rung is reported unfiled, which
+  charges the failure and gets a person, the right answer for a test that
+  keeps coming back.
+
+  That reconciliation is only as good as the read behind it, so a read that
+  did not HAPPEN settles nothing. "No such node" and "could not look" are
+  different answers (a 404 versus a transport error or a 5xx; ENOENT versus an
+  I/O fault), and an occupant that could not be read is reported unfiled — not
+  written past as if absent, not linked as if live, not climbed over as if
+  settled. The write is not a second chance at that question: its door reports
+  an id that was already occupied as a SUCCESS (`if_exists: skip` remotely,
+  identical-content adoption locally), so believing it would adopt whatever is
+  there unread — which for a resolved occupant is the very thing this
+  reconciliation exists to prevent. A write that created NOTHING therefore
+  sends the id back through the read once and lets the same live / settled /
+  unreadable rule decide. That also covers the check-then-write RACE: two
+  workers tripping over the same flaky file both read the id as free, and the
+  loser's skip is read back rather than reported as a filing.
+
+  Declaring nothing keeps the pre-existing behaviour exactly: with no
+  `isolate` the runner never runs an extra command. What it DOES do for every
+  command gate, declared or not, is put the failing file paths on the charged
+  failure's outcome — flake telemetry aggregatable by file, where before the
+  record said only that `npm test` exited 1.
 
 The suite's environment says what it is judging: `SPOR_GATE_BASE` and
 `SPOR_GATE_HEAD` (the shas), `SPOR_TRUSTED_REF`, `SPOR_GATE_STAGE` (`gate`,
 or `integration` for the candidate suite, where base/head are the target
 ref's tip and the candidate), and `SPOR_GATE_NODE`, beside `CI=1` and
 `SPOR_GATE=<id>` — enough for a script to diff and decide what to run.
+`SPOR_GATE_ISOLATE=1` is set only for an `isolate` re-run, so a suite that
+wants to skip its own setup for a single-file pass can tell the two apart.
 
 Step 3 is belt and braces — step 2 already refuses a branch that touched those
 paths — and that is the point: the guarantee that the suite is the trusted ref's
@@ -1547,7 +1768,7 @@ Code's plan mode) — the
 reviewer reads the implementer's live checkout, so it must not be able to write
 to it, and the posture overrides any write-capable `--sandbox`/
 `--permission-mode` the worker's passthrough carries. A harness with NO
-declared posture — a declared custom harness, by v1 scope — is **refused**
+read-only posture — including a custom harness without `posture: read-only` — is **refused**
 before launch, never run write-capable behind a warning: `--read-only` is a
 promise, and a review gate has to route to a harness that can keep it), with a
 prompt that carries everything the reviewer needs
@@ -3215,9 +3436,14 @@ every inert inbound resolver, a note — INSTEAD of the `resolution` ride-along.
 `spor get` prints a HELD note and, from this box's run journal, whether the
 holding worker is live, gone (**stale** — fail-closed until released or
 resumed, never read as done), or elsewhere. The hold keeps a COMPLETION inert,
-not a person's decision to drop the work: a give-up status (`abandoned`,
-`rejected` — the registry's non-resolving partition) is dead on the status half
-even while held; the local status door ends the execution in the same write,
+not a person's decision to drop the work: a give-up status must be both
+non-resolving for the item's own type and inert for that type (including the
+universal terminal register). Task `abandoned` qualifies; artifact `in-review`
+and `approved` do not. No type borrows another type's non-resolving stages.
+Remote completion reads the live `/v1/schema` partitions and refuses to mutate
+completion when that policy cannot be verified; it never substitutes shipped
+seed assumptions for an organization's override. A give-up status is dead
+on the status half even while held; the local status door ends the execution in the same write,
 and the reconciler withdraws a hold that outlived an abandonment (and retypes
 our edge back, if it stood) — `set_status abandoned` is the person's door out
 of an execution, and the escalation a refusal files names both doors (`spor
@@ -3391,12 +3617,11 @@ path, the run record and the idle-stop that already own them.
   object-store request, so `s3://` and its kin are refused at parse rather than
   at the first publish. `branch` pushes an immutable candidate ref to
   `candidate.remote` (a remote NAME, resolved to its URL at publish; default
-  `origin`); `both` publishes both. Two refusals a parse cannot make — an
-  `https://` store in LOCAL mode, where there is no candidate door, and a
-  `branch` publish with no usable remote — belong at worker startup beside the
-  `gh` capability check `integration.mode: propose` makes: `spor work` runs
-  `candidatePublish.publishSatisfiability` there (§2.4 E9/E14) and refuses to
-  start the worker on a box that cannot publish (see "What runs today" below).
+  `origin`); `both` publishes both. Declaration/mode errors a parse cannot
+  decide, such as `https://` in local mode, are fatal startup checks.
+  Runtime store/remote unavailability is checked per selected item before
+  claim, alongside integration satisfiability, and idles with visible bounded
+  retries rather than stopping the worker (§2.4 E9/E14).
 - **`gates[].rejudge_on_repin`** (command gates only, default true; read only
   under `completion.by: controller`) — the per-gate half of the stage.
   Acceptance is a property of the TIP (§10.12): the completion write asserts
@@ -3405,8 +3630,17 @@ path, the run record and the idle-stop that already own them.
   is re-run on the tip — a suite run, never a dispatch, so it moves no dispatch
   bound. `false` is the explicit opt-out for a suite the
   operator accepts standing on an ancestor. It is not declarable on an
-  agent-review gate at all: a review ALWAYS re-judges a moved tip, which is not
-  an operator's to relax.
+  agent-review or human gate: reviews and approvals always re-judge a moved
+  tip. Under agent completion, commands also keep the default re-judgement.
+  A retained pass keeps its original head and candidate ID; the runner proves
+  that head is an ancestor of the new tip. Unknown ancestry or missing original
+  candidate identity causes a fresh command run. Same-attempt restarts may
+  reuse a saved pass under the exact same pinned factory declaration. A new
+  attempt (re-gate), rescue pass, or changed declaration reruns the command;
+  unpaid flake evidence and filing intents are settled before cache reuse.
+  Attestations preserve `head_consistent: false` for retained ancestor evidence
+  and separately sign `policy_consistent: true`, the explicit pinned opt-out,
+  the original candidate, and the tip for which ancestry was verified.
 - **`completion.by`** (`agent` | `controller`) — `agent` is the shipped
   contract (the implementer writes the resolving edge and flips the status).
   `controller` is §10.13. It defaults to `controller` for a factory whose
@@ -3447,18 +3681,17 @@ floor, because a typo must never read as "no retries", "retry in a second", or
 everything `completion` governs — the execution hold, the `CANDIDATE:`
 submission, the candidate pin and the controller's completion write (§10.12,
 §10.13) — candidate publication (`lib/shell/candidate-publish.js`: `bundle`
-| `branch` | `both`, the `spor work`-startup `publishSatisfiability` refusal
+| `branch` | `both`, the startup configuration and per-item runtime `publishSatisfiability` checks
 above, and the `publish_pending` debt of an outage), `candidate.require_clean`
 (issue-spor-candidate-require-clean-parsed-never-read: the pin itself refuses,
 with its own reason, on a checkout with uncommitted tracked changes — see
 above), and the STAGE RUNNER itself (§10.16: `implementation.profile` routing,
 `budget.attempts`, `retry.attempts`/`backoff_ms`, `budget.run_max_ms`/
 `run_idle_ms`, and the dirty-tree round-trip the stage re-dispatches under
-`require_clean` before the pin ever refuses) are shipped. The one key still
-declared and validated but read by nobody is `rejudge_on_repin` (parsed onto
-the gate; issue-spor-gate-rejudge-on-repin-parsed-never-read). Declaring it
-today is a DECLARATION of intent the runner validates and will honor when that
-item lands; nothing about it changes what a worker does now.
+`require_clean` before the pin ever refuses) are shipped. The gate runner also
+honors command `rejudge_on_repin: false` under controller completion, with the
+retention checks and signed evidence described above. Reviews, human approvals,
+and factories using agent completion continue to judge the current tip.
 
 See test/gates.test.js (the validation table), test/worker-contract.test.js,
 test/candidate.test.js and test/completion-boundary.test.js.
@@ -3725,3 +3958,391 @@ See test/gate-pipeline.test.js ("the implementation stage": every row with a
 fake dispatcher, plus the real doors end to end), test/completion-boundary.
 test.js (the claim-time reservation and budget stamp) and
 test/work-loop.test.js (the per-record ceiling).
+### 10.10 The attestation — a commit-bound, config-checksummed record per run
+
+A gate fact that says only "gate `acceptance` passed" cannot be validated by
+anyone who did not watch it run: nothing in it names the commit it judged, the
+definition that judged it, or whether the commit that later landed is the one
+it judged. Paul Stack's pre-PR verification loop
+(stack72.dev/ai-broke-the-assumptions-behind-ci) and the swamp `verification/`
+reference implementation close exactly that gap — a fresh worktree at the
+verified commit, config checksums, one attestation JSON a CI
+`validate-attestation` job checks (commit == PR head, all steps green, fresh,
+checksums match) instead of re-running the suite. The pipeline now leaves the
+same evidence chain (task-spor-factory-gate-attestation), in four pieces:
+
+1. **Every gate fact is commit-bound.** `gateChangeSet` already reads
+   `head`/`base` from the run's checkout; every `art-gate-*` fact now carries
+   them as `gate_head:`/`gate_base:` frontmatter plus the trusted ref and its
+   own sha (`git rev-parse <trusted_ref>`, which can lead the merge-base) and
+   the branch in the body ("Judged commit: …"). An unreadable change says
+   "Judged commit: unknown" rather than inventing one. The pipeline's result
+   hands the same chain back (`head`, `base`, `trusted_ref`, `trusted_sha`,
+   `branch`) and each step carries the head IT judged. **Every step judges the
+   same head**: a fix cycle that moves the head (it committed) sends the
+   pipeline back to the FIRST gate, and each earlier gate is re-run against the
+   moved head — a gate whose recorded pass already judged the current head
+   stands (a review is never re-dispatched at a head it approved), fix cycles
+   are charged against each gate's cap cumulatively across restarts (so the
+   whole pipeline runs at most the sum of the caps), and the superseded fact
+   stays on the graph under its own id: fact ids are commit-bound too
+   (`gateFactId` folds the judged head into the hash), so gate A at H1 and gate
+   A at H2 are two facts, never one adopting the other. An unreadable change
+   fails EVERY gate kind closed — command, human, and agent-review alike — so
+   no passing fact is ever minted with no head to bind it to.
+2. **Every gate fact is definition-bound.** `parseFactory` attaches
+   `definition` provenance to the parsed factory: a `sha256:` digest of the
+   normalized factory (canonical JSON — sorted keys, no whitespace — so
+   authored key order never changes it) and of each normalized gate — over
+   the RUNTIME-EFFECTIVE definition only: a gate's `source` (inline, or the
+   shareable gate node it was folded in from) is provenance the runner never
+   branches on, so it is stripped before hashing (`effectiveGate`/
+   `effectiveFactory`) and an inline gate and the same gate referenced by id
+   digest identically at both levels, exactly as the runner cannot tell them
+   apart; `source` still rides beside the digest as provenance — and
+   `loadFactoryDefinition` stamps the node **revision** (blob sha) of the
+   factory node and of every referenced gate node beside them
+   (`stampDefinitionRevisions`; an inline gate inherits the factory node's).
+   Each fact's body names both ("Definition: factory `…` rev `…` digest `…`;
+   gate `…` digest `…`"), so a fact says which revision of which rules judged
+   it. A validator recomputes the digest from the graph node with the kernel's
+   own `definitionDigest` (`lib/kernel/gates.js`) and compares.
+3. **Head equality at integration.** The integration stage re-reads the
+   implementer's tree independently; a FIRST read whose head differs from the
+   head the last passing gate judged (`gatedHead`, handed in by
+   `runGateAndIntegration`) REFUSES — settled `failed`, escalated to a person,
+   the item demoted per §10.7 — with no candidate built and nothing pushed.
+   Whatever moved the checkout between the verdict and the landing produced a
+   head no gate has judged. This is deliberately NOT a fix cycle: a fix cycle
+   commits, so it produces a new head by construction and can never restore
+   the equality; only `spor work --regate <run>` can (the refusal names it).
+   The stage's OWN fix cycles (a conflict, a red candidate suite, a failed
+   landing) move the head afterwards by construction, and the same rule holds
+   there: after every fix cycle the stage re-reads the tree and, when the head
+   is no longer `gatedHead`, hands it back to the gate pipeline through
+   `deps.regate` (wired by `runGateAndIntegration` to re-run the REAL pipeline)
+   — only a PASS at exactly that head advances `gatedHead` and lets the
+   rebuilt candidate be judged and landed; a re-gate that fails settles the
+   stage `failed` with the re-gate's own escalation standing in (no second
+   person's item for one refusal), a re-gate that passed at some other head is
+   not a pass for the moved one, and a wiring with no re-gate door fails
+   closed. The `art-merge-*` fact records the head it landed and the head the
+   gates judged ("Integrated commit: `…` (the head the gates judged)") plus the
+   landed sha (`gate_head:`/`landed_sha:` frontmatter).
+4. **One attestation artifact per run** — `art-attest-<stem>-<short-run[-aN]>-
+   <hash>`, deterministic and idempotent like every gate-minted node (a re-gate
+   attests separately by attempt), `relates-to` the work item and every
+   `art-gate-*`/`art-merge-*` fact it summarizes, never `resolves`. Its body
+   carries the attestation as fenced JSON (`schema: spor.attestation/1`):
+   `subject` {node, run, attempt, repo, commit, branch, base, trusted_ref,
+   trusted_sha}, `factory` {id, revision, digest}, `gate` {allPassed, state,
+   head, steps[] with per-step verdict/head/digest/revision/fact/timing},
+   `integration` {mode, strategy, state, target_ref, target_sha, head,
+   gated_head, head_matches_gated, landed_sha, candidate, proposal, timing} or
+   null, `configIntegrity` {factory, gates[], trusted_ref, trusted_sha,
+   protected_paths, protected_paths_count, protected_paths_digest}, `timing`,
+   `environment` {spor_version, worker, host, platform, node, mode}. `gate.allPassed` is true only when every step passed
+   AND every step judged the gated head AND that head is known
+   (`gate.head_consistent` — checked here, not assumed from the runner);
+   `passed` additionally needs the integration (if any) landed or parked with
+   `head_matches_gated` not false. `subject.commit` is the head the STAGE saw
+   when one ran (what would have landed), else the gated head — so a validator
+   comparing it against a PR head sees the truth when they differ. The node
+   body is capped (the REST door's 8KB) but the JSON is NEVER cut: the
+   rendering steps down — pretty, compact, free-text dropped, steps thinned to
+   id/kind/verdict/head/digest/fact (`abridged` says so), fewer linked edges,
+   and at the floor every list (steps, gates, protected paths) REMOVED —
+   never left as an empty list beside a nonzero count, which the validator
+   refuses as a disagreement — and replaced by
+   its count — so every rung is whole JSON carrying what a validator checks;
+   the full object still rides the run's in-process result. The floor is
+   bounded by construction (ids, shas, digests, counts — no list rides the
+   bound core, see below) and it is MEASURED, not assumed: a rendering that
+   still does not fit is refused as a build error, and an attestation that
+   could not be built or recorded is stamped on the run record
+   (`gate_attestation_missing`, `gate_attestation_error`) through the
+   settler's own door, never lost behind a log line. OWNERSHIP comes before
+   the first gate: `claimGateRecord` mints the run's ownership nonce
+   (`gate_settle_id`) under the record lock BEFORE the pipeline runs — a
+   record another pipeline already settled, or one a still-live worker is
+   gating, refuses the claim and the worker runs NOTHING for it (no fact, no
+   escalation, no demotion, no attestation; its result carries `not_run` and
+   `superseded` with the record's own verdict), while a dead owner's record is
+   taken over, which is what orphan resumption is — so two adopters of one
+   orphan can never both mutate the graph and leave the loser's escalation or
+   demotion standing against the winner's verdict. ORDER: the run record is settled FIRST
+   (`gate_state` and the verdict fields, read-back verified) and the
+   attestation node written second, so no window holds a graph artifact
+   claiming a verdict the record does not. The evidence fields (`gate_head`,
+   `gate_base`, `gate_trusted_sha`, `gate_factory_digest`, `gate_landed_sha`)
+   ride IN that settle stamp — one write, one writer — through the claim's
+   own door (`own: <gate_settle_id>`: a re-gate or another owner in between
+   re-opened the record, and the settle does not land) — and the settle is a
+   **locked compare-and-swap**, not a read-modify-rename: `stampGateState`
+   takes a per-record `<record>.lock` (O_EXCL; a lock older than 30s is a
+   dead writer's corpse and is broken; a lock that cannot be taken within the
+   bounded wait is a stamp that did NOT land) around the read-guard-write, and
+   returns the record READ BACK FROM DISK after its write — never the
+   in-memory merge — so two pipelines for one run cannot both pass the
+   unsettled guard and both believe they own the verdict. The settle keeps
+   the claim's `gate_settle_id` (a random nonce — two settlers in the same
+   millisecond cannot share it the way they could share `gate_at`; a record
+   that had none to claim gets a fresh one at settle time) and
+   reports whether it LANDED by that id: when the guard yielded to an earlier
+   writer (a duplicate pipeline for the same run — a resumed orphan, a second
+   adopter — settled first), this pipeline's verdict is not the record's, so
+   it writes NO attestation and touches NO evidence field (its result carries
+   `superseded: true` plus `settled` — the record's own verdict, head,
+   attestation and worker — and the log names the winner; the work loop then
+   PUBLISHES the record's verdict on `--status`, keeps the loser's under
+   `superseded_verdict`, stamps nothing for it, and cools the node by the
+   record's verdict). `gate_attestation` is stamped afterwards through the
+   settler's OWN door (`stampGateState`'s `own: <gate_settle_id>` — lands only
+   while the record still holds this pipeline's settle id, falling back to
+   `gate_at` only for a record settled without one; `force` stays
+   `--regate`'s door alone), so the graph and the record can never describe
+   two verdicts or two heads for one run.
+   Read back by `spor runs` ("gated head:", "attested:" — or "attested:
+   MISSING — <reason>" from `gate_attestation_missing`/`_error`, and
+   "proposal: PR body carries a STALE attestation" from
+   `gate_proposal_attestation_stale`) and `spor work --status` (whose
+   `gate_head` is the GATED head, not the stage's, and whose entries carry
+   `attestation_missing`/`attestation_error`/`proposal_attestation_stale`/
+   `proposal_attestation_error` for both a settled and a superseded
+   pipeline). And every
+   gate-minted node — fact, escalation, approval, attestation — is written
+   `if_exists: skip` in BOTH modes with the same rule: a skip means the id
+   exists, not that this write landed, so the existing node is read back and
+   compared (frontmatter minus the server's own stamps and the day, plus the
+   body); a different node under the same id is refused, never adopted as
+   this run's evidence. Fail-soft like every fact write: the verdict is the
+   enforcement, the attestation is its record.
+
+**Every attestation is BOUND: a digest, and a signature when the pipeline holds
+a key.** A PR body is mutable text its author can edit, so the JSON in it is
+not evidence by itself. `bindAttestation` stamps `digest` — sha256 over the
+canonical JSON of the attestation's bound core: subject, factory, per-step
+verdicts/heads/digests (through `gate.steps_digest`), the config lists
+(through `configIntegrity.gates_digest`, and the protected paths through
+`protected_paths_count`/`protected_paths_digest` — a count and a digest, never
+the list, so a factory protecting hundreds of globs neither overflows the
+node nor escapes the binding), the integration stage's bound
+fields — mode, strategy, state, target ref and sha, head, gated head, landed
+sha, the **candidate-suite evidence** (`candidate` {base, sha, suite,
+command}: a validator trusting a propose-mode PR is trusting "merge(target,
+head) was green under <command>", so that block is as tamper-evident as the
+verdicts) and the proposal's identity (`proposal` {number, repo, branch,
+url}) — `passed`, `issued_at`, the artifact
+`id`; free text and the box's host/worker are outside it, so the core survives
+every rung of the node-body ladder including the floor that elides the lists —
+and, when `attestation.signingKey` (`SPOR_ATTESTATION_KEY`; a secret, so
+stripped from a committable repo `.spor.json` — env, user or global config
+only; `attestation.keyId` names it) is configured, `signature`
+{alg: hmac-sha256, key_id, value} over those same bytes. Two trust anchors
+follow: the GRAPH ARTIFACT the runner wrote — a copy is genuine only if its
+`digest` equals the artifact's, AND the artifact is checked as an attestation
+in its own right (its digest recomputes from its own content; under a key its
+signature verifies) AND its server-stamped provenance shows the judged code
+could not have written it: a dispatched agent holds graph-write authority
+(its agent-scoped token), so without a key a graph copy the server stamped
+`authored_by_agent`, or one read from a LOCAL graph (a directory on the box
+the implementer ran on), or one whose provenance is unknown, is NO anchor
+(`anchor` fails) — and the shared key, for a CI that cannot reach the graph
+or whose runner writes the graph under an agent identity. `spor attestation
+verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--max-age <dur>]
+[--factory <id>|--factory-digest <d>] [--require-signature] [--no-graph]` is
+the validator (`verifyAttestation`, every check fail-closed, exit 1 on any
+failure): schema, digest recomputation, signature (a key on the box and no
+signature is a failure), the graph binding (fetches `art-attest-*` by id;
+missing/unreadable fails unless `--no-graph` is passed deliberately),
+`passed`, **the evidence beneath it** (`verdicts`: `gate.allPassed`,
+`gate.state`, `gate.head_consistent`, every listed step passed AT the gated
+head — the list's length agreeing with `steps_count` — and, where a stage ran,
+a state the attestation may vouch for, `head_matches_gated`, the stage head
+equal to the gated head, and the candidate suite `passed`; a copy whose flag
+says passed over explicitly failed evidence is refused whatever bound it),
+commit equality, **the target binding** (`--target <sha>`: the tip the
+candidate was merged with — `integration.candidate.base`, else the stage's
+`target_sha`, else for a stage-less run `subject.trusted_sha` — must equal
+it, so an attestation over merge(old tip, head) goes stale when the base
+advances and one made for another base is not reusable against this one;
+`--target-ref <ref>`: the stage's `target_ref` names it, a short name
+matching the remote-tracking spelling), freshness, and the factory digest AS
+IT STANDS (`--factory` loads it through the worker's own loader). The digest
+alone is never a pass: whoever edits the body recomputes it, so a verification with
+NEITHER anchor — no key on the box and no graph copy — fails (`anchor`), and
+`--no-graph`, which drops the artifact, therefore REQUIRES a verified
+signature: it implies `--require-signature`, and on a box with no key
+configured it is refused outright rather than passed on a self-authored
+digest.
+
+A change read that fails AFTER a fix cycle (the tree moved and the re-read
+could not say where to) leaves the judged commit UNKNOWN — the fact says so
+and the chain carries no head — never the pre-fix head standing in as what
+was judged.
+
+`issued_at` is DERIVED from the judgement — the moment the last gate step (or
+the integration stage) finished — never minted from the clock: the id is
+stable per run and the node is written `if_exists: skip` with a read-back
+comparison, so an attestation rebuilt from the same results (a retried write,
+a resumed pipeline) must reproduce the same bytes rather than collide with
+its own earlier copy. The clock is the fallback only for a result carrying no
+timestamps.
+
+**The judged code never sees the judge's credentials.** A command gate's
+suite and the integration candidate's suite are the judged repository's own
+code running on the judge's box, so `runGateCommand` scrubs the attestation
+signing key and every graph credential (`SPOR_ATTESTATION_KEY`,
+`SPOR_TOKEN`/`SUBSTRATE_TOKEN`, refresh/admin tokens — `scrubSecretEnv`, one
+list) from the inherited environment AND from the tree's declared setup env
+before spawning; otherwise a branch could sign its own forged attestation or
+write the `art-attest-*` anchor as the runner. Unrelated keys the suite needs
+are left alone. The same holds one level up and one level down. UP: the
+dispatched implementer never inherits the judge's secrets either — the
+supervisor strips `SPOR_ATTESTATION_KEY`, `SPOR_ADMIN_TOKEN` and
+`SPOR_REFRESH_TOKEN` — under their legacy `SUBSTRATE_*` spellings too, which
+the config cascade dual-reads (`JUDGE_ONLY_ENV`, agent-dispatch-runner.js) —
+from every harness child, whatever the harness, on top of the agent-scoped
+token that replaces the person's graph bearer. SIDEWAYS: the repo's
+`dispatch.worktreeSetup`/`worktreeTeardown` hooks are resolved from the
+tree's own checkout — the commit under judgement — and run under the same
+`judgeGitEnv` as the judge's git (secrets scrubbed, hooks off), for every
+tree role, so candidate-controlled staging code never sees the key or a
+graph credential before the scrubbed suite does. DOWN: every git call the JUDGE makes over
+the judged tree (`git worktree add`, the protected-path checkout, the
+candidate merge/rebase) runs under `judgeGitEnv` — the same secret scrub plus
+every git HOOK disabled, `core.hooksPath` forced through git's env-config door
+to a path no hook can live under (`/dev/null/…` on POSIX; a fresh private
+empty directory on Windows) — because a commit can point `core.hooksPath` at
+a tracked directory and a `post-checkout` in the change under judgement would
+otherwise run as the judge before a single gate had looked at it.
+
+**The trusted tree is pinned once.** `gateChangeSet` resolves
+`trusted_sha` and REFUSES when the ref does not resolve; `prepareGateTree`
+and the integration candidate's protected-path restore then force from that
+sha, never from the symbolic ref — so a ref that advances between the read
+and the restore cannot put a different suite in the tree than the fact
+names. The candidate block carries the sha it was forced from
+(`candidate.trusted_sha`, inside the bound core).
+
+**Every whole-record writer takes the record lock.** The settle is a locked
+compare-and-swap, but the two in-process writers that rewrite the WHOLE run
+record from memory (`updateRun`, the supervisor's `update`) carried the
+on-disk `gate_*` fields OUTSIDE that lock — a settle landing between their
+read and their rename was renamed over, erasing a verdict and attestation the
+settler's read-back had verified. They, `closeRun` and `mergeTerminalOutcome`
+now do their read-carry-write under the same per-record lock
+(`writeRecordCarryingGate`), and NONE of them has an unlocked fallback: a
+write that cannot take the lock does not happen (`null`, or a throw the
+caller's own fail-soft handling absorbs — the supervisor keeps its in-memory
+record and carries the patch on its next update). The lock's bounded wait
+OUTLASTS the stale window (`RECORD_LOCK_ATTEMPTS × RECORD_LOCK_WAIT_MS` >
+`RECORD_LOCK_STALE_MS`), so a settler that died holding it costs a wait,
+never a write. Breaking a corpse is OWNERSHIP-SAFE: a breaker never unlinks
+the lock path (two waiters unlinking one stale lock let the second remove
+the first's fresh lock — two holders); it RENAMES the corpse to a name only
+it knows (one breaker wins), judges the file it actually took, deletes it if
+stale and hands it back (a hard link, never replacing a lock taken in the
+meantime) if it turned out live. The rename leaves the lock path empty for a
+moment, so the break runs under a BREAKER LOCK (`<lock>.break`, one breaker
+at a time, held until the moved lock is back at its path or deleted) and an
+acquirer whose O_EXCL open succeeds while that breaker lock exists does not
+hold — it releases what it took and goes round again — so a lock opened in
+the break window never becomes a second holder beside the live one whose
+lock was moved aside. Release is checked: the holder wrote a random token
+into its lock and removes the lock path only while that token is still what
+it holds.
+
+**In `propose` mode the PR body carries the attestation — or there is no PR.**
+A body that cannot be built (the attestation object throws, or renders
+empty) is a FAILED proposal, routed like any other stage failure (§10.9),
+never a PR opened with a generic description: the attestation-bearing body
+is the contract a PR-policy repo's CI validates, and a PR without it would
+pass through that repo's merge queue with nothing to check. `proposeIntegrationPR`
+writes `renderPrBody`'s text — the step list, the candidate suite that just
+passed on merge(target, head), the artifact id and digest it is bound to, the
+rule that the text alone is not evidence, and the JSON between
+`<!-- spor-attestation:begin -->`/`<!-- spor-attestation:end -->` markers
+(`extractPrAttestation` is the reader). It is built at PROPOSE time, bound to
+the head being proposed, with `integration.state: "proposing"` and
+`integration.candidate` {base, sha, suite, command, trusted_sha} — and it is
+a PASSING attestation as it stands (`proposing` is a state the builder vouches
+for when every gate passed at that head and the candidate suite is green; the
+proposal's identity is the one thing it cannot yet carry), signed when a key
+is held, so a validator triggered on PR creation checks it by SIGNATURE and
+passes rather than failing for good on a body the runner only repairs later;
+the body says so. A reused PR gets its body
+refreshed (`gh pr edit`), and that refresh is NOT best-effort — a PR
+re-proposed at a new head but still describing the old head's verdicts is
+stale evidence under a "success", so a failed edit is a failed proposal (fix
+cycle, then a person) with gh's reason verbatim. Because the graph artifact is
+minted only after the run SETTLES, the propose-time body predates it; once the
+run is settled and attested, `refreshProposalAttestation` replaces the PR body
+with the final, digest-bound copy the graph holds (the copy a validator
+compares against). A refresh that fails is logged loudly and stamped on the
+record (`gate_proposal_attestation_stale`, `gate_proposal_attestation_error`,
+through the settler's own door) — never reported as success; a validator
+comparing the stale body to the artifact refuses on the digest mismatch anyway.
+A repo's CI can then run `spor attestation verify --pr-body … --commit <PR
+head> --target <base tip> --target-ref <base> --max-age 24h --factory <id>` —
+instead of re-running the suite (a validator comparing against the graph
+artifact runs on the post-settle body edit, or re-runs; the creation-time
+body verifies by signature). Making
+any particular repo's CI do so is that repo's work, not the runner's; this is
+what makes `propose` mode worth adopting for a PR-policy team.
+
+See test/attestation.test.js, the provenance assertions in
+test/gate-pipeline.test.js and test/gates.test.js, and the head-equality tests
+plus the local end-to-end attestation check in test/integration-step.test.js.
+
+
+### Attestation settlement recovery and ownership (2026-09 repair)
+
+The run-record claim precedes every pipeline mutation. The work loop does not
+pre-stamp `gate_worker`: a losing adopter must not overwrite the live owner's
+nonce before the claim check. Proposal pushes and trusted-ref re-gate merges disable repository hooks.
+Native and supervised judged children both strip
+`SPOR_ATTESTATION_KEY` and `SUBSTRATE_ATTESTATION_KEY` from their environments.
+
+Settlement atomically writes the verdict and `gate_attestation_pending`, an
+outbox containing the exact artifact bytes and signature (never the signing
+key). `gate_attestation_missing` remains true until publication succeeds.
+Subsequent worker passes replay this debt without rerunning the gates or
+resigning evidence. Replay requires the original server and effective
+credential fingerprint, or the canonical local nodes directory. The raw token
+is never stored. A conflicting JWT organization refuses the binding; opaque
+tokens bind by fingerprint rather than stored tenant metadata. Publication
+freezes that exact bearer/server and disables automatic token refresh, so an
+environment override or credential rotation cannot redirect pending evidence.
+Changed or unknown credentials leave the debt owed for manual reconciliation. An old outbox without an origin binding
+is retained for manual reconciliation and is never published through an ambient
+graph selection. A parked proposal retains its debt until its PR body is
+refreshed successfully. Pending debt prevents run retention from pruning the
+record. Gate, implementation, completion, native/contract settlement and final
+run bookkeeping all share the same record lock, including their read/merge.
+The launcher also merges its post-spawn PID stamp through this lock: a paused
+launcher cannot restore its original record over a completed supervisor or
+subsequent re-gate.
+
+A re-gate publishes its PID and process start ticks before atomically reopening
+the prior verdict. Reopening refuses while the prior judgement still owes an
+attestation outbox; replay that evidence through its original graph first.
+Other workers therefore recognize its live ownership. Its
+final bookkeeping and recovery mutations retain the same ownership nonce; a
+losing re-gate cannot overwrite the successor. Human approval requests name
+and key their identity on the exact judged commit, so a fix that changes the
+candidate requires a fresh approval even when its risk paths stay unchanged.
+
+A stale breaker lock is deliberately fail-closed: age alone cannot authorize
+unlinking its pathname because that pathname may already name a live successor.
+If a worker dies while holding `<run-record>.lock.break`, stop all writers of
+that run record before removing that abandoned breaker and resuming work.
+Ordinary stale record locks still use the serialized rename-and-recheck path;
+no observer automatically removes an abandoned breaker lock.
+
+PR refresh first reads the current body and replaces only Spor's managed
+`spor-proposal` block (or the legacy `spor-attestation` block). Human text and
+other automation outside that block survive byte-for-byte. Ambiguous or
+unterminated markers refuse the update. GitHub provides no compare-and-swap
+operation for this body edit, so truly concurrent external edits between the
+read and update remain an API limitation.

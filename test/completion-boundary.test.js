@@ -136,8 +136,8 @@ test("hold, the person's door: an item ABANDONED under the hold is dead on the s
   const g = t.load();
   assert.equal(queue.isLive(g.nodes["task-up"], g.supersededBy, g), false);
   assert.ok(rankQueue(g, { now: NOW }).items.find((i) => i.id === "task-down"), "task-down is released by the abandonment");
-  assert.equal(resolution.isGiveUpStatus("rejected"), true);
-  assert.equal(resolution.isGiveUpStatus("done"), false);
+  assert.equal(resolution.isGiveUpStatus("rejected", "decision", { registry: graphLib.seedRegistry() }), true);
+  assert.equal(resolution.isGiveUpStatus("done", "task", { registry: graphLib.seedRegistry() }), false);
   const fg = fakeGraph({ status: "abandoned" });
   fg.rec.gates_state = "failed";
   const res = await shell.reconcileCompletion({ record: fg.rec, deps: fg.deps });
@@ -965,4 +965,85 @@ test("claimExecutionHold reserves implementation attempt 1 on the record's creat
   assert.equal(held3.ok, true);
   assert.equal(held3.recordFields.impl_attempts.length, 1, "the boundary alone still reserves the attempt — the ledger is the record's shape under controller completion");
   assert.equal(held3.recordFields.impl_budget, undefined);
+});
+
+// A resolver's own review stage is not an owner's decision to give up.
+test("give-up is type-aware, requires inert status, and never borrows another type's declaration", async () => {
+  const t = tmpGraph(Object.fromEntries([
+    node("art-review", "artifact", { status: "in-review", extra: "execution: exec-1\n" }),
+    node("art-approved", "artifact", { status: "approved", extra: "execution: exec-1\n" }),
+    node("task-gone", "task", { status: "abandoned", extra: "execution: exec-1\n" }),
+  ]));
+  const g = t.load();
+  for (const id of ["art-review", "art-approved"]) {
+    const n = g.nodes[id];
+    assert.equal(resolution.isGiveUpStatus(n.status, n.type, g), false);
+    assert.equal(queue.isLive(n, g.supersededBy, g), true);
+    assert.equal((await spor.completionReadItem(localCfg(t.dir), id)).giveUp, false);
+  }
+  assert.equal(resolution.isGiveUpStatus("abandoned", "task", g), true);
+  assert.equal(resolution.isGiveUpStatus("abandoned", "artifact", g), false);
+  assert.equal(resolution.isGiveUpStatus("rejected", "task", g), false);
+  assert.equal(resolution.isGiveUpStatus("abandoned", null, g), false);
+  assert.throws(() => resolution.isGiveUpStatus("abandoned", g), /type.*string/);
+  assert.deepEqual([...g.registry.nonResolvingStatuses("artifact")].sort(), ["approved", "in-review"]);
+  assert.ok(g.registry.nonResolvingStatuses().has("abandoned"), "resolver-side global union remains compatible");
+});
+
+test("organization give-up partitions govern local queue, completion and status writes", async () => {
+  const issueSchema = `---\nid: schema-issue\ntype: schema\nkind: node-schema\nschema_version: 2026.09.06.9\ntitle: Custom issue lifecycle\nsummary: An organization can decline an issue.\ndate: 2026-09-06\n---\n\n\`\`\`json\n${JSON.stringify({ node_type: "issue", prefix: ["issue-"], queueable: true, status: { non_resolving: ["declined", "reviewing"], terminal: ["declined"], vocabulary: ["open", "resolved", "declined", "reviewing"] } })}\n\`\`\`\n`;
+  const t = tmpGraph(Object.fromEntries([
+    ["schema-issue.md", issueSchema],
+    node("issue-x", "issue", { status: "reviewing", extra: "execution: exec-1\n" }),
+    node("task-x", "task", { status: "declined", extra: "execution: exec-2\n" }),
+  ]));
+  let g = t.load();
+  assert.equal(resolution.isGiveUpStatus("declined", "issue", g), true);
+  assert.equal(resolution.isGiveUpStatus("reviewing", "issue", g), false);
+  assert.equal(resolution.isGiveUpStatus("declined", "task", g), false);
+  assert.equal((await spor.completionReadItem(localCfg(t.dir), "issue-x")).giveUp, false);
+  const changed = spor.setStatusLocal(localCfg(t.dir), "issue-x", "declined");
+  assert.equal(changed.ok, true, changed.reason);
+  g = t.load();
+  assert.equal(g.nodes["issue-x"].execution, undefined);
+  assert.equal(queue.isLive(g.nodes["issue-x"], g.supersededBy, g), false);
+  assert.equal((await spor.completionReadItem(localCfg(t.dir), "issue-x")).giveUp, true);
+});
+
+test("remote completion reads authoritative organization status partitions and refuses unavailable policy", async (t) => {
+  const http = require("node:http");
+  const snapshot = graphLib.seedRegistry().snapshot();
+  const custom = snapshot.node_types.find((n) => n.type === "issue");
+  custom.non_resolving = ["declined", "reviewing"]; custom.terminal = ["declined"]; custom.inert = ["declined"];
+  let status = "declined", type = "issue", schemaMode = "okay", explicitInert;
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    requests.push(req.method + " " + req.url);
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/v1/schema") {
+      if (schemaMode === "unavailable") { res.statusCode = 503; res.end(JSON.stringify({ error: "unavailable" })); return; }
+      if (schemaMode === "old") { res.statusCode = 404; res.end("{}"); return; }
+      if (schemaMode === "malformed") { res.end("{}"); return; }
+      res.end(JSON.stringify(snapshot)); return;
+    }
+    res.end(JSON.stringify({ raw: node("issue-x", type, { status, extra: "execution: exec-1\n" })[1], revision: "rev-a", ...(explicitInert === undefined ? {} : { inert: explicitInert }) }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const cfg = { mode: () => "remote", server: () => `http://127.0.0.1:${server.address().port}`, token: () => "test-token", tenant: () => null };
+  let item = await spor.completionReadItem(cfg, "issue-x");
+  assert.equal(item.ok, true); assert.equal(item.giveUp, true); assert.equal(item.terminal, true);
+  status = "reviewing";
+  item = await spor.completionReadItem(cfg, "issue-x");
+  assert.equal(item.giveUp, false); assert.equal(item.terminal, false);
+  status = "declined"; type = "task";
+  assert.equal((await spor.completionReadItem(cfg, "issue-x")).giveUp, false, "other types do not borrow the issue's give-up status");
+  status = "abandoned"; explicitInert = false;
+  item = await spor.completionReadItem(cfg, "issue-x");
+  assert.equal(item.terminal, false); assert.equal(item.giveUp, false, "authoritative false is not overwritten by a local heuristic");
+  for (schemaMode of ["unavailable", "old", "malformed"]) {
+    item = await spor.completionReadItem(cfg, "issue-x");
+    assert.equal(item.ok, false); assert.match(item.reason, /live status policy could not be read/);
+  }
+  assert.ok(requests.every((r) => r.startsWith("GET ")), "policy uncertainty never mutates the hold");
 });

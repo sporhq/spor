@@ -3952,3 +3952,18 @@ test("dispatch <node-id> (remote): no readiness signal at all is byte-identical 
     srv.close();
   }
 });
+
+
+test("native background judged child never inherits either attestation signing-key alias", () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const outfile = path.join(home, "native-env.json");
+  const stub = writeSpawnableNodeStub(home, "native-env", `require("node:fs").writeFileSync(process.env.OUTFILE, JSON.stringify({
+    key: process.env.SPOR_ATTESTATION_KEY || null, legacy: process.env.SUBSTRATE_ATTESTATION_KEY || null,
+    keep: process.env.KEEP_NATIVE_FIXTURE || null
+  }));`);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { ...NATIVE_BG, SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outfile,
+    SPOR_ATTESTATION_KEY: "judge-secret", SUBSTRATE_ATTESTATION_KEY: "legacy-secret", KEEP_NATIVE_FIXTURE: "ordinary-setting" });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(outfile)), { key: null, legacy: null, keep: "ordinary-setting" });
+});

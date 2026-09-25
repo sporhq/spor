@@ -54,6 +54,19 @@ Keys by kind:
   deliberately no way to name a ref or a protected path here: those are the
   FACTORY's, so one shared gate cannot quietly relax another team's trusted
   boundary.
+  Optionally `isolate` — a command template
+  carrying a `{files}` token (`node --test {files}`) — which, when a failure
+  names only files the change does NOT touch, re-runs those test files alone
+  on that same tree: passing there makes the whole-suite failure an off-diff
+  FLAKE, so the gate passes and each failing file is filed as its own
+  convergent `issue-flake-*` instead of costing a fix cycle, a rescue or a
+  person. Off-diff is a reason
+  to look, never to pass, and the bar is deliberately high: every failed run
+  must have named only files off the diff, those tests must REFERENCE nothing
+  the change edits (they are read to check), and they must pass alone. A
+  failure that names or references a changed file, one that fails alone too,
+  and one the runner could not read enough to judge are all charged exactly
+  as before.
 - **agent-review** — `profile` (required: the review lane, cross-model by
   convention; the machine's declared binding decides what that actually
   executes), `instructions`, `await_ms`, and `risk`. The reviewer answers with a
@@ -69,8 +82,8 @@ reads exactly like one that passed.
 
 `cycles` is common to all three: how many implementer fix cycles a failure gets
 before the runner escalates to a human queue item. Reruns come BEFORE fix
-cycles: a command gate spends its `reruns` budget on one tree first, and only
-a suite that failed every run is charged a cycle.
+cycles: a command gate spends its `reruns` budget on one tree first, then its
+`isolate` pass, and only a suite still failing after both is charged a cycle.
 
 `resolution` (2026.09.06.1, issue-spor-offline-check-get-hook-resolution-proxy):
 the attestation path for this type's completion, DECLARED as registry data.

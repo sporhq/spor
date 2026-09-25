@@ -26,6 +26,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync, execFileSync } = require("node:child_process");
+const http = require("node:http");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const gates = require("../lib/kernel/gates.js");
@@ -54,7 +55,7 @@ const BASE = {
 // what the graph accepts. Every write is captured so the tests can assert on
 // the FACTS, which is the deliverable, not just on the verdict.
 function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok: true }), review = () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }), fix = () => ({ ok: true }), approval = () => ({ state: "approved", by: "person-a" }), demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }), writes = null, pools = null, savePools = null } = {}) {
-  const seen = { facts: [], lane: [], human: [], escalations: [], demotions: [], suites: [], reviews: [], fixes: [], approvals: 0, slept: 0, reads: 0, pools: pools ? { ...pools } : null, poolSaves: 0 };
+  const seen = { facts: [], lane: [], human: [], escalations: [], demotions: [], suites: [], reviews: [], fixes: [], approvals: 0, slept: 0, reads: 0, pools: pools ? { ...pools } : null, flakes: [], poolSaves: 0 };
   let clock = 1_700_000_000_000;
   const deps = {
     now: () => clock,
@@ -67,10 +68,12 @@ function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok:
     changedPaths: async () => {
       seen.reads += 1;
       if (changedSeq) return changedSeq[Math.min(seen.reads - 1, changedSeq.length - 1)];
-      return changed === null ? { ok: false, reason: "unreadable tree" } : { ok: true, paths: changed };
+      return changed === null ? { ok: false, reason: "unreadable tree" } : { ok: true, paths: changed, head: "headsha0000000000000000000000000000000001", base: "basesha0000000000000000000000000000000002", trustedRef: "main", trustedSha: "trustsha000000000000000000000000000000003", branch: "task-demo" };
     },
     runSuite: async (args) => {
-      seen.suites.push(args.gate.id);
+      // `args.command` is the isolation pass's override — absent for the
+      // declared suite and its reruns (see the off-diff flake tests).
+      seen.suites.push(args.command || args.gate.id);
       return suite(args, seen);
     },
     review: async (args) => {
@@ -88,6 +91,10 @@ function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok:
     fileTestLaneItem: async (args) => {
       seen.lane.push(args);
       return { ok: true, id: "task-test-lane-x" };
+    },
+    fileFlakeItem: async (args) => {
+      seen.flakes.push(args);
+      return { ok: true, id: "issue-flake-x" };
     },
     fileHumanItem: async (args) => {
       seen.human.push(args);
@@ -163,6 +170,39 @@ test("a passing pipeline runs its gates IN ORDER and records a graph fact for ea
   }
   assert.strictEqual(new Set(seen.facts.map((f) => f.id)).size, 3, "one distinct fact per gate");
   assert.strictEqual(seen.human.length, 0, "an unarmed human gate files nothing");
+
+  // task-spor-factory-gate-attestation: every fact is commit-bound and
+  // definition-bound, and the pipeline hands the chain back for the run record.
+  for (const f of seen.facts) {
+    assert.match(f.markdown, /^gate_head: headsha0000000000000000000000000000000001$/m, "the fact names the head it judged");
+    assert.match(f.markdown, /^gate_base: basesha0000000000000000000000000000000002$/m);
+    assert.match(f.markdown, /trusted ref `main` at `trustsha000000000000000000000000000000003`/);
+    assert.match(f.markdown, /on branch `task-demo`/);
+    assert.match(f.markdown, new RegExp(`Definition: factory \\\`factory-test\\\` digest \\\`${factory.definition.factory.digest}\\\``), "the fact names the definition that judged it");
+  }
+  assert.match(seen.facts[0].markdown, new RegExp(`gate \\\`acceptance\\\` digest \\\`${factory.definition.gates[0].digest}\\\``));
+  assert.strictEqual(res.head, "headsha0000000000000000000000000000000001");
+  assert.strictEqual(res.base, "basesha0000000000000000000000000000000002");
+  assert.strictEqual(res.trusted_ref, "main");
+  assert.strictEqual(res.trusted_sha, "trustsha000000000000000000000000000000003");
+  assert.strictEqual(res.branch, "task-demo");
+  assert.strictEqual(res.definition.factory.digest, factory.definition.factory.digest);
+  for (const g of res.gates) {
+    assert.strictEqual(g.head, "headsha0000000000000000000000000000000001", "each step records the head it judged");
+    assert.match(g.digest, /^sha256:/);
+    assert.match(g.started_at, /^\d{4}-\d{2}-\d{2}T/);
+    assert.ok(g.duration_ms >= 0);
+  }
+});
+
+test("a fact for an UNREADABLE change says so rather than inventing a head, and the chain reads null", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps, seen } = fakes({ changed: null });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.head, null);
+  assert.doesNotMatch(seen.facts[0].markdown, /^gate_head:/m);
+  assert.match(seen.facts[0].markdown, /Judged commit: unknown/);
 });
 
 test("a REFERENCED shareable gate node runs exactly like the same gate written inline", async () => {
@@ -982,7 +1022,7 @@ test("a failed escalation leaves a replayable retry payload — gate id, attempt
   // retry can write its closing artifact over the node that says "no
   // escalation could be filed" (task-spor-escalation-retry-closing-artifact-
   // and-integration-settle).
-  assert.strictEqual(res.escalation_retry.factId, gateRunner.gateFactId("acceptance", ITEM.node_id, ITEM.run_id, 3, 0));
+  assert.strictEqual(res.escalation_retry.factId, gateRunner.gateFactId("acceptance", ITEM.node_id, ITEM.run_id, 3, 0, "headsha0000000000000000000000000000000001"));
   assert.ok(res.facts.includes(res.escalation_retry.factId), "it names the fact this refusal recorded");
 });
 
@@ -1107,6 +1147,12 @@ test("gateChangeSet reads the committed change against the trusted ref, and refu
   assert.strictEqual(change.ok, true, change.reason);
   assert.deepStrictEqual(change.paths.sort(), ["lib/add.js", "test/acceptance.js"]);
   assert.strictEqual(change.head, git(dir, "rev-parse", "HEAD").trim());
+  // The evidence chain (task-spor-factory-gate-attestation): the trusted ref's
+  // own tip and the branch name ride along with the merge-base.
+  assert.strictEqual(change.trustedRef, "main");
+  assert.strictEqual(change.trustedSha, git(dir, "rev-parse", "main").trim());
+  assert.strictEqual(change.branch, git(dir, "rev-parse", "--abbrev-ref", "HEAD").trim());
+  assert.notStrictEqual(change.branch, "HEAD");
 
   fs.writeFileSync(path.join(dir, "lib", "add.js"), "module.exports = () => 0;\n");
   const dirty = gateRunner.gateChangeSet({ cwd: dir }, "main");
@@ -1498,7 +1544,7 @@ test("orphanedGateRuns joins the dead workers' slots to the run journal, and no 
   for (const gate_state of ["passed", "failed", "blocked"]) {
     assert.deepStrictEqual(workLoop.orphanedGateRuns([dead()], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state }]]) }), []);
   }
-  for (const gate_state of ["running", "interrupted"]) {
+  for (const gate_state of ["interrupted"]) {
     assert.strictEqual(workLoop.orphanedGateRuns([dead()], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state }]]) }).length, 1, gate_state);
   }
 
@@ -1735,7 +1781,7 @@ test("a worker RESUMES an unfinished gate pipeline before taking new work, and s
   h.deps.markGate = (runId, patch) => marks.push({ run_id: runId, ...patch });
   // The real scan stops offering a run once a LIVE worker stamps it `running`.
   h.deps.pendingGates = async () =>
-    marks.some((m) => m.gate_state === "running") ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
+    marks.some((m) => m.gate_state) ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
 
   const status = await workLoop.runWorkLoop({ opts: { workerId: "w2", concurrency: 1, intervalMs: 1000 }, deps: h.deps, control: h.control });
   assert.strictEqual(h.state.gateCalls.length, 1, "the abandoned pipeline is picked up, not left standing forever");
@@ -1745,7 +1791,7 @@ test("a worker RESUMES an unfinished gate pipeline before taking new work, and s
   assert.strictEqual(status.recent[0].node_id, "task-orphan");
   assert.strictEqual(status.recent[0].gate, "failed", "and the resumed run gets its verdict on the status surface");
   assert.strictEqual(status.skipped[0].id, "task-orphan", "a refused resume cools the node like any other");
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["running", "failed"]);
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["failed"]);
   assert.strictEqual(marks[0].gate_worker, "w2");
   assert.ok(marks.every((m) => m.gate_at), "every stamp is dated");
 });
@@ -1766,12 +1812,12 @@ test("a refusal whose escalation never landed is MARKED on the run record, and s
   });
   h.deps.markGate = (runId, patch) => marks.push({ run_id: runId, ...patch });
   h.deps.pendingGates = async () =>
-    marks.some((m) => m.gate_state === "running") ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
+    marks.some((m) => m.gate_state) ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
 
   const status = await workLoop.runWorkLoop({ opts: { workerId: "w9", concurrency: 1, intervalMs: 1000 }, deps: h.deps, control: h.control });
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["running", "failed"]);
-  assert.strictEqual(marks[1].gate_escalation_failed, true, "the record says this refusal is readable only on this box");
-  assert.strictEqual(marks[1].gate_demoted, false, "and that nothing was rolled back");
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["failed"]);
+  assert.strictEqual(marks[0].gate_escalation_failed, true, "the record says this refusal is readable only on this box");
+  assert.strictEqual(marks[0].gate_demoted, false, "and that nothing was rolled back");
   assert.strictEqual(status.recent[0].escalation_failed, true, "--status surfaces it beside the verdict");
   assert.strictEqual(status.gates.failed, 1);
   assert.strictEqual(status.skipped[0].id, "task-orphan", "a refused resume cools the node like any other");
@@ -1813,7 +1859,7 @@ test("a failed escalation's retry payload is stamped onto the run record beside 
   });
   h.deps.markGate = (runId, patch) => marks.push({ run_id: runId, ...patch });
   h.deps.pendingGates = async () =>
-    marks.some((m) => m.gate_state === "running") ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
+    marks.some((m) => m.gate_state) ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
 
   await workLoop.runWorkLoop({ opts: { workerId: "w10", concurrency: 1, intervalMs: 1000 }, deps: h.deps, control: h.control });
   const settled = marks.find((m) => m.gate_state === "failed");
@@ -1925,12 +1971,12 @@ test("a stop folds in the verdicts that DID land before abandoning the rest", as
   assert.deepStrictEqual(status.gating.map((g) => g.node_id), ["task-b"], "and only the pipeline that never reported is abandoned");
   assert.deepStrictEqual(
     marks.filter((m) => m.run_id === "run-task-a").map((m) => m.gate_state),
-    ["running", "failed"],
+    ["failed"],
     "the settled run is stamped with its verdict, never 'interrupted'"
   );
   assert.deepStrictEqual(
     marks.filter((m) => m.run_id === "run-task-b").map((m) => m.gate_state),
-    ["running", "interrupted"],
+    ["interrupted"],
     "and the one that never reported is left in the state the next worker resumes from"
   );
 });
@@ -1955,7 +2001,7 @@ test("a stop marks its abandoned pipelines INTERRUPTED — the state the next wo
   };
   const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000 }, deps, control });
   assert.strictEqual(status.gating.length, 1, "the slot stays in the published record — it is what the next worker joins on");
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["running", "interrupted"]);
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"]);
 });
 
 test("the resume scan reads back what the run journal and the worker status files actually store", () => {
@@ -2083,75 +2129,6 @@ test("a settle that gets clobbered by a concurrent whole-record write is re-appl
   const yielded = dispatchRuns.stampGateState(home, runId, { gate_state: "failed" }, { readBack: raced });
   assert.strictEqual(yielded.gate_state, "blocked", "a settled verdict is final, whoever wrote it");
   assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "blocked");
-});
-
-// Review finding F4: `gate_progress` is an ACCUMULATOR shared by three writers
-// (the fix-cycle ledger, the rescue lane's entries, the shared retry pool), and
-// each builds the next version by rewriting the whole object. Without a
-// compare-and-set the writer that reads first and lands second erases what the
-// other recorded — and an erased pool charge is an unrecorded retry, exactly
-// the unbounded case the pool exists to stop.
-test("stampGateState's expectProgress is a compare-and-set: a racing writer's stamp is never silently overwritten", () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cas-"));
-  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
-  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
-  const runId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-  const paths = dispatchRuns.runPaths(home, runId);
-  const base = { run_id: runId, node_id: "task-x", state: "running", gate_state: "running" };
-  const stampOf = (seq, extra) => ({ key: "k1", at: "2026-09-06T00:00:00.000Z", seq, gates: {}, ...extra });
-
-  // First write of an attempt: nothing to merge from, so the expectation is a
-  // null seq and the write lands.
-  dispatchRuns.atomicJson(paths.record, base);
-  const first = stampOf(1, { pools: { retry: 1 } });
-  assert.ok(
-    dispatchRuns.stampGateState(home, runId, { gate_progress: first }, { expectProgress: { key: "k1", seq: null } }),
-    "the first write of an attempt merges from nothing"
-  );
-  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress, first);
-
-  // Now the race: a rescue save read seq 1, a pool charge landed seq 2 in
-  // between, and the rescue's rewrite (which carries `pools` from its stale
-  // read) must be REFUSED rather than erasing the charge.
-  const charged = stampOf(2, { pools: { retry: 2 } });
-  dispatchRuns.stampGateState(home, runId, { gate_progress: charged }, { expectProgress: { key: "k1", seq: 1 } });
-  const status = {};
-  const stale = stampOf(2, { pools: { retry: 1 }, rescue: [{ n: 1 }] });
-  const refused = dispatchRuns.stampGateState(home, runId, { gate_progress: stale }, { expectProgress: { key: "k1", seq: 1 }, status });
-  assert.strictEqual(refused, null, "the loser writes nothing");
-  assert.strictEqual(status.conflict, true, "and says why — a race, not a failed journal write");
-  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress.pools, { retry: 2 }, "the charge survives");
-
-  // Row (d): progress under ANOTHER attempt's key is the EMPTY state, not a
-  // conflict — a `--regate` mints a new key and starts its ledger fresh.
-  const regated = { key: "k2", at: "2026-09-06T00:00:01.000Z", seq: 1, gates: {} };
-  assert.ok(
-    dispatchRuns.stampGateState(home, runId, { gate_progress: regated }, { expectProgress: { key: "k2", seq: null } }),
-    "a fresh attempt key expects nothing and lands"
-  );
-  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_progress.key, "k2");
-
-  // A reverting whole-record writer is retried, not reported as landed: the
-  // CAS write is read back like a gate_state write is.
-  dispatchRuns.atomicJson(paths.record, base);
-  let reads = 0;
-  const clobberOnce = (file) => {
-    reads += 1;
-    if (reads === 1) dispatchRuns.atomicJson(paths.record, base); // the supervisor's stale copy
-    return dispatchRuns.readJson(file);
-  };
-  const reapplied = dispatchRuns.stampGateState(
-    home, runId, { gate_progress: first }, { expectProgress: { key: "k1", seq: null }, readBack: clobberOnce }
-  );
-  assert.ok(reapplied, "the reverted progress write is re-applied");
-  assert.strictEqual(reads, 2);
-  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress, first);
-
-  // Undefined expectProgress leaves every other caller byte-identical.
-  const unchecked = stampOf(99, {});
-  assert.ok(dispatchRuns.stampGateState(home, runId, { gate_progress: unchecked }));
-  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress, unchecked);
-  fs.rmSync(home, { recursive: true, force: true });
 });
 
 // ------------------------------------------- the approval oracle + gate ids --
@@ -4644,6 +4621,11 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   // And the fix prompt names the findings by id, splits advisory from blocking,
   // and lists what earlier cycles already resolved.
   let fixLaunch = null;
+  // The fix launch now checks its durable parent stamp instead of silently
+  // continuing when the prompt-only fixture has no parent run record.
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").record, {
+    run_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", node_id: "task-fix-me", state: "done",
+  });
   const fixDeps = sporCli.makeGateDeps(cfg, {
     record: { node_id: "task-fix-me", cwd: repo }, entry: { run_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", node_id: "task-fix-me", project: null },
     factory: { id: "factory-test" }, slug: null, passthrough: { sandbox: "danger-full-access", "permission-mode": "bypassPermissions", model: "worker-model" },
@@ -6122,7 +6104,7 @@ test("the loop settles a SUPERSEDED verdict like a pass: tallied, stamped settle
   assert.strictEqual(status.gates.passed, 0);
   assert.deepStrictEqual(status.skipped, [], "a superseded item is done — no cooldown");
   assert.strictEqual(status.recent[0].gate, "superseded");
-  assert.deepStrictEqual(stamps.map((s) => s.gate_state), ["running", "superseded"]);
+  assert.deepStrictEqual(stamps.map((s) => s.gate_state), ["superseded"]);
   assert.ok(gates.SETTLED_GATE_STATES.has("superseded"));
   const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
   const dead = { worker_id: "w1", live: false, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [slot], active: [] };
@@ -6525,7 +6507,7 @@ test("the loop tallies SCOPED, stamps it settled, and cools the item off — it 
   assert.strictEqual(status.gates.passed, 0);
   assert.strictEqual(status.gates.failed, 0);
   assert.strictEqual(status.recent[0].gate, "scoped");
-  assert.deepStrictEqual(stamps.map((s) => s.gate_state), ["running", "scoped"]);
+  assert.deepStrictEqual(stamps.map((s) => s.gate_state), ["scoped"]);
   assert.deepStrictEqual(
     status.skipped.map((s) => s.id),
     ["task-a"],
@@ -7460,6 +7442,14 @@ test("a re-gate is a NEW segment of the ledger: the settled segment stays as his
   assert.strictEqual(h.seen.implements[0].name, `impl-${gateRunner.shortRunAttempt(ITEM.run_id, 0)}-2`, "the ORIGINAL segment's name, which the launcher adopts");
   assert.deepStrictEqual(h.seen.attempts.map((e) => `${e.attempt || 0}/${e.index}:${e.outcome}`), ["0/1:failed", "0/2:candidate"], "settled in the segment that owed it; no fresh segment opened");
 
+  const unlaunched = [...history, { index: 2, run_id: null, outcome: "pending", pool: null }];
+  const orphan = stageFakes({ implState: "running", attempts: unlaunched });
+  const regated = await runStage(stageFactory({ budget: { attempts: 2 } }), orphan, { ...ITEM, attempt: 2 });
+  assert.strictEqual(regated.state, "candidate");
+  assert.strictEqual(orphan.seen.implements.length, 0, "no old unlaunched reservation is dispatched");
+  assert.deepStrictEqual(orphan.seen.attempts.map(e => `${e.attempt || 0}/${e.index}:${e.outcome}`), ["0/1:no-candidate", "2/1:candidate"], "new segment atomically retires only unlaunched prior reservations");
+  assert.strictEqual(gates.implAttemptsSpent(orphan.seen.attempts, "implementation"), 1, "settled earlier history keeps its original charge");
+
   // The journal's force arm cmdWorkRegate uses: a settled refusal reopens, a
   // settled candidate never does, and without force nothing moves.
   const dr = require("../lib/shell/agent-dispatch-runner.js");
@@ -7556,4 +7546,2439 @@ test("real doors: runGateAndIntegration runs the implementation stage before any
   const again = await sporCli.runGateAndIntegration(cfg, entry, JSON.parse(fs.readFileSync(dispatchRunsLib.runPaths(home, runId).record, "utf8")), { factory, slug: "demo", passthrough: {}, warn: () => {}, runMaxMs: 1000, home, log: () => {}, stopping: () => false, sleep: async () => {} });
   assert.strictEqual(again.escalated_to, res.escalated_to);
   assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("task-impl-")).length, 1, "one escalation, however many times the settled stage is re-entered");
+});
+
+// ------------------------------------------------ head consistency across fix cycles --
+// (task-spor-factory-gate-attestation, review findings 1, 3 and 6)
+
+// Gate A passes at H1; gate B's fix cycle commits H2 and B passes there. A
+// never judged H2 — so the pipeline goes back to A, re-runs it at H2, and the
+// result's every step binds to the SAME head. The H1 fact stays on the graph
+// (a record of what was judged), under a different id than the H2 fact.
+test("a fix cycle that moves the head sends the pipeline back to the first gate, and every step then binds to the moved head", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }, { id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }] });
+  const H1 = "head1000000000000000000000000000000000001";
+  const H2 = "head2000000000000000000000000000000000002";
+  let head = H1;
+  let call = 0;
+  const { deps, seen } = fakes({
+    review: ({ prior }) => {
+      call += 1;
+      return { ok: true, text: call === 1 ? '```json\n{"verdict":"changes_requested","findings":[{"summary":"x","severity":"blocking","file":"lib/x.js","evidence":"deterministic failure"}]}\n```' : `\`\`\`json\n${JSON.stringify({verdict:"pass", prior: (prior || []).map(p => ({id:p.id,status:"resolved",evidence:"fixed in new head"}))})}\n\`\`\`` };
+    },
+    fix: () => {
+      head = H2; // the fix cycle committed
+      return { ok: true };
+    },
+  });
+  deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head, base: "basesha", trustedRef: "main", trustedSha: "trustsha", branch: "task-demo" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(res.head, H2);
+  assert.deepStrictEqual(res.gates.map((g) => [g.gate, g.verdict, g.head]), [["acceptance", "passed", H2], ["review", "passed", H2]], "every step in the result judged the moved head");
+  assert.strictEqual(seen.suites.length, 2, "the acceptance suite ran again at the moved head");
+  assert.strictEqual(seen.reviews.length, 2, "the review that already passed at H2 was NOT re-dispatched");
+  assert.strictEqual(seen.fixes.length, 1);
+  // Three facts: acceptance@H1, review@H2, acceptance@H2 — distinct ids.
+  assert.strictEqual(seen.facts.length, 3);
+  assert.strictEqual(new Set(seen.facts.map((f) => f.id)).size, 3, "the re-run's fact does not collide with the H1 fact's id");
+  assert.strictEqual(seen.facts.filter((f) => /gate_head: head1/.test(f.markdown)).length, 1);
+  assert.strictEqual(seen.facts.filter((f) => /gate_head: head2/.test(f.markdown)).length, 2);
+  assert.strictEqual(res.facts.length, 3, "the pipeline hands back every fact it minted, the superseded one included");
+  assert.strictEqual(gateRunner.gateFactId("acceptance", "task-demo", "run-abcdef12", 0, 0, H1) !== gateRunner.gateFactId("acceptance", "task-demo", "run-abcdef12", 0, 0, H2), true);
+});
+
+// Cross-model review, major finding 4: a change read that FAILS after a fix
+// cycle must not leave the pre-fix head standing as the judged commit — the
+// tree moved and nobody could read where to. The fact and the chain say
+// "unknown", and nothing is recorded as judged at the stale head.
+test("a change read that fails AFTER a fix cycle reports the judged commit as unknown, never the pre-fix head", async () => {
+  const H1 = "head1000000000000000000000000000000000001";
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 1 }] });
+  let reads = 0;
+  const { deps, seen } = fakes({
+    suite: () => ({ ok: false, reason: "1 failing" }),
+    fix: () => ({ ok: true }),
+  });
+  deps.changedPaths = async () => {
+    reads += 1;
+    if (reads === 1) return { ok: true, paths: ["lib/x.js"], head: H1, base: "basesha", trustedRef: "main", trustedSha: "trustsha", branch: "task-demo" };
+    return { ok: false, reason: "git diff exited 128 after the fix cycle" };
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(reads, 2, "the change was re-read after the fix cycle");
+  assert.strictEqual(res.head, null, "the chain does not carry the pre-fix head");
+  assert.strictEqual(res.base, null);
+  assert.strictEqual(res.branch, null);
+  assert.match(res.reason, /exited 128 after the fix cycle/);
+  const last = seen.facts[seen.facts.length - 1];
+  assert.match(last.markdown, /Judged commit: unknown/);
+  assert.doesNotMatch(last.markdown, /gate_head: head1/, "the escalating fact does not name the stale head as what it judged");
+  assert.strictEqual(seen.escalations.length, 1);
+});
+
+// The restart is bounded: fix cycles are charged against each gate's cap
+// CUMULATIVELY, so a gate that keeps failing after a restart escalates at its
+// declared cap rather than getting a fresh budget every time the head moves.
+test("fix cycles are charged cumulatively across restarts — a restarted gate does not get a fresh budget", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }, { id: "second", kind: "agent-review", profile: "profile-review", cycles: 1 }] });
+  let n = 0;
+  let head = "head-a";
+  const { deps, seen } = fakes({
+    // review#1 changes_requested -> fix (head moves) -> review#2 pass; then
+    // `second` fails -> fix (head moves) -> pass; restart: review at the
+    // third head fails again — its ONE cycle is spent, so it escalates.
+    review: ({ gate, prior }) => {
+      n += 1;
+      const pass = `\`\`\`json\n${JSON.stringify({verdict:"pass", prior: (prior || []).map(p => ({id:p.id,status:"resolved",evidence:"fixed in new head"}))})}\n\`\`\``;
+      const fail = '```json\n{"verdict":"changes_requested","findings":[{"summary":"x","severity":"blocking","file":"lib/x.js","evidence":"deterministic failure"}]}\n```';
+      if (gate.id === "review") return { ok: true, text: n === 2 ? pass : fail };
+      return { ok: true, text: n === 3 ? fail : pass };
+    },
+    fix: () => {
+      head = `${head}+`;
+      return { ok: true };
+    },
+  });
+  deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head, base: "b", trustedRef: "main", trustedSha: "t", branch: "task-demo" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /gate 'review' failed/);
+  assert.strictEqual(seen.fixes.filter((f) => f.gate === "review").length, 1, "review's single cycle was spent before the restart and not replenished by it");
+  assert.strictEqual(seen.escalations.length, 1);
+});
+
+// A review gate with nothing readable to review is a failure like the command
+// and human gates already were — never a passing fact with no head.
+test("an unconditional review keeps current arming policy when diff is unreadable, and its evidence has no invented head", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }] });
+  const { deps, seen } = fakes({ changed: null });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.strictEqual(seen.reviews.length, 1);
+  assert.strictEqual(res.head, null);
+  assert.strictEqual(res.gates[0].head, null);
+  assert.match(seen.facts[0].markdown, /Judged commit: unknown/);
+});
+
+// The status surface must say what the run record says: with an integration
+// stage folded in, the result's `head` is the stage's re-read head and the
+// gated head rides as `gate_head`.
+test("work --status records the GATED head, not the integration stage's head, when both are present", async () => {
+  const { deps, control } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({ state: "passed", reason: "landed", head: "integration-head", gate_head: "gated-head", facts: [] }),
+  });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, max: 1 }, deps, control });
+  assert.strictEqual(status.recent[0].gate, "passed");
+  assert.strictEqual(status.recent[0].gate_head, "gated-head");
+  const { deps: d2, control: c2 } = loopHarness({ queue: [{ id: "task-b" }], gate: () => ({ state: "passed", reason: "ok", head: "only-head", facts: [] }) });
+  const s2 = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, max: 1 }, deps: d2, control: c2 });
+  assert.strictEqual(s2.recent[0].gate_head, "only-head", "with no stage, the pipeline's own head is the gated head");
+});
+
+// -- blocking finding 2 (cross-model review): settlement is a locked
+// compare-and-swap. Two pipelines for one run cannot both pass the
+// unsettled guard, and what a stamp returns is the record ON DISK after its
+// write — so "did my verdict land" is a disk fact, never a process's belief.
+test("stampGateState is a locked CAS: a held lock refuses the stamp, a stale lock is broken, and two settlers cannot both own the record", () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cas-"));
+  const runId = "11111111-2222-3333-4444-00000000cas0";
+  const paths = dispatchRuns.runPaths(home, runId);
+  const base = { run_id: runId, node_id: "task-x", state: "done", terminal_state: "resolved", terminal_enforced: true, gate_state: "running" };
+  dispatchRuns.atomicJson(paths.record, base);
+  const lock = dispatchRuns.recordLockPath(paths.record);
+
+  // Held by a LIVE writer: the stamp does not land and reports so (null).
+  fs.writeFileSync(lock, "4242\n");
+  assert.strictEqual(dispatchRuns.stampGateState(home, runId, { gate_state: "passed", gate_at: "t1" }, { lock: (file, fn, o) => dispatchRuns.withRecordLock(file, fn, { ...o, attempts: 3, waitMs: 1 }) }), null);
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "running", "the record is untouched under a held lock");
+  assert.ok(fs.existsSync(lock), "and the holder's lock is left alone");
+
+  // A corpse — a lock older than the stale window — is broken and the stamp lands.
+  const old = new Date(Date.now() - dispatchRuns.RECORD_LOCK_STALE_MS - 5000);
+  fs.utimesSync(lock, old, old);
+  const landed = dispatchRuns.stampGateState(home, runId, { gate_state: "passed", gate_at: "t1", gate_settle_id: "tok-A" });
+  assert.strictEqual(landed.gate_state, "passed");
+  assert.strictEqual(landed.gate_settle_id, "tok-A");
+  assert.ok(!fs.existsSync(lock), "the lock is released after the stamp");
+
+  // A second settler for the same run: the guard yields and it gets the
+  // WINNER's record back — settle id and all — so it can tell it lost.
+  const lost = dispatchRuns.stampGateState(home, runId, { gate_state: "failed", gate_at: "t2", gate_settle_id: "tok-B" });
+  assert.strictEqual(lost.gate_settle_id, "tok-A");
+  assert.strictEqual(lost.gate_state, "passed");
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_settle_id, "tok-A");
+
+  // The `own` door keys on the settle id when the record has one: the
+  // loser's `gate_at` — even an identical timestamp — is not ownership.
+  dispatchRuns.atomicJson(paths.record, { ...base, gate_state: "passed", gate_at: "same-ms", gate_settle_id: "tok-A" });
+  const byAt = dispatchRuns.stampGateState(home, runId, { gate_attestation: "art-attest-loser" }, { own: "same-ms" });
+  assert.strictEqual(byAt.gate_attestation, undefined, "gate_at alone does not open the door on a record that carries a settle id");
+  const byToken = dispatchRuns.stampGateState(home, runId, { gate_attestation: "art-attest-winner" }, { own: "tok-A" });
+  assert.strictEqual(byToken.gate_attestation, "art-attest-winner");
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_attestation, "art-attest-winner");
+
+  // Every stamp inside the lock reads and writes under it — a writer that
+  // sees the lock taken waits for it rather than interleaving.
+  dispatchRuns.atomicJson(paths.record, base);
+  let order = [];
+  const held = dispatchRuns.withRecordLock(paths.record, () => {
+    order.push("first-in");
+    const r = dispatchRuns.stampGateState(home, runId, { gate_state: "blocked", gate_settle_id: "tok-C" }, { lock: (file, fn, o) => dispatchRuns.withRecordLock(file, fn, { ...o, attempts: 2, waitMs: 1 }) });
+    order.push(r === null ? "second-refused" : "second-landed");
+    return "done";
+  });
+  assert.deepStrictEqual([held.ok, held.value, order], [true, "done", ["first-in", "second-refused"]]);
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "running");
+});
+
+// -- major finding 4 (cross-model review): the loop publishes the RECORD's
+// verdict for a superseded pipeline — never the loser's head and verdict —
+// and stamps nothing on its behalf.
+test("a superseded pipeline's verdict is not what the loop publishes: the status surface carries the record's settled verdict, head and attestation", async () => {
+  const marks = [];
+  const { deps, control, state } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({
+      state: "passed", reason: "2 gate(s) passed", gate_head: "loserhead", attestation: null, gates: [{ gate: "acceptance", verdict: "passed" }],
+      superseded: true,
+      settled: { state: "failed", reason: "gate 'acceptance' failed: npm test exited 1", head: "winnerhead", attestation: "art-attest-winner", worker: "w-other", at: "2026-09-02T10:00:00.000Z" },
+    }),
+  });
+  deps.markGate = (runId, patch) => {
+    marks.push({ runId, patch });
+    return null;
+  };
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps, control });
+  const entry = status.recent[0];
+  assert.strictEqual(entry.gate, "failed", "the record's verdict, not the loser's 'passed'");
+  assert.strictEqual(entry.gate_head, "winnerhead");
+  assert.strictEqual(entry.attestation, "art-attest-winner");
+  assert.strictEqual(entry.gate_worker, "w-other");
+  assert.strictEqual(entry.superseded, true);
+  assert.deepStrictEqual(entry.superseded_verdict, { state: "passed", head: "loserhead" }, "what this pipeline found is kept, labeled as superseded");
+  assert.strictEqual(entry.gates, undefined, "the loser's per-gate steps are not published as the run's");
+  assert.strictEqual(status.gates.failed, 1);
+  assert.strictEqual(status.gates.superseded, 1);
+  assert.strictEqual(status.gates.passed, 0);
+  assert.ok(marks.every((m) => m.patch.gate_state !== "passed"), "the loser stamps no verdict on the record");
+  assert.strictEqual(marks.filter((m) => m.patch.gate_state && m.patch.gate_state !== "running").length, 0, "no settle stamp at all from the loser");
+  assert.strictEqual(status.skipped.length, 1, "the node cools off per the RECORD's failed verdict, not the loser's pass");
+  assert.match(status.skipped[0].reason, /settled by another pipeline/);
+  assert.ok(state.log.some((l) => /gates failed \(settled by w-other\) — this pipeline's 'passed' verdict was superseded/.test(l)), state.log.join("\n"));
+
+  // With no settled info carried back, the verdict is UNKNOWN — published as
+  // superseded, and the node cools (the safe direction), never a pass.
+  const { deps: d2, control: c2 } = loopHarness({ queue: [{ id: "task-b" }], gate: () => ({ state: "passed", superseded: true }) });
+  const s2 = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps: d2, control: c2 });
+  assert.strictEqual(s2.recent[0].gate, "superseded");
+  assert.strictEqual(s2.gates.superseded, 1);
+  assert.strictEqual(s2.gates.passed, 0);
+  assert.strictEqual(s2.skipped.length, 0, "superseded work retains current no-cooldown policy");
+});
+
+// -- cross-model review (second round), blocking finding 1: the judged
+// repository's own suite ran with the judge's credentials in its environment —
+// the attestation signing key (forge the signature anchor) and the graph
+// bearer token (write the graph anchor as the runner). Both doors are
+// scrubbed, whichever way the name arrives.
+test("runGateCommand never hands the suite the attestation key or a graph token — from the process env or the caller's extra env", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-secret-"));
+  const probe = 'const e = process.env; const leaked = ["SPOR_ATTESTATION_KEY","SPOR_TOKEN","SUBSTRATE_TOKEN","SPOR_REFRESH_TOKEN","SPOR_CI_SECRET"].filter((k) => k in e); if (leaked.length) { console.error("leaked " + leaked.join(",")); process.exit(3); } if (e.SPOR_HOME !== "/keep" || e.KEEP !== "1" || e.SPOR_GATE !== "secretgate") { console.error("lost a harmless var"); process.exit(4); } process.exit(0);';
+  const gate = { id: "secretgate", command: `"${process.execPath}" -e '${probe}'`, timeoutMs: 20000 };
+  const saved = {};
+  for (const k of ["SPOR_ATTESTATION_KEY", "SPOR_TOKEN", "SUBSTRATE_TOKEN"]) {
+    saved[k] = process.env[k];
+    process.env[k] = "hunter2";
+  }
+  try {
+    const r = await gateRunner.runGateCommand(gate, dir, { env: { SPOR_HOME: "/keep", KEEP: "1", SPOR_REFRESH_TOKEN: "x", SPOR_CI_SECRET: "y" } });
+    assert.strictEqual(r.ok, true, r.output || r.reason);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  assert.deepStrictEqual(gateRunner.scrubSecretEnv({ SPOR_ATTESTATION_KEY: "k", SPOR_TOKEN: "t", SUBSTRATE_TOKEN: "t", SPOR_HOME: "h", SPOR_SERVER: "s", PATH: "p", MY_API_KEY: "kept" }), { SPOR_HOME: "h", SPOR_SERVER: "s", PATH: "p", MY_API_KEY: "kept" }, "only the judge's own credentials are scrubbed — a repo's unrelated keys stay");
+});
+
+// -- major finding 5: the attested `trusted_sha` was resolved by one
+// rev-parse while the protected paths were restored from the SYMBOLIC ref by
+// a later checkout — a ref that moved in between put a different suite in
+// the tree than the fact named. The restore now forces from the pinned sha.
+test("prepareGateTree forces the protected paths from the sha gateChangeSet pinned, not from a ref that has since moved", () => {
+  const dir = repoWithBranch();
+  const change = gateRunner.gateChangeSet({ cwd: dir }, "main");
+  assert.strictEqual(change.ok, true, change.reason);
+  const pinned = change.trustedSha;
+  // Move `main` AFTER the change-set read: a new commit that rewrites the suite.
+  git(dir, "checkout", "-q", "main");
+  fs.writeFileSync(path.join(dir, "test", "acceptance.js"), "console.log('moved suite'); process.exit(0);\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "main moved");
+  assert.notStrictEqual(git(dir, "rev-parse", "main").trim(), pinned);
+  git(dir, "checkout", "-q", "impl");
+  const tree = gateRunner.prepareGateTree(change, { trustedRef: "main", protectedPaths: ["test/**"] });
+  assert.strictEqual(tree.ok, true, tree.reason);
+  try {
+    assert.match(fs.readFileSync(path.join(tree.dir, "test", "acceptance.js"), "utf8"), /add is broken/, "the suite is the PINNED sha's copy — what the fact's trusted_sha names");
+  } finally {
+    tree.cleanup();
+  }
+  // A caller whose change carries no pin falls back to the ref, as before.
+  const unpinned = gateRunner.prepareGateTree({ ...change, trustedSha: null }, { trustedRef: "main", protectedPaths: ["test/**"] });
+  try {
+    assert.match(fs.readFileSync(path.join(unpinned.dir, "test", "acceptance.js"), "utf8"), /moved suite/);
+  } finally {
+    unpinned.cleanup();
+  }
+});
+
+// -- blocking finding 4: the two whole-record writers (updateRun, the
+// supervisor's `update`) carried the on-disk gate fields but did their
+// read+rename OUTSIDE the record lock the settle takes — a settle landing
+// between the two was renamed over, erasing the verdict the settler's own
+// read-back had just verified. Every whole-record writer now takes the lock.
+test("whole-record writers take the record lock: a held lock makes them wait, a stale lock is broken, and a gate settle is never renamed over", () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-writer-lock-"));
+  const runId = "11111111-2222-3333-4444-00000000wr10";
+  const paths = dispatchRuns.runPaths(home, runId);
+  const base = { run_id: runId, node_id: "task-x", state: "running" };
+  dispatchRuns.atomicJson(paths.record, base);
+  const lock = dispatchRuns.recordLockPath(paths.record);
+
+  // A settle that landed after the writer's in-memory copy was taken is
+  // carried, whichever writer runs: updateRun (a handle), closeRun,
+  // mergeTerminalOutcome, and the raw writeRecordCarryingGate.
+  const handle = { paths, record: { ...base } };
+  dispatchRuns.stampGateState(home, runId, { gate_state: "passed", gate_settle_id: "tok", gate_attestation: "art-attest-x" }, { force: true });
+  dispatchRuns.updateRun(handle, { state: "done" });
+  let onDisk = dispatchRuns.readJson(paths.record);
+  assert.strictEqual(onDisk.state, "done");
+  assert.strictEqual(onDisk.gate_state, "passed");
+  assert.strictEqual(onDisk.gate_attestation, "art-attest-x", "the settle survives the whole-record write");
+  assert.ok(!fs.existsSync(lock), "the writer released the lock");
+
+  // Held by a live writer: the write WAITS for the bounded window and, if the
+  // lock is still held, DOES NOT HAPPEN — never an unlocked fallback (cross-
+  // model review, blocking finding 3): an unlocked carry is the rename-over-
+  // the-settle the lock exists to prevent. The bounded window is shortened
+  // here through the injectable lock; the real one outlasts the stale window.
+  fs.writeFileSync(lock, "4242\n");
+  const shortLock = (file, fn, o) => dispatchRuns.withRecordLock(file, fn, { ...o, attempts: 20, waitMs: 5 });
+  const t0 = Date.now();
+  assert.throws(() => dispatchRuns.writeRecordCarryingGate(paths.record, { ...onDisk, note: "late" }, { lock: shortLock }), /not written: record lock contended/);
+  const waited = Date.now() - t0;
+  assert.ok(waited >= 50, `waited for the lock (${waited}ms)`);
+  assert.strictEqual(dispatchRuns.closeRun(paths.record, { state: "failed" }, null, { lock: shortLock }), null, "closeRun under a live lock did not write");
+  assert.strictEqual(dispatchRuns.mergeTerminalOutcome(paths.record, { terminal_state: "failed" }, { lock: shortLock }), null, "mergeTerminalOutcome under a live lock did not write");
+  onDisk = dispatchRuns.readJson(paths.record);
+  assert.strictEqual(onDisk.note, undefined, "nothing landed unlocked");
+  assert.strictEqual(onDisk.state, "done");
+  assert.strictEqual(onDisk.gate_attestation, "art-attest-x");
+  assert.ok(fs.existsSync(lock), "a live holder's lock is left alone");
+  assert.strictEqual(fs.readFileSync(lock, "utf8"), "4242\n", "...and untouched");
+  // The real bounded wait outlasts the stale window, so no writer ever needs
+  // an unlocked path: a corpse is always broken before the wait runs out.
+  assert.ok(dispatchRuns.RECORD_LOCK_ATTEMPTS * dispatchRuns.RECORD_LOCK_WAIT_MS > dispatchRuns.RECORD_LOCK_STALE_MS, "the wait outlasts the stale window");
+
+  // A corpse is broken and the write goes through at once.
+  const old = new Date(Date.now() - dispatchRuns.RECORD_LOCK_STALE_MS - 5000);
+  fs.utimesSync(lock, old, old);
+  dispatchRuns.atomicJson(paths.record, { ...onDisk, state: "running" });
+  const t1 = Date.now();
+  const closed = dispatchRuns.closeRun(paths.record, { state: "failed", terminal_state: "failed" });
+  assert.strictEqual(closed.state, "failed");
+  assert.ok(Date.now() - t1 < 400, "no wait on a stale lock");
+  assert.strictEqual(closed.gate_attestation, "art-attest-x");
+  assert.ok(!fs.existsSync(lock), "the corpse is gone");
+  // closeRun refuses a record that is already terminal; mergeTerminalOutcome adds to it.
+  assert.strictEqual(dispatchRuns.closeRun(paths.record, { state: "done" }).state, "failed");
+  const merged = dispatchRuns.mergeTerminalOutcome(paths.record, { terminal_state: "resolved" });
+  assert.strictEqual(merged.terminal_state, "failed", "the earlier terminal outcome stands");
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "passed");
+});
+
+// -- minor finding 8: the record's `gate_attestation_missing`/`_error` and
+// `gate_proposal_attestation_stale` stamps were documented but rendered
+// nowhere. `spor runs` prints them and the work loop's status carries them.
+test("a missing attestation and a stale proposal body surface on 'spor runs' and on the work loop's status entry", async () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-attest-missing-"));
+  const runId = "11111111-2222-3333-4444-0000000miss1";
+  const paths = dispatchRuns.runPaths(home, runId);
+  dispatchRuns.atomicJson(paths.record, {
+    run_id: runId, node_id: "task-x", harness: "claude-code", launch_mode: "supervised-jsonl", state: "done", terminal_state: "resolved", terminal_enforced: true,
+    created_at: "2026-09-02T10:00:00.000Z", finished_at: "2026-09-02T10:05:00.000Z",
+    gate_state: "passed", gate_head: "abc123", gate_attestation: null, gate_attestation_missing: true, gate_attestation_error: "could not be recorded on the graph",
+    gate_proposal_attestation: "art-attest-x-1", gate_proposal_attestation_stale: true, gate_proposal_attestation_error: "gh pr edit exited 1",
+  });
+  const shown = cli(["runs", runId], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(shown.status, 0, shown.stderr);
+  assert.match(shown.stdout, /attested: {3}MISSING — could not be recorded on the graph/);
+  assert.match(shown.stdout, /proposal: {3}PR body carries a STALE attestation \(graph copy art-attest-x-1\) — gh pr edit exited 1/);
+
+  const { deps, control } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({ state: "passed", reason: "2 gate(s) passed", gate_head: "abc123", attestation: null, attestation_missing: true, attestation_error: "could not be built: boom", proposal_attestation_stale: true, proposal_attestation_error: "gh pr edit exited 1" }),
+  });
+  deps.markGate = () => null;
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps, control });
+  const entry = status.recent[0];
+  assert.strictEqual(entry.gate, "passed");
+  assert.strictEqual(entry.attestation_missing, true);
+  assert.strictEqual(entry.attestation_error, "could not be built: boom");
+  assert.strictEqual(entry.proposal_attestation_stale, true);
+  assert.strictEqual(entry.proposal_attestation_error, "gh pr edit exited 1");
+  // ...and for a superseded pipeline, the RECORD's own stamps are what is published.
+  const sup = loopHarness({
+    queue: [{ id: "task-b" }],
+    gate: () => ({ state: "passed", superseded: true, settled: { state: "passed", head: "def", attestation: null, attestation_missing: true, attestation_error: "could not be recorded on the graph", worker: "w-other", at: "t" } }),
+  });
+  sup.deps.markGate = () => null;
+  const status2 = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps: sup.deps, control: sup.control });
+  assert.strictEqual(status2.recent[0].attestation_missing, true);
+  assert.strictEqual(status2.recent[0].attestation_error, "could not be recorded on the graph");
+});
+
+// -- blocking finding 3 (cross-model review): breaking a stale lock is
+// ownership-safe, and releasing one is checked.
+test("the record lock is ownership-safe: a corpse is broken by rename (one breaker wins), a live lock a breaker took by mistake is handed back, and release never removes another holder's lock", () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-lock-own-"));
+  const file = path.join(home, "r.json");
+  dispatchRuns.atomicJson(file, { a: 1 });
+  const lock = dispatchRuns.recordLockPath(file);
+  const staleMs = dispatchRuns.RECORD_LOCK_STALE_MS;
+
+  // A FRESH lock that a breaker takes (its stat said stale a moment ago, the
+  // holder changed in between): the breaker finds it live and puts it back —
+  // same content, same path — and reports nothing broken.
+  fs.writeFileSync(lock, "4242:live\n");
+  assert.strictEqual(dispatchRuns.breakStaleLock(lock, { staleMs, now: Date.now }), false);
+  assert.ok(fs.existsSync(lock), "the live lock is back where its holder will release it");
+  assert.strictEqual(fs.readFileSync(lock, "utf8"), "4242:live\n");
+  assert.deepStrictEqual(fs.readdirSync(home).filter((f) => f.includes(".stale-")), [], "no renamed corpse left behind");
+
+  // A corpse: broken, and the lock path is free.
+  const old = new Date(Date.now() - staleMs - 5000);
+  fs.utimesSync(lock, old, old);
+  assert.strictEqual(dispatchRuns.breakStaleLock(lock, { staleMs, now: Date.now }), true);
+  assert.ok(!fs.existsSync(lock));
+  // ...and a second breaker for the same corpse finds nothing to break.
+  assert.strictEqual(dispatchRuns.breakStaleLock(lock, { staleMs, now: Date.now }), false);
+
+  // A holder whose lock was re-taken under the same name by someone else
+  // (the race the naive unlink produced) does NOT remove the newcomer's lock.
+  const held = dispatchRuns.withRecordLock(file, () => {
+    const mine = fs.readFileSync(lock, "utf8");
+    assert.match(mine, new RegExp(`^${process.pid}:[0-9a-f]{16}\\n$`), "the holder's token is in the lock");
+    fs.unlinkSync(lock);
+    fs.writeFileSync(lock, "9999:someone-else\n");
+    return "ran";
+  });
+  assert.deepStrictEqual(held, { ok: true, value: "ran" });
+  assert.strictEqual(fs.readFileSync(lock, "utf8"), "9999:someone-else\n", "release is checked: another holder's lock is left alone");
+  fs.unlinkSync(lock);
+
+  // The ordinary path: acquire, run, release — the lock is gone afterwards.
+  assert.deepStrictEqual(dispatchRuns.withRecordLock(file, () => 7), { ok: true, value: 7 });
+  assert.ok(!fs.existsSync(lock));
+
+  // Two waiters over one corpse, end to end: both go through the breaker and
+  // exactly one holds at a time (the critical sections never overlap).
+  fs.writeFileSync(lock, "4242:corpse\n");
+  fs.utimesSync(lock, old, old);
+  let inside = 0;
+  let overlap = false;
+  const run = () => dispatchRuns.withRecordLock(file, () => {
+    inside += 1;
+    if (inside > 1) overlap = true;
+    inside -= 1;
+    return true;
+  }, { attempts: 200, waitMs: 1 });
+  assert.deepStrictEqual([run().ok, run().ok, overlap], [true, true, false]);
+  assert.ok(!fs.existsSync(lock));
+});
+
+// -- blocking finding 1 (cross-model review): the judge's git never runs a
+// hook the judged change controls, and never carries the judge's secrets.
+test("the judge's git runs hook-free over the judged tree: a committed core.hooksPath hook does not fire on the gate worktree, and the signing key is scrubbed", () => {
+  const dir = repoWithBranch({ weakenTest: false, regress: false });
+  // The implementer's commit points core.hooksPath at a TRACKED directory
+  // (the repo's own config does — as a `.githooks` convention would) whose
+  // post-checkout hook leaves a marker and exfiltrates the judge's key.
+  git(dir, "checkout", "-q", "impl");
+  const marker = path.join(dir, "..", `hook-fired-${path.basename(dir)}`);
+  fs.mkdirSync(path.join(dir, ".githooks"));
+  const hook = path.join(dir, ".githooks", "post-checkout");
+  fs.writeFileSync(hook, `#!/bin/sh\nprintf '%s' "\${SPOR_ATTESTATION_KEY:-none}" > "${marker}"\n`);
+  fs.chmodSync(hook, 0o755);
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "hooks");
+  git(dir, "config", "core.hooksPath", ".githooks");
+  // Sanity: the hook DOES fire for an ordinary checkout in that repo.
+  git(dir, "checkout", "-q", "main");
+  git(dir, "checkout", "-q", "impl");
+  assert.ok(fs.existsSync(marker), "the hook fires for a plain checkout");
+  fs.unlinkSync(marker);
+
+  const prevKey = process.env.SPOR_ATTESTATION_KEY;
+  process.env.SPOR_ATTESTATION_KEY = "judge-secret";
+  try {
+    const change = gateRunner.gateChangeSet({ cwd: dir }, "main");
+    assert.strictEqual(change.ok, true, change.reason);
+    const tree = gateRunner.prepareGateTree(change, { trustedRef: "main", protectedPaths: ["test/**"] });
+    assert.strictEqual(tree.ok, true, tree.reason);
+    try {
+      assert.ok(!fs.existsSync(marker), "no hook ran on the judge's worktree add / protected-path checkout");
+      assert.ok(fs.existsSync(path.join(tree.dir, ".githooks", "post-checkout")), "the tree itself is materialized");
+    } finally {
+      tree.cleanup && tree.cleanup();
+    }
+  } finally {
+    if (prevKey === undefined) delete process.env.SPOR_ATTESTATION_KEY;
+    else process.env.SPOR_ATTESTATION_KEY = prevKey;
+  }
+  if (process.platform !== "win32") assert.ok(!fs.existsSync(marker), "still no hook");
+
+  // The env itself: secrets scrubbed, hooks path forced, an existing
+  // GIT_CONFIG_COUNT appended to rather than clobbered.
+  const env = gateRunner.judgeGitEnv({ PATH: "/bin", SPOR_ATTESTATION_KEY: "k", SPOR_TOKEN: "t", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "a.b", GIT_CONFIG_VALUE_0: "c" });
+  assert.strictEqual(env.SPOR_ATTESTATION_KEY, undefined);
+  assert.strictEqual(env.SPOR_TOKEN, undefined);
+  assert.strictEqual(env.PATH, "/bin");
+  assert.deepStrictEqual([env.GIT_CONFIG_COUNT, env.GIT_CONFIG_KEY_0, env.GIT_CONFIG_VALUE_0, env.GIT_CONFIG_KEY_1, env.GIT_CONFIG_VALUE_1], ["2", "a.b", "c", "core.hooksPath", gateRunner.noHooksPath()]);
+  if (process.platform !== "win32") assert.ok(gateRunner.noHooksPath().startsWith(os.devNull), "a path nothing on the box can create a hook under");
+});
+
+test("attestation uses the rescue pass's current gate verdicts while preserving all historical facts", async () => {
+  const factory = factoryOf({ ...BASE, protected_paths: [], gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 0 }], rescue: { profile: "profile-codex-sol", attempts: 1 } });
+  let rescued = false;
+  const world = withRescue(fakes({ suite: () => ({ ok: rescued, reason: rescued ? null : "first candidate failed" }) }), () => {
+    rescued = true;
+    return { ok: true, runId: "run-rescue-test", category: "real-defect", diagnosis: "fixed", fixed: true, filed: [] };
+  });
+  world.deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head: rescued ? "head-new" : "head-old", base: "base", trustedRef: "main", trustedSha: "base" });
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: world.deps });
+  assert.equal(result.state, "passed", result.reason);
+  assert.ok(result.gates.some(g => g.verdict === "failed"), "history retains the original refusal");
+  const evidence = require("../lib/shell/attestation.js").buildAttestationObject({ item: ITEM, factory, gate: result });
+  assert.equal(evidence.passed, true, "a completed rescue attests the latest judgement");
+  assert.deepEqual(evidence.gate.steps.map(s => [s.id, s.verdict, s.head]), [["acceptance", "passed", "head-new"]]);
+  assert.ok(result.facts.length >= 3, "original refusal, rescue, and final pass all keep lineage");
+});
+
+// --- the off-diff flake pass (task-spor-factory-flake-rescue-should-not-burn-
+// when-failure-is-off-diff, WORKERS.md §10.3 `isolate`) ---
+//
+// The refusal that prompted this failed a whole suite twice on a load-sensitive
+// race in a file the change never touched, and at `cycles: 0` went straight to
+// the rescue lane. The property under test is the narrow one that fixes it and
+// nothing wider: a failure the change is DEMONSTRABLY not the cause of — every
+// RUN named only files off the diff, those files reference nothing the change
+// edits, and they pass alone on that same tree — passes and is filed as a
+// flake, while every other shape of failure is charged exactly as it was
+// before.
+
+// The failure a suite prints: an anchor line and the indented frames under it,
+// which is the only region a path is read from.
+const FAILED_OFF_DIFF = [
+  "✖ the launch handshake (40001.2ms)",
+  "  AssertionError [ERR_ASSERTION]: the record was never written",
+  "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)",
+].join("\n");
+
+// A real tree for the pass to READ. "Off-diff" is now two claims, and the
+// second one — that the failing tests do not reference the change either — is
+// answered by reading the files, so these tests hand it files.
+function flakeTree({ testSrc = 'require("./helpers/launch");\nconst assert = require("node:assert");\n', helperSrc = "module.exports = {};\n" } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-tree-"));
+  fs.mkdirSync(path.join(dir, "test", "helpers"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), testSrc);
+  fs.writeFileSync(path.join(dir, "test", "helpers", "launch.js"), helperSrc);
+  return dir;
+}
+
+// fakes() + a prepared tree at `dir`, the shape bin/spor.js's openSuite hands
+// the runner. `run(attempt, command)` is the suite; `command` is set only for
+// the isolation pass.
+function treeFakes({ dir, run, ...rest }) {
+  const { deps, seen } = fakes(rest);
+  deps.openSuite = async () => ({
+    ok: true,
+    dir,
+    run: async (attempt, command) => {
+      seen.suites.push(command || "acceptance");
+      return run(attempt, command);
+    },
+    close: () => {},
+  });
+  return { deps, seen };
+}
+
+test("an OFF-DIFF suite failure whose files pass alone on the same tree is a flake: the gate passes, and the flake is filed as its own issue", async () => {
+  const dir = flakeTree();
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js", "API.md"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", "the change is not what failed, so the item is not refused");
+  assert.deepStrictEqual(seen.suites, ["acceptance", "node --test 'test/codex-dispatch.test.js'"], "the declared suite, then just the failing file");
+  assert.deepStrictEqual(seen.escalations, [], "no person is paged");
+  assert.deepStrictEqual(seen.fixes, [], "no fix cycle is spent on a change that was never wrong");
+  assert.deepStrictEqual(seen.demotions, [], "and the item is not rolled back");
+  // The flake is filed against the FILE, carrying both commands so the issue
+  // says what failed and what proved it a flake.
+  assert.strictEqual(seen.flakes.length, 1);
+  assert.deepStrictEqual(seen.flakes[0].files, ["test/codex-dispatch.test.js"]);
+  assert.strictEqual(seen.flakes[0].command, "npm test");
+  assert.strictEqual(seen.flakes[0].isolate, "node --test 'test/codex-dispatch.test.js'");
+  // …and the pass is never a CLEAN one: the fact names the flake, links the
+  // issue (the edge that makes flakes countable per file across runs) and
+  // carries the whole-suite failure as evidence.
+  const fact = seen.facts[0].markdown;
+  assert.match(fact, /an off-diff flake by the gate's own isolation rule, not a failure of the change/);
+  assert.match(fact, /filed as issue-flake-x/);
+  assert.match(fact, /- \{type: relates-to, to: issue-flake-x\}/);
+  assert.match(fact, /Off-diff flake: test\/codex-dispatch\.test\.js failed the whole-suite run and passed alone on the same tree, filed as issue-flake-x\./);
+  assert.match(fact, /AssertionError \[ERR_ASSERTION\]: the record was never written/, "the failure it passed over is still on the record");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// The pass over a RED suite is only ever as good as the record that explains
+// it, and `record` swallows its own write failure — so a flake nobody could
+// file is a green light nobody can audit, and the failure is charged instead.
+test("a flake the graph refuses to file is CHARGED, not passed: the pass is conditional on the record landing", async () => {
+  const dir = flakeTree();
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  deps.fileFlakeItem = async () => ({ ok: false, reason: "the graph refused the write" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed", "no durable record of the flake, so no pass on the strength of it");
+  const fact = seen.facts[0].markdown;
+  assert.match(fact, /PASSED — an off-diff flake, but it could not be filed as its own issue \(test\/codex-dispatch\.test\.js: the graph refused the write\), so the failure is charged/);
+  assert.doesNotMatch(fact, /relates-to, to: issue-flake/);
+  assert.strictEqual(seen.escalations.length, 1, "and a person gets the item, which is what a charged failure has always done");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a flake whose per-file issue already exists, since TRIAGED, links that issue instead of reporting itself unfiled", async () => {
+  const dir = flakeTree();
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  // What the filing door answers for an id occupied by LIVE work carrying
+  // different content — which here means a person has triaged the flake.
+  deps.fileFlakeItem = async () => ({ ok: true, existing: true, id: "issue-flake-x" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  const fact = seen.facts[0].markdown;
+  assert.match(fact, /- \{type: relates-to, to: issue-flake-x\}/, "the occupant IS this flake's issue — the id is keyed on the files and nothing else");
+  assert.match(fact, /filed as issue-flake-x/);
+  assert.doesNotMatch(fact, /could not be filed/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("an ON-DIFF failure is never isolated: the change touched a file the failure names, so it is charged exactly as before", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = fakes({
+    changed: ["lib/shell/dispatch.js"],
+    suite: () => ({ ok: false, code: 1, output: "✖ boom\n  at a (lib/shell/dispatch.js:12:3)\n  at b (test/dispatch-runs.test.js:4:1)\n" }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "one run: there is nothing to isolate when the change is in the failure");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.match(seen.facts[0].markdown, /1 of which the change touches \(lib\/shell\/dispatch\.js\)/);
+});
+
+// Not being IN the diff is a coincidence, not an argument: the refusal that
+// prompted this whole feature failed in a file that spawns `bin/spor.js`, which
+// the change had edited. A gate that called that off-diff would pass a change
+// its own suite caught.
+test("a failing test that REFERENCES the change is not off-diff, however absent from the diff it is", async () => {
+  const dir = flakeTree({ testSrc: 'const CLI = path.join(__dirname, "..", "bin", "spor.js");\n' });
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["bin/spor.js"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "nothing is re-run in isolation: the change is implicated");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.match(seen.facts[0].markdown, /but the failing test\(s\) reference bin\/spor\.js, which the change does edit/);
+
+  // One hop out: the CLI path lives in a helper the test requires.
+  const dir2 = flakeTree({ helperSrc: 'exports.CLI = "bin/spor.js";\n' });
+  const two = treeFakes({
+    dir: dir2,
+    changed: ["bin/spor.js"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: two.deps })).state, "failed");
+  assert.deepStrictEqual(two.seen.flakes, []);
+  assert.match(two.seen.facts[0].markdown, /reference bin\/spor\.js/);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir2, { recursive: true, force: true });
+});
+
+// "References the change" is asked of RESOLVED import edges, not only of the
+// text. A file can name what it imports without its source containing that
+// file's repo-relative path anywhere — `lib/index.js` requiring
+// `./kernel/queue.js` is a reference to `lib/kernel/queue.js` while containing
+// neither that string nor `queue.js` as an unprefixed token — and the LAST hop
+// is where it matters most, since its candidates used to be computed only to be
+// thrown away.
+test("a reference is a resolved import edge, not just a spelling — including on the walk's last hop", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-edge-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "lib", "kernel"), { recursive: true });
+  // Nothing here spells `lib/kernel/queue.js`: the test names the barrel, the
+  // barrel names its own sibling.
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const spor = require("../lib/index.js");\n');
+  fs.writeFileSync(path.join(dir, "lib", "index.js"), 'module.exports = { queue: require("./kernel/queue.js") };\n');
+  fs.writeFileSync(path.join(dir, "lib", "kernel", "queue.js"), "module.exports = {};\n");
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps })).state, "failed");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "the change is reached two hops out, so nothing is re-run in isolation");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.match(seen.facts[0].markdown, /reference lib\/kernel\/queue\.js, which the change does edit/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// The failure named more than the files the isolation would RUN. Those others
+// are where the failure WENT, so what they import is as much part of the
+// question — but they are only guesses at a local file, so one that is not
+// there is simply not a reference rather than a refusal.
+test("every file the failure named is asked the reference question, and one that is not in the tree is not an answer", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const output = [
+    "✖ the launch handshake (40001.2ms)",
+    "  AssertionError [ERR_ASSERTION]: the record was never written",
+    "      at dispatch (lib/shell/dispatch.js:88:9)",
+    "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)",
+  ].join("\n");
+
+  // The frame in lib/ imports the change; the test file itself says nothing
+  // about it. Seeding only the isolation set would have called this off-diff.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-soft-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "lib", "shell"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  fs.writeFileSync(path.join(dir, "lib", "shell", "dispatch.js"), 'const q = require("../kernel/queue.js");\n');
+  const one = treeFakes({ dir, changed: ["lib/kernel/queue.js"], run: (a, c) => (c ? { ok: true } : { ok: false, code: 1, output }) });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: one.deps })).state, "failed");
+  assert.deepStrictEqual(one.seen.flakes, [], "the failure went through a file that imports the change");
+  assert.match(one.seen.facts[0].markdown, /reference lib\/kernel\/queue\.js, which the change does edit/);
+
+  // Same failure, same named files — but this tree has no lib/shell/dispatch.js
+  // at all. A path that is not a file here imports nothing, so the pass still
+  // happens; only a file the isolation would RUN fails closed when unreadable.
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-soft2-"));
+  fs.mkdirSync(path.join(dir2, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir2, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  const two = treeFakes({ dir: dir2, changed: ["lib/kernel/queue.js"], run: (a, c) => (c ? { ok: true } : { ok: false, code: 1, output }) });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: two.deps })).state, "passed");
+  assert.deepStrictEqual(two.seen.flakes[0].files, ["test/codex-dispatch.test.js"]);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir2, { recursive: true, force: true });
+});
+
+test("a failing test the walk cannot READ is charged, not isolated — the reference question fails closed", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  // A prepared tree that does not contain the file the failure named.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-empty-"));
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.match(seen.facts[0].markdown, /whether they reference the change could not be read/);
+  fs.rmSync(dir, { recursive: true, force: true });
+
+  // And with no prepared tree at all (a dep that only exposes the one-shot
+  // runSuite), there is nothing to read and nothing is claimed.
+  const bare = fakes({
+    changed: ["lib/kernel/queue.js"],
+    suite: (args) => (args.command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: bare.deps })).state, "failed");
+  assert.deepStrictEqual(bare.seen.suites, ["acceptance"]);
+  assert.match(bare.seen.facts[0].markdown, /the judged tree's path is unknown/);
+});
+
+// "Imported or executed by the failing test" is a TRANSITIVE claim, so the walk
+// that answers it has to be transitive too. A walk that stopped after a fixed
+// number of hops returned "no reference" for a test that reaches the change one
+// helper further out — an answer indistinguishable from having looked
+// everywhere, and the one budget in the reference read that failed OPEN.
+test("the reference walk follows the whole closure, not a fixed number of hops: a change reached through TWO helpers is still a reference", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-deep-"));
+  fs.mkdirSync(path.join(dir, "test", "helpers"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "lib", "kernel"), { recursive: true });
+  // test -> helpers/launch.js -> helpers/cli.js -> lib/kernel/queue.js. Nothing
+  // but the last file spells the change, and it is three hops from the seed.
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const launch = require("./helpers/launch.js");\n');
+  fs.writeFileSync(path.join(dir, "test", "helpers", "launch.js"), 'module.exports = require("./cli.js");\n');
+  fs.writeFileSync(path.join(dir, "test", "helpers", "cli.js"), 'module.exports = require("../../lib/kernel/queue.js");\n');
+  fs.writeFileSync(path.join(dir, "lib", "kernel", "queue.js"), "module.exports = {};\n");
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps })).state, "failed", "the test executes the change, however many helpers away");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "nothing is re-run in isolation");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.match(seen.facts[0].markdown, /reference lib\/kernel\/queue\.js, which the change does edit/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// Softness is about ABSENCE, and only absence. A path scraped out of a stack
+// frame that is not in this tree imports nothing — but one that IS here and
+// cannot be read is a file the failure went through and we did not look in, and
+// concluding "no reference" from it is the same fail-open the hop cap was.
+test("a soft seed that EXISTS and cannot be read closes the walk: unreadable is unknown, not absent", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const output = [
+    "✖ the launch handshake (40001.2ms)",
+    "  AssertionError [ERR_ASSERTION]: the record was never written",
+    "      at dispatch (lib/shell/dispatch.js:88:9)",
+    "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)",
+  ].join("\n");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-unreadable-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "lib", "shell"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  // Bigger than the walk's per-file ceiling: it is here, and we cannot read it.
+  fs.writeFileSync(path.join(dir, "lib", "shell", "dispatch.js"), `// ${"x".repeat(1024 * 1024 + 64)}\n`);
+  const { deps, seen } = treeFakes({ dir, changed: ["lib/kernel/queue.js"], run: (a, c) => (c ? { ok: true } : { ok: false, code: 1, output }) });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps })).state, "failed");
+  assert.deepStrictEqual(seen.flakes, [], "a file we could not look in settles nothing");
+  assert.match(seen.facts[0].markdown, /whether they reference the change could not be read \(lib\/shell\/dispatch\.js is too large to read\)/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// A flake belongs to the FILE that flakes. Keying its issue on the whole
+// co-failing set gives the same file a different issue every time its
+// companions — or their order — change, which is the near-duplicate the
+// convergent id exists to prevent.
+test("a failure naming two off-diff files files ONE issue PER FILE, and the fact links each", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-two-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  fs.writeFileSync(path.join(dir, "test", "dispatch-runs.test.js"), 'const assert = require("node:assert");\n');
+  const output = [
+    "✖ the launch handshake (40001.2ms)",
+    "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)",
+    "✖ the run record (2.1ms)",
+    "      at TestContext.<anonymous> (test/dispatch-runs.test.js:44:5)",
+  ].join("\n");
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output }),
+  });
+  deps.fileFlakeItem = async (args) => {
+    seen.flakes.push(args);
+    return { ok: true, id: `issue-flake-${args.file.replace(/[^a-z0-9]+/gi, "-")}` };
+  };
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps })).state, "passed");
+  assert.deepStrictEqual(seen.flakes.map((f) => f.file), ["test/codex-dispatch.test.js", "test/dispatch-runs.test.js"], "one filing per file");
+  for (const f of seen.flakes) assert.deepStrictEqual(f.files, ["test/codex-dispatch.test.js", "test/dispatch-runs.test.js"], "the co-failing set rides along as context");
+  const fact = seen.facts[0].markdown;
+  assert.match(fact, /- \{type: relates-to, to: issue-flake-test-codex-dispatch-test-js\}/);
+  assert.match(fact, /- \{type: relates-to, to: issue-flake-test-dispatch-runs-test-js\}/);
+  assert.match(fact, /filed as issue-flake-test-codex-dispatch-test-js, issue-flake-test-dispatch-runs-test-js/);
+  fs.rmSync(dir, { recursive: true, force: true });
+
+  // …and the pass needs EVERY one of them: a file whose issue did not land has
+  // no durable record, which is the one thing this pass may not trade away.
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-two2-"));
+  fs.mkdirSync(path.join(dir2, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir2, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  fs.writeFileSync(path.join(dir2, "test", "dispatch-runs.test.js"), 'const assert = require("node:assert");\n');
+  const second = treeFakes({ dir: dir2, changed: ["lib/kernel/queue.js"], run: (a, c) => (c ? { ok: true } : { ok: false, code: 1, output }) });
+  second.deps.fileFlakeItem = async (args) =>
+    args.file === "test/dispatch-runs.test.js" ? { ok: false, reason: "the graph refused the write" } : { ok: true, id: "issue-flake-one" };
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: second.deps })).state, "failed");
+  const charged = second.seen.facts[0].markdown;
+  assert.match(charged, /could not be filed as its own issue \(test\/dispatch-runs\.test\.js: the graph refused the write\)/);
+  // …but the issue that DID land is this run's occurrence and must not be
+  // orphaned by the charge (F7): the fact links it and names it, so its
+  // inbound-edge occurrence count and its provenance survive the charged pass.
+  assert.match(charged, /- \{type: relates-to, to: issue-flake-one\}/, "the landed filing is linked from the charged fact");
+  assert.match(charged, /an off-diff flake filed as issue-flake-one, but the rest of it could not be filed/);
+  assert.match(charged, /Off-diff flake: test\/codex-dispatch\.test\.js, test\/dispatch-runs\.test\.js failed the whole-suite run and passed alone on the same tree, filed as issue-flake-one; but test\/dispatch-runs\.test\.js: the graph refused the write could not be filed as its own issue, so the failure was charged/);
+  assert.doesNotMatch(charged, /relates-to, to: issue-flake-test-dispatch-runs/, "and nothing is linked for the file whose filing did not land");
+  fs.rmSync(dir2, { recursive: true, force: true });
+});
+
+// A declared `reruns` budget means a charged failure is several runs of one
+// tree, and they need not fail the same way. Judging the last one alone would
+// let an off-diff flake on run 2 overwrite an on-diff failure on run 1.
+test("the off-diff claim has to hold for EVERY failed run, not just the last one", async () => {
+  const dir = flakeTree();
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 1, isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => {
+      if (command) return { ok: true };
+      // Run 1 failed IN the change; run 2 flaked somewhere else entirely.
+      return attempt === 1
+        ? { ok: false, code: 1, output: "✖ boom\n  at q (lib/kernel/queue.js:9:1)\n" }
+        : { ok: false, code: 1, output: FAILED_OFF_DIFF };
+    },
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed", "run 1 named the change: the failure is the change's to answer for");
+  assert.deepStrictEqual(seen.suites, ["acceptance", "acceptance"], "two runs, no isolation");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.match(seen.facts[0].markdown, /1 of which the change touches \(lib\/kernel\/queue\.js\)/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a run whose output named nothing readable leaves the whole set unreadable, so nothing is claimed off-diff", async () => {
+  const dir = flakeTree();
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 1, isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => (command ? { ok: true } : attempt === 1 ? { ok: false, code: 1, output: "Failed tasks: server:test\n" } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.match(seen.facts[0].markdown, /at least one of the runs named no readable path/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("an off-diff failure whose files fail ALONE too is charged, and the outcome says the isolated rerun failed as well", async () => {
+  const dir = flakeTree();
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => (command ? { ok: false, code: 1, reason: "`node --test` exited 1", output: FAILED_OFF_DIFF } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed", "off-diff is a reason to LOOK, never a reason to pass");
+  assert.strictEqual(seen.suites.length, 2);
+  assert.deepStrictEqual(seen.flakes, [], "nothing was demonstrated to be a flake, so nothing is filed as one");
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.match(seen.facts[0].markdown, /re-running test\/codex-dispatch\.test\.js on its own \(`node --test` exited 1\) failed too, so the failure is this tree's, not the suite's scheduling/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("the per-file telemetry rides EVERY charged command-gate failure, isolation declared or not", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps, seen } = fakes({ changed: ["lib/kernel/queue.js"], suite: () => ({ ok: false, code: 1, output: FAILED_OFF_DIFF }) });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "reading paths costs nothing; RUNNING them needs a declaration");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.match(seen.facts[0].markdown, /the failure names 1 file\(s\) — test\/codex-dispatch\.test\.js — none of which the change touches/);
+  assert.doesNotMatch(seen.facts[0].markdown, /isolation rule/, "an undeclared isolation never claims a flake");
+  // A failure that named nothing readable reads exactly as it did before the
+  // telemetry existed — the safe direction when the paths cannot be read.
+  const bare = fakes({ changed: ["lib/kernel/queue.js"], suite: () => ({ ok: false, code: 1, output: "Failed tasks: server:test\n" }) });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: bare.deps });
+  assert.doesNotMatch(bare.seen.facts[0].markdown, /the failure names/);
+});
+
+test("the isolated rerun runs on the SAME prepared tree, after every declared rerun, and its absolute paths fold onto the tree's root", async () => {
+  const dir = flakeTree();
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 1, isolate: "node --test {files}", serialize: "repo" }] });
+  const { deps, seen } = fakes({ changed: ["lib/kernel/queue.js"] });
+  const events = [];
+  deps.acquireGateLease = async () => {
+    events.push("lease");
+    return { token: 1 };
+  };
+  deps.releaseGateLease = async () => events.push("release");
+  deps.openSuite = async () => {
+    events.push("open");
+    return {
+      ok: true,
+      dir,
+      run: async (attempt, command) => {
+        events.push(command ? `isolate:${attempt}:${command}` : `run:${attempt}`);
+        // The failure names the file ONLY as an absolute path inside the tree —
+        // a stack frame, which is how a real harness prints it.
+        return command ? { ok: true } : { ok: false, code: 1, output: `✖ boom\n  at T (${dir}/test/codex-dispatch.test.js:120:5)\n` };
+      },
+      close: () => events.push("close"),
+    };
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(
+    events,
+    ["lease", "open", "run:1", "run:2", "isolate:3:node --test 'test/codex-dispatch.test.js'", "close", "release"],
+    "reruns first, then one isolation run on that same open tree, all under the one lease"
+  );
+  assert.deepStrictEqual(seen.flakes[0].files, ["test/codex-dispatch.test.js"], "the absolute frame came back repo-relative and comparable with the diff");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// The flake issue is the one node a gate files that is keyed on the FAILING
+// FILE rather than on the run — because a flake is a property of the file, and
+// the same file flaking on ten dispatches must converge on one issue somebody
+// can actually fix, not ten near-duplicates nobody triages.
+function flakeDeps(cfg, home, { node = "task-p", run = "run-abcdef12" } = {}) {
+  return sporCli.makeGateDeps(cfg, {
+    record: { node_id: node, cwd: home },
+    entry: { run_id: run, node_id: node, project: "demo" },
+    factory: { id: "factory-demo", testLaneProfile: "profile-test-writer" },
+    slug: "demo", passthrough: {}, warn: () => {}, log: () => {}, stopping: () => false, home,
+    dispatch: async () => ({ ok: false, reason: "never" }),
+  });
+}
+
+test("makeGateDeps files an off-diff flake as a per-FILE issue in the test lane, and a repeat converges on the same node", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const deps = flakeDeps(cfg, home);
+  const call = { gate: { id: "acceptance" }, files: ["test/codex-dispatch.test.js"], command: "npm test", isolate: "node --test 'test/codex-dispatch.test.js'" };
+  const first = await deps.fileFlakeItem(call);
+  assert.strictEqual(first.ok, true, first.reason);
+  assert.match(first.id, /^issue-flake-test-codex-dispatch-test-js-[0-9a-f]{8}$/);
+  const md = fs.readFileSync(path.join(home, "nodes", `${first.id}.md`), "utf8");
+  assert.match(md, /^type: issue$/m, "a flaky test is a defect in the suite, not work the gated item owes");
+  assert.match(md, /^profile: profile-test-writer$/m, "routed to the lane that may touch tests");
+  assert.match(md, /- \{type: relates-to, to: factory-demo\}/);
+  assert.match(md, /- \{type: relates-to, to: profile-test-writer\}/);
+  assert.match(md, /`test\/codex-dispatch\.test\.js`/);
+  assert.match(md, /Re-running the failure's files alone on that same tree \(`node --test 'test\/codex-dispatch\.test\.js'`\) PASSED/);
+  // Nothing run-specific in it: the run, the item and the evidence live on the
+  // `art-gate-*` facts that point AT this issue, which is what makes a repeat
+  // an idempotent no-op instead of a colliding write.
+  assert.doesNotMatch(md, /run-abcdef12|task-p/);
+
+  // A second occurrence — a different run, a different item — is the same node.
+  const again = await flakeDeps(cfg, home, { node: "task-q", run: "run-99999999" }).fileFlakeItem(call);
+  assert.deepStrictEqual([again.ok, again.id, again.existing], [true, first.id, true], "one issue per flaky file, however many runs trip over it");
+  assert.strictEqual(fs.readdirSync(path.join(home, "nodes")).length, 1);
+
+  // A different file is a different flake.
+  const other = await deps.fileFlakeItem({ ...call, file: "test/dispatch-runs.test.js", files: ["test/dispatch-runs.test.js"] });
+  assert.notStrictEqual(other.id, first.id);
+  assert.strictEqual(fs.readdirSync(path.join(home, "nodes")).length, 2);
+
+  // …and the COMPANIONS are not part of the identity: the same file failing
+  // beside a different set, in a different order, is the same flake. Keying on
+  // the set would have minted a third node here and a fourth next time the
+  // suite's scheduling shuffled.
+  const beside = await deps.fileFlakeItem({ ...call, file: "test/codex-dispatch.test.js", files: ["test/dispatch-runs.test.js", "test/codex-dispatch.test.js"] });
+  assert.deepStrictEqual([beside.ok, beside.id, beside.existing], [true, first.id, true], "the file is the key; what it failed beside is context");
+  assert.strictEqual(fs.readdirSync(path.join(home, "nodes")).length, 2);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The read behind F10/F14: a gate fact whose write door reported the id
+// already OCCUPIED did not land this markdown, so BOTH of what follows are
+// questions only a read answers — is the node under that deterministic id
+// this record at all, and which of the occurrence edges it was carrying are
+// on it. Three answers, and "could not look" is its own — never collapsed
+// into "names nothing".
+test("makeGateDeps reads back an already-occupied fact id — its verdict, its TYPED edges — and a read it could not make settles nothing", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-fact-edges-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const deps = flakeDeps(cfg, home);
+  const fact = (title, edges) =>
+    ["---", "id: art-gate-occupied", "type: artifact", `title: ${title}`, "summary: s", "date: 2026-09-05", "edges:", ...edges, "---", "", "body", ""].join("\n");
+  const occupant = fact("Gate acceptance — failed on task-demo", [
+    "  - {type: relates-to, to: task-p}",
+    "  - {type: relates-to, to: issue-flake-one}",
+    // A NON-occurrence edge at the same issue: it names it, it does not
+    // record an occurrence of it (F14).
+    "  - {type: mentions, to: issue-flake-two}",
+  ]);
+  fs.writeFileSync(path.join(home, "nodes", "art-gate-occupied.md"), occupant);
+
+  // The occupant IS this record — same verdict, same item — and its edges come
+  // back TYPED, so the runner can tell the occurrence from the mention.
+  assert.deepStrictEqual(await deps.readFact({ id: "art-gate-occupied", markdown: occupant }), {
+    ok: true,
+    same: true,
+    edges: [
+      { type: "relates-to", to: "task-p" },
+      { type: "relates-to", to: "issue-flake-one" },
+      { type: "mentions", to: "issue-flake-two" },
+    ],
+  });
+
+  // Same id, a DIFFERENT verdict under it: the check-then-write race. This
+  // markdown did not land and the graph says something else about this gate
+  // run, so the record is not ours to claim.
+  const mine = fact("Gate acceptance — passed on task-demo", ["  - {type: relates-to, to: task-p}"]);
+  assert.strictEqual((await deps.readFact({ id: "art-gate-occupied", markdown: mine })).same, false, "a different verdict under our id is not our record");
+
+  // Absent: the write said the id was taken and the read says it is not there,
+  // which can only mean it was removed in between — either way no node on this
+  // graph carries this record or the edge, so the debt is owed, not unknown.
+  assert.deepStrictEqual(await deps.readFact({ id: "art-gate-missing", markdown: mine }), { ok: true, same: false, edges: [] });
+
+  // Unreadable: neither answer. The runner leaves the occurrence owed rather
+  // than assuming a node it could not open already records it.
+  fs.mkdirSync(path.join(home, "nodes", "art-gate-unreadable.md"));
+  const blind = await deps.readFact({ id: "art-gate-unreadable", markdown: mine });
+  assert.strictEqual(blind.ok, false, "an I/O fault is not an absence");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The paying half of the occurrence debt (F13): the door that writes ONE
+// occurrence edge onto a fact whose own write found the id already taken. It
+// is the same add_edge micro-mutation `spor edge` uses, so what matters here
+// is that it is idempotent (a second payer cannot double-count an occurrence)
+// and that it REFUSES rather than writing something dangling.
+test("makeGateDeps pays a flake occurrence edge onto an existing fact — idempotently, and never at a target that is not there", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-link-fact-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const deps = flakeDeps(cfg, home);
+  const node = (id, type, extra = []) =>
+    fs.writeFileSync(
+      path.join(home, "nodes", `${id}.md`),
+      ["---", `id: ${id}`, `type: ${type}`, `title: ${id}`, `summary: ${id}`, "date: 2026-09-05", ...extra, "---", "", "body", ""].join("\n")
+    );
+  node("art-gate-fact", "artifact", ["edges:", "  - {type: relates-to, to: task-p}"]);
+  node("task-p", "task", ["status: open"]);
+  node("issue-flake-one", "issue", ["status: open"]);
+  const read = () => fs.readFileSync(path.join(home, "nodes", "art-gate-fact.md"), "utf8");
+
+  const beforePayment = read();
+  const paid = await deps.linkFact({ id: "art-gate-fact", type: "relates-to", to: "issue-flake-one" });
+  assert.strictEqual(paid.ok, false);
+  assert.match(paid.reason, /atomic graph mutation/);
+  assert.strictEqual(read(), beforePayment, "fresh local refusal changes no node bytes");
+  assert.doesNotMatch(read(), /relates-to, to: issue-flake-one/);
+  // Seed an existing historical receipt; replay may acknowledge it even when
+  // fresh local payments cannot be made atomically.
+  fs.writeFileSync(path.join(home, "nodes", "art-gate-fact.md"), read().replace("edges:\n", "edges:\n  - {type: relates-to, to: issue-flake-one}\n"));
+
+  // Again: the same occurrence, including after its target was settled.
+  node("issue-flake-one", "issue", ["status: resolved"]);
+  assert.strictEqual((await deps.linkFact({ id: "art-gate-fact", type: "relates-to", to: "issue-flake-one" })).ok, true);
+  assert.strictEqual((read().match(/relates-to, to: issue-flake-one/g) || []).length, 1, "one occurrence, one edge, however many payers");
+
+  // A target that is not on the graph is a REFUSAL: an occurrence edge
+  // pointing at nothing is worse than one still owed, and the runner reports
+  // the debt as owed on exactly this answer.
+  const dangling = await deps.linkFact({ id: "art-gate-fact", type: "relates-to", to: "issue-flake-gone" });
+  assert.strictEqual(dangling.ok, false);
+  assert.match(dangling.reason, /does not exist/);
+  // …and so is a fact that is not there to carry it.
+  assert.strictEqual((await deps.linkFact({ id: "art-gate-missing", type: "relates-to", to: "issue-flake-one" })).ok, false);
+  assert.doesNotMatch(read(), /issue-flake-gone/);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The convergent id outlives its fix, so the SAME id can be sitting there
+// closed when the file flakes again a month later. Attaching a fresh occurrence
+// to a settled node is no signal at all — nothing resurfaces it and nobody
+// triages it — so the filing reconciles against the settled state instead of
+// adopting the id on the strength of its name.
+test("a flake whose issue is already SETTLED climbs to a recurrence rung rather than linking finished work", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-settled-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const deps = flakeDeps(cfg, home);
+  const call = { gate: { id: "acceptance" }, files: ["test/codex-dispatch.test.js"], command: "npm test", isolate: "node --test 'test/codex-dispatch.test.js'" };
+  const first = await deps.fileFlakeItem(call);
+  const file = path.join(home, "nodes", `${first.id}.md`);
+
+  // Still open: the same flake converges, exactly as above.
+  assert.deepStrictEqual((await deps.fileFlakeItem(call)).id, first.id);
+
+  // Somebody fixed it and closed the issue. The next occurrence is a NEW one.
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(/^date: /m, "status: resolved\ndate: "));
+  const recur = await deps.fileFlakeItem(call);
+  assert.strictEqual(recur.ok, true, recur.reason);
+  assert.strictEqual(recur.id, `${first.id}-r2`, "the recurrence gets its own live issue");
+  const md = fs.readFileSync(path.join(home, "nodes", `${recur.id}.md`), "utf8");
+  assert.match(md, new RegExp(`- \\{type: relates-to, to: ${first.id}\\}`), "which points back at the one that was closed");
+  assert.match(md, /This is a RECURRENCE/);
+  assert.match(md, /already settled \(status: resolved\)/);
+  // …and converges there while IT is live.
+  assert.deepStrictEqual((await deps.fileFlakeItem(call)).id, recur.id);
+
+  // A file that has been closed and reopened past every rung is not a
+  // convergence problem any more: the filing refuses, which the runner turns
+  // into a charged failure and a person.
+  fs.writeFileSync(path.join(home, "nodes", `${recur.id}.md`), fs.readFileSync(path.join(home, "nodes", `${recur.id}.md`), "utf8").replace(/^date: /m, "status: resolved\ndate: "));
+  for (const rung of [3, 4]) {
+    const r = await deps.fileFlakeItem(call);
+    assert.strictEqual(r.id, `${first.id}-r${rung}`);
+    const f = path.join(home, "nodes", `${r.id}.md`);
+    fs.writeFileSync(f, fs.readFileSync(f, "utf8").replace(/^date: /m, "status: resolved\ndate: "));
+  }
+  const exhausted = await deps.fileFlakeItem(call);
+  assert.strictEqual(exhausted.ok, false);
+  assert.match(exhausted.reason, /every candidate id for this flake .* is already settled/);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The reconciliation above only holds while the read that drives it actually
+// HAPPENS. A null from the graph is two different answers — "no such node" and
+// "could not look" — and treating the second as the first sends the filing to
+// its write door, whose success means "the id is occupied" as readily as "I
+// created it" (`if_exists: skip` remotely, identical-content adoption locally).
+// So an unreadable occupant must settle nothing: not absence, not liveness, not
+// settledness.
+test("an occupant the graph could not READ is never adopted — the filing refuses instead, and writes nothing", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-unread-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    hits.push(`${req.method} ${req.url.split("?")[0]}`);
+    // Drain the body before answering, so a regression that DOES write fails
+    // on the assertion below instead of stalling on a half-sent request.
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "boom", message: "the graph is down" } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${srv.address().port}`;
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: url, SPOR_TOKEN: "t" } });
+  const r = await flakeDeps(cfg, home).fileFlakeItem({
+    gate: { id: "acceptance" }, files: ["test/codex-dispatch.test.js"], command: "npm test", isolate: "node --test 'test/codex-dispatch.test.js'",
+  });
+  assert.strictEqual(r.ok, false, "an unread occupant is not a filing");
+  assert.match(r.reason, /could not be read.*whether it is still live could not be decided/);
+  assert.deepStrictEqual(hits, ["GET /v1/nodes/issue-flake-test-codex-dispatch-test-js-" + hits[0].split("-").pop()], "one read…");
+  assert.strictEqual(hits.length, 1, "…and no write attempted on the strength of a question the read left open");
+  await new Promise((r2) => srv.close(r2));
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The check-then-write RACE, in the mode where it is real: two workers trip
+// over the same flaky file at once, both read the id as free, and the loser's
+// write comes back `skipped`. A skip is not a write — this markdown did not
+// land — so the loser reads the id back and the same live/settled rule decides,
+// rather than reporting a filing for whatever is actually there.
+test("a write the door reports as SKIPPED is read back, not adopted — a settled occupant still climbs a rung", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-race-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const node = (id, status) => [
+    "---", `id: ${id}`, "type: issue", `status: ${status}`, "date: 2026-09-04",
+    "title: Flaky under the acceptance gate", "summary: it flakes", "---", "", "body",
+  ].join("\n");
+  // The occupant appears between the read and the write, the way a second
+  // worker's filing would: absent on the first GET, present on the re-read.
+  const run = async (statusOnReread) => {
+    const hits = [];
+    let base = "";
+    const srv = http.createServer((req, res) => {
+      const p = req.url.split("?")[0];
+      const id = decodeURIComponent(p.replace("/v1/nodes/", ""));
+      hits.push(`${req.method} ${req.method === "POST" ? "" : id}`.trim());
+      if (req.method === "GET") {
+        base = base || id;
+        const seenBefore = hits.filter((h) => h === `GET ${id}`).length > 1;
+        if (id === base && seenBefore) {
+          res.writeHead(200, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ raw: node(id, statusOnReread) }));
+        }
+        res.writeHead(404, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { code: "not_found", message: "no" } }));
+      }
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        const id2 = /^id: (\S+)$/m.exec(JSON.parse(body).nodes[0].node)[1];
+        res.writeHead(200, { "content-type": "application/json" });
+        // The FIRST write loses the race; a later rung's write is this
+        // worker's own and creates.
+        res.end(JSON.stringify({ results: [{ status: id2 === base ? "skipped" : "created" }] }));
+      });
+    });
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${srv.address().port}`;
+    const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: url, SPOR_TOKEN: "t" } });
+    const r = await flakeDeps(cfg, home).fileFlakeItem({
+      gate: { id: "acceptance" }, files: ["test/codex-dispatch.test.js"], command: "npm test", isolate: "node --test 'test/codex-dispatch.test.js'",
+    });
+    await new Promise((r2) => srv.close(r2));
+    return { r, hits, base };
+  };
+
+  // The winner's node is RESOLVED — an occurrence hung on it resurfaces to
+  // nobody, so this occurrence gets its own live rung.
+  const settled = await run("resolved");
+  assert.strictEqual(settled.r.ok, true, settled.r.reason);
+  assert.strictEqual(settled.r.id, `${settled.base}-r2`, "the skip was read back, found settled, and climbed");
+  assert.deepStrictEqual(
+    settled.hits,
+    [`GET ${settled.base}`, "POST", `GET ${settled.base}`, `GET ${settled.base}`, `GET ${settled.base}-r2`, "POST"],
+    "read, lost the race, re-read, then filed the recurrence"
+  );
+
+  // The winner's node is LIVE — the same flake, so it is linked and nothing
+  // new is minted.
+  const live = await run("open");
+  assert.deepStrictEqual([live.r.ok, live.r.id, live.r.existing], [true, live.base, true]);
+  assert.deepStrictEqual(live.hits, [`GET ${live.base}`, "POST", `GET ${live.base}`, `GET ${live.base}`], "linked the live occupant — no second write");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The flake-occurrence edge is a DEBT, and the rescue lane is where it used to
+// be dropped (F9, the residual of F7). A charged off-diff pass files real
+// issues; the fact that names them is what gives each its occurrence. When the
+// pre-rescue fact write fails and the worker dies, the pipeline is resumed from
+// the durable rescue entry — and that entry carried no flake at all, so the
+// escalation fact was written naming none of the issues the pass had created.
+test("a charged off-diff pass hands its flake filings to the rescue entry, and a RESUMED escalation pays the edge the failed fact write owed", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-rescue-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  fs.writeFileSync(path.join(dir, "test", "dispatch-runs.test.js"), 'const assert = require("node:assert");\n');
+  const output = [
+    "✖ the launch handshake (40001.2ms)",
+    "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)",
+    "✖ the run record (2.1ms)",
+    "      at TestContext.<anonymous> (test/dispatch-runs.test.js:44:5)",
+  ].join("\n");
+  const factory = factoryOf({
+    ...BASE,
+    gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }],
+    rescue: RESCUE,
+  });
+  // Worker A: both files pass alone, but the SECOND filing is refused — so the
+  // suite failure is charged with file 1's issue already minted — and every
+  // fact write fails, which is exactly the write that owed that issue its edge.
+  const states = [];
+  const a = withRescue(
+    treeFakes({
+      dir,
+      changed: ["lib/kernel/queue.js"],
+      run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output }),
+      writes: "refuse",
+    })
+  );
+  a.deps.fileFlakeItem = async (args) => {
+    a.seen.flakes.push(args);
+    return args.file === "test/dispatch-runs.test.js" ? { ok: false, reason: "the graph refused the write" } : { ok: true, id: "issue-flake-one" };
+  };
+  a.deps.saveRescueState = async ({ rescues }) => states.push(JSON.parse(JSON.stringify(rescues)));
+  let progress;
+  a.deps.saveGateProgress = async ({ progress: p }) => { progress = JSON.parse(JSON.stringify(p)); };
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps })).state, "interrupted");
+  assert.deepStrictEqual(states, [], "no rescue launches while occurrence evidence is unpaid");
+  // Legacy rescue records remain resumable: older clients could already have
+  // launched their rescue with exactly this unpaid outcome.
+  const entry = { n: 1, gate: "acceptance", ...progress.evidence.outcome, fact: null, seed: {} };
+  assert.strictEqual(entry.fact, null, "the pre-rescue fact write did not land, so the edge is still owed");
+  assert.deepStrictEqual(entry.flake.issues, ["issue-flake-one"], "…and the entry carries the filing that is owed it");
+  assert.deepStrictEqual(entry.flake.files, ["test/codex-dispatch.test.js", "test/dispatch-runs.test.js"]);
+
+  // Worker B resumes that entry with its rescue already settled as unrun, so
+  // the carried refusal escalates without re-judging anything: the ONLY fact
+  // this pipeline ever writes is the escalation's, and it must carry the edge.
+  const b = withRescue(fakes({ changed: ["lib/kernel/queue.js"] }));
+  b.deps.loadRescueState = async () => [{ ...JSON.parse(JSON.stringify(entry)), done: true, error: "not satisfiable" }];
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.strictEqual(res.state, "failed", "a partial filing is still a charged failure and a person");
+  assert.deepStrictEqual(b.seen.suites, [], "nothing is re-judged: the refusal it was handed is what escalates");
+  const escalation = b.seen.facts.find((f) => /^art-gate-/.test(f.id)).markdown;
+  assert.match(escalation, /- \{type: relates-to, to: issue-flake-one\}/, "the resumed escalation pays the edge the failed fact write owed");
+  assert.match(escalation, /Off-diff flake: test\/codex-dispatch\.test\.js, test\/dispatch-runs\.test\.js failed the whole-suite run and passed alone on the same tree, filed as issue-flake-one/);
+
+  // …and it pays it ONCE. Same entry, but this time the pre-rescue fact DID
+  // land with those edges on it — which the entry says PER ISSUE, in the same
+  // stamp as the fact id, because the pipeline observed that write create the
+  // node. An occurrence is one edge, so the escalation names the issue in
+  // prose and does not link it a second time.
+  const c = withRescue(fakes({ changed: ["lib/kernel/queue.js"] }));
+  const paidEntry = {
+    ...JSON.parse(JSON.stringify(entry)),
+    fact: "art-gate-acceptance-demo-abcdef12-cafe",
+    flake: { ...JSON.parse(JSON.stringify(entry.flake)), linked: ["issue-flake-one"], linkedBy: "art-gate-acceptance-demo-abcdef12-cafe" },
+    done: true,
+    error: "not satisfiable",
+  };
+  c.deps.loadRescueState = async () => [paidEntry];
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps })).state, "failed");
+  const paid = c.seen.facts.find((f) => /^art-gate-/.test(f.id)).markdown;
+  assert.doesNotMatch(paid, /relates-to, to: issue-flake-one/, "one occurrence, one edge — the fact that recorded this refusal already linked it");
+  assert.match(paid, /That occurrence is already recorded on art-gate-acceptance-demo-abcdef12-cafe, so this fact names the issue\(s\) without linking them a second time\./);
+
+  // F11: a fact ID is not a landed edge. The same entry with the fact id but
+  // NO record of what it linked — an entry stamped by a client from before the
+  // per-issue discharge state existed, or one whose write door reported an id
+  // that was already occupied — reads the debt as OWED and pays it. Adopting
+  // `fact` as proof would suppress the only edge the issue will ever get.
+  const d = withRescue(fakes({ changed: ["lib/kernel/queue.js"] }));
+  d.deps.loadRescueState = async () => [{ ...JSON.parse(JSON.stringify(entry)), fact: "art-gate-acceptance-demo-abcdef12-cafe", done: true, error: "not satisfiable" }];
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: d.deps })).state, "failed");
+  assert.match(
+    d.seen.facts.find((f) => /^art-gate-/.test(f.id)).markdown,
+    /- \{type: relates-to, to: issue-flake-one\}/,
+    "an unrecorded discharge is an owed one — the escalation pays it rather than trusting the id"
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// F12 (the uninterrupted twin of the resume above) and F10 (what a write door
+// that reports an occupied id actually proves). One pipeline, one occurrence:
+// the pre-rescue fact links the flake issue, the rescue cannot be dispatched,
+// and the escalation fact that follows immediately must NOT link it again.
+test("a charged off-diff pass whose rescue cannot be dispatched links its flake issue ONCE, and an occupied fact id is read back before its edges count as written", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-once-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  fs.writeFileSync(path.join(dir, "test", "dispatch-runs.test.js"), 'const assert = require("node:assert");\n');
+  const output = [
+    "✖ the launch handshake (40001.2ms)",
+    "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)",
+    "✖ the run record (2.1ms)",
+    "      at TestContext.<anonymous> (test/dispatch-runs.test.js:44:5)",
+  ].join("\n");
+  const factory = factoryOf({
+    ...BASE,
+    gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }],
+    rescue: RESCUE,
+  });
+  // Both files pass alone, but the SECOND filing is refused — so the suite
+  // failure is CHARGED with file 1's issue already minted, which is the
+  // outcome that carries a flake payload into the rescue lane.
+  const mk = () => {
+    const f = withRescue(
+      treeFakes({ dir, changed: ["lib/kernel/queue.js"], run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output }) })
+    );
+    f.deps.fileFlakeItem = async ({ file }) =>
+      file === "test/dispatch-runs.test.js" ? { ok: false, reason: "the graph refused the write" } : { ok: true, id: "issue-flake-one" };
+    f.deps.rescue = async () => ({ ok: false, reason: "no lane profile is satisfiable on this box" });
+    return f;
+  };
+  const edgesTo = (md) => (md.match(/relates-to, to: issue-flake-one/g) || []).length;
+
+  // The ordinary path: the pre-rescue write CREATES the fact, so the edge is
+  // on it, and the escalation fact names the issue without linking it again.
+  const a = mk();
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps })).state, "failed");
+  const gateFacts = a.seen.facts.filter((f) => /^art-gate-/.test(f.id));
+  assert.strictEqual(gateFacts.length, 2, "the pre-rescue fact and the escalation's");
+  assert.deepStrictEqual(gateFacts.map((f) => edgesTo(f.markdown)), [1, 0], "one occurrence, one edge");
+  assert.match(gateFacts[1].markdown, /That occurrence is already recorded on /);
+
+  // The write door reports the id ALREADY OCCUPIED — which is not this
+  // markdown landing, so BOTH whether that record is ours and what it names
+  // are questions only a read answers. Here it is ours and it names the issue
+  // with the occurrence edge: the debt is discharged, and the escalation does
+  // not link it a second time.
+  const occupied = (f, seen) => {
+    f.deps.recordFact = async ({ id, markdown }) => (f.seen.facts.push({ id, markdown }), { ok: true, id, existing: true });
+    f.deps.readFact = async ({ id }) => (f.seen.reads = (f.seen.reads || 0) + 1, seen(id));
+    return f;
+  };
+  const b = occupied(mk(), () => ({ ok: true, same: true, edges: [{ type: "relates-to", to: "task-demo" }, { type: "relates-to", to: "issue-flake-one" }] }));
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.deepStrictEqual(b.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)), [1, 0]);
+
+  // F14: the occupant NAMES the issue, but not with the occurrence edge — a
+  // `mentions` says the fact talks about it, the `relates-to` is what counts
+  // as an occurrence of it. Erasing the type let the mention discharge a debt
+  // no fact had recorded, so the issue's occurrence count silently lost one.
+  const b2 = occupied(mk(), () => ({ ok: true, same: true, edges: [{ type: "mentions", to: "issue-flake-one" }] }));
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b2.deps });
+  assert.deepStrictEqual(
+    b2.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)),
+    [1],
+    "a mention is not an occurrence — unpaid evidence interrupts before escalation"
+  );
+
+  // Same, but the occupant does NOT name it at all — an earlier incarnation of
+  // this pipeline whose filing had failed. The debt is still owed, so the
+  // escalation's fact pays it.
+  const c = occupied(mk(), () => ({ ok: true, same: true, edges: [{ type: "relates-to", to: "task-demo" }] }));
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps });
+  assert.deepStrictEqual(c.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)), [1], "unpaid evidence interrupts before a second fact");
+
+  // F10, durable row (c) — the check-then-write race: the id is occupied by a
+  // DIFFERENT record (another actor wrote this gate run's fact between our
+  // check and our write). This markdown did not land, so the verdict is not
+  // reported as recorded — the run's gate result carries no fact id — and
+  // nothing about that stranger's node discharges our occurrence.
+  const c2 = occupied(mk(), () => ({ ok: true, same: false, edges: [{ type: "relates-to", to: "issue-flake-one" }] }));
+  const raced = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c2.deps });
+  assert.deepStrictEqual(c2.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)), [1], "a stranger's verdict under our id settles nothing");
+  assert.deepStrictEqual(raced.gates.map((g) => g.fact), [null], "neither record that did not land is reported as one");
+  assert.deepStrictEqual(raced.facts, [], "and it is not offered to the rescue as an anchor");
+
+  // And a read that could not be MADE settles nothing: an unconfirmed edge
+  // stays owed. An extra edge overcounts one occurrence; a missing one leaves
+  // an issue no fact names at all.
+  const d = occupied(mk(), () => ({ ok: false, reason: "the graph could not be reached" }));
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: d.deps });
+  assert.deepStrictEqual(d.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)), [1], "unknown is owed, never assumed paid");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// F13: an occupied fact id whose occupant does not carry the occurrence is a
+// debt with nowhere left to go on a PASSING gate or a final refusal — there is
+// no later fact of that pass to pay it. So it is paid where it is discovered,
+// straight onto the fact that IS there, through the idempotent add_edge door.
+test("an occurrence edge the fact's own write could not carry is paid onto that fact directly, and stays owed when that payment fails", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-pay-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  const output = ["✖ the launch handshake (40001.2ms)", "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)"].join("\n");
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const mk = () => {
+    const f = treeFakes({ dir, changed: ["lib/kernel/queue.js"], run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output }) });
+    f.deps.fileFlakeItem = async () => ({ ok: true, id: "issue-flake-one" });
+    // The occupant is this record — same verdict — but was written before the
+    // filing landed, so it does not carry the occurrence.
+    f.deps.recordFact = async ({ id, markdown }) => (f.seen.facts.push({ id, markdown }), { ok: true, id, existing: true });
+    f.deps.readFact = async () => ({ ok: true, same: true, edges: [{ type: "relates-to", to: "task-demo" }] });
+    return f;
+  };
+
+  // The gate PASSES on the off-diff flake, so this is the last fact of the
+  // pass: with no direct payment the occurrence would sink here forever.
+  const a = mk();
+  a.seen.links = [];
+  a.deps.linkFact = async ({ id, type, to }) => (a.seen.links.push({ id, type, to }), { ok: true, id });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps })).state, "passed");
+  assert.deepStrictEqual(a.seen.links.map((l) => [l.type, l.to]), [["relates-to", "issue-flake-one"]], "the occurrence is written onto the fact that is there");
+  assert.match(a.seen.links[0].id, /^art-gate-acceptance-/);
+
+  // A payment that did not land pays nothing (durable row (a)): the debt is
+  // reported owed rather than recorded as discharged, so a later fact of this
+  // item still pays it.
+  const b = mk();
+  b.seen.links = [];
+  b.deps.linkFact = async ({ id, type, to }) => (b.seen.links.push({ id, type, to }), { ok: false, reason: "the graph could not be reached" });
+  const logs = [];
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps, log: (m) => logs.push(m) })).state, "interrupted");
+  assert.strictEqual(b.seen.links.length, 1, "it was attempted");
+  assert.ok(logs.some((m) => /could not be linked onto .* stays owed/.test(m)), "and its failure is said out loud, not swallowed");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("unpaid flake evidence survives a process restart without rerunning commands or spending rescue", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-debt-resume-"));
+  fs.mkdirSync(path.join(dir, "test"));
+  fs.writeFileSync(path.join(dir, "test", "off.test.js"), 'require("node:assert");\n');
+  const journal = path.join(dir, "progress.json");
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }], rescue: RESCUE });
+  factory.implementation = {};
+  let currentCandidate = "cand-original";
+  const factCandidates = [];
+  let writable = false;
+  let failFactCreate = true;
+  let failReceipt = false;
+  const remoteOrigin = (server, org) => ({ mode: () => "remote", server: () => server, token: () => `credential-${org}`, tenant: () => ({ org }) });
+  const originalCfg = remoteOrigin("https://graph-a.example", "team-a");
+  let currentCfg = originalCfg;
+  const facts = new Map();
+  const edges = new Set();
+  const worker = () => {
+    const f = withRescue(treeFakes({ dir, changed: ["lib/x.js"], run: (n, command) => command ? { ok: true } : { ok: false, code: 1, output: "✖ flakes\n at TestContext.<anonymous> (test/off.test.js:4:2)" } }));
+    f.deps.fileFlakeItem = async () => ({ ok: true, id: "issue-flake-one" });
+    f.deps.pinCandidate = async () => ({ ok: true, candidate: { candidate_id: currentCandidate, reference: { verified_at: "2026-09-06" } } });
+    f.deps.evidenceOrigin = () => sporCli.attestationGraphOrigin(currentCfg);
+    f.deps.acceptsEvidenceOrigin = (origin) => sporCli.attestationOriginMatches(currentCfg, origin);
+    f.deps.checkEvidenceOrigins = () => {
+      const progress = fs.existsSync(journal) ? JSON.parse(fs.readFileSync(journal, "utf8")) : null;
+      return { ok: !progress || !progress.evidence || sporCli.attestationOriginMatches(currentCfg, progress.evidence.origin) };
+    };
+    f.deps.loadGateProgress = async () => fs.existsSync(journal) ? JSON.parse(fs.readFileSync(journal, "utf8")) : null;
+    f.deps.saveGateProgress = async ({ progress }) => {
+      if (failReceipt && progress.evidence && progress.evidence.complete) throw new Error("process lost before receipt save");
+      fs.writeFileSync(journal, JSON.stringify(progress));
+    };
+    f.deps.recordFact = async ({ id, markdown, candidate_id, head }) => {
+      factCandidates.push({ candidate_id, head });
+      if (failFactCreate) return { ok: false, reason: "graph write unavailable" };
+      const existing = facts.has(id);
+      facts.set(id, markdown);
+      return { ok: true, id, existing, linked: [] };
+    };
+    f.deps.readFact = async () => ({ ok: true, same: true, edges: [...edges].map((to) => ({ type: "relates-to", to })) });
+    f.deps.linkFact = async ({ to }) => { if (!writable) return { ok: false, reason: "offline" }; edges.add(to); return { ok: true }; };
+    return f;
+  };
+  const a = worker();
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps })).state, "interrupted");
+  const debt = JSON.parse(fs.readFileSync(journal, "utf8"));
+  assert.deepStrictEqual(debt.evidence.outcome.flake.issues, ["issue-flake-one"]);
+  assert.strictEqual(debt.evidence.complete, false);
+  assert.strictEqual(debt.evidence.candidate_id, "cand-original");
+  currentCandidate = "cand-repin-tip";
+  assert.strictEqual(a.seen.fixes.length, 0);
+  assert.strictEqual(facts.size, 0, "the refused fact write did not discard its debt");
+  const savedBytes = fs.readFileSync(journal, "utf8");
+  for (const cfg of [remoteOrigin("https://graph-b.example", "team-a"), remoteOrigin("https://graph-a.example", "team-b"), { mode: () => "local", nodesDir: () => dir }]) {
+    currentCfg = cfg;
+    const other = worker();
+    assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: other.deps })).state, "interrupted");
+    assert.deepStrictEqual(other.seen.suites, []);
+    assert.strictEqual(other.seen.reads, 0, "origin refusal precedes candidate pinning and dirty-tree recovery");
+    assert.strictEqual(fs.readFileSync(journal, "utf8"), savedBytes, "origin refusal preserves the original obligation");
+    assert.strictEqual(facts.size, 0);
+  }
+  currentCfg = originalCfg;
+  const unbound = JSON.parse(savedBytes);
+  delete unbound.evidence.origin;
+  fs.writeFileSync(journal, JSON.stringify(unbound));
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: worker().deps })).state, "interrupted");
+  assert.strictEqual(facts.size, 0, "an unbound legacy debt cannot be inferred to belong here");
+  fs.writeFileSync(journal, savedBytes);
+  failFactCreate = false;
+  const edgeFailure = worker();
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: edgeFailure.deps })).state, "interrupted");
+  assert.deepStrictEqual(edgeFailure.seen.suites, []);
+  const originalFact = [...facts.keys()][0];
+  writable = true;
+  failReceipt = true;
+  const crash = worker();
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: crash.deps })).state, "interrupted");
+  assert.strictEqual(edges.size, 1, "the graph payment landed before its receipt save failed");
+  assert.strictEqual(JSON.parse(fs.readFileSync(journal, "utf8")).evidence.complete, undefined);
+  failReceipt = false;
+  const b = worker();
+  const resumed = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.strictEqual(resumed.state, "passed");
+  assert.deepStrictEqual(b.seen.suites, [], "replay the exact evidence, never rerun the suite");
+  assert.deepStrictEqual([...facts.keys()], [originalFact]);
+  assert.strictEqual(edges.size, 1);
+  assert.ok(factCandidates.every((entry) => entry.candidate_id === "cand-original" && entry.head === debt.evidence.change.head), "replayed evidence carries its original candidate and commit, never the current pin");
+  const c = worker();
+  c.deps.recordFact = async () => { throw new Error("completed evidence should not be rewritten"); };
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps })).state, "passed");
+  assert.deepStrictEqual(c.seen.suites, []);
+  assert.strictEqual(edges.size, 1);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a first flake intent journal write failure stops before any graph publication", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-debt-save-"));
+  fs.mkdirSync(path.join(dir, "test"));
+  fs.writeFileSync(path.join(dir, "test", "off.test.js"), 'require("node:assert");\n');
+  const f = treeFakes({ dir, changed: ["lib/x.js"], run: (n, command) => command ? { ok: true } : { ok: false, code: 1, output: "✖ flakes\n at TestContext.<anonymous> (test/off.test.js:4:2)" } });
+  f.deps.saveGateProgress = async ({ progress }) => { if (progress.filingIntent) throw new Error("disk full"); };
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps })).state, "interrupted");
+  assert.deepStrictEqual(f.seen.facts, [], "no graph payment is attempted without a durable obligation");
+  assert.deepStrictEqual(f.seen.flakes, [], "the initial issue filing also waits for the durable intent");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("settlement after flake selection routes payment to a live recurrence and recovers its historical receipt", async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-debt-settled-"));
+  fs.mkdirSync(path.join(home, "nodes"));
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      const send = (status, json) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(json)); };
+      const id = decodeURIComponent(req.url.split("/")[3] || "");
+      const file = path.join(home, "nodes", `${id}.md`);
+      if (req.method === "GET") {
+        if (!fs.existsSync(file)) return send(404, {});
+        return send(200, { raw: fs.readFileSync(file, "utf8") });
+      }
+      const payload = JSON.parse(body);
+      if (req.url === "/v1/nodes") {
+        const raw = payload.nodes[0].node;
+        const putId = /^id: (\S+)$/m.exec(raw)[1];
+        const dest = path.join(home, "nodes", `${putId}.md`);
+        const existing = fs.existsSync(dest);
+        if (!existing) fs.writeFileSync(dest, raw);
+        return send(200, { results: [{ status: existing ? "skipped" : "created" }] });
+      }
+      assert.match(req.url, /\/edges\/live$/);
+      const edge = `  - {type: ${payload.type}, to: ${payload.to}}`;
+      const raw = fs.readFileSync(file, "utf8");
+      if (raw.split("\n").includes(edge)) return send(200, { status: "skipped", target_guard: "live" });
+      const target = fs.readFileSync(path.join(home, "nodes", `${payload.to}.md`), "utf8");
+      if (/^status: resolved$/m.test(target)) return send(409, { error: { code: "target_not_live", message: "target settled" } });
+      fs.writeFileSync(file, raw.replace("edges:\n", `edges:\n${edge}\n`));
+      return send(200, { status: "updated", target_guard: "live" });
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${server.address().port}`, SPOR_TOKEN: "fake" } });
+  const deps = flakeDeps(cfg, home);
+  const call = { gate: { id: "acceptance", command: "npm test", isolate: "node --test {files}" }, file: "test/off.test.js", files: ["test/off.test.js"] };
+  const selected = await deps.fileFlakeItem({ ...call, command: call.gate.command, isolate: call.gate.isolate });
+  assert.ok(selected.ok);
+  const fact = gateRunner.buildGateFact({ gate: call.gate, nodeId: "task-p", runId: "run-abcdef12", project: "demo", verdict: "passed", detail: "isolated green", factory: "factory-demo", flake: { files: call.files, issues: [selected.id] } });
+  assert.strictEqual((await deps.recordFact({ ...fact, flakeIssues: [selected.id] })).ok, false);
+  assert.strictEqual(fs.existsSync(path.join(home, "nodes", `${fact.id}.md`)), false);
+  assert.ok((await deps.recordFact({ ...fact, flakeIssues: [selected.id], origin: deps.evidenceOrigin() })).ok);
+  const factPath = path.join(home, "nodes", `${fact.id}.md`);
+  assert.doesNotMatch(fs.readFileSync(factPath, "utf8"), new RegExp(`relates-to, to: ${selected.id}\\}`), "fresh fact creation cannot bypass the live-target door");
+  const settle = (id) => {
+    const file = path.join(home, "nodes", `${id}.md`);
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(/^type: issue$/m, "type: issue\nstatus: resolved"));
+  };
+  settle(selected.id); // deterministic selection/payment interleaving
+  const payment = { id: fact.id, type: "relates-to", to: selected.id, ...call, origin: deps.evidenceOrigin() };
+  assert.ok((await deps.linkFact(payment)).ok);
+  const recurrence = `${selected.id}-r2`;
+  const raw = fs.readFileSync(factPath, "utf8");
+  assert.match(raw, new RegExp(`relates-to, to: ${recurrence}\\}`));
+  assert.doesNotMatch(raw, new RegExp(`relates-to, to: ${selected.id}\\}`));
+  // A process died after that edge landed but before its progress save. A
+  // later close must not turn replay into a second occurrence on rung 3.
+  settle(recurrence);
+  assert.ok((await deps.linkFact(payment)).ok);
+  assert.strictEqual(fs.existsSync(path.join(home, "nodes", `${selected.id}-r3.md`)), false);
+  assert.strictEqual(fs.readFileSync(factPath, "utf8"), raw);
+  const reread = await deps.readFact({ ...fact, flakeIssues: [selected.id] });
+  assert.strictEqual(reread.same, true, "recurrence edge is receipt metadata, the original evidence identity remains intact");
+  assert.strictEqual((await deps.readFact({ ...fact, markdown: fact.markdown.replace("isolated green", "different evidence"), flakeIssues: [selected.id] })).same, false);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("remote occurrence payments demand an acknowledged atomic live-target guard", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-guard-protocol-"));
+  let acknowledge = false;
+  const bodies = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      assert.match(req.url, /\/edges\/live$/);
+      bodies.push(JSON.parse(body));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "updated", ...(acknowledge ? { target_guard: "live" } : {}) }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${server.address().port}`, SPOR_TOKEN: "fake" } });
+    const deps = flakeDeps(cfg, home);
+    assert.strictEqual((await deps.linkFact({ id: "art-gate-fact", type: "relates-to", to: "issue-flake-one" })).ok, false);
+    acknowledge = true;
+    assert.strictEqual((await deps.linkFact({ id: "art-gate-fact", type: "relates-to", to: "issue-flake-one" })).ok, true);
+    assert.ok(bodies.every((body) => body.require_live_target === true));
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a later gate fix changes the commit and requires a fresh human approval despite identical risk paths", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-human-head-"));
+  fs.mkdirSync(path.join(home, "nodes"));
+  const { loadConfig } = require("../lib/config.js");
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const h1 = "a".repeat(40), h2 = "b".repeat(40);
+  const factory = factoryOf({ ...BASE, gates: [
+    { id: "security", kind: "human", risk: ["touches:auth"], approval_timeout_ms: 1, poll_ms: 1 },
+    { id: "suite", kind: "command", command: "test", reruns: 0, cycles: 1 },
+  ] });
+  let head = h1, suites = 0;
+  const f = fakes({ suite: () => ({ ok: ++suites > 1, output: "first attempt requires a fix" }), fix: () => { head = h2; return { ok: true }; } });
+  f.deps.changedPaths = async () => ({ ok: true, paths: ["lib/auth.js"], head, base: "c".repeat(40), trustedRef: "main", trustedSha: "c".repeat(40), branch: "candidate" });
+  const real = sporCli.makeGateDeps(cfg, { entry: ITEM, factory, slug: null, log: () => {} });
+  const approvals = [];
+  f.deps.fileHumanItem = async (args) => {
+    const filed = await real.fileHumanItem(args);
+    assert.ok(filed.ok, filed.reason);
+    approvals.push({ id: filed.id, head: args.head });
+    if (args.head === h1) fs.writeFileSync(path.join(home, "nodes", "dec-first-approved.md"), `---\nid: dec-first-approved\ntype: decision\ntitle: Approved the first commit\nsummary: Approved the first candidate only.\nstatus: accepted\nedges:\n  - {type: resolves, to: ${filed.id}}\n---\n`);
+    return filed;
+  };
+  f.deps.checkApproval = ({ id }) => sporCli.gateApprovalState(cfg, id);
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+  assert.equal(result.state, "blocked", JSON.stringify(result));
+  assert.deepStrictEqual(approvals.map((a) => a.head), [h1, h2]);
+  assert.notEqual(approvals[0].id, approvals[1].id);
+  assert.match(fs.readFileSync(path.join(home, "nodes", `${approvals[1].id}.md`), "utf8"), new RegExp(h2));
+  assert.equal((await sporCli.gateApprovalState(cfg, approvals[0].id)).state, "approved");
+  assert.equal((await sporCli.gateApprovalState(cfg, approvals[1].id)).state, "pending");
+});
+
+test("a crash after flake issue filing resumes the saved classification even when a fresh suite would be green", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-intent-crash-"));
+  fs.mkdirSync(path.join(dir, "test"));
+  fs.writeFileSync(path.join(dir, "test", "off.test.js"), 'require("node:assert");\n');
+  const file = path.join(dir, "progress.json");
+  const issues = new Set();
+  let crash = true;
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const worker = () => {
+    const f = treeFakes({ dir, changed: ["lib/x.js"], run: (n, command) => !crash || command ? { ok: true } : { ok: false, code: 1, output: "✖ original failure\n at TestContext.<anonymous> (test/off.test.js:4:2)" } });
+    f.deps.loadGateProgress = async () => fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : null;
+    f.deps.saveGateProgress = async ({ progress }) => {
+      if (crash && progress.filingIntent && progress.filingIntent.outcome) throw new Error("crash after issue write, before result save");
+      fs.writeFileSync(file, JSON.stringify(progress));
+    };
+    f.deps.fileFlakeItem = async () => { issues.add("issue-flake-one"); return { ok: true, id: "issue-flake-one" }; };
+    return f;
+  };
+  const a = worker();
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps })).state, "interrupted");
+  assert.strictEqual(issues.size, 1, "the issue landed before the simulated crash");
+  const intent = JSON.parse(fs.readFileSync(file, "utf8")).filingIntent;
+  assert.match(intent.draft.firstFailure.output, /original failure/);
+  assert.deepStrictEqual(intent.draft.isolation.files, ["test/off.test.js"]);
+  assert.strictEqual(intent.outcome, undefined);
+  crash = false;
+  const b = worker();
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.strictEqual(result.state, "passed");
+  assert.deepStrictEqual(b.seen.suites, [], "the later green suite cannot erase the classified occurrence");
+  assert.strictEqual(issues.size, 1);
+  assert.match(b.seen.facts[0].markdown, /original failure/);
+  assert.match(b.seen.facts[0].markdown, /relates-to, to: issue-flake-one/);
+  const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(saved.filingIntent, undefined, "intent is replaced by evidence and its receipt in one save");
+  assert.strictEqual(saved.evidence.complete, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("flake graph doors freeze the verified credential across filing and refuse rotated replay without refresh", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-bound-"));
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: "https://flake.example.test", SPOR_TOKEN: "original" } });
+  let bearer = "original";
+  cfg.mode = () => "remote";
+  cfg.server = () => "https://flake.example.test";
+  cfg.token = () => bearer;
+  cfg.tenant = () => ({ org: "selected", exp: 1, refresh_token: "refresh-selected" });
+  const deps = flakeDeps(cfg, home);
+  const origin = deps.evidenceOrigin();
+  assert.strictEqual(JSON.stringify(origin).includes("original"), false);
+  const auth = require("../lib/auth.js");
+  const originalFetch = global.fetch, originalRefresh = auth.refreshTenant;
+  const requests = [];
+  let refreshes = 0;
+  const fact = gateRunner.buildGateFact({ gate: { id: "acceptance", kind: "command" }, nodeId: "task-p", runId: "run-abcdef12", verdict: "passed", detail: "classified evidence", factory: "factory-demo", date: "2026-09-06" });
+  auth.refreshTenant = async () => { refreshes += 1; return "refreshed-wrong-identity"; };
+  global.fetch = async (url, options) => {
+    requests.push({ url, bearer: options.headers.Authorization });
+    if (url.endsWith("/edges/live")) return new Response("denied", { status: 401 });
+    if (options.method === "GET") {
+      if (url.endsWith(fact.id)) return new Response(JSON.stringify({ raw: fact.markdown }), { status: 200 });
+      bearer = "successor"; // config rotates after selection, before issue POST
+      return new Response("missing", { status: 404 });
+    }
+    return new Response(JSON.stringify({ results: [{ status: "created" }] }), { status: 200 });
+  };
+  try {
+    const gate = { id: "acceptance", command: "npm test", isolate: "node --test {files}" };
+    const filed = await deps.fileFlakeItem({ gate, file: "test/off.test.js", files: ["test/off.test.js"], command: gate.command, isolate: gate.isolate, origin });
+    assert.ok(filed.ok, JSON.stringify({ filed, requests }));
+    assert.strictEqual(requests.length, 2);
+    const before = requests.length;
+    assert.strictEqual((await deps.recordFact({ ...fact, flakeIssues: ["issue-flake-one"], origin })).ok, false);
+    assert.strictEqual(requests.length, before, "rotated replay sends no evidence");
+    bearer = "original";
+    assert.ok((await deps.recordFact({ ...fact, flakeIssues: ["issue-flake-one"], origin })).ok);
+    assert.ok((await deps.readFact({ ...fact, flakeIssues: ["issue-flake-one"], origin })).same);
+    assert.strictEqual((await deps.linkFact({ id: fact.id, type: "relates-to", to: "issue-flake-one", gate, file: "test/off.test.js", files: ["test/off.test.js"], origin })).ok, false);
+    assert.ok(requests.every((request) => request.bearer === "Bearer original"));
+    assert.strictEqual(refreshes, 0, "publication never substitutes the selected tenant credential");
+  } finally {
+    global.fetch = originalFetch;
+    auth.refreshTenant = originalRefresh;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+function repinWorld({ optOut = true, controller = true, progress = new Map(), command = "fast", head = "a".repeat(40), fixMoves = true } = {}) {
+  const factory = factoryOf({ ...BASE, implementation: { budget: { attempts: 1 } }, completion: { by: controller ? "controller" : "agent" }, gates: [
+    { id: "fast", kind: "command", command, ...(optOut ? { rejudge_on_repin: false } : {}) },
+    { id: "review", kind: "agent-review", profile: "profile-review" },
+    { id: "later", kind: "command", command: "later", cycles: 1, reruns: 0 },
+  ] });
+  gates.stampDefinitionRevisions(factory, { factory: "definition-1", gates: {} });
+  const f = fakes({ suite: ({ gate }) => ({ ok: gate.id !== "later" || !fixMoves || head[0] === "b", output: "needs a committed fix" }), fix: () => { head = "b".repeat(40); return { ok: true }; } });
+  f.deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head, base: "c".repeat(40), trustedRef: "main", trustedSha: "c".repeat(40), branch: "candidate" });
+  f.deps.pinCandidate = async () => ({ ok: true, candidate: { candidate_id: `cand-${head[0]}`, reference: { verified_at: "2026-09-06" } } });
+  f.deps.retainedHeadIsAncestor = ({ head: prior, tip }) => prior[0] === "a" && tip[0] === "b";
+  f.deps.loadGateProgress = async ({ gate, rescue = 0 }) => progress.get(`${rescue}:${gate.id}`) || null;
+  f.deps.saveGateProgress = async ({ gate, rescue = 0, progress: p }) => progress.set(`${rescue}:${gate.id}`, JSON.parse(JSON.stringify(p)));
+  return { ...f, factory, progress };
+}
+
+test("controller command opt-out retains the original verdict while default commands and reviews judge the moved tip", async () => {
+  for (const [optOut, controller, expected] of [[true, true, 1], [false, true, 2], [true, false, 2]]) {
+    const f = repinWorld({ optOut, controller });
+    const result = await gateRunner.runGatePipeline({ item: ITEM, factory: f.factory, deps: f.deps });
+    assert.strictEqual(result.state, "passed");
+    assert.strictEqual(f.seen.suites.filter((id) => id === "fast").length, expected);
+    assert.strictEqual(f.seen.reviews.length, 2, "the review always re-judges the moved tip");
+    const fast = result.gates.find((g) => g.gate === "fast");
+    assert.strictEqual(fast.head, (expected === 1 ? "a" : "b").repeat(40));
+    assert.strictEqual(fast.candidate_id, expected === 1 ? "cand-a" : "cand-b");
+    assert.strictEqual(result.gates.find((g) => g.gate === "review").head, "b".repeat(40));
+    const att = require("../lib/shell/attestation.js").buildAttestationObject({ item: ITEM, factory: f.factory, gate: result, signing: { key: "test-signing", keyId: "test" } });
+    assert.strictEqual(att.passed, true);
+    assert.strictEqual(att.gate.head_consistent, expected !== 1, "ancestor evidence is never relabeled as current-head evidence");
+    assert.strictEqual(require("../lib/shell/attestation.js").verifyAttestation(att, { key: "test-signing" }).ok, true);
+  }
+});
+
+test("retained command receipts survive restart only within the same attempt and pinned factory declaration", async () => {
+  const initial = repinWorld();
+  await gateRunner.runGatePipeline({ item: ITEM, factory: initial.factory, deps: initial.deps });
+  const saved = new Map(initial.progress);
+  const resumed = repinWorld({ progress: new Map(saved), head: "b".repeat(40), fixMoves: false });
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory: resumed.factory, deps: resumed.deps });
+  assert.strictEqual(resumed.seen.suites.includes("fast"), false);
+  assert.strictEqual(result.gates.find((g) => g.gate === "fast").candidate_id, "cand-a");
+  for (const [item, command] of [[{ ...ITEM, attempt: 1 }, "fast"], [ITEM, "new-fast-command"]]) {
+    const rerun = repinWorld({ progress: new Map(saved), head: "b".repeat(40), fixMoves: false, command });
+    assert.strictEqual((await gateRunner.runGatePipeline({ item, factory: rerun.factory, deps: rerun.deps })).state, "passed");
+    assert.strictEqual(rerun.seen.suites.filter((id) => id === "fast").length, 1, "a new attempt or changed declaration reruns the command");
+  }
+});
+
+test("a retained command receipt cannot bypass unpaid occurrence debt or a filing intent", async () => {
+  const initial = repinWorld();
+  await gateRunner.runGatePipeline({ item: ITEM, factory: initial.factory, deps: initial.deps });
+  for (const kind of ["evidence", "filingIntent"]) {
+    const saved = new Map(JSON.parse(JSON.stringify([...initial.progress])));
+    const p = saved.get("0:fast");
+    p[kind] = kind === "filingIntent" ? { origin: "unknown" } : { complete: false, outcome: { passed: true, verdict: "passed", flake: { files: ["test/off.js"], issues: ["issue-flake-one"] } }, change: { head: "a".repeat(40) } };
+    const resumed = repinWorld({ progress: saved, head: "b".repeat(40), fixMoves: false });
+    if (kind === "filingIntent") resumed.deps.acceptsEvidenceOrigin = () => false;
+    else resumed.deps.recordFact = async () => ({ ok: false, reason: "offline" });
+    assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory: resumed.factory, deps: resumed.deps })).state, "interrupted");
+    assert.deepStrictEqual(resumed.seen.reviews, []);
+  }
+});
+
+test("package entry imports refuse flake isolation when changed source could be their entry", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-package-ref-"));
+  try {
+    fs.mkdirSync(path.join(dir, "test"));
+    fs.mkdirSync(path.join(dir, "lib"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "self-package", main: "lib/graph.js" }));
+    fs.writeFileSync(path.join(dir, "lib", "graph.js"), "module.exports = 1;");
+    fs.writeFileSync(path.join(dir, "lib", "package.json"), JSON.stringify({ main: "graph.js" }));
+    for (const source of ['require("..")', 'require("../")', 'import x from ".."', 'import {\n x\n} from ".."', 'import("..")', 'require("../lib")', 'require("self-package")']) {
+      fs.writeFileSync(path.join(dir, "test", "off.test.js"), source);
+      const reference = gateRunner.changeReferencedBy(dir, ["test/off.test.js"], ["lib/graph.js"]);
+      assert.ok(reference.unknown || reference.reached.includes("lib/graph.js"), source);
+      const f = treeFakes({ dir, changed: ["lib/graph.js"], run: (n, command) => command ? { ok: true } : { ok: false, code: 1, output: "✖ fail\n test/off.test.js:1:1" } });
+      const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}", cycles: 0, reruns: 0 }] });
+      const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+      assert.equal(result.state, "failed", source);
+      assert.equal(f.seen.flakes.length, 0, source);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("partial occurrence payments preserve the original fact payload on restart", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-partial-payment-"));
+  try {
+    fs.mkdirSync(path.join(dir, "test"));
+    for (const name of ["one", "two"]) fs.writeFileSync(path.join(dir, "test", `${name}.test.js`), 'require("node:assert");');
+    const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+    let progress = null, retry = false, original = null;
+    const receipts = new Set(), calls = [];
+    const worker = () => {
+      const f = treeFakes({ dir, changed: ["lib/x.js"], run: (n, command) => command ? { ok: true } : { ok: false, code: 1, output: "✖ fail\n test/one.test.js:1:1\n test/two.test.js:1:1" } });
+      f.deps.fileFlakeItem = async ({ file }) => ({ ok: true, id: file.includes("one") ? "issue-one" : "issue-two" });
+      f.deps.loadGateProgress = async () => progress;
+      f.deps.saveGateProgress = async ({ progress: p }) => { progress = JSON.parse(JSON.stringify(p)); };
+      f.deps.recordFact = async ({ markdown }) => { if (original) return { existing: true }; original = markdown; return { ok: true, linked: [] }; };
+      f.deps.readFact = async ({ markdown }) => ({ ok: true, same: markdown === original, edges: [...receipts].map((to) => ({ type: "relates-to", to })) });
+      f.deps.linkFact = async ({ to }) => { calls.push(to); if (to === "issue-two" && !retry) return { ok: false }; receipts.add(to); return { ok: true }; };
+      return f;
+    };
+    assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: worker().deps })).state, "interrupted");
+    const outcome = JSON.stringify(progress.evidence.outcome);
+    assert.equal(progress.evidence.complete, false);
+    assert.deepEqual(progress.evidence.payment_receipts.linked, ["issue-one"]);
+    retry = true;
+    const resumed = worker();
+    assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: resumed.deps })).state, "passed");
+    assert.equal(JSON.stringify(progress.evidence.outcome), outcome);
+    assert.deepEqual(calls, ["issue-one", "issue-two", "issue-two"]);
+    assert.equal(progress.evidence.complete, true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("removed gate obligations block before candidate pinning or any new green suite", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  try {
+    const entry = { node_id: "task-demo", run_id: "aabbccdd-bbbb-cccc-dddd-eeeeeeeeeeee" };
+    const record = dispatchRuns.runPaths(home, entry.run_id).record;
+    dispatchRuns.atomicJson(record, { ...entry, state: "done" });
+    const oldGate = { id: "acceptance", kind: "command" };
+    const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance-v2", kind: "command", command: "true" }] });
+    const real = sporCli.makeGateDeps(cfg, { entry, factory, slug: null, log: () => {} });
+    for (const pending of [
+      { evidence: { gate: oldGate, complete: false, origin: real.evidenceOrigin(), outcome: { passed: true } } },
+      { filingIntent: { gate: oldGate, origin: real.evidenceOrigin(), draft: {} } },
+    ]) {
+      await real.saveGateProgress({ gate: oldGate, item: entry, progress: pending });
+      const bytes = fs.readFileSync(record, "utf8");
+      const f = fakes();
+      f.deps.checkEvidenceOrigins = real.checkEvidenceOrigins;
+      f.deps.pinCandidate = async () => { throw new Error("must refuse before pin"); };
+      f.deps.changedPaths = async () => { throw new Error("must refuse before tree work"); };
+      const result = await gateRunner.runGatePipeline({ item: entry, factory, deps: f.deps });
+      assert.equal(result.state, "interrupted");
+      assert.match(result.reason, /removed or renamed gate/);
+      assert.equal(fs.readFileSync(record, "utf8"), bytes);
+    }
+    await real.saveGateProgress({ gate: oldGate, item: entry, progress: { evidence: { gate: oldGate, complete: true, origin: real.evidenceOrigin() } } });
+    assert.deepEqual(real.checkEvidenceOrigins(), { ok: true }, "paid history does not prohibit changing declarations");
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("command retention reruns when ancestry or the original candidate cannot be proved", async () => {
+  for (const missing of ["ancestry", "candidate"]) {
+    const f = repinWorld();
+    if (missing === "ancestry") f.deps.retainedHeadIsAncestor = () => false;
+    else f.deps.pinCandidate = async () => ({ ok: true, candidate: { reference: { verified_at: "2026-09-06" } } });
+    const result = await gateRunner.runGatePipeline({ item: ITEM, factory: f.factory, deps: f.deps });
+    assert.equal(result.state, "passed");
+    assert.equal(f.seen.suites.filter((g) => g === "fast").length, 2);
+    assert.equal(result.gates.find((g) => g.gate === "fast").head, "b".repeat(40));
+  }
+});
+
+test("a command-only pipeline still attests its retained ancestor when no review forces a rewind", async () => {
+  const f = repinWorld();
+  f.factory.gates = f.factory.gates.filter((g) => g.id !== "review");
+  f.factory.definition = gates.describeDefinition(f.factory);
+  gates.stampDefinitionRevisions(f.factory, { factory: "definition-1", gates: {} });
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory: f.factory, deps: f.deps });
+  const retained = result.gates.find((g) => g.gate === "fast");
+  assert.equal(result.state, "passed");
+  assert.equal(f.seen.suites.filter((g) => g === "fast").length, 1);
+  assert.equal(retained.retained, true);
+  assert.equal(retained.retained_for, "b".repeat(40));
+  assert.equal(require("../lib/shell/attestation.js").buildAttestationObject({ item: ITEM, factory: f.factory, gate: result }).passed, true);
+});
+
+test("an unknown head does not trigger an unbounded rejudge loop or gain retention evidence", async () => {
+  let runs = 0;
+  const f = fakes({ suite: () => { if (++runs > 1) return { ok: false, code: 1 }; return { ok: true }; } });
+  f.deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"] });
+  const factory = factoryOf({ ...BASE, gates: [{ id: "once", kind: "command", command: "test", cycles: 0, reruns: 0 }] });
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+  assert.equal(runs, 1);
+  assert.equal(result.state, "passed");
+  assert.equal(result.gates[0].retained, undefined);
+  assert.equal(require("../lib/shell/attestation.js").buildAttestationObject({ item: ITEM, factory, gate: result }).passed, false, "unknown heads still cannot attest acceptance");
+});
+
+test("real Git ancestry retains the opted-out command while human approval follows the new commit", async () => {
+  const dir = repoWithBranch({ weakenTest: false, regress: false });
+  try {
+    const original = git(dir, "rev-parse", "HEAD").trim();
+    let moved = false;
+    const factory = factoryOf({ ...BASE, risk_classes: { "touches:auth": ["lib/sub.js"] }, implementation: {}, completion: { by: "controller" }, gates: [
+      { id: "fast", kind: "command", command: "fast", rejudge_on_repin: false },
+      { id: "approval", kind: "human", risk: ["touches:auth"] },
+      { id: "later", kind: "command", command: "later", cycles: 1, reruns: 0 },
+    ] });
+    const f = fakes({ suite: ({ gate }) => ({ ok: gate.id !== "later" || moved }), fix: () => {
+      fs.appendFileSync(path.join(dir, "lib", "sub.js"), "// committed fix\n");
+      git(dir, "add", "lib/sub.js");
+      git(dir, "commit", "-q", "-m", "fix candidate");
+      moved = true;
+      return { ok: true };
+    } });
+    f.deps.changedPaths = async () => gateRunner.gateChangeSet({ cwd: dir }, "main");
+    f.deps.pinCandidate = async () => ({ ok: true, candidate: { candidate_id: `candidate-${git(dir, "rev-parse", "HEAD").trim()}`, reference: { verified_at: "2026-09-06" } } });
+    const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+    const tip = git(dir, "rev-parse", "HEAD").trim();
+    assert.equal(result.state, "passed");
+    assert.equal(f.seen.suites.filter((g) => g === "fast").length, 1);
+    assert.deepEqual(f.seen.human.map((a) => a.head), [original, tip]);
+    assert.equal(result.gates.find((g) => g.gate === "fast").head, original);
+    assert.equal(result.gates.find((g) => g.gate === "fast").retained_for, tip);
+    assert.equal(result.gates.find((g) => g.gate === "approval").head, tip);
+    assert.equal(require("../lib/shell/attestation.js").buildAttestationObject({ item: ITEM, factory, gate: result }).passed, true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("nested root package imports cannot justify off-diff isolation", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-nested-package-ref-"));
+  try {
+    fs.mkdirSync(path.join(dir, "test", "unit"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "lib"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ main: "lib/graph.js" }));
+    fs.writeFileSync(path.join(dir, "lib", "graph.js"), "module.exports = 1;");
+    const file = "test/unit/off.test.js";
+    for (const source of ['require("../..")', 'require("../../")', 'import x from "../.."', 'import("../../")', 'require("../unit/../..")']) {
+      fs.writeFileSync(path.join(dir, file), source);
+      const reference = gateRunner.changeReferencedBy(dir, [file], ["lib/graph.js"]);
+      assert.ok(reference.unknown || reference.reached.includes("lib/graph.js"), source);
+      const f = treeFakes({ dir, changed: ["lib/graph.js"], run: (_n, command) => command ? { ok: true } : { ok: false, code: 1, output: `✖ fail\n ${file}:1:1` } });
+      const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}", cycles: 0, reruns: 0 }] });
+      assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps })).state, "failed", source);
+      assert.equal(f.seen.flakes.length, 0, source);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("completed evidence receipts survive a crash before rescue state and prevent a second occurrence", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }], rescue: RESCUE });
+  const f = withRescue(fakes(), () => ({ ok: false, reason: "rescue could not launch" }));
+  const first = "art-gate-original-paid";
+  const flake = { issues: ["issue-flake-one"], files: ["test/off.test.js"], linked: [] };
+  const outcome = { passed: false, verdict: "failed", detail: "original failure", flake, rescueNext: { n: 1, attempts: 1, profile: RESCUE.profile }, attempts: [], ledger: [] };
+  const change = await f.deps.changedPaths({});
+  f.seen.reads = 0;
+  const { ok, paths, ...savedChange } = change;
+  const original = JSON.stringify(outcome);
+  let progress = { evidence: { complete: true, fact: first, gate: factory.gates[0], outcome, payment_receipts: { ...flake, linked: ["issue-flake-one"], linkedBy: first }, change: savedChange, definition: factory.definition || null } };
+  f.deps.loadGateProgress = async () => progress;
+  f.deps.saveGateProgress = async ({ progress: p }) => { progress = JSON.parse(JSON.stringify(p)); };
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+  assert.equal(result.state, "failed");
+  assert.equal(f.seen.rescues.length, 1);
+  assert.deepEqual(f.seen.suites, [], "completed evidence is adopted without another judgement");
+  const occurrenceEdges = f.seen.facts.reduce((count, fact) => count + (fact.markdown.match(/type: relates-to, to: issue-flake-one/g) || []).length, 0);
+  assert.equal(occurrenceEdges, 0, "the existing first fact already paid this occurrence");
+  assert.equal(JSON.stringify(outcome), original, "the original classified outcome remains immutable");
+});
+
+test("all pending gate and rescue-pass evidence settles before tree reads, pins, fixes or earlier gates", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  try {
+    const entry = { node_id: "task-demo", run_id: "11223344-bbbb-cccc-dddd-eeeeeeeeeeee" };
+    const path = dispatchRuns.runPaths(home, entry.run_id).record;
+    dispatchRuns.atomicJson(path, { ...entry, state: "done" });
+    const factory = factoryOf({ ...BASE, gates: [{ id: "first", kind: "command", command: "first" }, { id: "acceptance", kind: "command", command: "acceptance" }] });
+    const real = sporCli.makeGateDeps(cfg, { entry, factory, slug: null, log: () => {} });
+    const origin = real.evidenceOrigin();
+    const gate = factory.gates[1];
+    const savedChange = { head: "original-head", base: "original-base", trustedRef: "original-main", trustedSha: "original-trust" };
+    const definition = { gates: [{ id: "acceptance", digest: "original-definition" }] };
+    for (const rescue of [0, 2]) {
+      const outcome = { passed: true, verdict: "passed", detail: "original classified failure", rescue, flake: { issues: ["issue-original"], files: ["test/off.test.js"], linked: [] } };
+      const debt = { gate, outcome, change: savedChange, definition, origin, candidate_id: "cand-original", complete: false };
+      await real.saveGateProgress({ gate, rescue, item: entry, progress: rescue ? { filingIntent: debt } : { evidence: debt } });
+    }
+    assert.equal(real.checkEvidenceOrigins().pending.length, 2, "journal preflight includes later gates in every pass");
+    let payable = false;
+    const calls = [];
+    const worker = () => {
+      const f = fakes();
+      f.deps.checkEvidenceOrigins = real.checkEvidenceOrigins;
+      f.deps.acceptsEvidenceOrigin = real.acceptsEvidenceOrigin;
+      f.deps.evidenceOrigin = real.evidenceOrigin;
+      f.deps.loadGateProgress = real.loadGateProgress;
+      f.deps.saveGateProgress = real.saveGateProgress;
+      const changedPaths = f.deps.changedPaths;
+      f.deps.changedPaths = async (args) => { calls.push("tree"); assert.ok(payable); return changedPaths(args); };
+      f.deps.pinCandidate = async () => { calls.push("pin"); assert.ok(payable); return { ok: true }; };
+      f.deps.fix = async () => { calls.push("fix"); assert.ok(payable); return { ok: true }; };
+      const suite = f.deps.runSuite;
+      f.deps.runSuite = async (args) => { calls.push(args.gate.id); assert.ok(payable); return suite(args); };
+      const recordFact = f.deps.recordFact;
+      f.deps.recordFact = async (args) => {
+        if (args.flakeIssues && args.flakeIssues.length) {
+          calls.push(`debt:${args.rescue || 0}`);
+          assert.equal(args.candidate_id, "cand-original");
+          assert.equal(args.head, savedChange.head);
+          assert.deepEqual(args.origin, origin);
+          assert.match(args.markdown, /original-definition/);
+          return payable ? { ok: true, id: args.id } : { ok: false, reason: "offline" };
+        }
+        return recordFact(args);
+      };
+      return f;
+    };
+    const blocked = worker();
+    assert.equal((await gateRunner.runGatePipeline({ item: entry, factory, deps: blocked.deps })).state, "interrupted");
+    assert.deepEqual(calls, ["debt:0"]);
+    assert.equal(blocked.seen.reads, 0);
+    assert.deepEqual(blocked.seen.suites, []);
+    payable = true; calls.length = 0;
+    const resumed = worker();
+    assert.equal((await gateRunner.runGatePipeline({ item: entry, factory, deps: resumed.deps })).state, "passed");
+    assert.deepEqual(calls.slice(0, 2), ["debt:0", "debt:2"]);
+    assert.ok(calls.indexOf("tree") > 1);
+    assert.ok(calls.indexOf("first") > 1);
+    assert.deepEqual(real.checkEvidenceOrigins(), { ok: true }, "paid obligations do not deadlock normal resumes");
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("an opted-out command skipped on the ancestor runs when a later fix introduces its risk path", async () => {
+  const f = repinWorld();
+  f.factory.gates.find((g) => g.id === "fast").risk = ["touches:auth"];
+  f.factory.definition = gates.describeDefinition(f.factory);
+  gates.stampDefinitionRevisions(f.factory, { factory: "definition-risk", gates: {} });
+  const read = f.deps.changedPaths;
+  f.deps.changedPaths = async () => {
+    const change = await read();
+    return { ...change, paths: change.head[0] === "a" ? ["lib/x.js"] : ["lib/auth.js"] };
+  };
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory: f.factory, deps: f.deps });
+  assert.equal(result.state, "passed");
+  assert.equal(f.seen.suites.filter((id) => id === "fast").length, 1, "the initial risk skip does not excuse the newly armed command");
+  const fast = result.gates.find((g) => g.gate === "fast");
+  assert.equal(fast.verdict, "passed");
+  assert.equal(fast.head, "b".repeat(40));
+  assert.equal(fast.candidate_id, "cand-b");
+  assert.equal(fast.retained, undefined);
+  assert.ok(f.seen.facts.some((fact) => fact.id.includes("fast") && /skipped/.test(fact.markdown)), "the ancestor really was unarmed");
+  const att = require("../lib/shell/attestation.js");
+  const signed = att.buildAttestationObject({ item: ITEM, factory: f.factory, gate: result, signing: { key: "k" } });
+  assert.equal(signed.passed, true);
+  assert.equal(att.verifyAttestation(signed, { key: "k" }).ok, true);
+});
+
+test("flake filing replay preserves the remaining fix cycles independently of payment completion", async (t) => {
+  for (const priorFixes of [0, 1]) for (const crashAt of ["draft", "outcome", "receipt-before", "receipt-after"]) {
+    await t.test(`${priorFixes} earlier fixes; crash at ${crashAt}`, async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-continuation-"));
+      try {
+        fs.mkdirSync(path.join(dir, "test"));
+        for (const name of ["one", "two"]) fs.writeFileSync(path.join(dir, "test", `${name}.test.js`), 'require("node:assert");');
+        const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}", cycles: priorFixes + 1, reruns: 0 }] });
+        const run = async (interrupted) => {
+          let progress = null, fixes = 0, armed = interrupted;
+          const facts = new Map(), events = [], workers = [];
+          const worker = () => {
+            const f = treeFakes({ dir, changed: ["lib/x.js"], run: (_attempt, command) => {
+              events.push(command ? "isolate" : "suite");
+              if (command || fixes > priorFixes) return { ok: true };
+              return { ok: false, code: 1, output: fixes < priorFixes ? "an ordinary first-cycle failure" : "✖ original flake\n test/one.test.js:1:1\n test/two.test.js:1:1" };
+            }, fix: async ({ cycle, onLaunch }) => {
+              events.push(`fix:${cycle}`);
+              assert.equal(cycle, fixes, "replay neither skips nor replenishes a fix cycle");
+              await onLaunch({ runId: `fix-${cycle}` });
+              fixes += 1;
+              return { ok: true, runId: `fix-${cycle}` };
+            } });
+            const read = f.deps.changedPaths;
+            f.deps.changedPaths = async () => { events.push("tree"); return { ...await read(), head: `head-${fixes}` }; };
+            f.deps.fileFlakeItem = async ({ file }) => file.includes("one") ? { ok: true, id: "issue-one" } : { ok: false, reason: "second filing refused" };
+            f.deps.loadGateProgress = async () => progress && JSON.parse(JSON.stringify(progress));
+            f.deps.saveGateProgress = async ({ progress: p }) => {
+              const outcome = p.filingIntent && p.filingIntent.outcome;
+              const receipt = p.evidence && p.evidence.complete;
+              if (armed && ((crashAt === "draft" && outcome) || (crashAt === "receipt-before" && receipt))) {
+                armed = false; throw new Error("injected crash before save");
+              }
+              progress = JSON.parse(JSON.stringify(p));
+              if (armed && ((crashAt === "outcome" && outcome) || (crashAt === "receipt-after" && receipt))) {
+                armed = false; throw new Error("injected crash after save");
+              }
+            };
+            f.deps.recordFact = async ({ id, markdown, flakeIssues }) => {
+              if (flakeIssues.length) events.push("pay");
+              const previous = facts.get(id);
+              if (previous) assert.equal(markdown, previous, "payment replay preserves the original fact");
+              facts.set(id, markdown);
+              return { ok: true, id, existing: !!previous, identical: true };
+            };
+            workers.push(f);
+            return f;
+          };
+          const first = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: worker().deps });
+          let result = first;
+          if (interrupted) {
+            assert.equal(first.state, "interrupted");
+            assert.equal(fixes, priorFixes, "the interrupted filing has not launched its remaining fix");
+            const before = events.length;
+            const debtWasPaid = progress.evidence && progress.evidence.complete;
+            result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: worker().deps });
+            const replay = events.slice(before);
+            assert.deepEqual(replay.filter((x) => x === "suite" || x === "isolate"), ["suite"], "only the fixed head is tested; the filed outcome is consumed without another suite or isolation");
+            if (!debtWasPaid) assert.ok(replay.indexOf("pay") >= 0 && replay.indexOf("pay") < replay.indexOf("tree"), "payment precedes candidate reads and all ordinary work");
+            else assert.equal(replay.includes("pay"), false, "a completed receipt is not paid again");
+          }
+          assert.equal(result.state, "passed");
+          assert.equal(fixes, priorFixes + 1);
+          assert.equal(workers.reduce((n, f) => n + f.seen.escalations.length, 0), 0);
+          assert.equal([...facts.values()].filter((md) => md.includes("type: relates-to, to: issue-one")).length, 1, "the original occurrence is recorded once");
+          return { state: result.state, fixes, cycles: workers.flatMap((f) => f.seen.fixes.map((x) => x.cycle)) };
+        };
+        assert.deepEqual(await run(true), await run(false), "crash/replay has the same fix budget and outcome as uninterrupted execution");
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test("a paid filing continuation preserves the cap and only judges its original head and declaration", async (t) => {
+  for (const scenario of ["exhausted", "no-retry", "new-head", "new-definition"]) await t.test(scenario, async () => {
+    const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "test", cycles: 1, reruns: 0 }] });
+    const f = fakes();
+    const { ok, paths, ...change } = await f.deps.changedPaths();
+    const flake = { issues: ["issue-one"], files: ["test/off.test.js"], linked: ["issue-one"], linkedBy: "original-fact" };
+    const outcome = { passed: false, verdict: "failed", detail: "original classified failure", flake, ...(scenario === "no-retry" ? { noRetry: true } : {}) };
+    let progress = {
+      fixes: scenario === "exhausted" ? 1 : 0,
+      attempts: scenario === "exhausted" ? [{ passed: false, verdict: "failed", detail: "earlier failure" }] : [], ledger: [],
+      evidence: { complete: true, fact: "original-fact", outcome, payment_receipts: flake, gate: factory.gates[0], change, definition: factory.definition || null, continuation: { phase: "judge", cycle: scenario === "exhausted" ? 1 : 0 } },
+    };
+    if (scenario === "new-head") progress.evidence.change = { ...change, head: "old-head" };
+    if (scenario === "new-definition") progress.evidence.definition = { revision: "old-declaration" };
+    f.deps.loadGateProgress = async () => JSON.parse(JSON.stringify(progress));
+    f.deps.saveGateProgress = async ({ progress: p }) => { progress = JSON.parse(JSON.stringify(p)); };
+    const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+    const changed = scenario.startsWith("new-");
+    assert.equal(result.state, changed ? "passed" : "failed");
+    assert.equal(f.seen.fixes.length, 0, "no extra fix after the cap, explicit noRetry, or a newly passing candidate");
+    assert.deepEqual(f.seen.suites, changed ? ["acceptance"] : [], "only a changed candidate needs a new judgement");
+    assert.equal(f.seen.escalations.length, changed ? 0 : 1);
+  });
+});
+
+test("mandatory flake payment and durable receipt precede execution settlement across interruption and restart", async (t) => {
+  for (const fault of ["payment", "receipt-before", "receipt-after"]) await t.test(fault, async () => {
+    const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "test", cycles: 0 }] });
+    const f = fakes(), gate = factory.gates[0];
+    const { ok, paths, ...change } = await f.deps.changedPaths();
+    const flake = { issues: ["issue-one"], files: ["test/off.js"], linked: [] };
+    let saved = { evidence: { gate, outcome: { passed: true, verdict: "passed", detail: "isolation passed", flake }, change, definition: factory.definition || null, candidate_id: "candidate-original" } };
+    let armed = true, paid = false;
+    const settlements = [], actions = [];
+    const worker = () => {
+      const fresh = fakes();
+      fresh.deps.loadGateProgress = async () => JSON.parse(JSON.stringify(saved));
+      fresh.deps.saveGateProgress = async ({ progress }) => {
+        if (armed && progress.evidence?.complete && fault === "receipt-before") throw new Error("before receipt persistence");
+        saved = JSON.parse(JSON.stringify(progress));
+        if (armed && progress.evidence?.complete && fault === "receipt-after") throw new Error("after receipt persistence");
+      };
+      fresh.deps.recordFact = async () => { actions.push("bare-fact"); return { ok: true, linked: paid ? ["issue-one"] : [] }; };
+      fresh.deps.linkFact = async () => { actions.push("payment"); if (armed && fault === "payment") return { ok: false }; paid = true; return { ok: true }; };
+      fresh.deps = require("../bin/spor.js").reportingGateDeps(fresh.deps, { gateSettled: async (id, verdict, options) => { settlements.push({ id, verdict, options }); assert.equal(saved.evidence.complete, true, "settlement requires durable complete payment receipt"); return { ok: true }; }, rescueStarted: async () => {} });
+      return fresh;
+    };
+    const first = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: worker().deps });
+    assert.equal(first.state, "interrupted");
+    assert.equal(settlements.length, 0, "a bare fact cannot advance the execution boundary");
+    assert.ok(saved.evidence.outcome.flake.issues.includes("issue-one"), "original obligation survives failure");
+    armed = false;
+    const resumed = worker(), result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: resumed.deps });
+    assert.equal(result.state, "passed");
+    assert.equal(settlements.length, 1, "receipt adoption reports exactly once in the resumed pass");
+    assert.equal(settlements[0].options.candidateId, "candidate-original");
+    assert.deepEqual(resumed.seen.suites, [], "receipt replay does not rerun the suite");
+  });
+});
+
+test("completed flake receipt restored during rewind has one verdict per gate and pass", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "fast", kind: "command", command: "fast" }, { id: "later", kind: "command", command: "later", cycles: 1, reruns: 0 }] });
+  const a = "a".repeat(40), b = "b".repeat(40);
+  let head = a;
+  const f = fakes({ suite: ({ gate }) => ({ ok: gate.id === "fast" || head === b }), fix: () => { head = b; return { ok: true }; } });
+  const snapshot = { paths: ["lib/x.js"], base: "base", trustedRef: "main", trustedSha: "trusted", branch: "task-demo" };
+  f.deps.changedPaths = async () => ({ ok: true, ...snapshot, head });
+  const change = { ...snapshot, head: a }; delete change.paths;
+  const flake = { issues: ["issue-one"], files: ["test/off.js"], linked: [] };
+  const progress = new Map([["fast", { evidence: { complete: true, gate: factory.gates[0], fact: "paid-original", outcome: { passed: true, verdict: "passed", flake }, payment_receipts: { ...flake, linked: ["issue-one"] }, change, definition: factory.definition || null, candidate_id: "candidate-a", result: { gate: "fast", kind: "command", verdict: "passed", head: a, candidate_id: "candidate-a", fact: "paid-original" } } }]]);
+  f.deps.loadGateProgress = async ({ gate }) => JSON.parse(JSON.stringify(progress.get(gate.id) || null));
+  f.deps.saveGateProgress = async ({ gate, progress: p }) => progress.set(gate.id, JSON.parse(JSON.stringify(p)));
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+  assert.equal(result.state, "passed");
+  assert.equal(f.seen.fixes.length, 1);
+  assert.deepEqual(result.gates.map(r => [r.gate, r.head]), [["fast", b], ["later", b]]);
+  assert.equal(result.facts.filter(id => id === "paid-original").length, 1, "original fact remains evidence without an extra verdict");
+});
+
+
+test("rejected or throwing settlement stays retryable when a receipt is adopted again", async (t) => {
+  for (const mode of ["refused", "throws", "queued"]) await t.test(mode, async () => {
+    const f = repinWorld();
+    let fastCalls = 0;
+    f.deps = require("../bin/spor.js").reportingGateDeps(f.deps, {
+      candidateSubmitted: async () => ({ ok: true }),
+      gateSettled: async (id) => {
+        if (id !== "fast") return { ok: true };
+        fastCalls++;
+        if (fastCalls === 1) {
+          if (mode === "throws") throw new Error("store write refused");
+          return mode === "queued" ? { ok: false, deferred: true, pending: 1 } : { ok: false };
+        }
+        return { ok: true };
+      },
+    });
+    const result = await gateRunner.runGatePipeline({ item: ITEM, factory: f.factory, deps: f.deps });
+    assert.equal(result.state, "passed");
+    assert.equal(fastCalls, mode === "queued" ? 1 : 2, "only acknowledged or durable queued reporting is deduplicated");
+  });
+});
+
+test("rescue publication reports execution history after its fact is confirmed", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "test", cycles: 0, reruns: 0 }], rescue: RESCUE });
+  let rescued = false;
+  const f = withRescue(fakes({ suite: () => ({ ok: rescued }) }), () => {
+    rescued = true;
+    return { ok: true, runId: "run-rescue-1", category: "real-defect", fixed: true };
+  });
+  const events = [];
+  f.deps = require("../bin/spor.js").reportingGateDeps(f.deps, {
+    gateSettled: async (_id, verdict) => { events.push(verdict); return { ok: true }; },
+    rescueStarted: async (n) => {
+      assert.ok(f.seen.facts.some(fact => fact.id.startsWith("art-rescue-")), "fact publication precedes execution reporting");
+      events.push(`rescue-${n}`); return { ok: true };
+    },
+  });
+  assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps })).state, "passed");
+  assert.deepEqual(events, ["failed", "rescue-1", "passed"]);
+});
+
+
+test("integration escalation retry preserves captured posture and refuses ambiguous legacy chronology", async (t) => {
+  for (const posture of [true, false, "legacy"]) await t.test(String(posture), async () => {
+    const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+    const record = pendingRecord(dispatchRuns, home, "post-completion-retry", { pending: {
+      stage: "integration", gateId: "integration", attempts: [{ verdict: "failed", detail: "suite failed" }], detail: "suite failed", evidence: "", factId: "art-merge-original",
+      ...(posture === "legacy" ? {} : { completedBeforeIntegration: posture }),
+    } });
+    // Reconciliation may have completed the item during escalation backoff.
+    // This late stamp cannot change the original posture or reconstruct one.
+    record.completion_written_at = "2026-09-06T12:00:00Z"; record.completion_boundary = "gates";
+    await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, {
+      factory: { ...RETRY_INTEGRATION_FACTORY, completion: { by: "controller", after: "integration" } }, home, log: () => {},
+    });
+    const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, record.run_id).record);
+    const item = fs.readFileSync(path.join(home, "nodes", "task-demo.md"), "utf8");
+    if (posture === "legacy") {
+      assert.equal(after.gate_escalation_retry_exhausted, true);
+      assert.ok(after.gate_escalation_pending, "original evidence remains available for reconciliation");
+      assert.equal(after.gate_escalated_to, undefined); assert.match(item, /status: done/);
+      return;
+    }
+    assert.equal(after.gate_demoted, !posture);
+    const escalation = fs.readFileSync(path.join(home, "nodes", `${after.gate_escalated_to}.md`), "utf8");
+    assert.match(escalation, posture ? /relates-to, to: task-demo/ : /blocks, to: task-demo/);
+    assert.match(item, posture ? /status: done/ : /status: open/);
+  });
 });

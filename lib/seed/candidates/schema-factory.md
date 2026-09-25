@@ -88,6 +88,14 @@ convention schema nodes use:
   lands (or, in `propose` mode, opens its PR) with the first failure kept as
   evidence on the `art-merge-*` fact; a suite that fails every run is charged
   ONE failure whose outcome says how many runs it failed.
+- `gates[].isolate` (command gates) — a command template carrying a `{files}`
+  token. After the reruns, a failure naming only files the change does NOT
+  touch has those test files re-run alone on the same tree; passing there
+  makes it an off-diff FLAKE, so the gate passes and the flake is filed as
+  its own `issue-flake-*` rather than costing a fix cycle, the rescue lane
+  and finally a person (WORKERS.md §10.3). Declaring nothing keeps the prior
+  behaviour; either way a charged command-gate failure now records WHICH
+  files it failed in, so flakes are countable per file.
 - `rescue` (optional, WORKERS.md §10.10) — the rescue lane: when any gate has
   spent its fix cycles, BEFORE the human escalation, the runner dispatches
   `rescue.profile` (a strong model by intent; profile-routed only, like a

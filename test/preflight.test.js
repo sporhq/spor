@@ -105,6 +105,21 @@ test("a DECLARED custom harness is operator-bound: warned about, never refused (
   assert.match(v.warning, /dispatch\.harness\.myfake\.args/);
 });
 
+test("an optional declared posture uses the built-in worker and attended-rescue checks", () => {
+  for (const posture of ["unattended", "attended", "read-only"]) {
+    const { declaration } = dispatchHarnesses.normalizeHarnessDeclaration("myfake", { command: "/bin/true", posture });
+    const adapter = dispatchHarnesses.declaredAdapter(declaration);
+    const options = { sandbox: "workspace-write", approvalPolicy: "never" };
+    assert.strictEqual(preflight.launchPostureMeaning(adapter, options), posture, "ambient Codex defaults never overwrite the declaration");
+    const worker = preflight.checkWritePosture({ adapter, options, unattended: true });
+    assert.strictEqual(worker.policy, "declared");
+    assert.strictEqual(worker.ok, posture === "unattended");
+    assert.strictEqual(worker.warning, undefined);
+    const rescue = preflight.checkWritePosture({ adapter, options, unattended: true, allowAttended: true });
+    assert.strictEqual(rescue.ok, posture !== "read-only", "attended acknowledgment cannot permit read-only writes");
+  }
+});
+
 test("liveWorkspaceWriters counts only live, write-capable runs in the exact candidate", () => {
   const dir = path.resolve("/tmp/candidate");
   const watching = (r) => r.runner_pid === 111;
@@ -325,7 +340,7 @@ test("a lock's TTL bounds only an UNVERIFIABLE holder — a verified live one ke
   assert.deepStrictEqual(preflight.workspaceLockContends("not-one-of-ours"), { contends: false, prunable: false }, "a foreign file is never touched");
 });
 
-test("two CONCURRENT processes racing for one candidate: exactly one holds it", async () => {
+test("zero-wait concurrent candidate claims are exclusive and acquire after contention clears", async () => {
   // The same-process test above cannot see the real hazard — a `wx` create is
   // open-then-write, so a cross-process racer can read a live lock as empty,
   // and a well-known lock pathname lets two contenders break one stale lock and
@@ -357,7 +372,21 @@ test("two CONCURRENT processes racing for one candidate: exactly one holds it", 
   for (let attempt = 0; attempt < 5; attempt++) {
     const [a, b] = await Promise.all([contend(), contend()]);
     const holders = [a, b].filter((r) => r.held).length;
-    assert.strictEqual(holders, 1, `exactly one contender may hold the candidate, saw ${JSON.stringify([a, b])}`);
+    for (const result of [a, b]) {
+      assert.strictEqual(typeof result.ok, "boolean", "a contender must report a real acquisition result");
+      assert.strictEqual(typeof result.held, "boolean", "a crashed contender is not a safe refusal");
+      assert.strictEqual(result.degraded, null, "the test must exercise the lock, not degraded unlocked operation");
+      assert.strictEqual(result.ok, result.held, "a successful non-degraded acquisition must hold a token");
+    }
+    // With no retry wait, both may observe the other's unique contender lock
+    // and safely withdraw. Exclusivity forbids TWO holders; it does not require
+    // either contender to win that first simultaneous observation.
+    assert.ok(holders <= 1, `at most one contender may hold the candidate, saw ${JSON.stringify([a, b])}`);
+    // Both children have now exited. A fresh acquisition must make progress,
+    // including when the zero-wait attempt left no winner at all.
+    const next = await preflight.acquireWorkspace(home, dir, { waitMs: 1000 });
+    assert.ok(next.ok && next.token, `acquisition must succeed once contention clears: ${JSON.stringify(next)}`);
+    preflight.releaseWorkspace(next.token);
     // A stale lock from the previous round must not let both in next time.
     for (const f of fs.readdirSync(path.join(home, "journal", "workspace"))) {
       fs.rmSync(path.join(home, "journal", "workspace", f), { force: true });
@@ -558,6 +587,29 @@ test("the pilot's missing-posture case: an unattended worker refuses a claude-co
     0,
     "and no run was opened"
   );
+});
+
+test("spor work checks a custom harness's optional posture before opening a run", async () => {
+  for (const posture of ["unattended", "attended", "read-only"]) {
+    const f = fixture({ profileHarness: "custom-pre" });
+    fs.writeFileSync(path.join(f.home, "config.json"), JSON.stringify({ dispatch: {
+      repos: { demo: f.repo },
+      harness: { "custom-pre": { command: f.env.SPOR_CLAUDE_CMD, posture, session: "session_id" } },
+    } }));
+    const result = await cliAsync(["work", "--once", "--max", "1", "--interval", "1", "--no-brief"], f.env);
+    assert.strictEqual(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    if (posture === "unattended") {
+      assert.match(result.stdout, /work: dispatched task-ready/);
+      assert.ok(await waitForFile(f.outfile), "the declared launcher ran");
+      const invocation = JSON.parse(fs.readFileSync(f.outfile, "utf8").trim());
+      assert.deepStrictEqual(invocation.args, [], "the posture added no permission flags");
+    } else {
+      assert.match(result.stdout, /work: skipping task-ready/);
+      assert.match(result.stdout, /ATTENDED|read-only/);
+      assert.ok(!fs.existsSync(f.outfile), "the restriction refused before launching");
+      assert.strictEqual(runRecords(f.home).length, 0, "no run or execution opened");
+    }
+  }
 });
 
 test("...and the same item dispatches once the worker is given an unattended posture", async () => {

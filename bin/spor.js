@@ -45,10 +45,12 @@ const executionStore = require(path.join(ROOT, "lib", "shell", "execution-store.
 const executionKernel = require(path.join(ROOT, "lib", "kernel", "execution.js"));
 const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
 const candidatePublish = require(path.join(ROOT, "lib", "shell", "candidate-publish.js"));
+const factoryAvailability = require(path.join(ROOT, "lib", "shell", "factory-availability.js"));
 const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
 const implementationStage = require(path.join(ROOT, "lib", "shell", "implementation-stage.js"));
 const workerContractLib = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
 const { workerContract } = workerContractLib;
+const attestation = require(path.join(ROOT, "lib", "shell", "attestation.js"));
 // Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
 // queue ranker and read surfaces use. The dispatch guard reads it so it never
@@ -4249,7 +4251,7 @@ function setStatusLocal(cfg, id, value, { graph = null } = {}) {
   const current = g.nodes[id] || {};
   let clearHold = false;
   if (resolution.executionHeld(current) && resolution.isTerminalStatus(String(value), type, g)) {
-    if (!resolution.isGiveUpStatus(String(value), g)) {
+    if (!resolution.isGiveUpStatus(String(value), type, g)) {
       return {
         ok: false,
         reason: `'${value}' is refused while ${id} is under execution '${current.execution}' (a factory controller holds it): the controller writes the completion when its gates pass; end the execution explicitly with 'spor release ${id} --execution ${current.execution}' first`,
@@ -4656,6 +4658,18 @@ async function cmdLease(cfg, action, { positionals, values = {} }) {
     err(`usage: spor ${action} <node-id>${action === "extend" ? " <duration>" : ""}${action === "release" ? " [--execution <exec-id>]" : ""}`);
     if (action === "extend") err("  duration: 2h / 45m / 30s / 1d (or bare milliseconds)");
     return 1;
+  }
+  if (action === "release" && (values.force || values.reason != null)) {
+    if (!values.force || !values.execution || !values.reason || !String(values.reason).trim()) {
+      err("usage: spor release <node-id> --execution <exec-id> --force --reason <reason>");
+      return 1;
+    }
+    try {
+      const result = await forceReleaseFromCli(cfg, { nodeId: id, executionId: String(values.execution).trim(), reason: String(values.reason) });
+      if (!result.ok) { err(result.reason); return 1; }
+      out(`released execution ${values.execution} on ${id} — person release recorded; graph hold cleanup complete`);
+      return 0;
+    } catch (e) { err(`cannot force release: ${e.message || e}`); return 1; }
   }
   // The person's door out of a factory controller's EXECUTION HOLD
   // (task-spor-factory-controller-completion-boundary, FACTORY-IMPLEMENTATION-
@@ -7640,7 +7654,8 @@ function nodeUnreadable(node) {
 // art-verify-run-resolution-jsonerror-fix already closed elsewhere). Local mode
 // has no such body to fail to parse — a read either succeeds or ENOENTs — so it
 // never returns the marker.
-async function resolveNode(cfg, id) {
+async function resolveNode(cfg, id, out = null) {
+  if (out) out.unreadable = false;
   let raw = "";
   // The server's get(node) hook attaches read-time enrichment as additive
   // top-level keys (API.md §3): `resolution` is the live inbound resolves/answers
@@ -7658,6 +7673,7 @@ async function resolveNode(cfg, id) {
   let resolution = null;
   let held = null;
   let inert = null;
+  let revision = null;
   // `open_findings` (API.md §3) is the same hook's open-gardener-findings
   // ride-along — every LIVE (non-terminal, non-superseded) finding that
   // `relates-to` this node, as `[{id, title, summary}]`. Kept so the decline-
@@ -7675,7 +7691,10 @@ async function resolveNode(cfg, id) {
   let supersededBy = null;
   if (cfg.mode() === "remote") {
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
-    if (!r.ok) return null;
+    if (!r.ok) {
+      if (out) out.unreadable = r.status !== 404;
+      return null;
+    }
     // A 2xx with an unparseable (or non-object) body is a FAILED read, not a
     // node whose enrichment keys all happen to be absent — falling through to
     // `r.json && ...` used to read every one of resolution/held/inert/
@@ -7683,17 +7702,23 @@ async function resolveNode(cfg, id) {
     // that genuinely carries none of them. Surface it as the distinguished
     // unreadable marker instead so a caller that skips checking for it fails
     // loudly in review rather than quietly trusting a read that never happened.
-    if (r.jsonError || !r.json || typeof r.json !== "object") return { unreadable: true, id };
+    if (r.jsonError || !r.json || typeof r.json !== "object") {
+      if (out) out.unreadable = true;
+      return { unreadable: true, id };
+    }
     raw = r.json.raw || r.text || "";
     resolution = r.json.resolution || null;
     held = r.json.held || null;
     inert = typeof r.json.inert === "boolean" ? r.json.inert : null;
     openFindings = Array.isArray(r.json.open_findings) ? r.json.open_findings : null;
     supersededBy = r.json.superseded_by || r.json.supersededBy || null;
+    revision = (r.json && typeof r.json.revision === "string" && r.json.revision) || null;
   } else {
     try {
       raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`), "utf8");
-    } catch {
+      revision = gitBlobSha(Buffer.from(raw, "utf8"));
+    } catch (e) {
+      if (out) out.unreadable = !(e && e.code === "ENOENT");
       return null;
     }
   }
@@ -7730,6 +7755,13 @@ async function resolveNode(cfg, id) {
     held,
     inert,
     openFindings,
+    revision,
+    // Server-stamped authorship (API.md §3): who wrote the node and through
+    // what. In local mode these are whatever the file says — a validator
+    // treats a local graph's provenance as unverifiable (attestation.js).
+    author: parsed.author || null,
+    authored_by_agent: parsed.authored_by_agent || null,
+    authored_via: parsed.authored_via || null,
   };
 }
 
@@ -8860,9 +8892,19 @@ function runWorktreeHook(which, dir, { repoDir, slug = null, nodeId = null, stdi
     // Scrubbed of the git location vars (u.gitEnv): the hook stages the fresh
     // worktree, so its git must follow cwd rather than an ambient GIT_DIR
     // inherited from whatever launched dispatch
-    // (issue-spor-dispatch-worktree-wrong-repo-location).
+    // (issue-spor-dispatch-worktree-wrong-repo-location). And run under the
+    // JUDGE's environment (gateRunner.judgeGitEnv — cross-model review,
+    // blocking finding 1): the hook is resolved from the tree's OWN checkout,
+    // i.e. from the commit under judgement (a gate tree, the integration
+    // candidate — and a reused dispatch worktree on a fix cycle sits at the
+    // implementer's branch too), so it is candidate-controlled code that ran
+    // BEFORE the scrubbed gate command with the attestation signing key and
+    // the graph credentials in its environment. Same scrub as the suite
+    // (scrubSecretEnv: the key, every graph bearer/refresh/admin token, both
+    // SPOR_/SUBSTRATE_ spellings) plus every git hook disabled. The hook
+    // never needs the judge's credentials: it stages files.
     env: {
-      ...u.gitEnv(),
+      ...gateRunner.judgeGitEnv(u.gitEnv()),
       SPOR_WORKTREE: dir,
       SPOR_MAIN_CHECKOUT: repoDir,
       SPOR_DISPATCH_SLUG: slug || "",
@@ -9476,8 +9518,8 @@ async function launchSupervisedHarness(cfg, {
       // reused the pid) can be told apart from a genuinely long-lived
       // supervisor (issue-spor-dispatch-supervisor-identity-stale-timeout).
       const startTicks = dispatchRuns.processStartTicks(child.pid);
-      dispatchRuns.atomicJson(p.record, {
-        ...record, runner_pid: child.pid,
+      dispatchRuns.stampRun(cfg.userConfigHome(), runId, {
+        runner_pid: child.pid,
         ...(startTicks != null ? { runner_started_ticks: startTicks } : {}),
       });
     }
@@ -9711,6 +9753,16 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
     // 'spor runs <that id>' is how a human (or a restarted 'spor work') finds
     // out whether it is still going.
     if (r.gate_state) out(`  gate:       ${r.gate_state}${r.gate_reason ? ` — ${r.gate_reason}` : ""}`);
+    if (r.gate_head) out(`  gated head: ${r.gate_head}${r.gate_landed_sha ? ` (landed ${String(r.gate_landed_sha).slice(0, 12)})` : ""}`);
+    if (r.gate_attestation) out(`  attested:   ${r.gate_attestation}`);
+    // A run that PROMISED an attestation and has none says so here, never
+    // only in the worker's log (cross-model review, minor finding 8) — the
+    // record's `gate_attestation_missing`/`_error` stamps are the evidence
+    // chain's own "no evidence" entry, and a parked proposal whose PR body
+    // could not be refreshed with the bound copy is a PR a validator will
+    // refuse against the graph artifact.
+    if (r.gate_attestation_missing) out(`  attested:   MISSING — ${r.gate_attestation_error || "the attestation was not recorded"}`);
+    if (r.gate_proposal_attestation_stale) out(`  proposal:   PR body carries a STALE attestation${r.gate_proposal_attestation ? ` (graph copy ${r.gate_proposal_attestation})` : ""}${r.gate_proposal_attestation_error ? ` — ${r.gate_proposal_attestation_error}` : ""}`);
     if (r.gate_fix_run_id) {
       out(`  fix cycle:  run ${String(r.gate_fix_run_id).slice(0, 8)} — 'spor runs ${r.gate_fix_run_id}' follows it${r.gate_state === "interrupted" ? " (left running by a stopped worker)" : ""}`);
     }
@@ -10411,8 +10463,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // reviewer write-capable on exactly the harnesses that had no posture yet):
   // `--read-only` is a promise the caller relies on, and a launch that cannot
   // keep it must not proceed as if it had. Every built-in adapter declares a
-  // posture; a declared custom harness has none by v1 scope, so a review gate
-  // has to route to a built-in one.
+  // posture; a custom harness must explicitly declare its fixed launcher
+  // read-only before it can serve a review gate.
   if (readOnly && harnessAdapter) {
     const ro = harnessAdapter.readOnly || null;
     if (!ro) {
@@ -11129,7 +11181,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     // a spawn's `cwd` moves the child's real working directory but leaves the
     // INHERITED `PWD` pointing at the launcher's — pin it to launchDir so the two
     // launch modes agree instead of disagreeing about which env var is authoritative.
-    const r = spawnPortableSync(harnessBin, nativeArgs, { cwd: launchDir, stdio: "inherit", env: { ...u.gitEnv(), PWD: launchDir } });
+    const r = spawnPortableSync(harnessBin, nativeArgs, { cwd: launchDir, stdio: "inherit", env: dispatchRuns.judgedChildEnv({ ...u.gitEnv(), PWD: launchDir }) });
     if (r.error) {
       dispatchRuns.updateRun(nativeRun, {
         state: "failed_launch", termination_class: "launch", termination_signal: "launch-failed",
@@ -11642,6 +11694,29 @@ function integrationSatisfiability(cfg, factory, { persistProbe = true } = {}) {
   return sat.satisfiesIntegration(machine, factory);
 }
 
+// Availability is checked on the selected item's own checkout before the
+// controller hold or dispatch lease exists. Cache failures only, and include
+// definition and checkout in the key so config/repo changes take effect.
+function makeFactoryAvailabilityCheck(cfg, { passthrough = {}, baseMs, maxMs, now, persistProbe = true, probe = factoryAvailability.probeFactoryAvailability, integrationCheck = integrationSatisfiability } = {}) {
+  const retry = factoryAvailability.availabilityBackoff({ baseMs, maxMs, now });
+  return async (factory, item) => {
+    if (!factory) return { ok: true };
+    const repo = item.project || item.repo || null;
+    const cwd = resolveDir(cfg, { dir: passthrough.dir, slug: repo }).dir;
+    const key = JSON.stringify([factory, repo, cwd, cfg.mode()]);
+    return retry(key, async () => {
+      const integration = integrationCheck(cfg, factory, { persistProbe });
+      if (!integration.ok) return { ok: false, reason: integration.reasons.join("; "), kind: "availability" };
+      const result = await probe({ factory, repo, cwd, graphHome: cfg.userConfigHome(), mode: cfg.mode(), bearer: cfg.mode() === "remote" ? remote.token(cfg) : null });
+      return result.ok ? result : { ...result, kind: "availability" };
+    });
+  };
+}
+async function dispatchSatisfiableWorkItem(cfg, item, passthrough, { checkAvailability, dispatch = dispatchWorkItem, ...ctx }) {
+  const verdict = await checkAvailability(ctx.factory, item);
+  return verdict.ok ? dispatch(cfg, item, passthrough, ctx) : verdict;
+}
+
 // The shared body of the above and of the gate pipeline's review/fix launches
 // (task-spor-work-gate-pipeline): one dispatch through the real code path,
 // reporting the run it started or the refusal's own reason.
@@ -11873,12 +11948,30 @@ function cmdWorkStatus(cfg, { json }) {
         `  done:     ${r.node_id || "(free-text)"}  ${r.terminal_state || r.state || "?"}` +
           `${r.terminal_state && !r.terminal_enforced ? " (unenforced)" : ""}` +
           `${r.resolved_by ? ` by ${r.resolved_by}` : ""}${r.report_node_id ? ` — report ${r.report_node_id}` : ""}` +
-          `${r.gate ? `  gates ${r.gate}` : ""}`
+          `${r.gate ? `  gates ${r.gate}` : ""}${r.superseded ? " (superseded)" : ""}`
       );
       if (r.gate && r.gate !== "passed" && r.gate_reason) out(`            ${r.gate_reason}`);
+      // A verdict this worker's pipeline did NOT produce (cross-model review,
+      // minor finding 5): the `gates` state above is the record's — the one
+      // that won the settle race — and this worker's own verdict lost and was
+      // never recorded. Without the marker a displayed `passed` reads as this
+      // worker's judgement.
+      if (r.superseded) {
+        const own = r.superseded_verdict || {};
+        out(
+          `            superseded: this worker's own '${own.state || "failed"}' verdict${own.head ? ` at ${String(own.head).slice(0, 12)}` : ""} lost the settle race and is not recorded — shown is the record's verdict${
+            r.gate_worker ? `, settled by ${r.gate_worker}` : ", settled by another pipeline"
+          }`
+        );
+      }
       // The fail-soft half of a refusal: the verdict stands either way, but an
       // operator has to know the item is still reading DONE on the graph.
       if (r.demote_reason) out(`            not demoted on the graph: ${r.demote_reason}`);
+      // The evidence chain's own holes (cross-model review, minor finding 8):
+      // a verdict whose attestation was never recorded, or a parked PR whose
+      // body still carries the propose-time copy a validator will refuse.
+      if (r.attestation_missing) out(`            attestation MISSING: ${r.attestation_error || "not recorded"}`);
+      if (r.proposal_attestation_stale) out(`            PR body carries a STALE attestation${r.proposal_attestation_error ? `: ${r.proposal_attestation_error}` : ""}`);
       // ...and its atomic twin: the escalation never landed, so NOTHING was
       // written to the graph — no blocker, and deliberately no rollback either
       // (task-spor-gate-escalation-demote-atomic). This refusal exists only
@@ -11966,10 +12059,16 @@ async function loadFactoryDefinition(cfg, id) {
   }
   const errors = [];
   const gateNodes = new Map();
+  // Definition provenance (task-spor-factory-gate-attestation): the revision
+  // (blob sha) of the factory node and of every referenced gate node, stamped
+  // onto the parsed definition beside the kernel's digests so each fact says
+  // which revision of which definition judged it.
+  const gateRevisions = {};
   const explainedRefs = new Set(); // refs whose problem we already reported below
   for (const ref of gatesKernel.factoryRefs(parsed.body || "")) {
     const gn = await resolveNode(cfg, ref);
     if (!gn || !gn.raw) continue; // resolveGates reports the missing reference itself
+    if (gn.revision) gateRevisions[ref] = gn.revision;
     const pg = parse(gn.raw, `${ref}.md`);
     if ((pg.type || "") !== "gate") {
       errors.push(`referenced gate '${ref}' is a '${pg.type || "?"}' node, not a 'type: gate' node`);
@@ -11993,6 +12092,7 @@ async function loadFactoryDefinition(cfg, id) {
   // payload declares no `repos` (issue-spor-work-scope-union-factory-mismatch)
   // — a factory authored for one repo says so by living in it.
   const res = gatesKernel.parseFactory(parsed.body || "", { gateNodes, id, project: parsed.project || null });
+  if (res.factory) gatesKernel.stampDefinitionRevisions(res.factory, { factory: node.revision || null, gates: gateRevisions });
   // A ref we already explained above (wrong type, retired, bad payload) is left
   // out of gateNodes on purpose, which makes resolveGates raise its own generic
   // "could not be read from the graph" for the same ref — accurate for an
@@ -12265,6 +12365,38 @@ function stripFrontmatterDate(markdown) {
   return text.slice(0, end).replace(/^date: .*$/m, "date:") + text.slice(end);
 }
 
+// Is the node the graph already holds under a gate id the SAME node this
+// runner is writing? The server stamps what it stamps on write (author,
+// authored_via, agent/session attribution, timestamps) and the calendar day
+// drifts (stripFrontmatterDate), so the comparison is over the frontmatter
+// lines that carry the fact — order-insensitive, minus the server's own keys —
+// and the body, whitespace-trimmed. Anything else (a different verdict, a
+// different head, a different summary) is a different node.
+const SERVER_STAMPED_KEYS = new Set(["date", "author", "authored_via", "authored_by_agent", "session", "revision", "created_at", "updated_at", "captured_at", "authored_at"]);
+function gateNodeShape(markdown) {
+  const text = String(markdown || "").replace(/\r\n/g, "\n");
+  if (!text.startsWith("---\n")) return { fm: [], body: text.trim() };
+  const end = text.indexOf("\n---", 4);
+  if (end === -1) return { fm: [], body: text.trim() };
+  const fm = text
+    .slice(4, end)
+    .split("\n")
+    .map((l) => l.replace(/\s+$/, ""))
+    .filter((l) => l.trim())
+    .filter((l) => {
+      const m = /^([A-Za-z_][\w-]*):/.exec(l);
+      return !(m && SERVER_STAMPED_KEYS.has(m[1]));
+    })
+    .sort();
+  const body = text.slice(end + 4).replace(/^\n+/, "").trim();
+  return { fm, body };
+}
+function gateNodeEquivalent(a, b) {
+  const x = gateNodeShape(a);
+  const y = gateNodeShape(b);
+  return x.body === y.body && x.fm.length === y.fm.length && x.fm.every((l, i) => l === y.fm[i]);
+}
+
 // Write a gate's node — a fact, an escalation, an approval — through the same
 // validated door `spor put-node` uses, idempotently (a deterministic id written
 // twice is one node, never two).
@@ -12273,7 +12405,20 @@ async function writeGateNode(cfg, id, markdown) {
     const r = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: markdown, if_exists: "skip" }] }, { timeoutMs: 15000 });
     if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
     const res0 = r.json && r.json.results && r.json.results[0];
-    if (res0 && (res0.ok === true || res0.status === "skipped" || res0.status === "created")) return { ok: true, id };
+    if (res0 && res0.status === "skipped") {
+      // The SAME distinction the local door draws below (review finding 5): a
+      // skip means the id exists, not that THIS fact landed. Read it back and
+      // compare — a racing runner's node under this id carrying a different
+      // verdict is a collision to refuse, never evidence to adopt. An
+      // unreadable existing node is refused too (fail closed: it cannot be
+      // shown to be this fact).
+      const existing = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 8000 });
+      if (existing.transport) return { ok: false, id, existing: true, reason: `${id} already exists and could not be read back to compare (offline — ${existing.error})` };
+      const raw = existing.ok ? (existing.json && existing.json.raw) || existing.text || "" : "";
+      if (!existing.ok || !raw) return { ok: false, id, existing: true, reason: `${id} already exists and could not be read back to compare (HTTP ${existing.status})` };
+      return gateNodeEquivalent(raw, markdown) ? { ok: true, id, existing: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
+    }
+    if (res0 && (res0.ok === true || res0.status === "created")) return { ok: true, id };
     return { ok: false, reason: putNodeEntryError(res0, r.status, "gate") };
   }
   const dir = cfg.nodesDir();
@@ -12288,7 +12433,12 @@ async function writeGateNode(cfg, id, markdown) {
       // ignores `date:` drift (see stripFrontmatterDate) so it stays keyed on
       // the fact itself, not the calendar day it was re-filed on.
       const same = stripFrontmatterDate(fs.readFileSync(file, "utf8")) === stripFrontmatterDate(markdown);
-      return same ? { ok: true, id, existing: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
+      // `identical` is the local door's own proof (F10): it COMPARED this
+      // markdown against the occupant, so an `existing` it reports is this
+      // record — edges and all — and the caller needs no read to know it.
+      // The remote door cannot say that (`if_exists: skip` compares nothing),
+      // so it omits the flag and the caller reconciles by reading.
+      return same ? { ok: true, id, existing: true, identical: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
     }
     // The same validation the local `put-node` door runs: a malformed gate node
     // written straight to disk would break loadGraph for everything downstream.
@@ -12302,6 +12452,65 @@ async function writeGateNode(cfg, id, markdown) {
     return { ok: false, reason: e.message };
   }
 }
+
+// Add ONE typed edge to a node a gate already wrote — the paying half of the
+// flake occurrence debt (F13), through the same add_edge micro-mutation
+// `spor edge` uses (POST /v1/nodes/{id}/edges remotely, an in-place validated
+// append locally). Idempotent on both sides: the server reports an edge that
+// is already there as `skipped` and this reads it as the success it is, and
+// locally the edge set is checked before the append — so a second worker (or
+// this one, after a crash between the edge landing and the state that records
+// it) can never double-count one occurrence. A missing source or a dangling
+// target is a REFUSAL, never a silent write: an occurrence edge that points at
+// nothing is worse than one still owed.
+function withoutFlakeEdges(markdown, issues) {
+  const families = new Set(issues.map((id) => String(id).replace(/-r[2-4]$/, "")));
+  const text = String(markdown || "");
+  const end = text.startsWith("---\n") ? text.indexOf("\n---", 4) : -1;
+  if (end < 0) return text;
+  return text.slice(0, end).split("\n").filter((line) => {
+    const m = /^\s*- \{type: relates-to, to: ([^} ,]+)\}$/.exec(line);
+    return !m || !families.has(m[1].replace(/-r[2-4]$/, ""));
+  }).join("\n") + text.slice(end);
+}
+
+async function addGateEdge(cfg, id, type, to) {
+  if (cfg.mode() === "remote") {
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/edges/live`, { type, to, require_live_target: true }, { timeoutMs: 8000 });
+    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (!r.ok) {
+      const e = (r.json && r.json.error) || {};
+      return { ok: false, code: e.code || null, reason: `edge error ${r.status}${e.message ? `: ${e.message}` : ""}` };
+    }
+    if (!r.json || r.json.target_guard !== "live") return { ok: false, reason: "the server did not acknowledge live-target enforcement" };
+    return { ok: true, id };
+  }
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const dir = cfg.nodesDir();
+  try {
+    const file = path.join(dir, `${id}.md`);
+    let raw;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      return { ok: false, reason: `no such node: ${id}` };
+    }
+    const g = graphLib.loadGraph(dir);
+    if (!g.nodes[to]) return { ok: false, reason: `edge target '${to}' does not exist` };
+    if (((g.nodes[id] && g.nodes[id].edges) || []).some((e) => e.type === type && e.to === to)) return { ok: true, id };
+    // No local transaction is shared by every status/resolution writer. An
+    // optimistic snapshot cannot authorize a fresh occurrence across processes.
+    return { ok: false, code: "local_atomic_unavailable", reason: "fresh local flake occurrence payment requires an atomic graph mutation door; evidence remains pending (use the team server)" };
+  } catch (e) {
+    return { ok: false, reason: e.message };
+  }
+}
+
+// How many recurrence rungs the per-file flake id may climb past a SETTLED
+// occupant before the gate gives up and charges the failure (fileFlakeItem).
+// Small on purpose: a file whose flake issue has been closed and reopened four
+// times is not a convergence problem, it is a test that needs a person.
+const FLAKE_ID_RUNGS = 4;
 
 function gateStem(nodeId) {
   return String(nodeId || "item")
@@ -12330,7 +12539,7 @@ const { gateIdSuffix, fenceSafe, capBytes: gateCapBytes, NODE_BODY_CAP_BYTES } =
 // (work.accept ready, dec-spor-work-accept-policy-configurable) would leave it
 // unworked forever. The consent the stamp records is real, just upstream: the
 // operator declared the lane's profile in the factory definition.
-function buildGateWorkNode({ id, title, summary, body, project, date, edges = [], requiresHuman = false, profile = null }) {
+function buildGateWorkNode({ id, type = "task", title, summary, body, project, date, edges = [], requiresHuman = false, profile = null }) {
   // The frontmatter parser is line-based: a title or summary carrying a newline
   // (a git message, a suite's first failing line) would truncate the node. Flatten
   // and cap both, the same discipline the dispatch report artifact keeps.
@@ -12341,7 +12550,7 @@ function buildGateWorkNode({ id, title, summary, body, project, date, edges = []
   const lines = [
     "---",
     `id: ${id}`,
-    "type: task",
+    `type: ${type}`,
     ...(project ? [`project: ${project}`] : []),
     `title: ${flat(title, 120)}`,
     `summary: ${flat(summary, 460)}`,
@@ -12865,7 +13074,7 @@ function refuseDirtyCandidate(factory, cwd) {
 
 function makeGateDeps(
   cfg,
-  { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, runIdleMs = workLoop.WORK_DEFAULTS.runIdleMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
+  { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, gateOwner = undefined, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, runIdleMs = workLoop.WORK_DEFAULTS.runIdleMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
 ) {
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
@@ -12879,6 +13088,18 @@ function makeGateDeps(
   // Pass 0 hands back the exact keys above.
   const keysFor = (rescue) => (rescue ? { short: gateRunner.shortRunAttempt(entry.run_id, entry.attempt, rescue), runKey: gateRunner.gateRunKey(entry.run_id, entry.attempt, rescue) } : { short, runKey });
   const progressKey = (gate, rescue) => (rescue ? `${gate.id}#x${rescue}` : gate.id);
+  // Capture the owning nonce once, never refresh it after another adopter
+  // takes over. The controller supplies its claim explicitly; standalone
+  // callers inherit only the record they observed when creating these deps.
+  const progressOwner = gateOwner !== undefined ? gateOwner : (() => {
+    try { const r = dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record); return r ? r.gate_settle_id ?? r.gate_at ?? null : null; }
+    catch { return null; }
+  })();
+  const updateGateProgress = (mutate, sidePatch = {}) => {
+    const result = dispatchRuns.updateGateProgress(home, entry.run_id, mutate, { key: runKey, attempt: entry.attempt, own: progressOwner, sidePatch });
+    if (!result.ok) throw new Error(`the run record could not be updated: ${result.reason}`);
+    return result.progress;
+  };
   let change = null;
   // The local graph, loaded lazily and at most once, for the one inbound fact
   // the `node` dep cannot read off a node's own file (see there). Remote mode
@@ -13414,7 +13635,7 @@ function makeGateDeps(
     // resumed pipeline whose progress save never landed (the crash window
     // between this stamp and `onLaunch` below) can read the launch back from
     // the stamp instead of taking the fix for undispatched (loadGateProgress).
-    dispatchRuns.stampGateState(home, entry.run_id, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString(), gate_fix_gate: gate.id, gate_fix_cycle: cycle });
+    updateGateProgress(null, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString(), gate_fix_gate: gate.id, gate_fix_cycle: cycle });
     // …and the runner charges the fix cycle to the gate's progress at this
     // same moment: launched, not merely decided on (a worker killed before
     // this line resumes INTO the fix; one killed after it resumes past it).
@@ -13475,66 +13696,7 @@ function makeGateDeps(
     }
     return { ...p, lastFix };
   };
-  // Every `gate_progress` write goes through here (review finding F4). The
-  // object is an ACCUMULATOR — the finding ledger, the fix counts, the rescue
-  // entries and the shared retry pool on one stamp — and each of its three
-  // writers builds the next version by reading the current one and rewriting
-  // the whole thing. Read-modify-write across two separate file reads is a
-  // check-then-write race: whoever writes second silently erases what the
-  // other just recorded, and a lost pool charge is an unrecorded retry, the
-  // unbounded case the pool exists to stop. So `build` is called on a FRESH
-  // read and the write is a compare-and-set on the version it merged from
-  // (`stampGateState`'s `expectProgress`); a caller that loses the race
-  // rebuilds on the winner's state instead of overwriting it, bounded because
-  // an unbounded retry against a contended file is a spin.
-  //
-  // The durable-flag rows (gatesKernel.renderDurableFlagChecklist) for this
-  // write, answered once for all three writers:
-  //   (a) the write fails — nothing landed and nothing is silently believed to
-  //       have: after the bounded attempts this THROWS, exactly as it did
-  //       before, and the runner refuses the step the write was paying for.
-  //   (b) clear-before-owe — there is no clear: a stamp is one whole-object
-  //       write, so a ledger entry, a cycle count and a pool charge that must
-  //       agree land together or not at all; there is no window with one
-  //       written and the next owed.
-  //   (c) the check-then-write race — THIS is what the CAS closes. The loser
-  //       does not overwrite; it re-reads and rebuilds. `stampGateState` also
-  //       reads the write back, so an unlocked whole-record writer that
-  //       reverts the stamp is retried rather than reported as landed.
-  //   (d) a stale version against settled state — the CAS is keyed on this
-  //       ATTEMPT's `runKey`, so a `--regate` reads and expects none (a
-  //       foreign key's progress is the empty state, not a conflict), and
-  //       `stampGateState`'s settled-verdict guard still refuses the write on
-  //       a settled record — which surfaces as the same throw, never as a
-  //       write believed to have landed.
-  const casProgress = (build) => {
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      const r = readRecordNow();
-      const prevAll = r && r.gate_progress && r.gate_progress.key === runKey ? r.gate_progress : null;
-      const stamp = build(r, prevAll);
-      const status = {};
-      const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp }, {
-        expectProgress: { key: runKey, seq: prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : null },
-        status,
-      });
-      // stampGateState hands back the record UNCHANGED (not null) when the
-      // verdict is already settled; a progress write that did not land is a
-      // failure the runner should hear about, not a silent no-op.
-      if (wrote && wrote.gate_progress === stamp) return;
-      if (!status.conflict) break; // not a race — a real write failure
-    }
-    throw new Error("the run record could not be updated");
-  };
-  const nextSeq = (prevAll) => (prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : 0) + 1;
-  const saveGateProgress = async ({ gate, progress, rescue = 0 }) => casProgress((r, prevAll) => {
-    const prev = prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {};
-    // The rescue lane's own entries and the pipeline's shared infrastructure
-    // pool ride beside the gates under the same key (loadRescueState /
-    // loadGatePools below) and are carried, never dropped, by a gate save.
-    const carried = prevAll && Array.isArray(prevAll.rescue) ? { rescue: prevAll.rescue } : {};
-    const carriedPools = prevAll && prevAll.pools && typeof prevAll.pools === "object" ? { pools: prevAll.pools } : {};
-    return { key: runKey, at: new Date().toISOString(), seq: nextSeq(prevAll), gates: { ...prev, [progressKey(gate, rescue)]: progress }, ...carried, ...carriedPools };
-  });
+  const saveGateProgress = async ({ gate, progress, rescue = 0 }) => updateGateProgress({ gates: { [progressKey(gate, rescue)]: progress } });
   // The rescue lane's durable state (task-spor-factory-rescue-lane): one
   // entry per rescue attempt — the refusal it was handed, the seed its gate
   // pass starts from, its run and its diagnosis — on the same `gate_progress`
@@ -13555,14 +13717,7 @@ function makeGateDeps(
       return out;
     });
   };
-  const saveRescueState = async ({ rescues }) => casProgress((r, prevAll) => ({
-    key: runKey,
-    at: new Date().toISOString(),
-    seq: nextSeq(prevAll),
-    gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {},
-    rescue: rescues,
-    ...(prevAll && prevAll.pools && typeof prevAll.pools === "object" ? { pools: prevAll.pools } : {}),
-  }));
+  const saveRescueState = async ({ rescues }) => updateGateProgress({ rescue: rescues });
 
   // The pipeline's shared INFRASTRUCTURE pool (FACTORY-IMPLEMENTATION-STAGE.md
   // §5.3, task-spor-factory-execution-outcome-classifier): ONE count for the
@@ -13588,16 +13743,9 @@ function makeGateDeps(
   //   (c) the check-then-write race — one worker owns a pipeline: a second is
   //       kept off the node by the gating-slot exclusion, and an ORPHAN is
   //       adopted only after its worker is dead (§10.8), reading this count
-  //       back before it charges. That leaves the SAME-object race — the pool
-  //       shares one `gate_progress` stamp with the ledger and the rescue
-  //       entries, so a gate-progress or rescue save that read before this
-  //       charge would rewrite the whole object without it and erase an
-  //       already-spent retry (review finding F4). Every writer now goes
-  //       through `casProgress`, which merges from a fresh read and
-  //       compare-and-sets on the version it merged from, so the loser
-  //       rebuilds on the winner's count instead of overwriting it. The write
-  //       still goes through `stampGateState`, which refuses to overwrite a
-  //       settled verdict.
+  //       back before it charges. The merging writer checks the captured
+  //       owner and attempt under the record lock and refuses settled state.
+  //       Atomic reservations can use updateGateProgress's fresh callback.
   //   (d) a stale count against settled state — the count is keyed on the
   //       ATTEMPT's run key, so a `--regate` reads none and starts fresh (the
   //       outage that exhausted the last pool may be long over), and a
@@ -13608,14 +13756,10 @@ function makeGateDeps(
     if (!all || all.key !== runKey || !all.pools || typeof all.pools !== "object") return null;
     return all.pools;
   };
-  const saveGatePools = async ({ pools }) => casProgress((r, prevAll) => ({
-    key: runKey,
-    at: new Date().toISOString(),
-    seq: nextSeq(prevAll),
-    gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {},
-    ...(prevAll && Array.isArray(prevAll.rescue) ? { rescue: prevAll.rescue } : {}),
-    pools,
-  }));
+  const saveGatePools = async ({ pools }) => updateGateProgress((fresh) => ({ pools: {
+    ...fresh.pools,
+    ...Object.fromEntries(Object.entries(pools).map(([name, pool]) => [name, { ...fresh.pools?.[name], ...pool }])),
+  } }));
 
   // --- the rescue lane (task-spor-factory-rescue-lane, WORKERS.md §10.10) ---
   // Composed HERE, deterministically, like the review and the fix: the
@@ -13802,7 +13946,7 @@ function makeGateDeps(
     const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(cfg, values, [prompt], { allowAttended });
     if (!launched.ok) return { ok: false, reason: `the rescue under ${lane.profile} could not be dispatched: ${launched.reason}` };
     if (launched.adopted) log(`work: rescue attempt ${attempt} on ${entry.node_id} was already launched as run ${String(launched.run.run_id).slice(0, 8)} — adopting it, not dispatching again`);
-    dispatchRuns.stampGateState(home, entry.run_id, { gate_rescue_run_id: launched.run.run_id, gate_rescue_at: new Date().toISOString(), gate_rescue_attempt: attempt });
+    updateGateProgress(null, { gate_rescue_run_id: launched.run.run_id, gate_rescue_at: new Date().toISOString(), gate_rescue_attempt: attempt });
     if (onLaunch) {
       try {
         await onLaunch({ runId: launched.run.run_id });
@@ -13969,11 +14113,32 @@ function makeGateDeps(
     // pretending to a verdict nobody gave.
     stopping,
     loadGateProgress,
+    checkEvidenceOrigins: () => {
+      const r = readRecordNow();
+      const progress = r && r.gate_progress;
+      if (!progress || progress.key !== runKey) return { ok: true };
+      const saved = Object.values(progress.gates || {});
+      const evidence = saved.flatMap((p) => p ? [p.evidence, p.filingIntent] : []).filter(Boolean);
+      // Enumerate the journal, not the current gate list: removing/renaming a
+      // declaration must not make an existing graph obligation unreachable.
+      const current = new Set((factory.gates || []).map((g) => g.id));
+      const orphan = saved.flatMap((p) => p ? [p.filingIntent, p.evidence && !p.evidence.complete ? p.evidence : null] : [])
+        .filter(Boolean).find((e) => !e.gate || !current.has(e.gate.id));
+      if (orphan) return { ok: false, reason: "pending flake evidence belongs to a removed or renamed gate; restore its original declaration and settle its obligation before changing the factory" };
+      if (!evidence.every((e) => attestationOriginMatches(cfg, e.origin))) return { ok: false, reason: "pending flake evidence belongs to a different or unknown graph; resume against its original graph" };
+      const pending = Object.entries(progress.gates || {}).filter(([, p]) => p && (p.filingIntent || p.evidence && !p.evidence.complete)).map(([key, p]) => ({
+        gate: (p.filingIntent || p.evidence).gate,
+        rescue: Number((/#x(\d+)$/.exec(key) || [])[1]) || 0,
+        progress: p,
+      }));
+      return pending.length ? { ok: true, pending } : { ok: true };
+    },
     saveGateProgress,
     loadRescueState,
     saveRescueState,
     loadGatePools,
     saveGatePools,
+    updateGateProgress,
     rescue,
     implement,
     loadImplAttempts,
@@ -14330,7 +14495,11 @@ function makeGateDeps(
       return {
         ok: true,
         dir: tree.dir,
-        run: async (attempt = 1) => {
+        // `command` overrides the gate's declared one for THIS run only — the
+        // door the off-diff isolation pass uses (WORKERS.md §10.3 `isolate`)
+        // to re-run just the failing files on this same prepared tree. Absent,
+        // the run is the declared suite, byte-identical to before.
+        run: async (attempt = 1, command = null) => {
           // What the suite is judging, in its env (task-spor-gate-command-
           // change-env): a script can `git diff $SPOR_GATE_BASE..$SPOR_GATE_HEAD`
           // inside the tree and decide what to run, the way a CI job reads the
@@ -14345,8 +14514,11 @@ function makeGateDeps(
             // 1 for the declared run, N+1 for the Nth same-tree rerun — a
             // suite can log or tighten itself on a rerun.
             SPOR_GATE_ATTEMPT: String(attempt),
+            // Set only for the isolation run, so a suite that wants to skip its
+            // own setup for a single-file re-run can tell the two apart.
+            ...(command ? { SPOR_GATE_ISOLATE: "1" } : {}),
           };
-          return await runGateCommand(gate, tree.dir, { env });
+          return await runGateCommand(command ? { ...gate, command } : gate, tree.dir, { env });
         },
         // Called by the runner only after the LAST run has returned (its loop
         // awaits each run), never under a running suite.
@@ -14370,7 +14542,86 @@ function makeGateDeps(
     releaseGateLease: (token) => releaseIntegrationLease(cfg, token),
     review,
     fix,
-    recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
+    evidenceOrigin: () => attestationGraphOrigin(cfg),
+    acceptsEvidenceOrigin: (origin) => attestationOriginMatches(cfg, origin),
+    recordFact: async ({ id, markdown, flakeIssues = [], origin }) => {
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : flakeIssues.length ? null : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake evidence belongs to a different or unknown graph" };
+      // Occurrence edges use the guarded micro-mutation even on fresh facts:
+      // issue selection is not a liveness guarantee at publication time.
+      const bare = withoutFlakeEdges(markdown, flakeIssues);
+      const wrote = await writeGateNode(publicationCfg, id, bare);
+      return { ...wrote, linked: [] };
+    },
+    // Reconcile the complete evidence identity, ignoring only this flake's
+    // occurrence edges (including recurrence rungs). Those edges are separate
+    // guarded payments; title equality alone cannot vouch for a judged head,
+    // gate definition, or evidence body. Return typed edges so mentions never
+    // discharge occurrence debt.
+    readFact: async ({ id, markdown, flakeIssues = [], origin }) => {
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake evidence belongs to a different or unknown graph" };
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+      const read = {};
+      let node = null;
+      try {
+        node = await resolveNode(publicationCfg, id, read);
+      } catch (e) {
+        return { ok: false, reason: `${id} could not be read (${(e && e.message) || e})` };
+      }
+      if (!node || nodeUnreadable(node)) return (read.unreadable || (node && nodeUnreadable(node))) ? { ok: false, reason: `${id} could not be read` } : { ok: true, same: false, edges: [] };
+      let edges = [];
+      try {
+        edges = graphLib.parseFrontmatter(node.raw || "", `${id}.md`).edges || [];
+      } catch (e) {
+        return { ok: false, reason: `${id}'s frontmatter could not be parsed (${(e && e.message) || e})` };
+      }
+      let mine = "";
+      try {
+        mine = String(graphLib.parseFrontmatter(String(markdown || ""), `${id}.md`).title || "").trim();
+      } catch {
+        mine = "";
+      }
+      const theirs = String(node.title || "").trim();
+      return {
+        ok: true,
+        // An unreadable title on either side is not a match: `same` is a
+        // POSITIVE reading or nothing.
+        same: !!(mine && theirs && gateNodeEquivalent(withoutFlakeEdges(node.raw, flakeIssues), withoutFlakeEdges(markdown, flakeIssues))),
+        edges: edges.filter((e) => e && e.to).map((e) => ({ type: String((e && e.type) || ""), to: String(e.to) })),
+      };
+    },
+    // Pay a flake occurrence edge the FACT itself could not carry (F13). The
+    // fact's id was already occupied, so this markdown — and the edges in its
+    // frontmatter — did not land, and for a PASSING gate or the final refusal
+    // there is no later fact of this pass to carry them: without this door the
+    // occurrence is a permanent debt sink, an issue no fact names. Written
+    // through the same add_edge micro-mutation `spor edge` uses, which is
+    // IDEMPOTENT on both sides (the server answers `skipped`, local dedups
+    // against the edges already on the node), so two workers paying the same
+    // occurrence cannot double-count it — and which REFUSES a dangling target,
+    // so a flake issue that vanished leaves the debt logged unpaid rather than
+    // an edge pointing at nothing.
+    linkFact: async function ({ id, type, to, gate, file, files, origin }) {
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : file ? null : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake evidence belongs to a different or unknown graph" };
+      const first = await addGateEdge(publicationCfg, id, type, to);
+      if (first.ok || !["target_not_live", "local_atomic_unavailable"].includes(first.code) || !file || !gate) return first;
+      // A settled selection owes a recurrence. Before selecting another rung,
+      // recover a payment that landed before a process died: it remains paid
+      // even when that recurrence itself has since been settled.
+      const source = await resolveNode(publicationCfg, id);
+      if (!source || nodeUnreadable(source)) return { ok: false, reason: "the occurrence fact could not be read before recurrence selection" };
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+      const family = (target) => String(target).replace(/-r[2-4]$/, "");
+      const edges = graphLib.parseFrontmatter(source.raw, `${id}.md`).edges || [];
+      const paid = edges.find((e) => e.type === type && family(e.to) === family(to));
+      if (paid) return { ok: true, id, to: paid.to };
+      if (first.code === "local_atomic_unavailable") return first;
+      const next = await this.fileFlakeItem({ gate, file, files, command: gate.command, isolate: gate.isolate, origin });
+      if (!next || !next.ok) return next || { ok: false, reason: "recurrence selection returned no answer" };
+      return { ...await addGateEdge(publicationCfg, id, type, next.id), to: next.id };
+    },
     fileTestLaneItem: async ({ gate, paths, profile, rescue = 0 }) => {
       const k = keysFor(rescue);
       const id = `task-test-lane-${stem}-${k.short}-${gateIdSuffix("test-lane", gate.id, entry.node_id, k.runKey)}`;
@@ -14409,9 +14660,168 @@ function makeGateDeps(
         })
       );
     },
-    fileHumanItem: async ({ gate, classes, rescue = 0 }) => {
+    // The off-diff FLAKE report (task-spor-factory-flake-rescue-should-not-
+    // burn-when-failure-is-off-diff): a whole-suite failure in files the change
+    // never touched, which passed alone on the same tree. Filed as an ISSUE —
+    // a defect in the suite, not work the gated item owes — and routed to the
+    // same `test_lane_profile` the protected-path lane uses, because fixing a
+    // flaky test IS a test change and must not come from the implementer.
+    //
+    // Alone among the nodes a gate files, its id and its BODY are keyed on ONE
+    // failing FILE rather than on the run — the runner calls this once per file
+    // the failure named. A flake is a property of the file, not of the set it
+    // happened to fail beside (a set that changes with load and ordering, and
+    // whose every permutation would otherwise be its own issue), and the same
+    // file flaking on ten dispatches must converge on ONE issue
+    // (writeGateNode's `if_exists: skip` remotely, and its identical-content
+    // adoption locally, both then read the repeat as a no-op) instead of ten
+    // near-duplicates nobody triages. The occurrence count is the inbound
+    // `relates-to` edges from the `art-gate-*` facts, which each carry the run,
+    // the item and the evidence — so nothing run-specific is lost by leaving
+    // it out here, and there is no per-run content to make the write diverge.
+    //
+    // The convergence is RECONCILED against settled state, never taken on the
+    // strength of the id (the stale-flag failure mode): the same file can flake
+    // again months after its issue was fixed and closed, and a fresh occurrence
+    // attached to a terminal node is no signal at all — nothing resurfaces it,
+    // nobody triages it, and the gate would have passed a red suite against a
+    // record that reads "already handled". So each candidate id is READ first
+    // and only an id that is free (create) or occupied by LIVE work (link) is
+    // taken; a settled occupant advances to the next rung (`-r2`, `-r3`, …),
+    // which is a live issue for the recurrence that also points back at the
+    // one that was closed. All rungs settled — a file closed and reopened four
+    // times — is reported unfiled, which the runner turns into a charged
+    // failure and a person, the right answer for a file that keeps coming back.
+    //
+    // And a read that could not be MADE decides nothing at all: it is neither
+    // absence (which would write) nor liveness (which would link) nor
+    // settledness (which would climb), so it is reported unfiled and the
+    // failure is charged. The write is not a second chance at that question —
+    // its door reports an occupied id as a SUCCESS, so believing it would adopt
+    // whatever is there unread, which for a resolved occupant is the very
+    // "fresh occurrence attached to a terminal node" this reconciliation
+    // exists to prevent. That is why a write that did not create anything
+    // (`existing`, in either mode) sends the id back through the read once,
+    // instead of being returned as a filing.
+    fileFlakeItem: async ({ gate, file, files, command, isolate, origin }) => {
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : origin === null ? null : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake filing belongs to a different or unknown graph" };
+      const list = (files || []).map(String);
+      // ONE issue per FILE, keyed on that file and nothing else. Keying it on
+      // the whole co-failing SET would mint a fresh issue for the same flaky
+      // file every time its companions — or their order — changed, which is
+      // exactly the near-duplicate a convergent id exists to prevent: the file
+      // is what someone fixes, so the file is the key. The rest of the
+      // failure's files are context in the body, never in the id.
+      const target = String(file || list[0]);
+      const others = list.filter((f) => f !== target);
+      const stem = target.replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 34).replace(/-+$/, "") || "suite";
+      const base = `issue-flake-${stem}-${gateIdSuffix("flake", gate.id, slug || "", target)}`;
+      const profile = factory.testLaneProfile || null;
+      const markdown = (id, priorId, priorWhy) =>
+        buildGateWorkNode({
+          id,
+          type: "issue",
+          title: `Flaky under the ${gate.id} gate — ${target} fails the full suite and passes alone`,
+          summary: `${target} failed factory \`${factory.id}\`'s \`${gate.id}\` gate (\`${command}\`) and passed when re-run alone on the same tree — an off-diff flake, not a failure of any change under judgement.`,
+          body: [
+            `The \`${gate.id}\` command gate of factory \`${factory.id}\` failed its whole-suite run \`${command}\`,`,
+            "in this file, which the change under judgement did not touch and which references nothing it edits:",
+            "",
+            `- \`${target}\``,
+            ...(others.length ? ["", `It failed alongside ${others.map((f) => `\`${f}\``).join(", ")}, each of which carries its own issue — the`, "companion set is context here, not part of this issue's identity, so the same file converges on this", "node however it fails next time."] : []),
+            "",
+            `Re-running the failure's files alone on that same tree (\`${isolate}\`) PASSED, so the failure was the`,
+            "suite's scheduling — load, ordering, a shared fixture — and not the change. An off-diff flake costs",
+            "this issue rather than the item's fix cycles, its rescue lane and finally a person, all spent on",
+            "work that was never wrong (WORKERS.md §10.3).",
+            "",
+            "Fix the flake in the file itself: make it independent of what else is running. Every `art-gate-*`",
+            "fact that relates to this issue is one occurrence — the inbound edges are the count, and each",
+            "carries the run, the item and the whole-suite failure it saw as evidence.",
+            ...(priorId ? ["", `This is a RECURRENCE: \`${priorId}\` holds the earlier occurrences of the same flake and is`, `already settled (${priorWhy}), so this file carries the ones since.`] : []),
+            ...(profile ? ["", `Test changes belong in the \`${profile}\` lane, not an implementer's branch.`] : []),
+          ].join("\n"),
+          project: slug,
+          date: date(),
+          profile,
+          edges: [
+            ...(factory.id ? [{ type: "relates-to", to: factory.id }] : []),
+            ...(profile ? [{ type: "relates-to", to: profile }] : []),
+            ...(priorId ? [{ type: "relates-to", to: priorId }] : []),
+          ],
+        });
+      // The occupant of one candidate id, as the FOUR answers the adoption rule
+      // needs rather than the two a null carries. "Could not look" is the one
+      // the old reading collapsed into "absent": a read that timed out was
+      // followed by a write, the write's door reported the id already taken as
+      // a success (`if_exists: skip` remotely, identical-content adoption
+      // locally), and a RESOLVED occupant was adopted unread — the stale-flag
+      // failure exactly. It is now its own answer and it settles nothing.
+      const occupantOf = async (id) => {
+        const read = {};
+        let node = null;
+        try {
+          node = await resolveNode(publicationCfg, id, read);
+        } catch (e) {
+          return { state: "unknown", why: `${id} could not be read (${(e && e.message) || e})` };
+        }
+        if (node && !nodeUnreadable(node)) {
+          const settled = dispatchResolutionReason(publicationCfg, node);
+          return settled ? { state: "settled", why: settled } : { state: "live" };
+        }
+        return (read.unreadable || (node && nodeUnreadable(node))) ? { state: "unknown", why: `${id} could not be read` } : { state: "absent" };
+      };
+      let prior = null;
+      let priorWhy = "";
+      let rung = 0;
+      let raced = false;
+      while (rung < FLAKE_ID_RUNGS) {
+        const id = rung === 0 ? base : `${base}-r${rung + 1}`;
+        const occupant = await occupantOf(id);
+        // Nothing is concluded from a read that failed. Climbing to the next
+        // rung would mint a duplicate beside a live issue; adopting would link
+        // a possibly-settled one. Both are answers about state we did not see,
+        // so the filing is refused — which the runner turns into a charged
+        // failure, the same direction every other unreadable answer takes here.
+        if (occupant.state === "unknown") return { ok: false, reason: `the flake's issue ${occupant.why}, so whether it is still live could not be decided` };
+        if (occupant.state === "live") return { ok: true, id, existing: true };
+        if (occupant.state === "settled") {
+          prior = id;
+          priorWhy = occupant.why;
+          rung += 1;
+          raced = false;
+          continue;
+        }
+        const written = await writeGateNode(publicationCfg, id, markdown(id, prior, priorWhy));
+        // Created it: this filing IS the record.
+        if (written.ok && !written.existing) return written;
+        // The id was occupied between the read and the write — another worker
+        // filed the same flake first (its content is this flake's by
+        // construction, the id being keyed on the file and nothing else), or
+        // the same-content door adopted it. Either way this markdown did not
+        // land, so the occupant is read back ONCE and the same live/settled/
+        // unknown rule decides, rather than adopted on the strength of the id.
+        if (written.existing && !raced) {
+          raced = true;
+          continue;
+        }
+        // Occupied by content that is not this flake's, or occupied again after
+        // a re-read that said absent: the id is not usable, climb a rung.
+        if (written.existing) {
+          rung += 1;
+          raced = false;
+          continue;
+        }
+        return written;
+      }
+      return { ok: false, reason: `every candidate id for this flake (${base}, +${FLAKE_ID_RUNGS - 1} recurrence rungs) is already settled — the file has been closed and reopened too often to file another` };
+    },
+    fileHumanItem: async ({ gate, classes, head, rescue = 0 }) => {
+      if (!head || !/^[0-9a-f]{40,64}$/i.test(head)) return { ok: false, reason: "the judged commit is unknown; approval cannot be bound to a candidate" };
+
       const k = keysFor(rescue);
-      const id = `task-approve-${gate.id.slice(0, 24)}-${stem}-${k.short}-${gateIdSuffix("approve", gate.id, entry.node_id, k.runKey)}`.toLowerCase();
+      const id = `task-approve-${gate.id.slice(0, 24)}-${stem}-${k.short}-${gateIdSuffix("approve", gate.id, entry.node_id, `${k.runKey}@${head}`)}`.toLowerCase();
       const body = [
         `The \`${gate.id}\` human gate is armed for ${entry.node_id}: the change touches` +
           (classes.length ? ` the declared risk class(es) ${classes.map((c) => `\`${c.class}\``).join(", ")}.` : " work this factory always has a person approve."),
@@ -14419,6 +14829,8 @@ function makeGateDeps(
         ...(classes.length
           ? classes.map((c) => `- \`${c.class}\`: ${c.paths.slice(0, 8).map((p) => `\`${p}\``).join(", ")}${c.paths.length > 8 ? ` (+${c.paths.length - 8} more)` : ""}`)
           : []),
+        "",
+        `Judged commit: \`${head}\`. This approval applies only to this commit; a changed candidate needs a new approval.`,
         "",
         gate.instructions || "Review the change and decide whether it may stand.",
         "",
@@ -14644,6 +15056,17 @@ async function retryOneEscalation(
     );
     return;
   }
+  // Historical payloads did not capture this posture. A completion stamp
+  // visible now may have been written during the retry backoff, so it cannot
+  // establish whether the item was already complete when integration ran.
+  // Keep that ambiguous obligation for explicit reconciliation, never infer
+  // chronology from the current factory or a later materialized stamp.
+  if (fromIntegration && typeof payload.completedBeforeIntegration !== "boolean"
+    && (record.completion_written_at || record.completion_consumed_at
+      || record.impl_claim?.completion?.after === "gates")) {
+    giveUp("the legacy integration refusal did not record its completion posture; reconcile whether completion preceded the original integration attempt");
+    return;
+  }
   // `attempt` travels with the payload, not recomputed: it keys the
   // escalation's deterministic id (gateRunKey/shortRunAttempt), and getting it
   // wrong here would mint a SECOND escalation instead of finishing the first.
@@ -14668,7 +15091,9 @@ async function retryOneEscalation(
   // have filed) — so the id a retry lands is the one the first attempt
   // reached for, and a person reads one escalation shape per refusal kind.
   const deps = fromIntegration
-    ? makeIntegrationDeps(cfg, { record, entry, factory, slug: project, log, warn, home })
+    ? makeIntegrationDeps(cfg, { record, entry, factory, slug: project, log, warn, home,
+        completedBeforeIntegration: payload.completedBeforeIntegration === true,
+      })
     : makeGateDeps(cfg, { record, entry, factory, slug: project, log, home });
   let esc;
   try {
@@ -15039,7 +15464,7 @@ async function releaseIntegrationLease(cfg, token) {
 // direct caller of makeIntegrationDeps (a test, a future entry point) gets
 // the same refusal rather than a raw ENOENT.
 function runGh(args, opts = {}) {
-  return spawnPortableSync("gh", args, { encoding: "utf8", timeout: 20000, ...opts });
+  return spawnPortableSync("gh", args, { encoding: "utf8", timeout: 20000, ...opts, env: gateRunner.judgeGitEnv(opts.env) });
 }
 
 // The github.com `owner/repo` slug `gh --repo` needs, read from the `origin`
@@ -15064,7 +15489,7 @@ function ghRepoSlug(top) {
 // Idempotent across a fix cycle: a re-run pushes the branch's new tip and
 // reuses whatever PR is already open for it rather than erroring on a
 // duplicate.
-function proposeIntegrationPR({ top, head, targetRef }) {
+function proposeIntegrationPR({ top, head, targetRef, body = null, editBody = editProposalBody }) {
   if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH — propose mode needs it to open pull requests" };
   const repo = ghRepoSlug(top);
   if (!repo) return { ok: false, reason: `could not resolve a github.com 'owner/repo' from ${top}'s 'origin' remote — propose mode needs a GitHub remote` };
@@ -15072,7 +15497,7 @@ function proposeIntegrationPR({ top, head, targetRef }) {
   const branchName = (git(top, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout || "").trim();
   if (!branchName || branchName === "HEAD") return { ok: false, reason: `could not read the branch name to propose from — ${top} is in detached HEAD` };
 
-  const push = git(top, ["push", "-u", remoteName, `${head}:refs/heads/${branchName}`]);
+  const push = git(top, ["push", "-u", remoteName, `${head}:refs/heads/${branchName}`], { env: gateRunner.judgeGitEnv() });
   if (push.status !== 0) {
     return { ok: false, reason: (push.stderr || "").trim().split("\n").filter(Boolean).pop() || "git push failed" };
   }
@@ -15098,6 +15523,12 @@ function proposeIntegrationPR({ top, head, targetRef }) {
       const list = JSON.parse(existing.stdout);
       const j = Array.isArray(list) ? list[0] : null;
       if (j && j.number && String(j.state || "").toUpperCase() === "OPEN" && j.baseRefName === baseBranch) {
+        if (body) {
+          const edited = editBody({ top, repo, number: j.number, body });
+          if (!edited || !edited.ok) {
+            return { ok: false, reason: `PR #${j.number} is already open (${j.url}) and now carries ${head.slice(0, 8)}, but its body could not be refreshed with that head's attestation — ${(edited && edited.reason) || "gh pr edit failed"}` };
+          }
+        }
         return { ok: true, number: j.number, url: j.url, repo, branch: branchName, targetRef, detail: `PR #${j.number} already open (${j.url}) — updated with ${head.slice(0, 8)}` };
       }
     } catch {
@@ -15109,7 +15540,7 @@ function proposeIntegrationPR({ top, head, targetRef }) {
     [
       "pr", "create", "--repo", repo, "--base", baseBranch, "--head", branchName,
       "--title", `Integration: ${branchName}`,
-      "--body", `Opened by the spor work integration stage (\`propose\` mode) for \`${branchName}\` onto \`${baseBranch}\`.`,
+      "--body", body || `Opened by the spor work integration stage (\`propose\` mode) for \`${branchName}\` onto \`${baseBranch}\`.`,
     ],
     { cwd: top }
   );
@@ -15120,6 +15551,27 @@ function proposeIntegrationPR({ top, head, targetRef }) {
   const num = (url.match(/\/pull\/(\d+)/) || [])[1];
   if (!num) return { ok: false, reason: `gh pr create did not report a pull request number/url (got: ${url || "nothing"})` };
   return { ok: true, number: Number(num), url, repo, branch: branchName, targetRef, detail: `opened PR #${num} (${url}) for ${head.slice(0, 8)} onto ${targetRef}` };
+}
+
+// Replace a PR's description — the attestation refresh door, used both by the
+// reuse arm above and by runGateAndIntegration once the run has SETTLED and the
+// graph artifact the PR body must be bound to exists (the body written at
+// propose time predates that artifact, so it is refreshed with the final,
+// digest-bound copy). {ok} | {ok:false, reason}.
+function editProposalBody({ top = null, repo, number, body, gh = runGh }) {
+  if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH" };
+  if (!repo || !number) return { ok: false, reason: "no pull request repo/number to edit" };
+  const viewed = gh(["pr", "view", String(number), "--repo", repo, "--json", "body"], top ? { cwd: top } : {});
+  if (viewed.status !== 0) return { ok: false, reason: (viewed.stderr || viewed.stdout || "gh pr view failed").trim() };
+  let merged;
+  try {
+    const current = JSON.parse(viewed.stdout);
+    if (!current || typeof current.body !== "string") throw new Error("PR body could not be read");
+    merged = attestation.mergePrBody(current.body, String(body || ""));
+  } catch (e) { return { ok: false, reason: e.message }; }
+  const r = gh(["pr", "edit", String(number), "--repo", repo, "--body", merged], top ? { cwd: top } : {});
+  if (r.status !== 0) return { ok: false, reason: (r.stderr || r.stdout || "").trim().split("\n").filter(Boolean).pop() || "gh pr edit failed" };
+  return { ok: true };
 }
 
 // The PR's current state, for checkProposals below — {ok, state: "open" |
@@ -15204,8 +15656,36 @@ function buildProposalTrackingNode({ id, nodeId, runId, targetRef, proposal, pro
 // integration-runner.js's pure orchestration, mirroring makeGateDeps above.
 // Only ever constructed when `factory.integration` resolved, so a bare
 // factory (or one with no integration block) never touches any of this.
-function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome(), completedBeforeIntegration = false }) {
+// The propose-time PR body: the run's attestation as it stands (the gate
+// verdicts bound to the head being proposed, with the candidate suite the
+// stage just ran), rendered with the validation recipe
+// (task-spor-factory-gate-attestation, piece 4). Built here rather than in
+// the pure runner because it needs the gate pipeline's result and the
+// environment, which the stage never sees. Throws when it cannot be built —
+// the caller (makeIntegrationDeps `propose`) turns that into a failed
+// proposal, never a PR without it.
+function buildProposalBody({ cfg, entry, factory, slug, workerId, top, head, targetRef, chain = null, integration, gate }) {
+  const baseBranch = integrationRunner.splitRemoteRef(targetRef).branch;
+  const partial = {
+    mode: integration.mode, strategy: integration.strategy, state: "proposing", target_ref: targetRef,
+    target_sha: chain ? chain.targetSha : null, head: head || (chain && chain.head) || null,
+    gated_head: chain ? chain.gatedHead : null, landed_sha: null, candidate: chain ? chain.candidate : null,
+  };
+  const att = attestation.buildAttestationObject({
+    item: { ...entry, project: slug || entry.project || null }, factory,
+    gate,
+    integration: partial,
+    environment: attestationEnvironment(cfg, workerId),
+    signing: attestationSigning(cfg),
+  });
+  return attestation.renderPrBody({ attestation: att, branch: (git(top, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout || "").trim() || "HEAD", base: baseBranch });
+}
+
+function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome(), completedBeforeIntegration = false, gateResult = null, regate = null, buildProposalBody: buildBody = buildProposalBody, proposeIntegrationPR: proposePR = proposeIntegrationPR }) {
   const integration = factory.integration;
+  // The gate pipeline's result AS IT STANDS — a re-gate of a moved head
+  // (below) replaces it, and the PR body's attestation must carry the latest.
+  const currentGate = () => (typeof gateResult === "function" ? gateResult() : gateResult);
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
   const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
@@ -15266,6 +15746,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
   };
 
   return {
+    completedBeforeIntegration: completedBeforeIntegration === true,
     now: () => Date.now(),
     changedTree: async () => {
       const c = gateRunner.gateChangeSet(record, integration.targetRef);
@@ -15427,7 +15908,15 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       return built;
     },
     forceProtected: ({ dir, sha }) => {
-      const forced = gateRunner.forceProtectedPaths({ top, dir, trustedRef: factory.trustedRef, protectedPaths: factory.protectedPaths });
+      // Pin the trusted ref to ONE commit before touching the tree, and force
+      // from that sha — never from the symbolic ref, which can advance between
+      // this restore and the attestation naming it (cross-model review, major
+      // finding 5). An unresolvable ref refuses the stage rather than forcing
+      // from whatever the ref means by the time checkout runs.
+      const pin = git(top, ["rev-parse", "--verify", `${factory.trustedRef}^{commit}`]);
+      const trustedSha = pin.status === 0 ? (pin.stdout || "").trim() : null;
+      if (!trustedSha) return { ok: false, reason: `the trusted ref '${factory.trustedRef}' does not resolve to a commit in ${top}, so the candidate's protected paths cannot be pinned to it` };
+      const forced = gateRunner.forceProtectedPaths({ top, dir, trustedRef: trustedSha, protectedPaths: factory.protectedPaths });
       if (!forced.ok) return forced;
       // The restore above only touches the candidate worktree's WORKING
       // DIRECTORY — `sha` still names the pre-restoration commit. Landing it
@@ -15435,7 +15924,8 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       // meant to strip (issue-spor-integration-landed-sha-pre-restoration), so
       // re-commit when the restore actually changed anything and land that
       // sha instead; a no-op restore returns `sha` unchanged.
-      return integrationRunner.reconcileCandidateSha({ dir, sha });
+      const reconciled = integrationRunner.reconcileCandidateSha({ dir, sha });
+      return reconciled && reconciled.ok ? { ...reconciled, trusted_sha: trustedSha } : reconciled;
     },
     runSuite: ({ dir, base, head, attempt = 1 }) =>
       gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir, {
@@ -15450,7 +15940,32 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
         },
       }),
     land: (args) => integrationRunner.landCandidate(args),
-    propose: ({ head, targetRef }) => proposeIntegrationPR({ top, head, targetRef }),
+    // The PR body carries the run's attestation (task-spor-factory-gate-
+    // attestation, piece 4): the gate verdicts as they stand, bound to the head
+    // being proposed, with the candidate suite the stage just ran. Built here
+    // rather than in the pure runner because it needs the gate pipeline's
+    // result (ctx.gateResult) and the environment, which the stage never sees.
+    // A PR that cannot carry its attestation is NOT opened (cross-model
+    // review, major finding 5): the attestation-bearing body is the contract
+    // a PR-policy repo's CI validates, and a PR opened with a generic body
+    // would pass through that repo's merge queue with nothing to check. A
+    // body that cannot be built is a failed proposal, which the stage
+    // routes like any other failure (§10.9) — never a silent downgrade.
+    propose: ({ head, targetRef, chain = null }) => {
+      let body = null;
+      try {
+        body = buildBody({
+          cfg, entry, factory, slug, workerId, top, head, targetRef, chain, integration,
+          gate: currentGate() || { state: "passed", gates: [], facts: [], definition: factory.definition || null },
+        });
+      } catch (e) {
+        const reason = `the attestation for the pull request body could not be built (${(e && e.message) || e}) — a proposal must carry its attestation, so no PR was opened`;
+        log(`work: ${reason}`);
+        return { ok: false, reason };
+      }
+      if (!body) return { ok: false, reason: "the attestation for the pull request body was not built — a proposal must carry its attestation, so no PR was opened" };
+      return proposePR({ top, head, targetRef, body });
+    },
     parkForReview: async ({ proposal }) => {
       const id = proposalTrackingId(entry.node_id, entry.run_id);
       const written = await writeGateNode(
@@ -15487,6 +16002,10 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       return { ...written, id };
     },
     fix,
+    // A fix cycle moved the implementer's head: the stage hands it back to the
+    // gate pipeline before anything at that head can land (review finding 2).
+    // Wired by runGateAndIntegration, which owns the pipeline's result.
+    ...(typeof regate === "function" ? { regate } : {}),
     recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
     cleanupImplementer: async () => {
       const dir = record && record.cwd;
@@ -15544,12 +16063,16 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
           ? [
               `This item \`relates-to\` ${entry.node_id}, which was COMPLETED at the factory's 'gates' boundary before this`,
               "stage ran and stays completed — the operator chose to release dependents before the change is on the",
-              "target ref. Every declared gate already passed; only the merge-queue landing itself is unresolved.",
+              kind === "mismatch"
+                ? "target ref. The gates passed on the previously pinned candidate; the current branch has not been accepted."
+                : "target ref. Every declared gate already passed; only the merge-queue landing itself is unresolved.",
             ]
           : [
               `This item \`blocks\` ${entry.node_id} on the graph, and if that item had already been flipped to a`,
-              "completion status the worker rolled it back. Every declared gate already passed; only the merge-queue",
-              "landing itself is unresolved. The run's resolver is left standing.",
+              kind === "mismatch"
+                ? "completion status the worker rolled it back. The gates passed on the previously pinned candidate; the current branch has not been accepted."
+                : "completion status the worker rolled it back. Every declared gate already passed; only the merge-queue landing itself is unresolved.",
+              "The run's resolver is left standing.",
             ]),
         "",
         detail ? `Last outcome: ${detail}` : "",
@@ -15694,15 +16217,23 @@ async function completionReadItem(cfg, nodeId) {
       : r.json.resolution && r.json.resolution.by
         ? [{ by: r.json.resolution.by, edge: r.json.resolution.edge || "resolves" }]
         : [];
+    // Withdrawing a hold is a mutation based on status policy. A shipped
+    // seed fallback cannot establish an organization's give-up semantics.
+    const schema = await remote.get(cfg, "/v1/schema", { timeoutMs: 8000 });
+    const statusRegistry = schema.ok && !schema.jsonError
+      ? require(path.join(ROOT, "lib", "kernel", "registry.js")).statusRegistryFromSnapshot(schema.json) : null;
+    if (!statusRegistry || !statusRegistry.nodeSchemas.has(fm.type)) return { ok: false, reason: `${nodeId}: live status policy could not be read; completion hold is unchanged` };
+    const statusGraph = { registry: statusRegistry };
     const status = String(fm.status || "");
+    const terminal = !!status && (typeof r.json.inert === "boolean" ? r.json.inert : resolution.isTerminalStatus(status, fm.type, statusGraph));
     return {
       ok: true,
       status,
       type: String(fm.type || ""),
-      terminal: !!status && graphLib.isTerminalStatusOffline(status, fm.type || null),
+      terminal,
       execution: typeof fm.execution === "string" ? fm.execution : "",
       executionAt: typeof fm.execution_at === "string" ? fm.execution_at : null,
-      giveUp: resolution.isGiveUpStatus(status, null),
+      giveUp: terminal && resolution.isGiveUpStatus(status, fm.type, statusGraph),
       revision: r.json.revision || null,
       raw: r.json.raw,
       inbound,
@@ -15734,7 +16265,7 @@ async function completionReadItem(cfg, nodeId) {
     terminal: !!status && isTerminalStatus(status, n.type, g),
     execution: typeof n.execution === "string" ? n.execution : "",
     executionAt: typeof n.execution_at === "string" ? n.execution_at : null,
-    giveUp: resolution.isGiveUpStatus(status, g),
+    giveUp: resolution.isGiveUpStatus(status, n.type, g),
     revision: gitBlobSha(buf),
     raw: buf.toString("utf8"),
     inbound: resolution.inboundResolvers(g, nodeId).map((x) => ({ by: x.by, edge: x.edge })),
@@ -15865,7 +16396,7 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
   // is content-addressed the same way in both (tenant, item, factory, pipeline
   // attempt), so a local execution and a hosted one describe the same thing.
   let store = openExecutionStoreFor(cfg, { home, log });
-  const gates = (factory.gates || []).map((g) => ({ id: g.id, node_id: g.source && g.source !== "inline" ? String(g.source) : null }));
+  const gates = (factory.gates || []).map((g) => ({ id: g.id, node_id: g.source && g.source !== "inline" ? String(g.source) : null, rejudge_on_repin: g.rejudgeOnRepin !== false }));
   const openArgs = { node_id: item.id, factory: factory.id, gates, boundary: factory.completion.after, repo: item.project || null };
   let opened = await store.open(openArgs);
   // A server that does not serve the surface (an older version, or one with
@@ -15971,8 +16502,7 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
 // dispatch agent when one is configured (the same identity the hosted store
 // derives from an agent token), else the user. Remote mode never sends it as
 // its own name — the server derives the principal from the authenticated
-// identity and reads a body `worker` only as the fallback label for an
-// unbound token.
+// identity; an unbound token cannot acquire execution ownership.
 function executionWorkerPrincipal(cfg) {
   const agent = cfg.get("dispatch.agent", null);
   if (agent) return String(agent);
@@ -16020,6 +16550,27 @@ function openExecutionStoreFor(cfg, { home = cfg.userConfigHome(), mode = null, 
     pinRead: executionPinRead(cfg),
     log,
   });
+}
+
+// The local person binding is the existing graph-home Git email viewer. It
+// is filesystem/configuration trust, not proof of an interactive human. An
+// agent-configured local principal is deliberately not promoted to its owner.
+async function forceReleaseFromCli(cfg, { nodeId, executionId, reason, home = cfg.userConfigHome(), remote: remoteOverride = null, clearHold: clearOverride = null } = {}) {
+  let person = null;
+  if (cfg.mode() !== "remote") {
+    if (cfg.get("dispatch.agent", null)) throw new Error("local force release requires person configuration; dispatch.agent is set");
+    const q = require(path.join(ROOT, "lib", "queue.js"));
+    const graph = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
+    person = q.viewerFor(graph, q.gitIdentityEmail(path.dirname(cfg.nodesDir())))?.id || null;
+    if (!person) throw new Error("local force release requires Git email bound to a person node in this graph");
+  }
+  const origin = attestationGraphOrigin(cfg);
+  const bound = attestationPublicationConfig(cfg, origin);
+  if (!bound) throw new Error("publication identity changed; nothing released");
+  const store = executionStore.openExecutionStore(bound, { home, worker: executionWorkerPrincipal(cfg), person, machine: os.hostname(), pinRead: executionPinRead(cfg), remote: remoteOverride });
+  const deps = makeCompletionDeps(bound, { home });
+  const clearHold = clearOverride || (args => completionShell.clearHold({ ...args, deps }));
+  return require(path.join(ROOT, "lib", "shell", "person-force-release.js")).personForceRelease({ home, store, origin, nodeId, executionId, reason, clearHold });
 }
 
 // The gate verdict words the pipeline records (gate-runner.js's facts) mapped
@@ -16071,6 +16622,7 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
   let fence = claim.fence != null ? Number(claim.fence) : null;
   let owned = fence != null;
   let last = null; // the latest execution record any store answer carried
+  let candidateTip = null; // latest locally pinned candidate, including owed events
   const pinned = new Set(Array.isArray(claim.gates) ? claim.gates.map(String) : []);
   // Attempt counters, ADVANCED LOCALLY on every report whether or not it was
   // delivered: the idempotency key of a gate verdict or an integration
@@ -16216,7 +16768,7 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
       if (fence == null) return { ok: false };
       const r = await st.renew(id, { fence, ttl_ms: st.ttlMs });
       if (r.ok && r.execution) last = r.execution;
-      else if (!r.ok && executionKernel.OWNERSHIP_CODES.includes(r.code)) {
+      else if (!r.ok && (r.ownership === false || executionKernel.OWNERSHIP_CODES.includes(r.code))) {
         owned = false;
         note(`lost:${r.code}`, `work: ${record.node_id} — execution ${id} lease lost on renew (${r.code}: ${r.message})`);
       }
@@ -16233,14 +16785,20 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
       return r;
     },
     stageObserved: (attempt, state, extra = {}) => send({ type: "stage.observed", attempt, state, ...extra }),
-    candidateSubmitted: (candidate, { premature = false } = {}) =>
-      send({ type: "candidate.submitted", candidate, ...(premature ? { premature_resolution: true } : {}) }),
-    gateSettled: (gateId, verdict) => {
+    candidateSubmitted: async (candidate, { premature = false } = {}) => {
+      candidateTip = candidate;
+      const pinnedResult = await send({ type: candidate.supersedes ? "candidate.superseded" : "candidate.submitted", candidate, ...(premature ? { premature_resolution: true } : {}) });
+      if (candidate.reference?.verified_at && (pinnedResult.ok || pinnedResult.deferred)) {
+        return send({ type: "candidate.published", candidate_id: candidate.candidate_id, reference: candidate.reference, verified_at: candidate.reference.verified_at });
+      }
+      return pinnedResult;
+    },
+    gateSettled: (gateId, verdict, { candidateId = null } = {}) => {
       const state = GATE_VERDICT_TO_STATE[String(verdict || "")] || null;
       if (!state) return Promise.resolve({ ok: true, skipped: true });
       if (pinned.size && !pinned.has(String(gateId))) return Promise.resolve({ ok: true, skipped: true }); // a synthetic gate (scoping, no-code) is not in the pinned list
       const attempt = gateAttempt(String(gateId));
-      return send({ type: "gate.settled", gate_id: String(gateId), attempt, state });
+      return send({ type: "gate.settled", gate_id: String(gateId), attempt, state, candidate_id: candidateId || candidateTip?.candidate_id || last?.candidate?.candidate_id || null });
     },
     rescueStarted: (attempt) => send({ type: "rescue.started", attempt }),
     escalationFiled: (nodeId, reason, { terminal = false } = {}) => send({ type: "escalation.filed", node_id: nodeId, reason: reason || null, ...(terminal ? { terminal: true } : {}) }),
@@ -16252,14 +16810,38 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
     integrationSettled: (state, { ref = null, commit = null } = {}) =>
       send({ type: "integration.settled", attempt: integrationAttempt || 1, state, ...(ref ? { ref } : {}), ...(commit ? { commit } : {}) }),
     completionWritten: (resolver) => send({ type: "completion.written", resolver }),
-    // The pipeline produces nothing further under this execution: the
-    // pool-spent terminal (the one non-escalation door to `refused`), which
-    // frees the item pointer for the next attempt. Then the reporter leaves.
+    // Refusal retains the hold. Persist both steps until the explicit release
+    // is acknowledged; graph completion stamps must not hide this store debt.
     async end(reason, { outcome = "cancelled" } = {}) {
-      const attempt = last && Array.isArray(last.attempts) && last.attempts.length ? last.attempts[last.attempts.length - 1].index : 1;
-      const r = await send({ type: "stage.observed", attempt, state: "exhausted", outcome, ...(reason ? { reason } : {}) });
+      const fresh = dispatchRuns.readJson(dispatchRuns.runPaths(home, record.run_id).record);
+      const prior = fresh?.completion_execution_end;
+      const attempt = last?.attempts?.length ? last.attempts[last.attempts.length - 1].index : 1;
+      const debt = prior?.event ? prior : { execution_id: id, reason, outcome, phase: "observe", event: { type: "stage.observed", attempt, state: "exhausted", outcome, ...(reason ? { reason } : {}) } };
+      if (debt.execution_id !== id) return { ok: false, code: "conflict", message: "execution release debt belongs to another execution" };
+      const stamp = (value) => dispatchRuns.stampCompletionState(home, record.run_id, { completion_execution_end: value });
+      if (!stamp(debt)) return { ok: false, code: "conflict", message: "could not persist execution release debt" };
       LIVE_EXECUTIONS.delete(id);
-      return r;
+      if (debt.phase !== "release") {
+        const r = await send(debt.event);
+        if (!r.ok) return r;
+        if (!stamp({ ...debt, phase: "release" })) return { ok: false, code: "conflict", message: "could not persist execution release phase" };
+      }
+      const released = await st.release(id, { fence });
+      if (released.ok) stamp(null);
+      return released;
+    },
+    async retryEnd(debt) {
+      if (debt.execution_id && debt.execution_id !== id) return { ok: false, code: "conflict", message: "execution release debt belongs to another execution" };
+      // An acknowledgement can be lost after release; an authoritative closed
+      // record settles our debt without trying to claim an already closed hold.
+      const observed = await st.get(id);
+      if (observed.ok && !observed.cached && observed.execution && executionKernel.isTerminal(observed.execution)) {
+        dispatchRuns.stampCompletionState(home, record.run_id, { completion_execution_end: null });
+        return { ok: true, replayed: true };
+      }
+      const resumed = await reporter.resume();
+      if (!resumed.ok || resumed.unconfirmed) return resumed;
+      return reporter.end(debt.reason, { outcome: debt.outcome || "cancelled" });
     },
     async release() {
       LIVE_EXECUTIONS.delete(id);
@@ -16290,7 +16872,7 @@ async function renewLiveExecutions(log = () => {}) {
 }
 
 // Wrap a gate-deps object so the reporter sees the seams the pipeline
-// already has — the candidate pin, the recorded fact, the escalation, the
+// already has — the candidate pin, completed evidence, the escalation, the
 // human-gate approval item — without gate-runner.js learning about the store.
 // Each wrapper calls the original first (the pipeline's own verdict is never
 // held up by a report) and reports fail-soft afterwards.
@@ -16301,7 +16883,7 @@ function reportingGateDeps(deps, reporter) {
     wrapped.pinCandidate = async (args) => {
       const r = await deps.pinCandidate(args);
       try {
-        if (r && r.ok && r.candidate && (r.change === "created" || r.change === "superseded")) {
+        if (r && r.ok && r.candidate) {
           await reporter.candidateSubmitted(r.candidate, { premature: !!(r.candidate.resolver && r.candidate.resolver.resolves_edge) });
         }
       } catch {
@@ -16310,19 +16892,20 @@ function reportingGateDeps(deps, reporter) {
       return r;
     };
   }
-  if (deps.recordFact) {
-    wrapped.recordFact = async (args) => {
-      const r = await deps.recordFact(args);
-      try {
-        const gate = args && args.gate;
-        if (gate && gate.kind === "rescue") await reporter.rescueStarted(Number(args.rescue) || 1);
-        else if (gate && gate.id) await reporter.gateSettled(gate.id, args.verdict);
-      } catch {
-        /* fail-soft */
-      }
-      return r;
-    };
-  }
+  // A bare fact is not a settled gate: its mandatory occurrence edges and
+  // durable receipt may still be owed. The runner calls this seam only after
+  // all payment is confirmed, including adoption of a completed receipt.
+  wrapped.gateEvidenceRecorded = async (args) => {
+    if (deps.gateEvidenceRecorded) await deps.gateEvidenceRecorded(args);
+    try {
+      const gate = args && args.gate;
+      if (gate && gate.kind === "rescue") return await reporter.rescueStarted(Number(args.rescue) || 1);
+      if (gate && gate.id) return await reporter.gateSettled(gate.id, args.verdict, { candidateId: args.candidate_id || null });
+    } catch {
+      // Fail-soft for the verdict, but preserve the caller's reporting retry.
+    }
+    return { ok: false };
+  };
   if (deps.escalate) {
     wrapped.escalate = async (args) => {
       const r = await deps.escalate(args);
@@ -16426,11 +17009,21 @@ async function candidateResolverFromReport(cfg, producer, nodeId, fallback) {
 // per pass and fail-soft: an unreadable graph leaves every debt owed.
 const COMPLETION_RECONCILE_MAX = 10;
 async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = () => {} } = {}) {
-  const records = dispatchRuns.readRunRecords(home).filter((r) => completionKernel.isControllerRecord(r) && !r.completion_written_at && !r.completion_withdrawn_at && !r.completion_consumed_at);
+  const records = dispatchRuns.readRunRecords(home).filter((r) => completionKernel.isControllerRecord(r) && (r.completion_execution_end || (!r.completion_written_at && !r.completion_withdrawn_at && !r.completion_consumed_at)));
   let worked = 0;
   for (const r of records) {
     if (worked >= COMPLETION_RECONCILE_MAX) break;
     worked += 1; // every EXAMINED record counts — a pass is bounded in reads, not in writes
+    if (r.completion_execution_end) {
+      const ending = executionReporter(cfg, r, { home, log });
+      try {
+        const result = ending && await ending.retryEnd(r.completion_execution_end);
+        if (!result?.ok) log(`work: ${r.node_id} — execution release remains owed`);
+      } catch (e) {
+        log(`work: ${r.node_id} — execution release retry deferred (${e.message || e})`);
+      } finally { if (ending) ending.leave(); }
+      continue;
+    }
     // A pipeline still RUNNING under a live worker owns its own completion;
     // the reconciler only ever picks up what nothing else is holding — a
     // settled verdict with the boundary reached but the write not landed, a
@@ -16515,7 +17108,43 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // a refusal (§10.7) under the worker's scope token would hide it from exactly
   // the project-scoped queue a person would look in.
   const dctx = { ...ctx, slug: item.project || ctx.slug || null, record, entry };
+  // OWN THE RECORD BEFORE JUDGING (cross-model review, blocking finding 2).
+  // The settle below is a compare-and-swap, but the pipeline writes facts,
+  // files an escalation and demotes the item on its way there — irreversible
+  // graph state — so the ownership nonce is taken FIRST, under the record
+  // lock: a record another pipeline already settled, or one a still-live
+  // worker is gating, refuses the claim and this worker runs NOTHING for it
+  // (no fact, no escalation, no demotion, no attestation). Only a dead
+  // owner's record is taken over, which is what orphan resumption is. The
+  // settle then lands only while the record still carries this token.
   const home = ctx.home || cfg.userConfigHome();
+  const ownerLive =
+    ctx.ownerLive ||
+    ((owner) => {
+      try {
+        return workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner);
+      } catch {
+        return false;
+      }
+    });
+  const claim = ctx.gateClaim || dispatchRuns.claimGateRecord(home, item.run_id, { workerId: ctx.workerId || null, ownerLive });
+  if (ctx.gateClaim && freshRecord(home, record).gate_settle_id !== claim.token) claim.refused = "the re-gate ownership changed before judging";
+  if (claim.refused) {
+    const rec = claim.record || null;
+    ctx.log(`work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) is ${claim.refused} — this worker does not run the gate pipeline for it: no fact, escalation, demotion or attestation is written`);
+    return {
+      state: (rec && rec.gate_state) || "failed",
+      reason: `the gate pipeline was not run: the run record is ${claim.refused}`,
+      gates: [],
+      facts: [],
+      attestation: null,
+      superseded: true,
+      not_run: true,
+      settled: rec ? settledGateSummary(rec) : null,
+    };
+  }
+  const ownToken = claim.ok ? claim.token : null;
+  dctx.gateOwner = ownToken;
   const controller = completionKernel.isControllerRecord(record) && ctx.factory.completion && ctx.factory.completion.by === "controller";
   // The boundary is the CLAIM's (pinned at H1), never the factory node's
   // current text — an edit mid-pipeline changes nothing (§7.2).
@@ -16578,7 +17207,9 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     }
     if (stage.handoff) ctx.log(`work: ${entry.node_id} — implementation stage hands the run to the gates: ${stage.handoff}`);
   }
-  const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: gateDeps });
+  let gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: gateDeps });
+  const gateFacts = [...(gateResult.facts || [])];
+  let intResult = null;
   // The SPLIT verdict of the gate list alone (task-spor-factory-controller-
   // completion-boundary, §6.5): `gates_state` says what the gates said, and
   // `integration_state` below what the integration stage said, so the
@@ -16595,10 +17226,73 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // the escalation the gate filed (§4.4).
   // The reporter leaves the heartbeat set when the pass returns: a completion
   // still owed is re-driven by reconcileCompletions under its own resume.
-  const leave = (r) => {
+  const leave = async (result) => {
     if (reporter) reporter.leave();
-    return r;
+    const gateAsStands = { ...gateResult, facts: gateFacts };
+    // Persist the verdict AND its signed publication outbox atomically.
+    // A crash before graph publication leaves replayable evidence debt.
+    // SETTLE FIRST, ATTEST SECOND (review finding 5): the verdict is written to
+    // the run record — the durable, read-back-verified `gate_state` the resume
+    // scan and `spor runs` key on — BEFORE the attestation node exists, so no
+    // window has a graph artifact claiming a verdict the record does not yet
+    // hold (a worker dying in that window would leave evidence a resumed
+    // pipeline could later be pointed at). The loop's own settle stamp after
+    // this is a no-op against an already-settled verdict, by stampGateState's
+    // contract; the `--regate` path retains the same ownership fence for final bookkeeping.
+    //
+    // The evidence fields (gate_head/gate_base/trusted sha/factory digest/landed
+    // sha) ride IN the settle stamp — one write, one writer — and the settle
+    // reports whether it LANDED. When it did not (another pipeline for the same
+    // run — a duplicate adopter, a resumed orphan — settled first and the guard
+    // yielded to it), this pipeline's verdict is not the record's, so it writes
+    // NO attestation and touches NO evidence field (cross-model review, blocking
+    // finding 1): the graph and the record must describe one verdict at one
+    // head, and that is the winner's. The result still reports what this
+    // pipeline found (`superseded` says the record disagrees) so the loop's own
+    // bookkeeping stays honest.
+    const pending = prepareRunAttestation(cfg, { item, factory: ctx.factory, gateResult: gateAsStands, intResult, workerId: ctx.workerId || null, cwd: record && record.cwd });
+    const settled = settleRunRecord(home, item.run_id, result, ctx.workerId || null, { gateResult: gateAsStands, factory: ctx.factory, intResult, token: ownToken, pending });
+    if (!settled.landed) {
+      ctx.log(
+        `work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) was already settled${settled.record && settled.record.gate_state ? ` as '${settled.record.gate_state}'` : ""}${settled.record && settled.record.gate_worker ? ` by ${settled.record.gate_worker}` : ""} — this pipeline's '${result.state}' verdict is not recorded and no attestation is written for it`
+      );
+      const rec = settled.record || null;
+      return {
+        ...result,
+        attestation: null,
+        superseded: true,
+        // What the record DOES hold — the winner's verdict — so the loop's status
+        // surface publishes that, never this pipeline's losing head and verdict
+        // (cross-model review, major finding 4).
+        settled: rec ? settledGateSummary(rec) : null,
+    };
+
+  }
+  // ONE attestation per run (piece 4): the evidence chain over everything
+  // above, written as a graph artifact and stamped onto the run record
+  // (`gate_attestation`) through the settler's OWN door (`own: gate_at`), so
+  // it can never land on a record another writer settled. Fail-soft like
+  // every fact write — the verdict is the enforcement, the attestation is its
+  // record.
+  const { attestationObject, ...attested } = await writeRunAttestation(cfg, {
+    item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token, built: pending.built, origin: pending.origin,
+  });
+  // Propose mode: the PR body written at propose time predates the graph
+  // artifact it must be bound to (the artifact is minted only after the run
+  // settles, above), so the PR is refreshed with the final, digest-bound copy
+  // the graph holds — the copy a CI validate-attestation job compares against.
+  if (attested.attestation && attestationObject && intResult && intResult.state === "parked" && intResult.proposal && intResult.proposal.number && ctx.factory.integration && ctx.factory.integration.mode === "propose") {
+    const refreshed = await refreshProposalAttestation(cfg, {
+      item, factory: ctx.factory, intResult, attestationObject, home, log: ctx.log, settleToken: settled.token,
+      cwd: (record && record.cwd) || null, editBody: ctx.editProposalBody || editProposalBody,
+    });
+    attested.proposal_attestation_stale = !refreshed.ok;
+    if (!refreshed.ok) attested.proposal_attestation_error = String(refreshed.reason || "no response").slice(0, 300);
+  }
+  return { ...result, ...attested };
   };
+
+
   let completed = null;
   if (controller && boundary === "gates" && gateResult.state === "passed") {
     completed = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: makeCompletionDeps(cfg, { home, runId: entry.run_id, execution: executionCompletionDeps(reporter) }), log: ctx.log, facts: gateResult.facts || [], boundary: "gates" });
@@ -16613,9 +17307,16 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   const intCtx = completed && completed.ok && (completed.settled === "written" || completed.settled === "consumed") ? { ...dctx, completedBeforeIntegration: true } : dctx;
   dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: "running" });
   if (reporter) await reporter.integrationStarted();
-  const intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, deps: makeIntegrationDeps(cfg, intCtx) });
+    const regate = async ({ head }) => {
+      const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
+      for (const f of again.facts || []) if (!gateFacts.includes(f)) gateFacts.push(f);
+      gateResult = again;
+      if (again.state === "passed" && again.head !== head) ctx.log(`work: the re-gate of ${item.node_id} judged ${String(again.head || "an unknown head").slice(0, 12)}, not the moved head ${String(head).slice(0, 12)}`);
+      return again;
+    };
+  intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null, deps: makeIntegrationDeps(cfg, { ...intCtx, gateResult: () => gateResult, regate }) });
   const intState = completionKernel.INTEGRATION_STATES.includes(intResult.state) ? intResult.state : intResult.state === "passed" ? "landed" : "failed";
-  const allFacts = [...(gateResult.facts || []), ...(intResult.facts || [])];
+  const allFacts = [...gateFacts, ...(intResult.facts || [])];
   dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: intState, ...(allFacts.length ? { completion_facts: allFacts } : {}) });
   // The store's integration verdict: landed and parked are its own words; a
   // failure or a refusal is `failed` (a fix cycle or a refusal follows).
@@ -16628,9 +17329,9 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     if (!written.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the integration boundary (${written.reason}); the debt stands and the next pass retries it`);
   }
   if (intCtx.completedBeforeIntegration && intResult.state !== "passed" && intResult.state !== "parked") {
-    return leave({ ...intResult, gates: gateResult.gates, facts: allFacts, demoted: false, demote_reason: null, reason: `${intResult.reason || intResult.state} (the item was completed at the 'gates' boundary and stays completed; the landing is a person's to finish)` });
+    return leave({ ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: allFacts, demoted: false, demote_reason: null, reason: `${intResult.reason || intResult.state} (the item was completed at the 'gates' boundary and stays completed; the landing is a person's to finish)` });
   }
-  return leave({ ...intResult, gates: gateResult.gates, facts: allFacts });
+  return leave({ ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: allFacts });
 }
 
 // The run record as it reads NOW — the pipeline's captured copy predates every
@@ -16641,6 +17342,401 @@ function freshRecord(home, record) {
   } catch {
     return record;
   }
+}
+// The settled verdict, on the run record, in the same shape work-loop.js's
+// settleGates stamps it (one writer's fields, not two disagreeing ones), plus
+// the run's evidence fields when the pipeline's inputs are given. Returns
+// {landed, at, token, record}: `landed` is whether THIS stamp is the verdict
+// now on the file — false when the settled-verdict guard yielded to an earlier
+// writer (the record returned is theirs) or the write could not be made at
+// all. The stamp is a locked compare-and-swap (stampGateState) and what comes
+// back is the record READ FROM DISK after the write, so `landed` is a disk
+// fact, never this process's belief. `token` is the settler's ownership nonce
+// (`gate_settle_id`, random — two settlers in one millisecond cannot share it
+// the way they could share `gate_at`): every evidence field stamped after the
+// verdict goes through stampGateState's `own` door with it.
+function settleRunRecord(home, runId, res, workerId = null, { gateResult = null, factory = null, intResult = null, token: owned = null, pending = null } = {}) {
+  const at = new Date().toISOString();
+  // The token claimGateRecord minted before the pipeline ran, when there was a
+  // record to own — the settle then goes through the `own` door and lands only
+  // while the record still carries it (a re-gate or another owner in between
+  // refuses it). With no record to own beforehand, a fresh nonce and the
+  // settled-verdict guard alone, as before.
+  const token = owned || crypto.randomBytes(12).toString("hex");
+  try {
+    const state = res && res.state ? res.state : "failed";
+    const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
+    const stamped = dispatchRuns.stampGateState(home, runId, {
+      gate_state: state,
+      gate_at: at,
+      gate_settle_id: token,
+      ...(pending ? { gate_attestation_pending: pending, gate_attestation_missing: true, gate_attestation_error: pending.error || "attestation publication pending" } : {}),
+      ...(res && res.escalation_failed ? { gate_escalation_failed: true } : {}),
+      ...(res && res.escalation_retry ? { gate_escalation_pending: res.escalation_retry, gate_escalation_retry_count: 0 } : {}),
+      ...(res && res.demote_reason && res.state === "parked" ? { gate_demote_pending: true } : {}),
+      ...(workerId ? { gate_worker: workerId } : {}),
+      ...(reason ? { gate_reason: reason } : {}),
+      ...(res && res.escalated_to ? { gate_escalated_to: res.escalated_to, gate_escalation_ids: [res.escalated_to] } : {}),
+      ...(res && res.demoted != null ? { gate_demoted: !!res.demoted } : {}),
+      ...(gateResult
+        ? {
+            gate_head: gateResult.head || null,
+            gate_base: gateResult.base || null,
+            gate_trusted_sha: gateResult.trusted_sha || null,
+            gate_factory_digest: (factory && factory.definition && factory.definition.factory && factory.definition.factory.digest) || null,
+            ...(intResult && intResult.landed_sha ? { gate_landed_sha: intResult.landed_sha } : {}),
+          }
+        : {}),
+    }, owned ? { own: owned } : {});
+    const landed = !!stamped && stamped.gate_settle_id === token && stamped.gate_state === state;
+    return { landed, at, token, record: stamped || null };
+  } catch {
+    /* fail-soft: the loop's own settle stamp is the second writer */
+    return { landed: false, at, token, record: null };
+  }
+}
+
+// What the run record holds of a settled pipeline, for the loop's `--status`
+// surface — INCLUDING the attestation's own failure stamps (a promised
+// attestation that is missing, a parked PR whose body is stale), so the
+// status a person reads never shows a clean verdict over an evidence chain
+// with a hole in it (cross-model review, minor finding 8).
+function settledGateSummary(rec) {
+  return {
+    state: rec.gate_state || null,
+    reason: rec.gate_reason || null,
+    head: rec.gate_head || null,
+    attestation: rec.gate_attestation || null,
+    attestation_missing: rec.gate_attestation_missing === true,
+    attestation_error: rec.gate_attestation_error || null,
+    proposal_attestation_stale: rec.gate_proposal_attestation_stale === true,
+    proposal_attestation_error: rec.gate_proposal_attestation_error || null,
+    worker: rec.gate_worker || null,
+    at: rec.gate_at || null,
+  };
+}
+
+// The HMAC key the pipeline signs each attestation with, from the config
+// cascade (`attestation.signingKey` / SPOR_ATTESTATION_KEY — never a repo
+// `.spor.json`, lib/config.js REPO_FORBIDDEN_PATHS). No key = digest-only
+// binding through the graph artifact.
+function attestationSigning(cfg) {
+  let key = null;
+  let keyId = null;
+  try {
+    key = cfg.get("attestation.signingKey", null) || null;
+    keyId = cfg.get("attestation.keyId", null) || null;
+  } catch {
+    /* no config — unsigned */
+  }
+  return key ? { key: String(key), keyId: keyId ? String(keyId) : "default" } : null;
+}
+
+// Refresh a parked proposal's PR body with the run's FINAL attestation — the
+// digest-bound copy of the graph artifact, the thing a CI validate-attestation
+// job is told to compare against. Not best-effort: a refresh that fails leaves
+// the PR carrying the propose-time (pre-artifact, unbound) copy, so the failure
+// is logged loudly and stamped on the run record (`gate_proposal_attestation_
+// stale`), where `spor runs`/`--status` surface it; a validator comparing the
+// PR body to the graph artifact fails closed on the digest mismatch anyway.
+async function refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject, home, log = () => {}, settleToken, cwd = null, editBody = editProposalBody }) {
+  const proposal = intResult.proposal;
+  let edited;
+  try {
+    const base = integrationRunner.splitRemoteRef(factory.integration.targetRef).branch;
+    const body = attestation.renderPrBody({ attestation: attestationObject, branch: proposal.branch || "HEAD", base });
+    edited = await editBody({ top: cwd, repo: proposal.repo, number: proposal.number, body });
+  } catch (e) {
+    edited = { ok: false, reason: (e && e.message) || String(e) };
+  }
+  const ok = !!(edited && edited.ok);
+  if (ok) log(`work: PR #${proposal.number} now carries the bound attestation ${attestationObject.id} for ${item.node_id}`);
+  else log(`work: PR #${proposal.number} for ${item.node_id} could NOT be refreshed with the bound attestation ${attestationObject.id} (${(edited && edited.reason) || "no response"}) — its body still carries the propose-time copy, which a validator will refuse against the graph artifact`);
+  try {
+    dispatchRuns.stampGateState(
+      home,
+      item.run_id,
+      { ...(ok ? { gate_attestation_pending: null } : {}), gate_proposal_attestation: attestationObject.id, gate_proposal_attestation_stale: !ok, ...(ok ? {} : { gate_proposal_attestation_error: String((edited && edited.reason) || "no response").slice(0, 300) }) },
+      { own: settleToken }
+    );
+  } catch {
+    /* fail-soft: the log line above is the record of it */
+  }
+  return { ok, reason: ok ? null : (edited && edited.reason) || "no response" };
+}
+
+// What the attestation says about where it was produced. `spor_version` is the
+// package's; the rest is the box, so two attestations for one commit from two
+// workers stay distinguishable.
+function attestationEnvironment(cfg, workerId = null) {
+  let version = null;
+  try {
+    version = require(path.join(ROOT, "package.json")).version || null;
+  } catch {
+    /* an unreadable package.json is not worth failing an attestation over */
+  }
+  let mode = null;
+  try {
+    mode = cfg.mode();
+  } catch {
+    /* unknown */
+  }
+  return { spor_version: version, worker: workerId || null, host: os.hostname(), platform: `${process.platform}-${process.arch}`, node: process.version, mode };
+}
+
+// The settlement outbox contains already signed artifact bytes, never the key.
+// Settlement and the publication debt are one atomic record write. A later pass
+// publishes these exact bytes after a crash instead of re-running any gate.
+function prepareRunAttestation(cfg, { item, factory, gateResult, intResult, workerId = null, cwd = null }) {
+  try {
+    const built = attestation.buildAttestationNode({ item, factory, gate: gateResult, integration: intResult, environment: attestationEnvironment(cfg, workerId), signing: attestationSigning(cfg) });
+    return { built, item, origin: attestationGraphOrigin(cfg), factory: { id: factory.id, integration: factory.integration || null }, intResult, cwd };
+  } catch (e) { return { error: `attestation could not be built: ${e.message}` }; }
+}
+
+// Exact publication destination; no ambient fallback for old unbound outboxes.
+function attestationGraphOrigin(cfg) {
+  if (cfg.mode() === "remote") {
+    const bearer = remote.token(cfg);
+    const server = remote.base(cfg);
+    if (!server || !bearer) throw new Error("remote attestation publication identity is unknown");
+    const org = auth.jwtOrg(bearer);
+    const selectedOrg = typeof cfg.tenant === "function" ? cfg.tenant()?.org : null;
+    if (org && selectedOrg && org !== selectedOrg) throw new Error("effective publication credential disagrees with the selected organization");
+    // Opaque credentials cannot prove an org from tenant metadata. Bind the
+    // actual credential instead; its raw bytes never enter the durable outbox.
+    const credential = crypto.createHash("sha256").update(`spor-attestation-origin\0${bearer}`).digest("hex");
+    return { mode: "remote", server, org: org || null, credential };
+  }
+  const nodes = cfg.nodesDir();
+  let canonical;
+  try { canonical = fs.realpathSync(nodes); } catch { canonical = path.resolve(nodes); }
+  return { mode: "local", nodes: canonical };
+}
+function attestationOriginMatches(cfg, origin) {
+  if (!origin) return false;
+  try { const current = attestationGraphOrigin(cfg); return current.mode === origin.mode && (current.mode === "remote" ? !!origin.server && current.server === origin.server && current.org === origin.org && !!origin.credential && current.credential === origin.credential : current.nodes === origin.nodes); }
+  catch { return false; }
+}
+
+// Freeze the exact bearer and server whose fingerprint was checked. Ordinary
+// HTTP requests may refresh a selected tenant's token, which is unsafe for
+// replay when its metadata disagrees with an explicit token override. Refresh
+// and credential rotation are therefore fail-closed for this publication.
+function attestationPublicationConfig(cfg, origin) {
+  if (!attestationOriginMatches(cfg, origin)) return null;
+  if (origin.mode !== "remote") return cfg;
+  const bearer = remote.token(cfg);
+  const credential = crypto.createHash("sha256").update(`spor-attestation-origin\0${bearer}`).digest("hex");
+  if (credential !== origin.credential) return null;
+  const fixed = { mode: () => "remote", server: () => origin.server, token: () => bearer, tenant: () => null };
+  return new Proxy(cfg, { get(target, key) {
+    if (Object.prototype.hasOwnProperty.call(fixed, key)) return fixed[key];
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+}
+
+async function replayAttestationDebts(cfg, { home = cfg.userConfigHome(), log = () => {}, write = writeRunAttestation, refresh = refreshProposalAttestation } = {}) {
+  for (const record of dispatchRuns.readRunRecords(home)) {
+    const pending = record.gate_attestation_pending;
+    if (!pending || !pending.built || !attestationOriginMatches(cfg, pending.origin) || !gatesKernel.SETTLED_GATE_STATES.has(record.gate_state) || !record.gate_settle_id) continue;
+    const current = freshRecord(home, record);
+    if (current.gate_settle_id !== record.gate_settle_id || !current.gate_attestation_pending) continue;
+    const r = await write(cfg, { ...pending, built: pending.built, home, log, settleToken: record.gate_settle_id });
+    if (r.attestation && pending.intResult && pending.intResult.state === "parked" && pending.intResult.proposal) {
+      await refresh(cfg, { ...pending, attestationObject: pending.built.attestation, home, log, settleToken: record.gate_settle_id });
+    }
+  }
+}
+
+// Build, write, and stamp the run's attestation. Returns `{attestation,
+// attestationObject}` — the node id (null when it could not be recorded) and
+// the bound object itself — for the gate result to carry onward; never throws.
+// `settleToken` is the settler's own `gate_settle_id`: the `gate_attestation`
+// stamp goes through stampGateState's `own` door, so it lands only while the
+// record still holds THIS pipeline's verdict — never force, which would let a
+// pipeline that lost the settle race overwrite the winner's evidence.
+async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null, settleToken = null, built: prepared = null, origin = null }) {
+  // `attestation_missing`/`attestation_error` ride on the result the loop
+  // publishes (`--status`), the same fields the run record is stamped with —
+  // a missing attestation is part of the verdict's evidence, not a log line
+  // (cross-model review, minor finding 8).
+  const out = { attestation: null, attestationObject: null, attestation_missing: false, attestation_error: null };
+  const missing = (reason) => {
+    out.attestation_missing = true;
+    out.attestation_error = String(reason || "unknown").slice(0, 300);
+    stampAttestationMissing(cfg, { item, home, settleToken, reason });
+    return out;
+  };
+  let built = null;
+  try {
+    built = prepared || attestation.buildAttestationNode({ item, factory, gate: gateResult, integration: intResult, environment: attestationEnvironment(cfg, workerId), signing: attestationSigning(cfg) });
+    out.attestationObject = built.attestation;
+  } catch (e) {
+    const reason = `could not be built: ${(e && e.message) || e}`;
+    log(`work: the attestation for ${item.node_id} ${reason} — the verdict still stands, and the record says the attestation is MISSING`);
+    return missing(reason);
+  }
+  try {
+    const destination = attestationPublicationConfig(cfg, origin || (!prepared ? attestationGraphOrigin(cfg) : null));
+    if (!destination) return missing("publication origin is unknown or its effective credential changed; original evidence remains owed");
+    const wrote = await writeGateNode(destination, built.id, built.markdown);
+    if (wrote && wrote.ok) out.attestation = built.id;
+    else log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(wrote && wrote.reason) || "no response"}) — the verdict still stands`);
+  } catch (e) {
+    log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(e && e.message) || e}) — the verdict still stands`);
+  }
+  if (!out.attestation) return missing("could not be recorded on the graph");
+  try {
+    const stamped = dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: out.attestation, gate_attestation_missing: false, gate_attestation_error: null, ...(!(intResult && intResult.state === "parked") ? { gate_attestation_pending: null } : {}) }, settleToken ? { own: settleToken } : {});
+    if (!stamped || stamped.gate_attestation !== out.attestation) log(`work: the run record for ${item.node_id} no longer holds this pipeline's verdict — attestation ${out.attestation} is on the graph but not stamped on the record`);
+  } catch {
+    /* fail-soft: the run record is bookkeeping, the attestation node is the record */
+  }
+  return out;
+}
+
+// A run that promised an attestation and has none says so ON THE RECORD
+// (`gate_attestation_missing` + the reason), through the settler's own door —
+// a log line alone is exactly the silent loss the review refused (cross-model
+// review, major finding 3). `spor runs` and `--status` read the field.
+function stampAttestationMissing(cfg, { item, home, settleToken, reason }) {
+  try {
+    dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: null, gate_attestation_missing: true, gate_attestation_error: String(reason || "unknown").slice(0, 300) }, settleToken ? { own: settleToken } : {});
+  } catch {
+    /* the log line above is the last record of it */
+  }
+}
+
+// `spor attestation verify` — the validator's half of the evidence chain
+// (task-spor-factory-gate-attestation, piece 4): what a repo's CI runs against
+// a propose-mode PR instead of re-running the suite. Reads an attestation from
+// a PR body (between the spor-attestation markers), a JSON file, or stdin;
+// then, by default, fetches the graph artifact it names (`art-attest-*`, the
+// runner's own write — a store the PR author does not write through) and
+// requires the two digests to agree; verifies the HMAC signature when this box
+// holds the key (`attestation.signingKey` / SPOR_ATTESTATION_KEY); and checks
+// the caller's commit/freshness/factory-digest expectations. Every check is
+// fail-closed (lib/shell/attestation.js verifyAttestation); exit 1 on any
+// failure, so a CI job can gate on the exit code alone.
+async function cmdAttestation(cfg, args) {
+  const usage = "usage: spor attestation verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--target <sha>] [--target-ref <ref>] [--max-age <ms|1h|24h>] [--factory-digest <sha256:…>|--factory <id>] [--key-id <id>] [--require-signature] [--no-graph] [--json]";
+  if (args[0] !== "verify") {
+    err(usage);
+    return 1;
+  }
+  const json = args.includes("--json");
+  const prBodyPath = optVal(args, "pr-body");
+  const filePath = optVal(args, "file");
+  const fromStdin = args.includes("-");
+  if (!prBodyPath && !filePath && !fromStdin) {
+    err(usage);
+    return 1;
+  }
+  let text;
+  try {
+    text = fromStdin && !prBodyPath && !filePath ? fs.readFileSync(0, "utf8") : fs.readFileSync(prBodyPath || filePath, "utf8");
+  } catch (e) {
+    err(`could not read ${prBodyPath || filePath || "stdin"}: ${(e && e.message) || e}`);
+    return 1;
+  }
+  // A PR body carries the JSON between markers; a bare file/stdin is the JSON
+  // itself — or a PR body, if the markers are there.
+  let att = null;
+  if (text.includes(attestation.PR_BEGIN)) att = attestation.extractPrAttestation(text);
+  else {
+    try {
+      att = JSON.parse(text);
+    } catch {
+      att = null;
+    }
+  }
+  const finish = (result) => {
+    if (json) out(JSON.stringify(result, null, 2));
+    else {
+      for (const c of result.checks) out(`${c.ok ? "ok  " : "FAIL"}  ${c.check.padEnd(9)} ${c.detail}`);
+      out(result.ok ? `attestation ${result.id || ""} verified` : `attestation ${result.id || ""} REFUSED — ${result.reason}`);
+    }
+    return result.ok ? 0 : 1;
+  };
+  if (!att) return finish({ ok: false, id: null, checks: [{ check: "schema", ok: false, detail: `no ${attestation.SCHEMA} attestation could be read from ${prBodyPath || filePath || "stdin"}` }], reason: "unreadable attestation" });
+
+  const maxAgeRaw = optVal(args, "max-age");
+  const maxAgeMs = maxAgeRaw != null ? parseDurationMs(maxAgeRaw) : null;
+  if (maxAgeRaw != null && maxAgeMs == null) {
+    err(`--max-age: '${maxAgeRaw}' is not a duration (ms, or 30s/10m/24h/7d)`);
+    return 1;
+  }
+  const commit = optVal(args, "commit");
+  const target = optVal(args, "target");
+  const targetRef = optVal(args, "target-ref");
+  let factoryDigest = optVal(args, "factory-digest");
+  const extra = [];
+  // `--factory <id>`: recompute the digest from the factory AS IT STANDS on
+  // the graph (the definition a validator must compare against), through the
+  // same loader the worker uses, so the two can never disagree on shape.
+  const factoryId = optVal(args, "factory");
+  if (factoryId && !factoryDigest) {
+    const loaded = await loadFactoryDefinition(cfg, factoryId);
+    if (!loaded.factory) extra.push({ check: "config", ok: false, detail: `the factory '${factoryId}' could not be loaded to compare against: ${loaded.errors.join("; ")}` });
+    else factoryDigest = loaded.factory.definition && loaded.factory.definition.factory && loaded.factory.definition.factory.digest;
+  }
+  // The trusted copy: the graph artifact the attestation names.
+  let trusted = null;
+  let trustedProvenance = null;
+  const noGraph = args.includes("--no-graph");
+  if (!noGraph) {
+    const id = att.id;
+    if (!id || !/^art-attest-/.test(String(id))) extra.push({ check: "trusted", ok: false, detail: `the attestation names no art-attest-* graph artifact (id: ${id || "none"})` });
+    else {
+      let node = null;
+      try {
+        node = await resolveNode(cfg, id);
+      } catch {
+        node = null;
+      }
+      const raw = node && node.raw;
+      const m = raw ? /```json\n([\s\S]*?)\n```/.exec(raw) : null;
+      if (!raw) extra.push({ check: "trusted", ok: false, detail: `the graph artifact ${id} could not be read (${cfg.mode()} mode) — pass --no-graph to skip the graph binding deliberately` });
+      else if (!m) extra.push({ check: "trusted", ok: false, detail: `the graph artifact ${id} carries no attestation JSON` });
+      else {
+        try {
+          trusted = JSON.parse(m[1]);
+          // The node's server-stamped authorship is what makes the graph copy
+          // an anchor (attestation.js verifyAttestation `anchor`): only a
+          // remote-mode node not written by an agent counts without a key.
+          trustedProvenance = { mode: cfg.mode(), author: node.author, authored_by_agent: node.authored_by_agent, authored_via: node.authored_via };
+        } catch {
+          extra.push({ check: "trusted", ok: false, detail: `the graph artifact ${id}'s attestation JSON does not parse` });
+        }
+      }
+    }
+  }
+  const signing = attestationSigning(cfg);
+  const keyId = optVal(args, "key-id") || null;
+  // `--no-graph` drops the runner-written artifact, which leaves the HMAC
+  // signature as the ONLY anchor a PR author does not control — so it implies
+  // `--require-signature`, and with no key on this box there is nothing to
+  // verify against: refused, never passed on the self-authored digest
+  // (cross-model review, blocking finding 1).
+  if (noGraph && !signing) extra.push({ check: "signature", ok: false, detail: "--no-graph drops the graph anchor, so a verification key is required (attestation.signingKey / SPOR_ATTESTATION_KEY) — none is configured on this box" });
+  const result = attestation.verifyAttestation(att, {
+    key: signing ? signing.key : null,
+    keyId,
+    maxAgeMs,
+    commit: commit || null,
+    target: target || null,
+    targetRef: targetRef || null,
+    factoryDigest: factoryDigest || null,
+    trusted,
+    trustedProvenance,
+    requireSignature: args.includes("--require-signature") || (noGraph && !!signing),
+    requireTrusted: !noGraph && !trusted && !extra.some((c) => c.check === "trusted"),
+  });
+  const checks = [...result.checks, ...extra];
+  const failed = checks.filter((c) => !c.ok);
+  return finish({ ok: failed.length === 0, id: att.id || null, checks, reason: failed.length ? failed.map((c) => `${c.check}: ${c.detail}`).join("; ") : null });
 }
 
 // task-spor-integration-propose-mode: the LATER half of propose mode's
@@ -17091,7 +18187,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     );
     return 1;
   }
-  if (record.gate_state === "passed" || record.gate_state === "parked" || record.gate_state === "superseded" || record.gate_state === "scoped") {
+  if (!gatesKernel.canRegateState(record.gate_state)) {
     err(`spor work --regate: run ${shortId} already read '${record.gate_state}'${record.gate_reason ? ` (${record.gate_reason})` : ""} — there is nothing to re-judge.`);
     return 1;
   }
@@ -17118,6 +18214,14 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
       /* the worker's scope token stands in */
     }
   }
+  const workerId = crypto.randomUUID();
+  const status = { worker_id: workerId, pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), started_at: new Date().toISOString(), updated_at: new Date().toISOString(), kind: "regate" };
+  if (!workLoop.writeWorkerStatus(home, status)) { err("spor work --regate: could not publish worker liveness; no judgement started"); return 1; }
+  try {
+  const gateClaim = dispatchRuns.claimGateRecord(home, record.run_id, { workerId, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), reopen: { settleId: record.gate_settle_id || null, regateCount: Number(record.gate_regate_count) || 0, state: record.gate_state } });
+  if (!gateClaim.ok) { err(`spor work --regate: ${gateClaim.refused || gateClaim.reason}`); return 1; }
+  const owns = () => freshRecord(home, record).gate_settle_id === gateClaim.token;
+  const stamp = (patch) => dispatchRuns.stampGateState(home, record.run_id, patch, { own: gateClaim.token });
   // Bring the implementer's branch up to the trusted ref BEFORE judging it
   // (issue-spor-command-gate-judges-stale-branch-base): the usual reason a
   // run is re-gated is that the trusted ref was red and has since been fixed,
@@ -17127,6 +18231,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // a dirty tree is left alone and refused by the gate as before.
   const refreshed = refreshBranchFromTrustedRef(record.cwd, factory.trustedRef);
   if (refreshed.refused) {
+    stamp({ gate_state: "failed", gate_reason: refreshed.refused });
     err(`spor work --regate: ${refreshed.refused}`);
     return 1;
   }
@@ -17136,8 +18241,6 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // re-gate answers all of them, not only the latest.
   const escalatedBefore = [...new Set([...(Array.isArray(record.gate_escalation_ids) ? record.gate_escalation_ids : []), record.gate_escalated_to].filter(Boolean))];
   out(`work: re-gating ${record.node_id} — run ${shortId}, attempt ${attempt}, under ${factoryId} (previously ${previous})`);
-  const stamp = (patch) => dispatchRuns.stampGateState(home, record.run_id, patch, { force: true });
-  stamp({ gate_state: "running", gate_at: new Date().toISOString(), gate_worker: null, gate_regate_count: attempt - 1, gate_regated_at: new Date().toISOString() });
   // A re-gate re-opens a controller record's completion: a refusal's
   // `consumed` stamp (reconcileCompletions) must not hide a completion this
   // attempt may now write and then owe.
@@ -17157,19 +18260,11 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     out(`work: re-gating ${record.node_id} — its implementation stage had settled '${record.impl_state}'; re-judging the run under attempt ${attempt}`);
   }
   const entry = { run_id: record.run_id, node_id: record.node_id, harness: record.harness || null, project, attempt };
-  // A single-shot identity for THIS invocation — --regate has no work-loop
-  // worker to inherit one from, but a re-pin (a fix cycle, or the trusted-ref
-  // merge above moving the tree) still mints a candidate whose provenance
-  // needs SOME worker to attribute it to; a mint that never got one is
-  // permanently unattributed (candidate identity is content-addressed, so a
-  // later re-pin cannot backfill it). Provenance only, same as the loop's own
-  // (task-spor-factory-candidate-record §3.1).
-  const workerId = crypto.randomUUID();
   let res;
   try {
     res = await runGateAndIntegration(cfg, entry, record, {
       factory, slug, passthrough, warn, runMaxMs, home,
-      workerId,
+      workerId, gateClaim,
       log: (line) => out(line),
       stopping: () => false,
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -17177,6 +18272,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   } catch (e) {
     res = { state: "failed", reason: `the gate pipeline threw: ${(e && e.message) || e}` };
   }
+  if (!owns() || res?.superseded || res?.not_run) { err("spor work --regate: ownership changed; no final mutation is applied"); return 1; }
   const state = (res && res.state) || "failed";
   const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
   stamp({
@@ -17217,6 +18313,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // back comes back. A `scoped` re-judgement answers the escalation but leaves
   // the rollback standing; see the branch below for why.
   const notes = [];
+  if (!owns()) return 1;
   if (escalatedBefore.length) {
     const closed = await writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo: escalatedBefore, project, state });
     notes.push(closed.ok ? `closed ${escalatedBefore.join(", ")} with ${closed.id}` : `could not close ${escalatedBefore.join(", ")} (${closed.reason}) — resolve by hand`);
@@ -17227,6 +18324,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // superseded — so promoting it back to `done` would mark work complete that
   // the verified outcome says is still outstanding. The rollback stands, and
   // the note says so rather than leaving it unexplained.
+  if (!owns()) return 1;
   if (record.gate_demoted && state === "scoped") {
     notes.push(`left ${record.node_id} open — a scoping result is not a completion, and the earlier rollback is where the scoping wants it`);
   } else if (record.gate_demoted) {
@@ -17235,12 +18333,14 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   }
   out(`work: re-gate of ${record.node_id} ${state} — ${reason || (state === "scoped" ? "a verified no-code outcome" : "every gate passed")}${notes.length ? `; ${notes.join("; ")}` : ""}`);
   return 0;
+  } finally { workLoop.writeWorkerStatus(home, { ...status, stopped_at: new Date().toISOString(), updated_at: new Date().toISOString() }); }
 }
 
 // Merge the trusted ref into the run's checkout ahead of a re-gate. Returns
 // {note} (what happened, for the log), {} (nothing to do — no checkout, not a
 // git tree, dirty, or already up to date), or {refused} (a conflict).
 function refreshBranchFromTrustedRef(cwd, trustedRef) {
+  const git = (dir, args) => gitSpawn(dir, args, { env: gateRunner.judgeGitEnv() });
   if (!cwd || !fs.existsSync(cwd)) return {};
   if (git(cwd, ["rev-parse", "--is-inside-work-tree"]).status !== 0) return {};
   const dirty = git(cwd, ["status", "--porcelain", "--untracked-files=no"]);
@@ -17591,14 +18691,8 @@ async function cmdWork(cfg, { values }) {
       err(`spor work: factory '${factoryId}' declares integration mode 'propose', but ${startupGh.reasons[0]}`);
       err("  every candidate under this factory will be skipped here (see 'spor work --status') until gh is available, or run this worker on a box that has it.");
     }
-    // §2.4 E9 and E14, deferred out of the parser because a parse can read
-    // neither a checkout nor a filesystem nor a mode. Unlike the `gh` check
-    // above this is FATAL: a box that cannot publish can complete nothing at
-    // all — every candidate must carry a portable reference, there is no
-    // `publish: none` to degrade to, and a worker that dispatches implementers
-    // whose candidates can never be submitted burns real model spend to produce
-    // nothing. Saying so once, here, is more honest than failing every item
-    // identically at its publish.
+    // Invalid declarations remain fatal. Runtime store/remote outages are
+    // item-level refusals before claim, visible in status and retried boundedly.
     const startupPublish = candidatePublish.publishSatisfiability(factory, {
       graphHome: cfg.userConfigHome(),
       mode: cfg.mode(),
@@ -17611,12 +18705,13 @@ async function cmdWork(cfg, { values }) {
       ),
     });
     for (const w of startupPublish.warnings) err(`spor work: ${w}`);
-    if (!startupPublish.ok) {
-      err(`spor work: factory '${factoryId}' cannot publish a candidate from this machine:`);
-      for (const e of startupPublish.errors) err(`  ${e}`);
-      err("  every candidate carries a portable reference (there is no publish: none), so a worker that cannot publish cannot submit one — fix the store/remote, or run this worker on a box that can reach them.");
+    if (startupPublish.configurationErrors.length) {
+      err(`spor work: factory '${factoryId}' has invalid publication configuration:`);
+      for (const e of startupPublish.configurationErrors) err(`  ${e}`);
       return 1;
     }
+    for (const e of startupPublish.unavailable) err(`spor work: ${e} — affected items will be skipped before claim and retried (see 'spor work --status').`);
+
   }
   // A standing `dispatch.claudeLaunchMode: native-background` is honored by an
   // interactive `spor dispatch` and IGNORED by every dispatch this loop makes
@@ -17759,6 +18854,7 @@ async function cmdWork(cfg, { values }) {
   // Read before `candidates` closes over it: `--print` calls that closure
   // before the loop starts, so this cannot be declared further down.
   const home = cfg.userConfigHome();
+  const checkAvailability = makeFactoryAvailabilityCheck(cfg, { passthrough, baseMs: intervalMs, maxMs: maxIntervalMs, persistProbe: !values.print });
 
   // The page width the last pass NEEDED, carried across polls
   // (task-spor-queue-api-offset-paging). A worker whose only eligible work sits
@@ -17912,10 +19008,19 @@ async function cmdWork(cfg, { values }) {
     const cands = workLoop.selectWorkCandidates(await candidates(), { accept, repos: factoryRepos, graph: localFactoryGraph, selfAgent, onSkip: (it, reason, kind) => policySkips.push({ it, reason, kind }) });
     if (!cands.length) out("queue:   nothing dispatchable right now");
     else {
-      out(`queue:   ${cands.length} candidate(s); this pass would take the first ${Math.min(concurrency, cands.length)}`);
-      for (const [i, it] of cands.entries()) {
+      const available = [];
+      const unavailable = [];
+      for (const it of cands) {
+        const verdict = await checkAvailability(factory, it);
+        if (verdict.ok) available.push(it);
+        else unavailable.push({ it, reason: verdict.reason });
+      }
+      out(`queue:   ${available.length} candidate(s); this pass would take the first ${Math.min(concurrency, available.length)}`);
+      for (const [i, it] of available.entries()) {
         out(`  ${i < concurrency ? "->" : "  "} ${it.id}  ${it.readiness || "untriaged"}  ${it.title || it.summary || ""}`.slice(0, 160));
       }
+      for (const { it, reason } of unavailable.slice(0, workLoop.SKIP_LOG_CAP)) out(`  skip ${it.id} — ${reason}`);
+      if (unavailable.length > workLoop.SKIP_LOG_CAP) out(`  ...and ${unavailable.length - workLoop.SKIP_LOG_CAP} more unavailable items`);
     }
     // Same treatment as the loop's own log and `--status`: a widened page can
     // hold hundreds of skips, and a preview that scrolls them all off the
@@ -18015,13 +19120,7 @@ async function cmdWork(cfg, { values }) {
       // ever established for an item this box can never finish landing. The
       // loop's existing refusal-cooldown machinery does the rest — the same
       // path any other unsatisfiable-profile refusal already takes.
-      dispatch: (item) => {
-        if (factory) {
-          const verdict = integrationSatisfiability(cfg, factory);
-          if (!verdict.ok) return { ok: false, reason: verdict.reasons[0] };
-        }
-        return dispatchWorkItem(cfg, item, passthrough, { factory, home, log: (line) => out(line) });
-      },
+      dispatch: (item) => dispatchSatisfiableWorkItem(cfg, item, passthrough, { checkAvailability, factory, home, log: (line) => out(line) }),
       pollRuns: (ids) => pollWorkRuns(cfg, ids, { maxAgeMs: runMaxMs, idleMs: runIdleMs, warn }),
       publish: (status) => workLoop.writeWorkerStatus(home, status),
       log: (line) => out(line),
@@ -18212,6 +19311,7 @@ async function cmdWork(cfg, { values }) {
               // holds, so a pipeline whose gates run for hours keeps its
               // fence without a timer (a pass is 30s-5min; a lease 15min).
               await renewLiveExecutions((line) => out(line));
+              await replayAttestationDebts(cfg, { home, log: (line) => out(line) });
               if (factory.integration && factory.integration.mode === "propose") await checkProposals(cfg, { home, log: (line) => out(line) });
               if (factory.completion && factory.completion.by === "controller") await reconcileCompletions(cfg, { home, log: (line) => out(line) });
             },
@@ -20314,9 +21414,15 @@ const COMMANDS = {
       "dispatches an implementer, under which no resolving edge or terminal status\n" +
       "retires the item). Both modes. Name the id the node carries ('spor get') — a\n" +
       "hold left by a dead worker is fail-closed until a person ends it here or a\n" +
-      "same-factory worker resumes the pipeline.",
+      "same-factory worker resumes the pipeline.\n\n" +
+      "Add --force --reason <text> to end a live foreign execution deliberately.\n" +
+      "Requires a person credential remotely; locally, Git email must bind a person\n" +
+      "and dispatch.agent must be unset. The execution is released before graph cleanup.\n" +
+      "Repeat this exact command to recover a lost acknowledgement or owed cleanup.",
     options: {
       execution: { type: "string", desc: "clear the execution hold with this id instead of releasing the lease" },
+      force: { type: "boolean", desc: "explicit person release of a live foreign execution (requires --reason)" },
+      reason: { type: "string", desc: "audited reason for --force (1-2000 characters)" },
     },
     examples: ["spor release task-x", "spor release task-x --execution exec-0123456789abcdef"],
     run: (cfg, p) => cmdLease(cfg, "release", p),
@@ -20661,6 +21767,55 @@ const COMMANDS = {
     },
     examples: ["spor executions", "spor executions --node task-x", "spor executions exec-4da6d4763543a301 --events"],
     run: (cfg, p) => cmdExecutions(cfg, p),
+  },
+  attestation: {
+    group: "Dispatch (background agents)", parse: "raw",
+    args: "verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--target <sha>] [--target-ref <ref>] [--max-age <dur>] [--factory <id>|--factory-digest <sha256:…>] [--key-id <id>] [--require-signature] [--no-graph] [--json]",
+    summary: "validate a gate-pipeline attestation (PR body or JSON) against the graph, a key, a commit",
+    help:
+      "The validator's half of the factory gate pipeline's evidence chain\n" +
+      "(task-spor-factory-gate-attestation): what a PR-policy repo's CI runs on a\n" +
+      "`propose`-mode pull request INSTEAD of re-running the whole suite.\n\n" +
+      "The attestation is read from the PR body (the JSON between the\n" +
+      "<!-- spor-attestation:begin/end --> markers), a JSON file, or stdin. PR text\n" +
+      "is not evidence by itself — anyone who can edit the PR can edit it — so the\n" +
+      "checks bind it to what the runner itself wrote:\n\n" +
+      "  trusted    the graph artifact it names (art-attest-*, written by the runner,\n" +
+      "             never by a PR author) is fetched, its `digest` must equal this\n" +
+      "             copy's, and it must be an attestation in its own right (its\n" +
+      "             digest recomputes; under a key its signature verifies) (skip\n" +
+      "             ONLY deliberately, with --no-graph — which then REQUIRES a\n" +
+      "             verified signature: no key on this box, no pass)\n" +
+      "  anchor     without a key, the graph copy anchors only when the server\n" +
+      "             stamped it as written by a PERSON in remote mode — a node an\n" +
+      "             agent wrote (a dispatched implementer has graph-write authority),\n" +
+      "             a local-mode graph, or unknown provenance is no anchor\n" +
+      "  digest     the copy's `digest` matches a recomputation over its own core\n" +
+      "  signature  when this box holds the key (attestation.signingKey /\n" +
+      "             SPOR_ATTESTATION_KEY), the HMAC-SHA256 signature must verify;\n" +
+      "             --require-signature refuses an unsigned attestation outright\n" +
+      "  passed     `passed` is true\n" +
+      "  verdicts   the evidence beneath it agrees: gate.allPassed, every listed step\n" +
+      "             passed AT the subject commit, the stage's head is the gated head,\n" +
+      "             and the candidate suite passed — a `passed` over failed evidence\n" +
+      "             is refused whatever bound it\n" +
+      "  commit     --commit <sha>: `subject.commit` equals it (the PR head)\n" +
+      "  target     --target <sha>: the target tip the candidate was merged with\n" +
+      "             (integration.candidate.base) equals it — the PR base's CURRENT\n" +
+      "             tip, so an attestation goes stale when the target advances and\n" +
+      "             cannot be reused against another base; --target-ref <ref> checks\n" +
+      "             the stage's target_ref names that ref\n" +
+      "  fresh      --max-age <dur>: `issued_at` is within it (ms, 30s, 24h, 7d)\n" +
+      "  config     --factory <id> recomputes the factory's digest AS IT STANDS on the\n" +
+      "             graph (same loader the worker uses) — or --factory-digest gives it\n" +
+      "             — and `configIntegrity.factory.digest` must equal it\n\n" +
+      "Every check is fail-closed; exit 1 on any failure, 0 only when all pass.\n" +
+      "--json prints {ok, id, checks[], reason}.",
+    examples: [
+      "gh pr view 42 --json body -q .body > pr.md && spor attestation verify --pr-body pr.md --commit $(git rev-parse HEAD) --target $(git rev-parse origin/main) --target-ref main --max-age 24h --factory factory-spor",
+      "spor attestation verify --file att.json --no-graph --require-signature",
+    ],
+    run: (cfg, args) => cmdAttestation(cfg, args),
   },
   runs: {
     group: "Dispatch (background agents)", parse: "strict", args: "[<run-id>]",
@@ -21048,7 +22203,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS };
+module.exports = { forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
 
 if (require.main === module) {
   main()
