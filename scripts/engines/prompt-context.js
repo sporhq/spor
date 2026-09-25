@@ -165,7 +165,7 @@ function compactNodeLine(line) {
   const [, id, title, meta, rest] = m;
   const warning = rest.match(/ ⚠ .+$/);
   const summary = warning ? rest.slice(0, warning.index).trim() : rest.trim();
-  const statusMatch = meta.match(/\b(resolved|done|rejected|abandoned|answered)\b/i);
+  const statusMatch = meta.match(/\b(resolved|done|rejected|abandoned|answered|superseded|settled)\b/i);
   const status = statusMatch ? ` (${statusMatch[1].toLowerCase()})` : "";
   return `- ${id}: ${title}${status} — ${summary}${warning ? warning[0] : ""}`;
 }
@@ -174,7 +174,15 @@ function microDigest(digest, maxNodes = MICRO_MAX_NODES, maxBytes = MICRO_MAX_BY
   const { nodes, corrections } = parseDigest(digest);
   if (!nodes.length) return u.byteHead(digest, maxBytes);
   let out = "Spor context (top matches; run /spor:brief for full):\n";
-  for (const line of nodes.slice(0, maxNodes)) out += `${compactNodeLine(line)}\n`;
+  // Whole node lines only: a line's ⚠ note (superseded / resolved) sits at
+  // its END, so a mid-line byte cut would inject the node minus the warning
+  // that says not to follow it (issue-spor-superseded-context-injected-as-live).
+  // The first line always goes in (byteHead below still bounds it).
+  for (const [i, line] of nodes.slice(0, maxNodes).entries()) {
+    const l = `${compactNodeLine(line)}\n`;
+    if (i > 0 && Buffer.byteLength(out + l, "utf8") > maxBytes) break;
+    out += l;
+  }
   if (corrections.length) {
     out += "\nStanding corrections:\n";
     for (const line of corrections) out += `${line}\n`;

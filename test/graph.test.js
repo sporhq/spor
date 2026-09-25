@@ -1089,13 +1089,91 @@ test("supersession: supersededBy map is built from supersedes edges", () => {
   assert.equal(g.supersededBy["dec-old"], "dec-new");
 });
 
-test("supersession: digest marks the stale node with the inline warning suffix", () => {
+test("supersession: the digest drops a superseded node (ambient context never carries it)", () => {
   const g = pricingFixture().load();
   const r = graph.compile(g, { rootId: "dec-new", digest: true });
-  // root-mode digest includes structural picks; dec-old (superseded) shows up flagged.
-  if (r.text.includes("dec-old")) {
-    assert.match(r.text, /dec-old.*⚠ SUPERSEDED by dec-new — do not follow/);
+  // dec-old is in the structural neighborhood (the brief shows it, flagged),
+  // but the digest the hooks inject unasked must not.
+  assert.match(graph.compile(g, { rootId: "dec-new", digest: false }).text, /dec-old/);
+  assert.ok(!r.text.includes("dec-old"), "superseded dec-old must not reach the digest");
+});
+
+// ---------- status-only supersession + retired norms
+// (issue-spor-superseded-context-injected-as-live) ----------
+
+function supersessionFixture() {
+  const n = (id, type, title, extra = "") => `---
+id: ${id}
+type: ${type}
+title: ${title}
+date: 2026-01-01
+summary: ${title} for the widget cache.
+${extra}---
+${title}. Widget cache widget cache.
+`;
+  return tmpGraph({
+    "dec-status-old.md": n("dec-status-old", "decision", "Use redis for the widget cache", "status: superseded\n"),
+    "dec-edge-old.md": n("dec-edge-old", "decision", "Use memcached for the widget cache"),
+    "dec-edge-new.md": n("dec-edge-new", "decision", "Use an in-process LRU for the widget cache", "edges:\n  - {type: supersedes, to: dec-edge-old}\n"),
+    "norm-live.md": n("norm-live", "norm", "Widget cache keys are namespaced"),
+    "norm-retired.md": n("norm-retired", "norm", "Widget cache entries expire hourly", "status: retired\n"),
+    "norm-status-sup.md": n("norm-status-sup", "norm", "Widget cache is write-through", "status: superseded\n"),
+    "norm-edge-old.md": n("norm-edge-old", "norm", "Widget cache warms on boot"),
+    "norm-edge-new.md": n("norm-edge-new", "norm", "Widget cache warms lazily", "edges:\n  - {type: supersedes, to: norm-edge-old}\n"),
+  });
+}
+
+test("supersession: a status-only superseded node is flagged and body-suppressed in the brief", () => {
+  const g = supersessionFixture().load();
+  const r = graph.compile(g, { query: "what should the widget cache use redis memcached", digest: false });
+  assert.equal(r.relevant, true);
+  const sect = r.text.slice(r.text.indexOf("### dec-status-old"));
+  assert.match(sect, /^### dec-status-old[^\n]*\n[^\n]*\n\n> ⚠ SUPERSEDED \(status: superseded; no superseding node linked\)\. Do not follow/);
+  assert.ok(!sect.split("\n### ")[0].includes("Widget cache widget cache"), "superseded body must not render");
+});
+
+test("supersession: the digest drops status- and edge-superseded nodes but keeps the replacement", () => {
+  const g = supersessionFixture().load();
+  const r = graph.compile(g, { query: "what should the widget cache use redis memcached", digest: true });
+  assert.equal(r.relevant, true);
+  assert.ok(!r.text.includes("dec-status-old"), "status-superseded must be dropped");
+  assert.ok(!r.text.includes("dec-edge-old"), "edge-superseded must be dropped");
+  assert.match(r.text, /dec-edge-new/);
+});
+
+test("supersession: a correction pin still renders a superseded node in the digest, flagged", () => {
+  const fx = supersessionFixture();
+  fs.writeFileSync(path.join(fx.nodesDir, "corr-pin-old.md"), `---
+id: corr-pin-old
+type: correction
+title: Pin the old cache decision
+date: 2026-01-02
+summary: Keep the redis decision visible.
+target: global
+pin: [dec-status-old]
+---
+Keep it visible.
+`);
+  const r = graph.compile(fx.load(), { query: "what should the widget cache use redis memcached", digest: true });
+  assert.match(r.text, /dec-status-old.*⚠ SUPERSEDED \(status: superseded; no superseding node linked\) — do not follow/);
+});
+
+test("supersession: superseded and retired norms never ride along; live norms still do", () => {
+  const g = supersessionFixture().load();
+  const r = graph.compile(g, { query: "unrelated pricing question about invoices", digest: false, minSim: 0 });
+  const norms = (r.picks?.norms ?? []).map((n) => n.id).sort();
+  assert.ok(norms.includes("norm-live"), "a live norm rides along");
+  assert.ok(norms.includes("norm-edge-new"), "the superseding norm rides along");
+  for (const id of ["norm-retired", "norm-status-sup", "norm-edge-old"]) {
+    assert.ok(!norms.includes(id), `${id} must not ride along`);
   }
+});
+
+test("supersession: validate warns on status superseded with no supersedes edge", () => {
+  const fx = supersessionFixture();
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.ok(v.warnings.some((w) => /dec-status-old\.md: status superseded but no node supersedes it/.test(w)));
+  assert.ok(!v.warnings.some((w) => /dec-edge-old\.md: status superseded/.test(w)), "no status field, no warning");
 });
 
 // ---------- correction pin / exclude ----------
