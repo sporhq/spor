@@ -249,6 +249,7 @@ test("re-gate publishes liveness before claiming and cannot overwrite a successo
 });
 
 test("proposal push and trusted-ref merge never execute repository hooks with judge credentials", () => {
+  if (process.platform === "win32") return; // the gh stub and the hooks are sh scripts
   const f = fixture();
   const repo = path.join(f.home, "repo");
   const bare = path.join(f.home, "remote.git");

@@ -1705,6 +1705,7 @@ function fakeNode(id, front) {
 }
 
 test("issue-spor-restore-proposal-closes-tracking-item-with-bare-done-no-resolver: propose mode under CONTROLLER completion — the landed fact resolves the tracking item BEFORE its status flips, so a remote-mode completion gate never refuses it", async (t) => {
+  if (process.platform === "win32") return; // the fake gh is a sh script
   const sporCli = require("../bin/spor.js");
   const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
   const { loadConfig } = require("../lib/config.js");
@@ -1785,6 +1786,7 @@ test("issue-spor-restore-proposal-closes-tracking-item-with-bare-done-no-resolve
 // controller writes here) — same enforcing gate, same "the tracking item's own
 // resolver must already exist before its status flips" requirement.
 test("issue-spor-restore-proposal-closes-tracking-item-with-bare-done-no-resolver: propose mode under LEGACY (agent-resolved) completion — the tracking item still closes against the enforcing remote gate", async (t) => {
+  if (process.platform === "win32") return; // the fake gh is a sh script
   const sporCli = require("../bin/spor.js");
   const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
   const { loadConfig } = require("../lib/config.js");
@@ -4736,6 +4738,7 @@ test("missing branch publication remote and integration target are item skips, w
 });
 
 test("checkProposals withholds controller completion when the hosted proposal fence is lost or changes after resume", async () => {
+  if (process.platform === "win32") return; // the fake gh is a sh script
   const sporCli = require("../bin/spor.js");
   const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
   const executionStore = require("../lib/shell/execution-store.js");
