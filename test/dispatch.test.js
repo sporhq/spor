@@ -822,11 +822,13 @@ test("dispatch --dir inside a linked worktree: refused, not silently nested", ()
   const { home } = fixture();
   const { repo } = gitTargetRepo();
   const wt = addLinkedWorktree(repo);
+  // git names the main checkout canonically (long names, no 8.3 RUNNER~1 on Windows).
+  const main = fs.realpathSync.native(repo);
   const r = run(["dispatch", "some free text task here", "--dir", wt, "--no-brief", "--print"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 1, r.stdout);
   assert.match(r.stderr, new RegExp(`--dir ${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} is inside a linked git worktree of`));
   assert.match(r.stderr, /nesting one inside another is refused/);
-  assert.match(r.stderr, new RegExp(`pass the main checkout instead: --dir ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(r.stderr, new RegExp(`pass the main checkout instead: --dir ${main.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   // It must NOT have proceeded to print the dispatch into the worktree.
   assert.doesNotMatch(r.stdout, /dir:    /);
 });
@@ -845,6 +847,8 @@ test("dispatch <node>: a dispatch.repos mapping poisoned to a linked worktree se
   const { home } = fixture(); // dec-x / task-rotate stamped repo: demo
   const { repo } = gitTargetRepo("demo");
   const wt = addLinkedWorktree(repo);
+  // git names the main checkout canonically (long names, no 8.3 RUNNER~1 on Windows).
+  const main = fs.realpathSync.native(repo);
   // `repos add` itself now refuses this (task-spor-repos-add-refuse-linked-
   // worktree-path), so poison the map directly — this is what a stale/hand-
   // edited config, or the pre-fix session-start re-probe corruption
@@ -852,9 +856,9 @@ test("dispatch <node>: a dispatch.repos mapping poisoned to a linked worktree se
   setDispatch(home, { repos: { demo: wt } });
   const r = run(["dispatch", "dec-x", "--no-brief", "--print"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stderr, new RegExp(`dispatch\\.repos\\['demo'\\] pointed inside a linked worktree \\(${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\); correcting to the main checkout ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
-  assert.match(r.stdout, new RegExp(`dir:    ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via config`));
-  assert.strictEqual(readRepos(home).demo, repo, "the healed path is persisted, not just used for this run");
+  assert.match(r.stderr, new RegExp(`dispatch\\.repos\\['demo'\\] pointed inside a linked worktree \\(${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\); correcting to the main checkout ${main.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(r.stdout, new RegExp(`dir:    ${main.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via config`));
+  assert.strictEqual(readRepos(home).demo, main, "the healed path is persisted, not just used for this run");
 });
 
 test("dispatch --dir: an ordinary subdirectory of a main checkout is NOT mistaken for a linked worktree", () => {
@@ -898,10 +902,12 @@ test("repos add: a path inside a linked worktree is refused, naming the main che
   const { home } = fixture();
   const { repo } = gitTargetRepo();
   const wt = addLinkedWorktree(repo);
+  // git names the main checkout canonically (long names, no 8.3 RUNNER~1 on Windows).
+  const main = fs.realpathSync.native(repo);
   const r = run(["repos", "add", "demo", wt], { SPOR_HOME: home });
   assert.strictEqual(r.status, 1, r.stdout);
   assert.match(r.stderr, new RegExp(`${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} is inside a linked git worktree of`));
-  assert.match(r.stderr, new RegExp(`map the main checkout instead: spor repos add demo ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(r.stderr, new RegExp(`map the main checkout instead: spor repos add demo ${main.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.deepStrictEqual(readRepos(home), {}, "refused registration must not land in config.json");
 });
 
@@ -3097,6 +3103,7 @@ test("acquireLocalDispatchLock: an unreadable lock file cannot be honored as liv
 });
 
 test("acquireLocalDispatchLock: an unwritable journal fails open (nothing to release)", () => {
+  if (process.platform === "win32") return; // chmod-based read-only has no meaning there
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-"));
   const journal = path.join(home, "journal");
   fs.mkdirSync(journal, { recursive: true });

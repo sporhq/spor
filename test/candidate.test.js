@@ -357,6 +357,21 @@ test("the own-working-tree guard fires for a UNC cwd", () => {
   );
 });
 
+test("the own-working-tree guard fires when pathToFileURL percent-encoded the locator", () => {
+  // A real locator is minted by `pathToFileURL`, which encodes `~` (a Windows
+  // 8.3 `RUNNER~1` temp dir), spaces and non-ASCII; the cwd arrives raw. The
+  // guard has to see through the encoding or it is inert on those checkouts.
+  for (const [cwd, locator] of [
+    ["C:\\Users\\RUNNER~1\\run-1", "file:///C:/Users/RUNNER%7E1/run-1/c.bundle"],
+    ["C:\\Users\\John Smith\\run-1", "file:///C:/Users/John%20Smith/run-1/c.bundle"],
+    ["/home/j\u00f6ns/run-1", "file:///home/j%C3%B6ns/run-1/c.bundle"],
+  ]) {
+    const ref = { kind: "bundle", key: "c.bundle", commit: COMMIT, locator };
+    assert.match(candidate.referenceRefusal(ref, { cwd }), /working tree/, cwd);
+    assert.strictEqual(candidate.referenceRefusal(ref, { cwd: `${cwd}0` }), null, `${cwd}0 is a sibling`);
+  }
+});
+
 test("a POSIX cwd that merely starts with two literal slashes is not mistaken for a UNC host", () => {
   // `pathToFileURL` only takes its UNC branch when the RAW path starts with a
   // literal `\\`, gated on the platform being Windows — never merely because

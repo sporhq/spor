@@ -283,8 +283,10 @@ function linkedWorktreeMainRoot(dir) {
   const raw = git(dir, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]) ?? "";
   const [top, common] = raw.trim().split("\n").map((l) => l.trim());
   if (!top || !common || path.basename(common) !== ".git") return null;
-  const mainTop = path.dirname(common);
-  return mainTop && mainTop !== top ? mainTop : null;
+  // git prints `C:/...` on Windows; resolve both to the platform's own form so
+  // the root this hands back reads (and persists) like every other path we print.
+  const mainTop = path.resolve(path.dirname(common));
+  return mainTop !== path.resolve(top) ? mainTop : null;
 }
 
 // Normalize a raw string to the canonical project slug (the server's SLUG_RE,

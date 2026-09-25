@@ -239,6 +239,7 @@ test("a TRUNCATED object we just published is a candidate-mismatch, not an outag
 });
 
 test("an unwritable store is an outage — re-attemptable from the workspace, charged to the retry pool", async (t) => {
+  if (process.platform === "win32") return; // chmod-based read-only has no meaning there
   const repo = producerRepo(t);
   const storeDir = scratch(t, "cand-store");
   const store = pathToFileURL(storeDir).href;
@@ -455,6 +456,7 @@ test("E14: an https bundle store in LOCAL mode is refused at startup, where a pa
 });
 
 test("a file:// store that cannot be written is refused at startup, not at the first publish", (t) => {
+  if (process.platform === "win32") return; // chmod-based read-only has no meaning there
   const home = scratch(t, "cand-home");
   const blocked = path.join(home, "no-write");
   fs.mkdirSync(blocked);

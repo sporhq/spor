@@ -7788,7 +7788,10 @@ test("a superseded pipeline's verdict is not what the loop publishes: the status
 test("runGateCommand never hands the suite the attestation key or a graph token — from the process env or the caller's extra env", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-secret-"));
   const probe = 'const e = process.env; const leaked = ["SPOR_ATTESTATION_KEY","SPOR_TOKEN","SUBSTRATE_TOKEN","SPOR_REFRESH_TOKEN","SPOR_CI_SECRET"].filter((k) => k in e); if (leaked.length) { console.error("leaked " + leaked.join(",")); process.exit(3); } if (e.SPOR_HOME !== "/keep" || e.KEEP !== "1" || e.SPOR_GATE !== "secretgate") { console.error("lost a harmless var"); process.exit(4); } process.exit(0);';
-  const gate = { id: "secretgate", command: `"${process.execPath}" -e '${probe}'`, timeoutMs: 20000 };
+  // The probe rides in a file, not `-e '...'`: cmd.exe does not honor single quotes.
+  const probeFile = path.join(dir, "probe.js");
+  fs.writeFileSync(probeFile, probe);
+  const gate = { id: "secretgate", command: `"${process.execPath}" "${probeFile}"`, timeoutMs: 20000 };
   const saved = {};
   for (const k of ["SPOR_ATTESTATION_KEY", "SPOR_TOKEN", "SUBSTRATE_TOKEN"]) {
     saved[k] = process.env[k];

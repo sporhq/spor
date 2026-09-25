@@ -3842,6 +3842,7 @@ test("the integration fix-cycle prompt names the refusal and ends with the one-t
   });
 
   test("acquireLocalIntegrationLease: an unwritable journal fails open (nothing to release)", async () => {
+    if (process.platform === "win32") return; // chmod-based read-only has no meaning there
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-"));
     const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-top-"));
     const journalDir = path.join(home, "journal");

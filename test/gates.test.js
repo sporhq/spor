@@ -2284,6 +2284,14 @@ test("failingFiles reads the repo-relative source paths a suite's failure names,
 // run prints a line per file it RAN, and a set of PASSING files is trivially
 // off-diff and trivially passes in isolation. Collection is therefore scoped to
 // the failure's own region, never to every path in the log.
+test("failingFiles folds a Windows drive-lettered frame onto the tree's root", () => {
+  // The drive is part of the path token, or `C:\\r\\test\\x.js` reads as the
+  // rootless `\\r\\...` and is dropped as outside the tree.
+  const dir = "C:\\Users\\RUNNER~1\\Temp\\tree";
+  const out = `✖ boom\n  at T (${dir}\\test\\a.test.js:1:1)\n  at U (${dir}/lib/b.js:2:2)\n  at V (D:\\elsewhere\\c.js:3:3)\n`;
+  assert.deepStrictEqual(gates.failingFiles(out, { dir }), ["test/a.test.js", "lib/b.js"]);
+});
+
 test("failingFiles collects from the FAILURE's region only — a passing file's own line, and the block under it, are never the failure's files", () => {
   const tap = [
     "TAP version 13",
