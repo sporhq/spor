@@ -99,6 +99,37 @@ test("export (local) --out writes a ustar tarball that reproduces nodes/ byte-fo
   }
 });
 
+test("export (local) a long id no ustar split can hold rides a pax header: system tar and lib/tar.js extract both recover it (issue-spor-export-drops-ids-over-ustar-name-limit)", () => {
+  const { dir, files } = fixtureGraph();
+  const longId = `find-near-dup-${"z".repeat(140)}`; // "<id>.md" alone is well over 100 bytes
+  const content = `---\nid: ${longId}\ntype: finding\ntitle: t\nsummary: s\nstatus: open\n---\n\nbody\n`;
+  fs.writeFileSync(path.join(dir, "nodes", `${longId}.md`), content);
+  const out = path.join(dir, "snap.tar");
+  const r = run(["export", "--out", out], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /exported 3 nodes/);
+  assert.doesNotMatch(r.stderr, /skipped/);
+  // lib/tar.js's own reader (the remote `spor query` / `get --json` fallback path)
+  const tar = require(path.join(__dirname, "..", "lib", "tar.js"));
+  const byName = Object.fromEntries(tar.extract(fs.readFileSync(out)).map((e) => [e.name, e.data.toString("utf8")]));
+  assert.deepStrictEqual(Object.keys(byName).sort(), ["nodes/dec-a.md", `nodes/${longId}.md`, "nodes/task-b.md"]);
+  assert.strictEqual(byName[`nodes/${longId}.md`], content);
+  for (const [name, c] of Object.entries(files)) assert.strictEqual(byName[name], c, name);
+  // a real (pax-aware) tar agrees
+  const x = path.join(dir, "x");
+  fs.mkdirSync(x);
+  assert.strictEqual(spawnSync("tar", ["-xf", out, "-C", x]).status, 0);
+  assert.strictEqual(fs.readFileSync(path.join(x, "nodes", `${longId}.md`), "utf8"), content);
+});
+
+test("paxRecord's length prefix counts the whole record, across a digit-count carry", () => {
+  const { paxRecord } = require(path.join(__dirname, "..", "lib", "tar.js"));
+  for (const len of [1, 90, 94, 95, 96, 97, 98, 995, 996]) {
+    const rec = paxRecord("path", "x".repeat(len));
+    assert.strictEqual(Number(rec.split(" ")[0]), Buffer.byteLength(rec, "utf8"), `value length ${len}`);
+  }
+});
+
 test("export (local) skips non-.md files", () => {
   const { dir } = fixtureGraph();
   const out = path.join(dir, "snap.tar");

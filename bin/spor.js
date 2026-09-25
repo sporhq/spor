@@ -1103,7 +1103,11 @@ async function cmdGet(cfg, { positionals, values }) {
     return 1;
   }
   if (cfg.mode() === "remote") {
-    const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
+    // --json asks the server for the node's inbound edges in the same read
+    // (?inbound=1, issue-spor-remote-get-json-full-export-per-call); an older
+    // server ignores the param and the export sweep below fills them instead.
+    const q = values.json ? "?inbound=1" : "";
+    const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}${q}`, { timeoutMs: 6000 });
     if (r.transport) {
       err(`offline — could not reach server (${r.error})`);
       return 1;
@@ -1122,9 +1126,10 @@ async function cmdGet(cfg, { positionals, values }) {
       return 0;
     }
     // --json: parse the raw with the SAME lib parser as local (parity), take the
-    // server's git-blob-sha revision, and gather inbound edges from the team graph
-    // (the documented graph-wide sweep via GET /v1/export — there is no inbound
-    // endpoint, the same path `spor query --to` walks).
+    // server's git-blob-sha revision, and take inbound edges from the server's
+    // inbound_edges when it sent them. Only an older server without ?inbound=1
+    // falls back to the graph-wide sweep via GET /v1/export (the path `spor
+    // query --to` walks) — a full download per read, so never the first choice.
     const graphLib = require(path.join(ROOT, "lib", "graph.js"));
     const raw = r.json && r.json.raw;
     if (typeof raw !== "string") {
@@ -1132,13 +1137,17 @@ async function cmdGet(cfg, { positionals, values }) {
       return 1;
     }
     const node = graphLib.parseFrontmatter(raw, `${id}.md`);
-    const fetched = await fetchRemoteExportNodes(cfg, "get");
-    if (fetched.error) return 1; // already reported
-    let inbound;
-    try {
-      inbound = inboundEdges(graphLib.loadGraph(fetched.nodesDir), node.id);
-    } finally {
-      fetched.cleanup();
+    let inbound = Array.isArray(r.json.inbound_edges)
+      ? r.json.inbound_edges.map((e) => ({ from: e.from, type: e.type }))
+      : null;
+    if (!inbound) {
+      const fetched = await fetchRemoteExportNodes(cfg, "get");
+      if (fetched.error) return 1; // already reported
+      try {
+        inbound = inboundEdges(graphLib.loadGraph(fetched.nodesDir), node.id);
+      } finally {
+        fetched.cleanup();
+      }
     }
     out(JSON.stringify(getNodeJson(node, inbound, r.json.revision), null, 2));
     return 0;

@@ -396,7 +396,7 @@ Body for the long-id export test.
   }
 });
 
-test("export (local): a pathologically long id with no viable split is still skipped (never corrupted)", () => {
+test("export (local): an id too long for any ustar split rides a pax header, never skipped or corrupted (issue-spor-export-drops-ids-over-ustar-name-limit)", () => {
   const home = freshHome();
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
@@ -413,8 +413,9 @@ Body.
   fs.writeFileSync(path.join(nodes, "dec-a.md"), "---\nid: dec-a\ntype: decision\nsummary: A decision.\n---\nBody.\n");
 
   const exported = tar.exportNodesDir(nodes);
-  assert.strictEqual(exported.skipped, 1);
-  assert.strictEqual(exported.count, 1, "the representable node still exports");
+  assert.strictEqual(exported.skipped, 0);
+  assert.strictEqual(exported.count, 2, "both nodes export");
   const entries = tar.extract(exported.buffer);
-  assert.deepStrictEqual(entries.map((e) => e.name), ["nodes/dec-a.md"]);
+  assert.deepStrictEqual(entries.map((e) => e.name), ["nodes/dec-a.md", `nodes/${unsplittableId}.md`]);
+  assert.match(entries[1].data.toString("utf8"), new RegExp(`id: ${unsplittableId}`));
 });

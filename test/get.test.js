@@ -4,7 +4,8 @@
 // scraping frontmatter. Dual-mode like `blame`/`history` (norm-spor-cli-mode-
 // parity): local reads the node file + scans the graph home for inbound edges and
 // recomputes the git-blob-sha revision zero-dep; remote reads /v1/nodes/<id> for
-// the body+revision and GET /v1/export for inbound (no inbound endpoint).
+// the body+revision (?inbound=1 carries inbound edges on a current server; an
+// older one falls back to a GET /v1/export sweep).
 //
 // Oracle = the rendered JSON shape + the requests the CLI makes + the fail-soft
 // exits, and PARITY: remote --json equals local --json over the same graph (we
@@ -212,7 +213,9 @@ test("getNodeJson splits edges and drops parser artifacts", () => {
 // {id, raw, frontmatter, revision} (revision = the git blob sha of the file, so a
 // stubbed server matches what local recomputes), and GET /v1/export → the ustar
 // tarball (lib/tar.js, byte-for-byte the server's). Records hits.
-function nodeStub(nodesDir) {
+// `serveInbound` makes the stub a current server that honors ?inbound=1 with
+// inbound_edges; without it the stub is an older server that ignores the param.
+function nodeStub(nodesDir, { serveInbound = false } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     hits.push({ method: req.method, url: req.url });
@@ -225,7 +228,13 @@ function nodeStub(nodesDir) {
       if (!fs.existsSync(f)) return j(404, { error: { code: "not_found" } });
       const buf = fs.readFileSync(f);
       const node = graphLib.parseFrontmatter(buf.toString("utf8"), `${id}.md`);
-      return j(200, { id, raw: buf.toString("utf8"), frontmatter: node, revision: gitBlobSha(buf) });
+      const body = { id, raw: buf.toString("utf8"), frontmatter: node, revision: gitBlobSha(buf) };
+      if (serveInbound && u.searchParams.get("inbound") === "1") {
+        const { queryGraph } = require(path.join(__dirname, "..", "lib", "query.js"));
+        body.inbound_edges = queryGraph(graphLib.loadGraph(nodesDir), { edges: true, to: id })
+          .edges.map((e) => ({ from: e.from, type: e.type }));
+      }
+      return j(200, body);
     }
     if (u.pathname === "/v1/export" && req.method === "GET") {
       const exported = tar.exportNodesDir(nodesDir);
@@ -241,7 +250,25 @@ function nodeStub(nodesDir) {
 const remoteEnv = (base, extra = {}) =>
   bare({ SPOR_HOME: ISO_HOME, SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra });
 
-test("get (remote) --json reads /v1/nodes/<id> + /v1/export and matches local over the same graph", async () => {
+test("get (remote) --json takes inbound edges from ?inbound=1 and never downloads the export (issue-spor-remote-get-json-full-export-per-call)", async () => {
+  const { dir, nodes } = fixtureGraph();
+  const { srv, hits, base } = await nodeStub(nodes, { serveInbound: true });
+  try {
+    const remote = await runAsync(["get", "dec-x", "--json"], remoteEnv(base));
+    assert.strictEqual(remote.status, 0, remote.stderr);
+    const j = JSON.parse(remote.stdout);
+    assert.deepStrictEqual(j.edges.inbound, [{ from: "issue-z", type: "blocks" }]);
+    assert.ok(hits.some((h) => h.method === "GET" && h.url === "/v1/nodes/dec-x?inbound=1"), "GET /v1/nodes/dec-x?inbound=1");
+    assert.ok(!hits.some((h) => h.url.startsWith("/v1/export")), "one node read, no export download");
+    // PARITY: byte-identical to the local --json over the same graph.
+    const local = run(["get", "dec-x", "--json"], { SPOR_HOME: dir });
+    assert.strictEqual(remote.stdout, local.stdout);
+  } finally {
+    srv.close();
+  }
+});
+
+test("get (remote) --json against an older server (no inbound_edges) falls back to /v1/export and matches local", async () => {
   const { dir, nodes } = fixtureGraph();
   const { srv, hits, base } = await nodeStub(nodes);
   try {
@@ -252,7 +279,7 @@ test("get (remote) --json reads /v1/nodes/<id> + /v1/export and matches local ov
     assert.deepStrictEqual(j.edges.inbound, [{ from: "issue-z", type: "blocks" }]);
     assert.strictEqual(j.revision, gitBlobSha(fs.readFileSync(path.join(nodes, "dec-x.md"))));
     // it hit BOTH endpoints (node for body+revision, export for inbound).
-    assert.ok(hits.some((h) => h.method === "GET" && h.url === "/v1/nodes/dec-x"), "GET /v1/nodes/dec-x");
+    assert.ok(hits.some((h) => h.method === "GET" && h.url === "/v1/nodes/dec-x?inbound=1"), "GET /v1/nodes/dec-x?inbound=1");
     assert.ok(hits.some((h) => h.method === "GET" && h.url.startsWith("/v1/export")), "GET /v1/export");
     // PARITY: byte-identical to the local --json over the same graph.
     const local = run(["get", "dec-x", "--json"], { SPOR_HOME: dir });
