@@ -66,6 +66,15 @@ test("explicit files and --test flags pass through; an explicit concurrency wins
   assert.ok(args.includes("--test-name-pattern=foo"));
   assert.deepStrictEqual(args.slice(-2), ["test/a.test.js", "test/b.test.js"]);
   assert.ok(!args.includes("test/*.test.js"));
+  // A flag's value given as its own word is the flag's, never a file: the
+  // default file list must survive it.
+  const spaced = withEnv("SPOR_TEST_CONCURRENCY", undefined, () =>
+    buildArgs(["--test-name-pattern", "lock", "--test-concurrency", "4", "--test-reporter", "dot"])
+  );
+  assert.deepStrictEqual(spaced.slice(spaced.indexOf("--test-name-pattern")), [
+    "--test-name-pattern", "lock", "--test-concurrency", "4", "--test-reporter", "dot", "test/*.test.js",
+  ]);
+  assert.ok(!spaced.some((a) => /^--test-concurrency=/.test(a)), "an explicit spaced concurrency still wins");
   const fromEnv = withEnv("SPOR_TEST_CONCURRENCY", "3", () => buildArgs([]));
   assert.ok(fromEnv.includes("--test-concurrency=3"));
 });
@@ -76,6 +85,7 @@ test("a malformed shard or concurrency is refused with a usage error, never run 
     [["--shard", "3/2"], {}],
     [["--shard", "half"], {}],
     [["--shard"], {}],
+    [["--test-name-pattern"], {}],
     [[], { SPOR_TEST_CONCURRENCY: "0" }],
     [[], { SPOR_TEST_CONCURRENCY: "lots" }],
   ]) {

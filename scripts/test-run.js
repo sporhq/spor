@@ -37,6 +37,34 @@ const PRELOADS = [
   "./test/helpers/compile-cache.js",
 ];
 
+// node flags whose value may come as the NEXT word (`--test-name-pattern foo`):
+// that word is the flag's value, not a file to run.
+const VALUE_FLAGS = new Set([
+  "-r",
+  "--require",
+  "--import",
+  "--test-name-pattern",
+  "--test-skip-pattern",
+  "--test-reporter",
+  "--test-reporter-destination",
+  "--test-concurrency",
+  "--test-timeout",
+  "--test-shard",
+  "--test-coverage-include",
+  "--test-coverage-exclude",
+  "--test-coverage-lines",
+  "--test-coverage-branches",
+  "--test-coverage-functions",
+  "--test-isolation",
+  "--test-global-setup",
+  "--test-rerun-failures",
+  "--env-file",
+  "--loader",
+  "--experimental-loader",
+  "-C",
+  "--conditions",
+]);
+
 function usage(msg) {
   if (msg) process.stderr.write(`test-run: ${msg}\n`);
   process.stderr.write("usage: node scripts/test-run.js [--shard <i>/<n>] [node --test args…] [files…]\n");
@@ -79,6 +107,10 @@ function buildArgs(argv) {
     else if (arg.startsWith("-")) {
       if (arg.startsWith("--test-concurrency")) concurrency = true;
       pass.push(arg);
+      if (VALUE_FLAGS.has(arg)) {
+        if (i + 1 >= argv.length) usage(`${arg} needs a value`);
+        pass.push(argv[++i]);
+      }
     } else files.push(arg);
   }
   const args = [];
