@@ -601,6 +601,26 @@ test('brief <id> is sugar for compile --root <id>', () => {
   assert.strictEqual(viaCli.stdout, viaLib.stdout);
 });
 
+test('search "<text>" is sugar for compile --query "<text>" --digest', () => {
+  const { nodes } = fixtureGraph();
+  const viaCli = run(['search', 'auth token rotation credential', '--nodes', nodes]);
+  const viaLib = runLib('compile.js', ['--query', 'auth token rotation credential', '--digest', '--nodes', nodes]);
+  assert.strictEqual(viaCli.stdout, viaLib.stdout);
+});
+
+test('search forwards trailing flags past the query text (e.g. --project)', () => {
+  const { nodes } = fixtureGraph();
+  const viaCli = run(['search', 'auth token rotation credential', '--project', 'demo', '--nodes', nodes]);
+  const viaLib = runLib('compile.js', ['--query', 'auth token rotation credential', '--digest', '--project', 'demo', '--nodes', nodes]);
+  assert.strictEqual(viaCli.stdout, viaLib.stdout);
+});
+
+test('search with no query text prints usage and exits 1', () => {
+  const r = run(['search']);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /usage: spor search/);
+});
+
 test('next (local) is byte-identical passthrough to lib/queue.js', () => {
   const { nodes } = fixtureGraph();
   const viaCli = run(['next', '--nodes', nodes]);
@@ -2131,6 +2151,31 @@ test('compile --query (remote) with a gate-miss prints nothing and exits 0', asy
   try {
     const r = await runAsyncCli(['compile', '--query', 'zzz-nothing relevant here'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
     assert.strictEqual(r.status, 0, r.stderr);   // mirrors local "nothing relevant"
+    assert.strictEqual(r.stdout, '');
+  } finally {
+    srv.close();
+  }
+});
+
+test('search "<text>" (remote) posts /v1/digest with --digest and prints the text', async () => {
+  const { srv, hits, base } = await digestStubServer();
+  try {
+    const r = await runAsyncCli(['search', 'auth token rotation'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /DIGEST for: auth token rotation/);
+    const dig = hits.find((h) => h.url === '/v1/digest');
+    assert.ok(dig, 'hit the digest route');
+    assert.strictEqual(dig.body.query, 'auth token rotation');
+  } finally {
+    srv.close();
+  }
+});
+
+test('search (remote) with a gate-miss prints nothing and exits 0', async () => {
+  const { srv, base } = await digestStubServer();
+  try {
+    const r = await runAsyncCli(['search', 'zzz-nothing relevant here'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
+    assert.strictEqual(r.status, 0, r.stderr);
     assert.strictEqual(r.stdout, '');
   } finally {
     srv.close();

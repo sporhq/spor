@@ -137,7 +137,8 @@ spor admin gardener [--json]   # run a gardener sweep now (POST /v1/gardener) �
                                #   items, resolves its own cleared ones; ops-facing (the `spor admin` surface)
 
 # dual-mode (local passthrough / remote dispatch to the server)
-spor compile --query "<text>"  # search → compiled neighborhood (--digest for compact)
+spor search "<text>"           # free-text graph search (sugar for compile --query "<text>" --digest)
+spor compile --query "<text>"  # the full form → compiled neighborhood (--digest for compact)
 spor brief <id>                # a briefing for one node (compile --root <id>)
 spor analytics --type task,issue      # created-vs-completed metrics (local git history / GET /v1/analytics)
 spor changes [--since <sha|date>]     # recent-activity feed: what changed lately (local git log / GET /v1/changes)
@@ -200,11 +201,14 @@ A few of these have enough surface to be worth a sentence:
   --json` so updates are optimistic-concurrency checked instead of last-writer
   wins. Prefer `spor edge`/`spor set-status` for narrow mutations; use
   `put-node` for full-node artifacts such as briefing versions or body edits.
-- **`spor compile`/`spor brief`** are mode-aware: local runs the in-repo
-  compiler, remote dispatches to the server (this is what `/spor:brief` pulls).
-  In local mode add `--project <repo-slug>` to scope to a repo — without it
-  `compile --root`/`--query` run *project-blind* and every `always_on` norm rides
-  along regardless of `applies_to_*`. `--nodes <dir>` always targets that local
+- **`spor compile`/`spor brief`/`spor search`** are mode-aware: local runs the
+  in-repo compiler, remote dispatches to the server (this is what `/spor:brief`
+  pulls). `search "<text>"` is sugar for `compile --query "<text>" --digest` —
+  reach for it for free-text search (the CLI twin of MCP `query_graph`); `brief
+  <id>` is sugar for `compile --root <id>`. In local mode add `--project
+  <repo-slug>` to scope to a repo — without it `compile --root`/`--query` (and
+  `search`) run *project-blind* and every `always_on` norm rides along
+  regardless of `applies_to_*`. `--nodes <dir>` always targets that local
   checkout, even under a server.
 
 The deeper mode-specific flows — the exact REST calls, and the rule that

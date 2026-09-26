@@ -2024,7 +2024,13 @@ function namesLocalGraph(args) {
 }
 
 async function cmdCompile(cfg, verb, args) {
-  // brief <id> is sugar for compile --root <id>.
+  // brief <id> is sugar for compile --root <id>; search "<text>" is sugar for
+  // compile --query "<text>" --digest (task-spor-cli-search-alias) — a result
+  // list reads as digest-compact by default, with the full neighborhood
+  // document still one `spor compile --query` away. --digest is idempotent as
+  // a bare flag, so a caller who also passes it explicitly is a no-op; remote
+  // mode's --query arm already always returns digest-shaped /v1/digest text,
+  // so the flag only changes local-mode output.
   let compileArgs = args;
   if (verb === "brief") {
     const id = args[0];
@@ -2033,6 +2039,13 @@ async function cmdCompile(cfg, verb, args) {
       return 1;
     }
     compileArgs = ["--root", id, ...args.slice(1)];
+  } else if (verb === "search") {
+    const text = args[0];
+    if (!text) {
+      err('usage: spor search "<text>"');
+      return 1;
+    }
+    compileArgs = ["--query", text, "--digest", ...args.slice(1)];
   }
   if (cfg.mode() === "remote" && !namesLocalGraph(compileArgs)) {
     return await compileRemote(cfg, compileArgs);
@@ -21572,6 +21585,18 @@ const COMMANDS = {
     help: "Compile a briefing for one node — sugar for 'compile --root <id>'. Local mode\nis a byte-identical passthrough to lib/compile.js; remote mode dispatches to the\nserver (the raw node plus a /v1/digest neighborhood), like the /spor:brief skill.",
     examples: ["spor brief dec-cc-zero-dep-client"],
     run: (cfg, args) => cmdCompile(cfg, "brief", args),
+  },
+  search: {
+    group: "Repo scoping", parse: "raw", args: '"<text>"',
+    summary: "free-text graph search (sugar for compile --query, digest-style)",
+    help:
+      "Search the graph by free text — sugar for 'compile --query \"<text>\" --digest'.\n" +
+      "Defaults to the compact digest rendering, since a search implies a result\n" +
+      "list; for the full neighborhood document run 'spor compile --query \"<text>\"'\n" +
+      "directly. Local mode is a byte-identical passthrough to lib/compile.js;\n" +
+      "remote mode dispatches to the server (POST /v1/digest), like 'spor compile'.",
+    examples: ['spor search "auth token rotation"'],
+    run: (cfg, args) => cmdCompile(cfg, "search", args),
   },
   validate: {
     group: "Repo scoping", parse: "raw", args: "",
