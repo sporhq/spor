@@ -181,7 +181,12 @@ function outResults(dir) {
 // carries a result? The cheap precheck session-start runs before paying for a
 // spawn: a readdir of the spool root plus one readdir per dir, stopping at the
 // first hit. Says nothing about ELIGIBILITY — the sweep re-decides that on the
-// evidence — only that there is something worth looking at.
+// evidence — only that there is something worth looking at. Consumed spool
+// dirs are deliberately left behind empty (no rmdir — see prompt-context.js),
+// so a box can accumulate far more non-self dirs than SCAN_DIR_MAX without any
+// of them holding a result; hitting the cap is therefore INCONCLUSIVE, never a
+// clean no, so it spawns the real sweep the same as a hit would (the safe side
+// is doing the work, like the unreadable-stamp case above).
 function hasSweepCandidates(graph, session) {
   let subs;
   try {
@@ -192,7 +197,7 @@ function hasSweepCandidates(graph, session) {
   let scanned = 0;
   for (const s of subs) {
     if (!s.isDirectory() || s.name === session) continue;
-    if (++scanned > SCAN_DIR_MAX) break;
+    if (++scanned > SCAN_DIR_MAX) return true;
     if (outResults(path.join(graph, "journal", "pending-nudges", s.name)).length) return true;
   }
   return false;

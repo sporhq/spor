@@ -519,6 +519,24 @@ test("SessionStart pays no spawn when there is nothing stranded", () => {
   assert.strictEqual(sweeper.hasSweepCandidates(home, "sNew"), false);
 });
 
+test("hasSweepCandidates: hitting the scan cap is inconclusive, not a clean no", () => {
+  const { home, cwd } = scratch();
+  // Consumed spools are left behind empty (no rmdir) — pile up more non-self
+  // dirs than the scan will walk, all with nothing in them.
+  const pendingRoot = path.join(home, "journal", "pending-nudges");
+  fs.mkdirSync(pendingRoot, { recursive: true });
+  for (let i = 0; i < 250; i++) {
+    fs.mkdirSync(path.join(pendingRoot, `empty-${String(i).padStart(4, "0")}`), { recursive: true });
+  }
+  // A real stranded result exists, but only reachable after the cap.
+  seedSpool(home, "zzz-real-result", { file: path.join(cwd, "notes.md") });
+  assert.strictEqual(
+    sweeper.hasSweepCandidates(home, "sNew"),
+    true,
+    "an inconclusive (capped) scan must still spawn the sweep, not silently skip it"
+  );
+});
+
 test("the box sweeps at most once per interval, and stamps before it spawns", () => {
   const { home, cwd } = scratch();
   const stamp = path.join(home, "journal", "spool-swept");
