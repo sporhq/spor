@@ -153,9 +153,11 @@ spor check [--staged|--range <a..b>|--files <f...>] [--strict]   # coupling-drif
                                #   disagreement. Advisory; --strict exits 1 (CI/pre-commit). The diff is
                                #   always local git; norms are mode-aware (local nodes dir / GET /v1/export)
 spor export [--gzip] [--history|--auth] [--out <file>]   # nodes/ ustar tarball (--history: git-bundle data-exit; --auth: admin-gated restore w/ auth files — both remote-only); local build / GET /v1/export
+spor validate [--summary|--json]   # whole-graph lint (local nodes dir / GET /v1/export then lint locally);
+                               #   --summary tallies warnings by kind (dangling edges, …) + orphans —
+                               #   the post-backfill sanity read. Never triggers a gardener sweep
 
 # local (personal graph) only — fail fast with a redirect in remote mode
-spor validate                  # lint the local graph (server validates per-write remotely)
 spor compile --root <id> --skeleton   # writes a local briefing-node skeleton
 ```
 

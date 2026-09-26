@@ -2601,15 +2601,26 @@ async function compileRemote(cfg, args) {
   return 0;
 }
 
-// validate lints a LOCAL graph (lib/validate.js). Remote mode has no
-// whole-graph lint endpoint — the server validates every write per node — so
-// fail fast naming that, unless --nodes points at a local checkout to lint.
-function cmdValidate(cfg, args) {
+// validate lints a graph (lib/validate.js). Local mode is byte-identical
+// passthrough over the local nodes dir. Remote mode has no whole-graph lint
+// endpoint — the server validates every write per node, and the gardener runs
+// the graph-wide lint per sweep, which is far too expensive to trigger on
+// demand (inc-spor-tenant-cpu-throttle-gardener-sweeps-2026-09-25) — so it runs
+// the SAME lib/validate.js over the team graph fetched the documented
+// graph-wide-sweep way (GET /v1/export), exactly as `spor query` does
+// (task-spor-cli-remote-validate-summary). That is the post-hoc sanity read a
+// backfill wants: `--summary` tallies warnings by kind plus orphans, `--json`
+// is the machine form. An explicit --nodes names a local checkout, so it always
+// takes the local path even under a server.
+async function cmdValidate(cfg, args) {
   if (cfg.mode() === "remote" && !namesLocalGraph(args)) {
-    err("validate lints a LOCAL graph; in remote mode the server validates every write,");
-    err("  so there is no whole-graph lint over the API. Point --nodes at a local checkout");
-    err("  to lint it, or unset SPOR_SERVER to validate the local graph home.");
-    return 1;
+    const fetched = await fetchRemoteExportNodes(cfg, "validate");
+    if (fetched.error) return 1; // already reported
+    try {
+      return passthrough("validate.js", [...args, "--nodes", fetched.nodesDir]);
+    } finally {
+      fetched.cleanup();
+    }
   }
   return passthrough("validate.js", args);
 }
@@ -22143,9 +22154,21 @@ const COMMANDS = {
   },
   validate: {
     group: "Repo scoping", parse: "raw", args: "",
-    summary: "lint the local graph (byte-identical)",
-    help: "Lint the local graph and exit 1 on errors. Byte-identical passthrough to\nlib/validate.js. Local-only — in remote mode the server validates every write,\nso this fails fast unless --nodes points at a local checkout.",
-    options: { nodes: { type: "string", value: "dir", desc: "graph nodes dir to lint" } },
+    summary: "lint the graph: counts, warnings, errors (--summary for a tally)",
+    help:
+      "Lint the graph and exit 1 on errors. Local mode is a byte-identical passthrough\n" +
+      "to lib/validate.js. Remote mode runs the same lint over the team graph fetched\n" +
+      "via GET /v1/export (like 'spor query') — the whole-graph read per-write\n" +
+      "validation can't give, without triggering a gardener sweep. --summary replaces\n" +
+      "the per-warning lines with a tally by kind (dangling edges, unknown types, …)\n" +
+      "plus orphans (nodes nothing resolvable connects); --json is the machine form.\n" +
+      "--nodes <dir> always lints that local checkout.",
+    examples: ["spor validate --summary", "spor validate --json"],
+    options: {
+      nodes: { type: "string", value: "dir", desc: "graph nodes dir to lint" },
+      summary: { type: "boolean", desc: "tally warnings by kind + orphans instead of listing each" },
+      json: { type: "boolean", desc: "machine-readable counts, warnings, errors, orphans" },
+    },
     run: (cfg, args) => cmdValidate(cfg, args),
   },
 

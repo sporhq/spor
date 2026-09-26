@@ -2052,7 +2052,8 @@ test('lens rejects an invalid --format', () => {
 // lib/compile.js/lib/validate.js even in remote mode, where $SPOR_HOME/nodes is
 // absent — exiting with a bare "no Spor graph" that read like a broken install.
 // Now brief/compile dispatch to the server (mirroring the /spor:brief skill) and
-// validate/--skeleton fail fast naming the remote path; an explicit --nodes
+// --skeleton fails fast naming the remote path (validate lints the exported
+// team graph since task-spor-cli-remote-validate-summary); an explicit --nodes
 // still names a local checkout. Same async-spawn stub pattern as the lens tests.
 function digestStubServer() {
   const http = require('node:http');
@@ -2194,11 +2195,13 @@ test('brief <unknown> (remote) exits 1 with a clear not-found, no stack', async 
   }
 });
 
-test('validate (remote, no --nodes) fails fast naming the remote path, no "no Spor graph"', () => {
+// validate (remote) now lints the team graph via GET /v1/export
+// (task-spor-cli-remote-validate-summary, see validate-remote.test.js); a dead
+// server is a clean offline line, never the local "no Spor graph".
+test('validate (remote, no --nodes, dead server) fails clean offline, no "no Spor graph"', () => {
   const r = run(['validate'], { SPOR_SERVER: 'http://127.0.0.1:1', SPOR_TOKEN: 't' });
   assert.strictEqual(r.status, 1);
-  assert.match(r.stderr, /validate lints a LOCAL graph/);
-  assert.match(r.stderr, /server validates every write/);
+  assert.match(r.stderr, /offline — could not reach server/);
   assert.doesNotMatch(r.stderr, /no Spor graph/);     // the confusing message is gone
   assert.doesNotMatch(r.stderr, /at Object|Error:/);
 });
