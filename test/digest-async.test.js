@@ -454,3 +454,64 @@ test("server intent on found:false is ignored — it never judged the personal-g
   assert.strictEqual(stdout.trim(), "");
   assert.strictEqual(journal(home).filter((x) => x.tool === "digest-intent-spawn").length, 1);
 });
+
+// issue-spor-prompt-context-repeat-record-before-gate: the repeat-suppression
+// bookkeeping used to write inside computeDigest, BEFORE the intent gate
+// decided whether to inject — so a digest the gate suppressed still got
+// recorded as "shown", and a later low-signal follow-up asking about the same
+// thing was wrongly treated as a repeat of context the user never actually
+// saw. Fixed by recording only once a digest clears the gate and is actually
+// injected.
+async function oneShotRemotePrompt({ home, cwd, session, prompt, intent, found = true, asyncFlag, intentCmd = null }) {
+  const { srv, base } = await digestServer(intent, found);
+  try {
+    const e = env(home, intentCmd, { SPOR_SERVER: base, SPOR_TOKEN: "spor_pat_test" });
+    if (asyncFlag === undefined) delete e.SPOR_DIGEST_ASYNC;
+    else e.SPOR_DIGEST_ASYNC = asyncFlag;
+    const payload = { cwd, session_id: session, hook_event_name: "UserPromptSubmit", prompt };
+    return await new Promise((resolve, reject) => {
+      const c = spawnHook(["prompt-context", "--host", "claude-code"], JSON.stringify(payload), e, {
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+      let out = "";
+      c.stdout.on("data", (d) => (out += d));
+      c.on("error", reject);
+      c.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(`exit ${code}`))));
+    });
+  } finally {
+    srv.close();
+  }
+}
+
+test("intent gate suppresses prompt 1's digest; a low-signal follow-up prompt 2 still gets its digest", async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, "nodes"), { recursive: true }); // pure remote: only the team digest matters
+  const session = "s1";
+
+  // Prompt 1: the server says the digest is not warranted for this prompt —
+  // it is computed but suppressed, never shown to the user.
+  const out1 = await oneShotRemotePrompt({
+    home, cwd, session, prompt: PROMPT, intent: JEV_NO, asyncFlag: "1", intentCmd: "false",
+  });
+  assert.strictEqual(out1.trim(), "", "prompt 1's digest is suppressed by the intent gate");
+  // Nothing was recorded as "already shown" — the bug wrote this file here.
+  const journalDir = path.join(home, "journal");
+  const stateFiles = fs.existsSync(journalDir)
+    ? fs.readdirSync(journalDir).filter((f) => f.startsWith("prompt-context-"))
+    : [];
+  assert.deepStrictEqual(stateFiles, [], "a suppressed digest must not be recorded as shown");
+
+  // Prompt 2: a short, low-signal follow-up asking about the same topic —
+  // exactly what the repeat-suppression gate targets. With the intent gate
+  // off this turn, the team digest (identical text, same server stub) injects
+  // synchronously unless wrongly suppressed as a "repeat" of prompt 1's
+  // (never-shown) digest.
+  const out2 = await oneShotRemotePrompt({
+    home, cwd, session, prompt: "what about widget caching once more please", intent: undefined, asyncFlag: "0",
+  });
+  assert.match(
+    JSON.parse(out2).hookSpecificOutput.additionalContext,
+    /dec-widget-cache/,
+    "prompt 2 must still get its digest — prompt 1's suppressed digest was never actually shown"
+  );
+});

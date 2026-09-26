@@ -203,7 +203,13 @@ function statePath(graph, input) {
   return path.join(graph, "journal", `prompt-context-${h}.json`);
 }
 
-function repeatedFollowup(graph, input, prompt, digest) {
+// Read-only: whether `digest` is the same content already recorded as SHOWN
+// (recordDigestShown below) for a low-signal follow-up prompt. Never writes —
+// the write happens only once a digest actually clears every later gate
+// (issue-spor-prompt-context-repeat-record-before-gate: recording here,
+// before the digest-intent gate runs, made a digest the gate went on to
+// suppress count as "shown" anyway, wrongly suppressing a later follow-up).
+function isRepeatedFollowup(graph, input, prompt, digest) {
   const p = statePath(graph, input);
   if (!p) return false;
   const sig = digestSignature(digest);
@@ -211,11 +217,21 @@ function repeatedFollowup(graph, input, prompt, digest) {
   try {
     prev = JSON.parse(fs.readFileSync(p, "utf8"));
   } catch {}
+  return prev && prev.sig === sig && !hasHighSignalToken(prompt) && u.wordCount(prompt) <= 12;
+}
+
+// Record `digest` as shown, for isRepeatedFollowup's next comparison. Call
+// this only at the point a digest is actually being injected THIS turn —
+// never from inside computeDigest, which runs before the digest-intent gate
+// (server-verdict or async-spool) decides whether to suppress it.
+function recordDigestShown(graph, input, digest) {
+  const p = statePath(graph, input);
+  if (!p) return;
+  const sig = digestSignature(digest);
   try {
     u.ensureDir(path.dirname(p));
     fs.writeFileSync(p, JSON.stringify({ sig, at: new Date().toISOString() }) + "\n");
   } catch {}
-  return prev && prev.sig === sig && !hasHighSignalToken(prompt) && u.wordCount(prompt) <= 12;
 }
 
 // Claude Code appends `<system-reminder>…</system-reminder>` blocks
@@ -785,6 +801,14 @@ async function promptContext(input) {
 
   const meta = {};
   let digest = await computeDigest(input, graph, slug, meta);
+  // Whether the digest about to be injected THIS turn is this turn's own
+  // compute (meta.rawDigest) rather than a `pending` one drained from an
+  // earlier turn's spool — only the former gets recorded as "shown"
+  // (recordDigestShown below), since a drained pending digest already has its
+  // own dedup via `<session>.digest-injected` and never had a `rawDigest`
+  // captured for it. Starts true (the default, no-gate path injects whatever
+  // computeDigest returned) and is corrected by the gates below.
+  let thisTurnInjected = !!digest;
 
   // digest.async is a TRI-STATE (task-spor-digest-intent-jev-gate): explicit
   // true is the full async gate below, explicit false is no gate at all, and
@@ -816,7 +840,10 @@ async function promptContext(input) {
         ...(typeof it.digest_helps === "number" ? { digest_helps: it.digest_helps } : {}),
       })
     );
-    if (!it.warranted) digest = "";
+    if (!it.warranted) {
+      digest = "";
+      thisTurnInjected = false;
+    }
     // Under the explicit async gate, a result the Haiku worker spooled for an
     // EARLIER prompt is superseded by this fresher verdict: consume it without
     // injecting, and record an injected digest's signature for the drain dedup
@@ -847,7 +874,17 @@ async function promptContext(input) {
       u.appendLine(path.join(graph, "journal", `${session}.digest-injected`), digestSignature(fresh));
     }
     digest = fresh || pending;
+    thisTurnInjected = !!fresh;
   }
+
+  // A digest actually injected THIS turn from THIS turn's own compute is now
+  // recorded as shown, so a later low-signal follow-up repeating identical
+  // content can be suppressed. A digest the intent gate suppressed (digest
+  // set to "" above) never reaches here, and a `pending` digest drained from
+  // an earlier turn's spool is excluded by `thisTurnInjected` — it has its
+  // own dedup and no captured `rawDigest` to compare against
+  // (issue-spor-prompt-context-repeat-record-before-gate).
+  if (thisTurnInjected && meta.rawDigest) recordDigestShown(graph, input, meta.rawDigest);
 
   const parts = [pendingNudge, digest].filter(Boolean);
   if (!parts.length) return null;
@@ -930,7 +967,8 @@ async function computeDigest(input, graph, slug, meta = {}) {
     // newlines before jq sees it.
     const merged = u.stripTrailingNewlines(u.byteHead(mergeDigests(team, local), 9216));
     if (!/\S/.test(merged)) return "";
-    if (repeatedFollowup(graph, input, prompt, merged)) return "";
+    meta.rawDigest = merged;
+    if (isRepeatedFollowup(graph, input, prompt, merged)) return "";
     return microDigest(merged);
   }
 
@@ -950,7 +988,8 @@ async function computeDigest(input, graph, slug, meta = {}) {
     cached: false,
   });
   if (!digest) return "";
-  if (repeatedFollowup(graph, input, prompt, digest)) return "";
+  meta.rawDigest = digest;
+  if (isRepeatedFollowup(graph, input, prompt, digest)) return "";
   return microDigest(digest);
 }
 
