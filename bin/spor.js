@@ -13169,7 +13169,7 @@ const { gateIdSuffix, fenceSafe, capBytes: gateCapBytes, NODE_BODY_CAP_BYTES } =
 // (work.accept ready, dec-spor-work-accept-policy-configurable) would leave it
 // unworked forever. The consent the stamp records is real, just upstream: the
 // operator declared the lane's profile in the factory definition.
-function buildGateWorkNode({ id, type = "task", title, summary, body, project, date, edges = [], requiresHuman = false, profile = null }) {
+function buildGateWorkNode({ id, type = "task", title, summary, body, project, date, edges = [], requiresHuman = false, profile = null, lists = {} }) {
   // The frontmatter parser is line-based: a title or summary carrying a newline
   // (a git message, a suite's first failing line) would truncate the node. Flatten
   // and cap both, the same discipline the dispatch report artifact keeps.
@@ -13187,6 +13187,15 @@ function buildGateWorkNode({ id, type = "task", title, summary, body, project, d
     `date: ${date}`,
     ...(requiresHuman ? ["requires: [human]"] : ["readiness: agent"]),
     ...(profile ? [`profile: ${profile}`] : []),
+    // Structured list fields (parseFrontmatter's LIST_FIELDS allowlist):
+    // `failing_tests` on an escalation, `covers_tests` on a flake issue
+    // (task-spor-gate-escalation-auto-regate-on-flake-fix). Entries are paths
+    // from the failure reader's own character class, so no quoting is needed;
+    // anything that would break the inline list is dropped, not escaped.
+    ...Object.entries(lists || {})
+      .map(([k, v]) => [k, (Array.isArray(v) ? v : []).map(String).filter((x) => x && !/[\[\],\n]/.test(x))])
+      .filter(([, v]) => v.length)
+      .map(([k, v]) => `${k}: [${v.join(", ")}]`),
     ...(edges.length ? ["edges:", ...edges.map((e) => `  - {type: ${e.type}, to: ${e.to}}`)] : []),
     "---",
     "",
@@ -15375,6 +15384,10 @@ function makeGateDeps(
           project: slug,
           date: date(),
           profile,
+          // The test this flake issue COVERS, as data: once the issue is fixed,
+          // a refusal whose every failing test is covered by a fixed flake is
+          // re-gated without a person (spor work --regate-flakes).
+          lists: { covers_tests: [target] },
           edges: [
             ...(factory.id ? [{ type: "relates-to", to: factory.id }] : []),
             ...(profile ? [{ type: "relates-to", to: profile }] : []),
@@ -15498,7 +15511,7 @@ function makeGateDeps(
     },
     checkApproval: ({ id }) => gateApprovalState(cfg, id),
     demote: ({ blockerId }) => gateDemoteItem(cfg, entry.node_id, { blockerId }),
-    escalate: async ({ gate, attempts, detail, evidence, findings, ledger, rescue = 0, rescues = [], outage = null }) => {
+    escalate: async ({ gate, attempts, detail, evidence, findings, ledger, rescue = 0, rescues = [], outage = null, failingTests = null }) => {
       const k = keysFor(rescue);
       const id = `task-gate-${gate.id.slice(0, 24)}-${stem}-${k.short}-${gateIdSuffix("escalate", gate.id, entry.node_id, k.runKey)}`.toLowerCase();
       const cycles = attempts.length;
@@ -15600,6 +15613,7 @@ function makeGateDeps(
           project: slug,
           date: date(),
           requiresHuman: true,
+          lists: { failing_tests: failingTests || [] },
           // `blocks`: the escalation is what the gated item now waits on, and
           // the graph has to say so — a refusal that lives only in one box's
           // cooldown map leaves every other reader calling the item done.
@@ -18014,6 +18028,8 @@ function settleRunRecord(home, runId, res, workerId = null, { gateResult = null,
       ...(workerId ? { gate_worker: workerId } : {}),
       ...(reason ? { gate_reason: reason } : {}),
       ...(res && res.escalated_to ? { gate_escalated_to: res.escalated_to, gate_escalation_ids: [res.escalated_to] } : {}),
+      ...(res && Array.isArray(res.failing_tests) ? { gate_failing_tests: res.failing_tests } : {}),
+      ...(res && res.empty_diff ? { gate_empty_diff: true } : {}),
       ...(res && res.demoted != null ? { gate_demoted: !!res.demoted } : {}),
       ...(gateResult
         ? {
@@ -18792,7 +18808,16 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
 // (with a resolving artifact) and restores the completion status that attempt
 // rolled back — the two graph-state halves of a refusal (WORKERS.md §10.7),
 // undone by the same machinery that wrote them.
-async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthrough, warn, runMaxMs, home }) {
+// `auto` (task-spor-gate-escalation-auto-regate-on-flake-fix) is the flake
+// sweep's call: `{issues, why}` — the fixed flake issues that cover every
+// failing test. It changes exactly two things on a pass: the closing artifact
+// names those issues, and the completion status the refusal rolled back is
+// NOT restored — an unattended path only ever removes the escalation's block
+// and leaves every terminal status on the item to a person.
+// `report` (optional) is filled in for a caller that must know what THIS call
+// did, not what the record says someone did: `claimed` once it owns the record,
+// `judged` once the pipeline actually ran.
+async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthrough, warn, runMaxMs, home, auto = null, report = null }) {
   if (!factory) {
     err("spor work --regate needs a factory — pass --factory <id> or set work.factory; a re-gate re-runs the factory's own gates.");
     return 1;
@@ -18857,6 +18882,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   try {
   const gateClaim = dispatchRuns.claimGateRecord(home, record.run_id, { workerId, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), reopen: { settleId: record.gate_settle_id || null, regateCount: Number(record.gate_regate_count) || 0, state: record.gate_state } });
   if (!gateClaim.ok) { err(`spor work --regate: ${gateClaim.refused || gateClaim.reason}`); return 1; }
+  if (report) report.claimed = true;
   const owns = () => freshRecord(home, record).gate_settle_id === gateClaim.token;
   const stamp = (patch) => dispatchRuns.stampGateState(home, record.run_id, patch, { own: gateClaim.token });
   // Bring the implementer's branch up to the trusted ref BEFORE judging it
@@ -18868,7 +18894,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // a dirty tree is left alone and refused by the gate as before.
   const refreshed = refreshBranchFromTrustedRef(record.cwd, factory.trustedRef);
   if (refreshed.refused) {
-    stamp({ gate_state: "failed", gate_reason: refreshed.refused });
+    stamp({ gate_state: "failed", gate_reason: refreshed.refused, gate_failing_tests: null, gate_empty_diff: false });
     err(`spor work --regate: ${refreshed.refused}`);
     return 1;
   }
@@ -18897,6 +18923,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     out(`work: re-gating ${record.node_id} — its implementation stage had settled '${record.impl_state}'; re-judging the run under attempt ${attempt}`);
   }
   const entry = { run_id: record.run_id, node_id: record.node_id, harness: record.harness || null, project, attempt };
+  if (report) report.judged = true;
   let res;
   try {
     res = await runGateAndIntegration(cfg, entry, record, {
@@ -18916,6 +18943,11 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     gate_state: state,
     gate_reason: reason,
     ...(res && res.escalated_to ? { gate_escalated_to: res.escalated_to, gate_escalation_ids: [...escalatedBefore, res.escalated_to] } : {}),
+    // Answered afresh by every attempt, like `gate_escalation_failed` below:
+    // a re-gate that failed on other tests (or on none it could read) must not
+    // leave the superseded attempt's list standing for the flake sweep.
+    gate_failing_tests: res && Array.isArray(res.failing_tests) ? res.failing_tests : null,
+    gate_empty_diff: !!(res && res.empty_diff),
     // Whether THIS attempt could file its escalation (task-spor-gate-escalation-
     // demote-atomic). Written either way, unlike the sticky `gate_demoted`
     // above: a demotion outlives the attempt that made it, but "nothing about
@@ -18952,7 +18984,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   const notes = [];
   if (!owns()) return 1;
   if (escalatedBefore.length) {
-    const closed = await writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo: escalatedBefore, project, state });
+    const closed = await writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo: escalatedBefore, project, state, auto });
     notes.push(closed.ok ? `closed ${escalatedBefore.join(", ")} with ${closed.id}` : `could not close ${escalatedBefore.join(", ")} (${closed.reason}) — resolve by hand`);
   }
   // A PASS restores the completion status the refusal rolled back. A SCOPED
@@ -18962,7 +18994,9 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // the verified outcome says is still outstanding. The rollback stands, and
   // the note says so rather than leaving it unexplained.
   if (!owns()) return 1;
-  if (record.gate_demoted && state === "scoped") {
+  if (auto && record.gate_demoted) {
+    notes.push(`left ${record.node_id}'s status for a person — an automatic re-gate only removes the escalation's block`);
+  } else if (record.gate_demoted && state === "scoped") {
     notes.push(`left ${record.node_id} open — a scoping result is not a completion, and the earlier rollback is where the scoping wants it`);
   } else if (record.gate_demoted) {
     const promoted = await gatePromoteItem(cfg, record.node_id);
@@ -19004,7 +19038,7 @@ function refreshBranchFromTrustedRef(cwd, trustedRef) {
 // the escalation the earlier refusal filed; they differ in what they claim was
 // judged, and this node is what a person reads later, so it must not say
 // "passed every gate" about a pass where no gate ran.
-async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo, project, state = "passed" }) {
+async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo, project, state = "passed", auto = null }) {
   const scoped = state === "scoped";
   const verdict = scoped ? "a verified no-code outcome" : "every gate passed";
   const stem = gateStem(entry.node_id);
@@ -19025,11 +19059,19 @@ async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, re
     "edges:",
     ...escalatedTo.map((id) => `  - {type: resolves, to: ${id}}`),
     `  - {type: relates-to, to: ${entry.node_id}}`,
+    ...((auto && auto.issues) || []).map((id) => `  - {type: relates-to, to: ${id}}`),
     "---",
     "",
     `\`spor work --regate ${entry.run_id}\` re-ran factory \`${factoryId}\`'s gates on the same run — the same committed`,
     `work, judged again after the cause of the earlier refusal was fixed outside the item. Previous verdict: ${flat(previous, 300)}.`,
     "",
+    ...(auto
+      ? [
+          `It ran UNATTENDED (\`spor work --regate-flakes\`): ${flat(auto.why, 400)}. The item's own status was left`,
+          "exactly as the refusal left it — an automatic re-gate removes the escalation's block and nothing else.",
+          "",
+        ]
+      : []),
     `Outcome: ${flat(reason || verdict, 300)}`,
     "",
     scoped
@@ -19039,6 +19081,259 @@ async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, re
   ];
   const written = await writeGateNode(cfg, id, gateCapBytes(lines.join("\n"), NODE_BODY_CAP_BYTES - 512));
   return { ...written, id };
+}
+
+// --- `spor work --regate-flakes` (task-spor-gate-escalation-auto-regate-on-flake-fix)
+// The unattended door back from a refusal that was never the item's. On
+// 2026-09-26 twenty three-week-old gate escalations each needed a person only
+// to notice their refusal was a flake that had since been fixed, or an empty
+// diff whose work already sat on main. This sweeps THIS box's run records and
+// does what that person did, under two rules that keep it from ever passing
+// work a person would not have:
+//
+//   - FLAKE-COVERED: every test the refusal recorded as failing
+//     (`gate_failing_tests`, gates.failingTests) is declared in `covers_tests:`
+//     by a graph node that is FIXED (a live resolver, or done/resolved). The
+//     sweep does not trust that reading on its own — it re-gates the run
+//     (cmdWorkRegate, the same door a person uses, which first merges the
+//     trusted ref so the fix is in the judged tree), and only a PASS retires
+//     the escalation. A re-gate that fails keeps it, files the new attempt's
+//     own escalation, and is annotated with an `art-flake-regate-…` note; the
+//     same covering set is never tried twice for one run.
+//   - EMPTY DIFF, WORK ON MAIN: the refusal was an empty-diff one
+//     (`gate_empty_diff`) and the item's live resolver cites commits that are
+//     all ancestors of the trusted ref. Re-gating an empty diff would refuse it
+//     again, so the escalation is retired directly with an artifact that says
+//     why.
+//
+// Neither path sets a terminal status on the item — it only removes the
+// escalation's block (the item's own resolver already stands). A controller-
+// completion record is therefore left to a person: its passing re-gate would
+// write the item's completion itself.
+function coveringFlakeNodes(graph) {
+  const out = [];
+  for (const n of Object.values(graph.nodes || {})) {
+    const covers = Array.isArray(n.covers_tests) ? n.covers_tests : [];
+    // A superseded cover speaks for nothing: its successor (if it declares
+    // the test) is the one whose state counts, and an open duplicate must not
+    // hold the test uncovered forever.
+    if (!covers.length || graph.supersededBy?.[n.id]) continue;
+    const status = String(n.status || "").toLowerCase();
+    const fixed = !!resolutionOf(graph, n.id) || status === "done" || status === "resolved";
+    out.push({ id: n.id, covers, fixed });
+  }
+  return out;
+}
+
+function graphNodeOpen(graph, id) {
+  const n = graph.nodes && graph.nodes[id];
+  if (!n) return false;
+  return !isTerminalStatus(n.status, n.type || null, graph) && !resolutionOf(graph, id) && !graph.supersededBy?.[id];
+}
+
+// Every commit the item's live resolver cites, and whether each is already on
+// the trusted ref in the run's checkout. `onMain` needs at least one citation
+// and EVERY one reachable — an unreadable sha (another repo's, a typo) is not
+// evidence the work landed here.
+function resolverOnTrustedRef(graph, nodeId, cwd, trustedRef) {
+  const r = resolutionOf(graph, nodeId);
+  if (!r || !r.by) return { onMain: false, why: `${nodeId} has no live resolver` };
+  const resolver = graph.nodes[r.by] || {};
+  const shas = (Array.isArray(resolver.commits) ? resolver.commits : []).map((c) => String(c).split("@").pop().trim()).filter((c) => /^[0-9a-f]{7,40}$/i.test(c));
+  if (!shas.length) return { onMain: false, resolver: r.by, why: `its resolver ${r.by} cites no commit` };
+  if (!cwd || !fs.existsSync(cwd)) return { onMain: false, resolver: r.by, why: "the run's checkout is gone" };
+  const git = (args) => gitSpawn(cwd, args, { env: gateRunner.judgeGitEnv() });
+  for (const sha of shas) {
+    if (git(["merge-base", "--is-ancestor", sha, trustedRef]).status !== 0) return { onMain: false, resolver: r.by, why: `${sha.slice(0, 8)} (cited by ${r.by}) is not on ${trustedRef}` };
+  }
+  return { onMain: true, resolver: r.by, shas, why: `${r.by} cites ${shas.map((x) => x.slice(0, 8)).join(", ")}, all on ${trustedRef}` };
+}
+
+async function loadSweepGraph(cfg) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  if (cfg.mode() !== "remote") return { graph: graphLib.loadGraph(cfg.nodesDir()) };
+  const fetched = await fetchRemoteExportNodes(cfg, "work --regate-flakes");
+  if (fetched.error) return { error: true };
+  try {
+    return { graph: graphLib.loadGraph(fetched.nodesDir) };
+  } finally {
+    fetched.cleanup();
+  }
+}
+
+function escalationsOf(record) {
+  return [...new Set([...(Array.isArray(record.gate_escalation_ids) ? record.gate_escalation_ids : []), record.gate_escalated_to].filter(Boolean))];
+}
+
+// Which of this box's refusals the sweep may act on, and how. Pure over the
+// records and a loaded graph apart from the empty-diff git read.
+function flakeSweepPlan(records, graph, { trustedRef, scope = null, isController = () => false, hasIntegration = false } = {}) {
+  const covering = coveringFlakeNodes(graph);
+  const plan = [];
+  for (const record of records) {
+    if (!record || !record.run_id || !record.node_id) continue;
+    if (!gatesKernel.SETTLED_GATE_STATES.has(record.gate_state) || !gatesKernel.canRegateState(record.gate_state)) continue;
+    if (!record.gate_escalated_to || !graphNodeOpen(graph, record.gate_escalated_to)) continue;
+    const skip = (why) => plan.push({ record, action: "skip", why });
+    if (scope && scope.size && !gatesKernel.inRepoScope(record.item_repo, scope, graph)) continue;
+    if (record.gate_empty_diff) {
+      if (record.gate_retired) continue;
+      const main = resolverOnTrustedRef(graph, record.node_id, record.cwd, trustedRef);
+      if (main.onMain) plan.push({ record, action: "retire", why: main.why, resolver: main.resolver });
+      else skip(`empty diff, but ${main.why}`);
+      continue;
+    }
+    if (!Array.isArray(record.gate_failing_tests) || !record.gate_failing_tests.length) continue;
+    const attempted = (record.gate_flake_regate && record.gate_flake_regate.issues) || [];
+    const cov = gatesKernel.flakeCoverage(record.gate_failing_tests, covering, { attempted });
+    if (!cov.covered) {
+      skip(cov.why);
+      continue;
+    }
+    if (isController(record)) {
+      skip(`${cov.why}, but a passing re-gate would write the item's completion itself — re-gate it by hand ('spor work --regate ${record.run_id}')`);
+      continue;
+    }
+    // A factory with an integration stage lands (or proposes) the branch on a
+    // pass, and a proposal's merge later restores the item's completion — far
+    // more than removing a block, so it stays a person's re-gate too.
+    if (hasIntegration) {
+      skip(`${cov.why}, but this factory's integration stage would land the branch on a pass — re-gate it by hand ('spor work --regate ${record.run_id}')`);
+      continue;
+    }
+    plan.push({ record, action: "regate", issues: cov.issues, why: cov.why });
+  }
+  return plan;
+}
+
+async function writeSweepNote(cfg, { kind, record, factoryId, escalations, related = [], title, summary, body, resolves = false }) {
+  const stem = gateStem(record.node_id);
+  const attempt = (Number(record.gate_regate_count) || 0) + 1;
+  const short = gateRunner.shortRunAttempt(record.run_id, attempt);
+  const id = `art-${kind}-${stem}-${short}-${gateIdSuffix(kind, factoryId || "factory", record.node_id, gateRunner.gateRunKey(record.run_id, attempt))}`.toLowerCase();
+  const flat = (t, cap) => {
+    const x = String(t || "").replace(/\s+/g, " ").trim();
+    return x.length > cap ? `${x.slice(0, cap - 1)}…` : x;
+  };
+  const lines = [
+    "---",
+    `id: ${id}`,
+    "type: artifact",
+    ...(record.item_repo ? [`project: ${record.item_repo}`] : []),
+    `title: ${flat(title, 120)}`,
+    `summary: ${flat(summary, 460)}`,
+    `date: ${new Date().toISOString().slice(0, 10)}`,
+    "edges:",
+    ...escalations.map((e) => `  - {type: ${resolves ? "resolves" : "relates-to"}, to: ${e}}`),
+    `  - {type: relates-to, to: ${record.node_id}}`,
+    ...related.filter(Boolean).map((r) => `  - {type: relates-to, to: ${r}}`),
+    "---",
+    "",
+    body,
+    "",
+  ];
+  const written = await writeGateNode(cfg, id, gateCapBytes(lines.join("\n"), NODE_BODY_CAP_BYTES - 512));
+  return { ...written, id };
+}
+
+async function cmdWorkRegateFlakes(cfg, values, ctx) {
+  const { factory, factoryId, home, factoryRepos = [] } = ctx;
+  if (!factory) {
+    err("spor work --regate-flakes needs a factory — pass --factory <id> or set work.factory; a re-gate re-runs the factory's own gates.");
+    return 1;
+  }
+  const loaded = await loadSweepGraph(cfg);
+  if (loaded.error) return 1;
+  const graph = loaded.graph;
+  const records = dispatchRuns.listRuns(home, {});
+  const scope = factoryRepos.length ? gatesKernel.repoScope(factoryRepos, graph) : null;
+  const plan = flakeSweepPlan(records, graph, { trustedRef: factory.trustedRef, scope, isController: (r) => completionKernel.isControllerRecord(r), hasIntegration: !!factory.integration });
+  let acted = 0;
+  let failed = 0;
+  for (const step of plan) {
+    const { record } = step;
+    const short = String(record.run_id).slice(0, 8);
+    if (step.action === "skip") {
+      out(`work: left ${record.gate_escalated_to} (run ${short}, ${record.node_id}) — ${step.why}`);
+      continue;
+    }
+    const escalations = escalationsOf(record);
+    if (step.action === "retire") {
+      const note = await writeSweepNote(cfg, {
+        kind: "gate-retire", record, factoryId, escalations, related: [step.resolver], resolves: true,
+        title: `Gate escalation retired — ${record.node_id}'s empty diff was already on ${factory.trustedRef}`,
+        summary: `Run ${short} on ${record.node_id} was refused for an empty diff, but the item's live resolver ${step.why}: the work had already landed, so the escalation is retired without a person. The item's status is left as it is.`,
+        body: [
+          `\`spor work --regate-flakes\` retired the escalation run ${short} filed on ${record.node_id}.`,
+          "",
+          `The gate refused an EMPTY diff: the branch carried no change against ${factory.trustedRef}. That is the`,
+          `expected shape when the work had already landed there, and it had: ${step.why}.`,
+          "",
+          "Re-gating an empty diff would only refuse it again, so this artifact resolves the escalation directly.",
+          "No terminal status was set on the item — its own resolver already stands.",
+        ].join("\n"),
+      });
+      if (note.ok) {
+        dispatchRuns.stampGateState(home, record.run_id, { gate_retired: { at: new Date().toISOString(), by: note.id, why: step.why } }, { allowSettledPatch: true });
+        out(`work: retired ${escalations.join(", ")} (run ${short}, ${record.node_id}) with ${note.id} — ${step.why}`);
+        acted += 1;
+      } else {
+        out(`work: could not retire ${escalations.join(", ")} (run ${short}) — ${note.reason || "the artifact write failed"}`);
+        failed += 1;
+      }
+      continue;
+    }
+    // action === "regate"
+    // RESERVE the attempt before running it: the attempted set is the UNION
+    // of every covering issue this run was ever re-gated against, so two
+    // still-flaky tests cannot alternate the sweep round a loop, and a stamp
+    // that did not land means no re-gate at all (never an untracked one).
+    const prior = record.gate_flake_regate || null;
+    const tried = [...new Set([...((prior && prior.issues) || []), ...step.issues])].sort();
+    const reservation = { issues: tried, tests: record.gate_failing_tests, at: new Date().toISOString(), state: "running" };
+    const reserved = dispatchRuns.stampGateState(home, record.run_id, { gate_flake_regate: reservation }, { allowSettledPatch: true });
+    if (!reserved || !reserved.gate_flake_regate || reserved.gate_flake_regate.at !== reservation.at) {
+      out(`work: could not record the unattended re-gate of run ${short} on its record — not re-gating it`);
+      failed += 1;
+      continue;
+    }
+    out(`work: re-gating ${record.node_id} (run ${short}) unattended — ${step.why}`);
+    const report = {};
+    const code = await cmdWorkRegate(cfg, { regate: record.run_id }, { ...ctx, auto: { issues: step.issues, why: step.why }, report });
+    const after = freshRecord(home, record);
+    // Whether THIS call took the record — never inferred from the record's
+    // counter, which a racing manual `--regate` moves just the same.
+    if (!report.claimed) {
+      // Refused before judging (a live gate on it, say): nothing was tried, so
+      // the reservation is handed back and the next sweep may try again.
+      dispatchRuns.stampGateState(home, record.run_id, { gate_flake_regate: prior }, { allowSettledPatch: true });
+      failed += 1;
+      continue;
+    }
+    dispatchRuns.stampGateState(home, record.run_id, { gate_flake_regate: { ...reservation, state: after.gate_state || null } }, { allowSettledPatch: true });
+    if (code === 0) {
+      acted += 1;
+      continue;
+    }
+    failed += 1;
+    const note = await writeSweepNote(cfg, {
+      kind: "flake-regate", record, factoryId, escalations, related: [...step.issues, after.gate_escalated_to !== record.gate_escalated_to ? after.gate_escalated_to : null],
+      title: `Automatic re-gate after a flake fix still refused ${record.node_id}`,
+      summary: `Run ${short} on ${record.node_id} was re-gated unattended because ${step.why}, and the re-gate settled '${after.gate_state || "failed"}' — so the refusal was not only the flake, and its escalation stays for a person.`,
+      body: [
+        `\`spor work --regate-flakes\` re-gated run ${short} on ${record.node_id}: ${step.why}.`,
+        "",
+        `The re-gate settled '${after.gate_state || "failed"}'${after.gate_reason ? `: ${String(after.gate_reason).slice(0, 300)}` : "."}`,
+        ...(!report.judged ? ["", "No gate ran: the re-gate stopped before judging the tree."] : Array.isArray(after.gate_failing_tests) && after.gate_failing_tests.length ? ["", `It failed on: ${after.gate_failing_tests.join(", ")}.`] : []),
+        "",
+        "The escalation this annotates stays open: the flake fix did not clear the refusal. The sweep will not",
+        `re-gate this run against the same flake issues again (${step.issues.join(", ")}).`,
+      ].join("\n"),
+    });
+    if (!note.ok) out(`work: the re-gate annotation for run ${short} could not be written (${note.reason || "no response"})`);
+  }
+  out(`work: flake sweep — ${acted} escalation(s) retired, ${failed} attempt(s) did not clear, ${plan.filter((p) => p.action === "skip").length} left for a person`);
+  return failed ? 1 : 0;
 }
 
 // The code a worker RUNS is the code it loaded at startup — a long-running
@@ -19509,6 +19804,9 @@ async function cmdWork(cfg, { values }) {
   // no polling, no dispatching (task-spor-work-regate).
   if (values.regate) {
     return cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthrough, warn: (line) => err(line), runMaxMs, home });
+  }
+  if (values["regate-flakes"]) {
+    return cmdWorkRegateFlakes(cfg, values, { factory, factoryId, slug, passthrough, warn: (line) => err(line), runMaxMs, home, factoryRepos });
   }
 
   const candidates = async ({ cooling = null } = {}) => {
@@ -22400,6 +22698,7 @@ const COMMANDS = {
       "run-max": { type: "string", value: "H", desc: "hours to follow one run before freeing its slot (default 24)" },
       "run-idle": { type: "string", value: "M", desc: "minutes of silence (nothing written to a run's log or transcript) before stopping it as wedged (default 45; 0 disables)" },
       regate: { type: "string", value: "run-id", desc: "re-judge one refused run under the factory (after fixing what refused it) and exit" },
+      "regate-flakes": { type: "boolean", desc: "sweep this box's refused runs: re-gate every one whose failing tests all belong to a since-fixed flake (covers_tests), retire empty-diff refusals whose work is already on the trusted ref, and exit" },
       max: { type: "string", value: "N", desc: "stop after N dispatches (default: run forever)" },
       once: { type: "boolean", desc: "one selection pass, wait for those runs, exit" },
       "restart-on-land": { type: "boolean", desc: "exit cleanly (after in-flight runs and pipelines settle) when the checkout this worker loaded its code from moves past that code, so a supervisor restarts it on the new code (also work.restartOnLand; self-hosting factories)" },
@@ -22889,7 +23188,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
+module.exports = { forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
 
 if (require.main === module) {
   main()

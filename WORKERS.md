@@ -1042,6 +1042,10 @@ written only after the outcome dimension exists):
 | `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}, rescue, pools}`: each gate's own memory (§10.4), saved after every review verdict (with the fix it decided on as `lastFix.dispatched: false`) and again when the fix's launch is known (`fixes` counts LAUNCHED fixes only). `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on. `pools` is the pipeline's shared INFRASTRUCTURE pool — `{retry: {spent}}`, §10.4 — carried by every other save under the same key; unlike the rest of the stamp its write is NOT best-effort, since a retry nobody recorded is one the next resume would grant again. All three writers (the gates' ledger, the rescue lane's entries, the pool) rewrite this ONE object, so every write is a compare-and-set on `seq` under the attempt's `key`: a writer that read before another landed is refused and rebuilds on the winner's state rather than erasing it — an erased pool charge is an unrecorded retry |
 | `gate_escalation_failed` | boolean | optional — set when the refusal (a gate's, or the integration stage's, §10.9) could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that the bounded auto-retry below — or `spor work --regate` once it gives up — is the door back. Cleared (`false`) once an escalation lands, by hand or by the auto-retry |
 | `gate_escalation_pending` | object | optional (§10.7) — the exact args `deps.escalate` needs to replay the failed write. A gate refusal's: `{gateId, attempt, attempts, detail, evidence, findings, ledger, factId, rescue?, rescues?}`; the integration stage's (§10.9): `{stage: "integration", gateId: "integration", attempt, attempts, detail, evidence, factId}` — `stage` is what routes the replay to the stage's own escalation (a declared gate may be named `integration` too), and `factId` names the refusal's own `art-gate-…`/`art-merge-…` fact so a landed retry can close it. What the bounded auto-retry reads; absent for a blocked human gate (no escalate call to replay). Cleared (`null`) once the escalation lands |
+| `gate_failing_tests` | array | optional — the refusal's STRUCTURED failing-test list: the test files (`gates.failingTests` — test paths only, never a stack frame's lib file) a charged command-gate failure named, in first-seen order. Absent when the failure named no test file or could not be read whole (a run with no readable path, the path cap exceeded) — which keeps the refusal out of the flake sweep below. The same list rides the escalation's frontmatter as `failing_tests: […]`. A re-gate answers it afresh (`null` when its own attempt recorded none) |
+| `gate_empty_diff` | boolean | optional — `true` when the refusal was an empty-diff one (the branch carried no change against the trusted ref), so the sweep below can find it without reading prose |
+| `gate_flake_regate` | object | optional — `{issues, tests, at, state}`: the flake sweep re-gated this run unattended; `issues` is the UNION of every covering issue any sweep re-gated it against (reserved, `state: running`, BEFORE the re-gate runs, handed back if the re-gate refused before judging), and `state` is what the last one settled. A run is never re-gated against a covering set already inside `issues` |
+| `gate_retired` | object | optional — `{at, by, why}`: the sweep retired this empty-diff refusal's escalation with artifact `by`; `gate_state` is left as it was |
 | `gate_escalation_retry_count` | number | optional — how many times the bounded auto-retry has attempted this refusal's escalation write, landed or not. `0` the moment `gate_escalation_pending` is first stamped |
 | `gate_escalation_retry_at` | ISO 8601 | optional — the earliest time the next auto-retry attempt may run (exponential backoff from `work.escalationRetryBackoffMs`, capped at `work.escalationRetryMaxBackoffMs`). Absent means "due now" |
 | `gate_escalation_retry_exhausted` | boolean | optional — the auto-retry spent `work.escalationRetryMaxAttempts` attempts without landing the escalation and gave up loudly (one log line); `spor work --regate` is the only door left |
@@ -2412,6 +2416,47 @@ writer (the loop, a resumed pipeline, a duplicate adopter) still cannot. The
 auto-retry above is not an exception: it never touches `gate_state` itself,
 only the escalation/demotion fields beside a verdict that stays exactly what
 it was.
+
+**A refusal that was only a fixed flake is re-judged without a person**
+(task-spor-gate-escalation-auto-regate-on-flake-fix). On 2026-09-26 twenty
+three-week-old escalations each needed a person only to notice that the refusal
+was a flake since fixed, or an empty diff whose work already sat on main. Two
+pieces of data make that noticing mechanical: a charged command-gate failure
+records its failing TEST files as a list (`gate_failing_tests` on the run
+record, `failing_tests:` on the escalation), and a flake issue declares the
+tests it covers (`covers_tests:`, stamped on every `issue-flake-*` the pipeline
+files and writable by hand on any issue or task that fixes a flake). `spor work
+--regate-flakes --factory <id>` sweeps this box's settled refusals whose latest
+escalation is still open and does one of three things:
+
+- **every failing test is covered by a FIXED node** (a live resolver, or
+  `done`/`resolved` — a dismissed, abandoned or superseded one fixed nothing):
+  the run is re-gated through the same door as `--regate` (so the trusted ref,
+  and with it the flake's fix, is merged in first). Only a PASS retires the
+  escalation, with the `art-regate-…` artifact naming the flake issues. A
+  re-gate that fails keeps the escalation, files its own attempt's escalation as
+  any refusal does, and is annotated with an `art-flake-regate-…` note. The
+  issues a run was re-gated against accumulate (a union, reserved on the record
+  before the re-gate runs), and a covering set already inside it is never tried
+  again — so a flake that comes back after its "fix", or two still-flaky tests
+  failing by turns, go to a person rather than round a loop. A test with ANY
+  open cover (an `-r2` recurrence beside the fixed original) is not covered.
+- **an empty-diff refusal whose item's live resolver cites commits that are all
+  ancestors of the trusted ref**: the work already landed there, so re-gating
+  would only refuse the empty diff again — the escalation is retired directly
+  with an `art-gate-retire-…` artifact and `gate_retired` is stamped.
+- **anything else** — a failing test no fixed flake covers (a real failure
+  beside the flake), a covering issue still open, no recorded list at all — is
+  left, and the sweep says why.
+
+Neither path sets a terminal status on the item: a passing unattended re-gate
+does NOT restore the completion status the refusal rolled back (a manual
+`--regate` does) — it only removes the escalation's block. For the same reason a
+controller-completion record (§10.12) is skipped with a note: its passing
+re-gate would write the item's completion itself, so it stays a person's
+`--regate` — and so is every run of a factory that declares an `integration:`
+stage (§10.9), whose pass would land or propose the branch. Refusals filed before these fields existed carry no list and are not
+swept.
 
 ### 10.8 An interrupted pipeline is resumed, not lost
 

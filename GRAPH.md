@@ -929,6 +929,14 @@ edges:
   optional `@YYYY-MM-DD` expiry) is per-viewer presentation only: the queue
   hides those items for this person and reports how many it hid; they stay live
   and visible to everyone else (QUEUE.md §4).
+- **`covers_tests`** (flat inline list of repo-relative test file paths) on a
+  flake issue — or the task that fixes one — declares which tests that flake
+  covers; the gate pipeline stamps it on every `issue-flake-*` it files. Its
+  twin **`failing_tests`** is written by the gate pipeline on a `task-gate-*`
+  escalation: the test files a command gate's refusal failed in. Once every
+  failing test of a refusal is covered by a FIXED node (a live resolver, or
+  `done`/`resolved`), `spor work --regate-flakes` re-gates the run unattended
+  and retires the escalation only on a pass (WORKERS.md §10.7).
 - **`roles`** (flat inline list, e.g. `roles: [reviewer, maintainer]`) is the
   qualification register the org-defined policy layer reads. A scoped `policy`
   node's gate counts approvals from persons holding a named role — the

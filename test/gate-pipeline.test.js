@@ -3918,6 +3918,194 @@ test("--regate re-pins the factory candidate with THIS invocation's own worker i
   assert.notStrictEqual(after.impl_candidate.provenance.worker, loopWorker, "a single-shot regate mints its own identity rather than borrowing the loop's");
 });
 
+// ------------------------------------ spor work --regate-flakes (flake sweep) --
+// task-spor-gate-escalation-auto-regate-on-flake-fix: a refusal whose only
+// failing tests belong to a since-FIXED flake is re-gated without a person, and
+// only a passing re-gate retires its escalation. The refusal record and the
+// escalation carry the failing tests as structured data; a flake issue declares
+// the tests it covers in `covers_tests:`.
+
+test("failingTests keeps only the test files of a readable, untruncated reading", () => {
+  assert.deepStrictEqual(gates.failingTests({ files: ["test/a.test.js", "lib/x.js", "test/b.js"] }), ["test/a.test.js", "test/b.js"]);
+  assert.strictEqual(gates.failingTests({ files: ["lib/x.js"] }), null, "no test file named: nothing to cover");
+  assert.strictEqual(gates.failingTests({ files: ["test/a.test.js"], unreadable: true }), null, "an unreadable run makes the list untrustworthy");
+  assert.strictEqual(gates.failingTests({ files: ["test/a.test.js"], truncated: true }), null);
+  assert.strictEqual(gates.failingTests(null), null);
+});
+
+test("flakeCoverage: ALL failing tests covered by a FIXED flake, never twice for the same set", () => {
+  const covering = [
+    { id: "issue-flake-a", covers: ["test/a.test.js"], fixed: true },
+    { id: "issue-flake-b", covers: ["test/b.test.js"], fixed: false },
+  ];
+  const all = gates.flakeCoverage(["test/a.test.js"], covering);
+  assert.strictEqual(all.covered, true);
+  assert.deepStrictEqual(all.issues, ["issue-flake-a"]);
+  const mixed = gates.flakeCoverage(["test/a.test.js", "test/real.test.js"], covering);
+  assert.strictEqual(mixed.covered, false);
+  assert.deepStrictEqual(mixed.uncovered, ["test/real.test.js"]);
+  assert.match(mixed.why, /no known flake/);
+  const open = gates.flakeCoverage(["test/b.test.js"], covering);
+  assert.strictEqual(open.covered, false);
+  assert.match(open.why, /issue-flake-b.*not fixed yet/);
+  assert.strictEqual(gates.flakeCoverage([], covering).covered, false, "no recorded failing tests never triggers");
+  const recurred = gates.flakeCoverage(["test/a.test.js"], [...covering, { id: "issue-flake-a-r2", covers: ["test/a.test.js"], fixed: false }]);
+  assert.strictEqual(recurred.covered, false, "an open recurrence beside the fixed original says the fix did not hold");
+  const both = [{ id: "issue-flake-a", covers: ["test/a.test.js"], fixed: true }, { id: "issue-flake-c", covers: ["test/c.test.js"], fixed: true }];
+  assert.strictEqual(gates.flakeCoverage(["test/c.test.js"], both, { attempted: ["issue-flake-a", "issue-flake-c"] }).covered, false, "a union of earlier attempts bounds tests that fail by turns");
+  const again = gates.flakeCoverage(["test/a.test.js"], covering, { attempted: ["issue-flake-a"] });
+  assert.strictEqual(again.covered, false);
+  assert.match(again.why, /already re-gated once/);
+});
+
+// A demo repo whose trusted suite fails naming `failing` test files until
+// lib/fixed.js exists on main — the shape of a flake that a later fix clears.
+function flakeSweepFixture({ failing, flakeStatus = "resolved", covers = ["test/flaky.test.js"] }) {
+  const fx = cliFixture({ factoryPayload: OK_FACTORY });
+  const { repo, nodes } = fx;
+  const lines = failing.map((f) => `console.error("✖ a flaky case\\n    at ${f}:3:1");`).join("\n");
+  fs.writeFileSync(path.join(repo, "test", "acceptance.js"), `const fs = require("fs");\nif (!fs.existsSync("lib/fixed.js")) { ${lines} process.exit(1); }\n`);
+  git(repo, "checkout", "-q", "main");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "a suite that flakes");
+  git(repo, "checkout", "-q", "impl");
+  git(repo, "merge", "-q", "--no-edit", "main");
+  fs.writeFileSync(
+    path.join(nodes, "issue-flake-known.md"),
+    `---\nid: issue-flake-known\ntype: issue\ntitle: A known flake\nsummary: test/flaky.test.js flakes under load.\nstatus: ${flakeStatus}\ncovers_tests: [${covers.join(", ")}]\ndate: 2026-08-26\n---\nFlaky.\n`
+  );
+  const env = { SPOR_HOME: fx.home, XDG_CONFIG_HOME: fx.home, GATE_OUTFILE: fx.outfile, PATH: pathWithOnlyGitAndNode() };
+  const first = cli(["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--factory", "factory-demo"], env);
+  assert.strictEqual(first.status, 0, `${first.stderr}\n${first.stdout}`);
+  const runId = fs.readdirSync(path.join(fx.home, "journal", "dispatch")).find((f) => f.endsWith(".run.json")).replace(".run.json", "");
+  const recordPath = path.join(fx.home, "journal", "dispatch", `${runId}.run.json`);
+  const fixMain = () => {
+    git(repo, "checkout", "-q", "main");
+    fs.writeFileSync(path.join(repo, "lib", "fixed.js"), "module.exports = true;\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "fix the flake");
+    git(repo, "checkout", "-q", "impl");
+  };
+  return { ...fx, env, runId, recordPath, fixMain, record: () => JSON.parse(fs.readFileSync(recordPath, "utf8")) };
+}
+
+test("the refusal record and the escalation carry the structured failing-test list", () => {
+  const f = flakeSweepFixture({ failing: ["test/flaky.test.js", "test/other.test.js"] });
+  const rec = f.record();
+  assert.strictEqual(rec.gate_state, "failed");
+  assert.deepStrictEqual(rec.gate_failing_tests, ["test/flaky.test.js", "test/other.test.js"]);
+  const esc = fs.readFileSync(path.join(f.nodes, `${rec.gate_escalated_to}.md`), "utf8");
+  assert.match(esc, /^failing_tests: \[test\/flaky\.test\.js, test\/other\.test\.js\]$/m);
+  const graphLib = require("../lib/graph.js");
+  assert.deepStrictEqual(graphLib.loadGraph(f.nodes).nodes[rec.gate_escalated_to].failing_tests, ["test/flaky.test.js", "test/other.test.js"], "it parses back as a list");
+});
+
+test("an ALL-flake refusal re-gates unattended and retires its escalation on a pass — the item's status is left alone", () => {
+  const f = flakeSweepFixture({ failing: ["test/flaky.test.js"] });
+  const escalation = f.record().gate_escalated_to;
+  // A refusal that rolled the item's completion back: the sweep must not
+  // restore it (no terminal status on the target from this path).
+  runnerStamp(f.home, f.runId, { gate_demoted: true });
+  f.fixMain();
+  const r = cli(["work", "--regate-flakes", "--factory", "factory-demo"], f.env);
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, /re-gating task-ready \(run [0-9a-f]{8}\) unattended — every failing test is covered by a fixed flake \(issue-flake-known\)/);
+  assert.match(r.stdout, new RegExp(`closed ${escalation} with art-regate-ready-`));
+  assert.match(r.stdout, /left task-ready's status for a person/);
+  const art = fs.readdirSync(f.nodes).find((n) => n.startsWith("art-regate-ready-"));
+  const body = fs.readFileSync(path.join(f.nodes, art), "utf8");
+  assert.match(body, new RegExp(`- \\{type: resolves, to: ${escalation}\\}`));
+  assert.match(body, /- \{type: relates-to, to: issue-flake-known\}/);
+  assert.match(body, /UNATTENDED/);
+  assert.match(fs.readFileSync(path.join(f.nodes, "task-ready.md"), "utf8"), /status: open/, "the target's status is untouched");
+  const after = f.record();
+  assert.strictEqual(after.gate_state, "passed");
+  assert.deepStrictEqual(after.gate_flake_regate.issues, ["issue-flake-known"]);
+  assert.strictEqual(after.gate_failing_tests, null, "a passing attempt leaves no failing tests standing");
+  // Nothing left to do on a second sweep.
+  const again = cli(["work", "--regate-flakes", "--factory", "factory-demo"], f.env);
+  assert.strictEqual(again.status, 0, again.stderr);
+  assert.match(again.stdout, /flake sweep — 0 escalation\(s\) retired, 0 attempt\(s\) did not clear, 0 left/);
+});
+
+test("a MIXED refusal (a flake beside a real failure) is left for a person", () => {
+  const f = flakeSweepFixture({ failing: ["test/flaky.test.js", "test/real.test.js"] });
+  f.fixMain();
+  const r = cli(["work", "--regate-flakes", "--factory", "factory-demo"], f.env);
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, /left task-gate-acceptance-ready-.* — test\/real\.test\.js belongs to no known flake/);
+  const after = f.record();
+  assert.strictEqual(after.gate_state, "failed");
+  assert.strictEqual(after.gate_regate_count || 0, 0, "nothing was re-gated");
+  assert.ok(!fs.readdirSync(f.nodes).some((n) => n.startsWith("art-regate-")));
+});
+
+test("a flake issue that is not FIXED yet does not trigger a re-gate", () => {
+  const f = flakeSweepFixture({ failing: ["test/flaky.test.js"], flakeStatus: "open" });
+  f.fixMain();
+  const r = cli(["work", "--regate-flakes", "--factory", "factory-demo"], f.env);
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, /covered only by issue-flake-known, which is not fixed yet/);
+  assert.strictEqual(f.record().gate_regate_count || 0, 0);
+});
+
+test("a re-gate that still FAILS keeps the escalation, annotates it, and is never retried against the same flake", () => {
+  const f = flakeSweepFixture({ failing: ["test/flaky.test.js"] });
+  const escalation = f.record().gate_escalated_to;
+  // The flake issue reads fixed, but main was never actually fixed.
+  const r = cli(["work", "--regate-flakes", "--factory", "factory-demo"], f.env);
+  assert.strictEqual(r.status, 1, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, /re-gate of task-ready failed/);
+  assert.ok(!fs.readdirSync(f.nodes).some((n) => n.startsWith("art-regate-")), "no resolving artifact: the escalation stays");
+  const graphLib = require("../lib/graph.js");
+  const resolution = require("../lib/kernel/resolution.js");
+  const g = graphLib.loadGraph(f.nodes);
+  assert.strictEqual(resolution.resolutionOf(g, escalation), null, "the original escalation is still open");
+  const note = fs.readdirSync(f.nodes).find((n) => n.startsWith("art-flake-regate-"));
+  assert.ok(note, "the escalation is annotated");
+  const body = fs.readFileSync(path.join(f.nodes, note), "utf8");
+  assert.match(body, new RegExp(`- \\{type: relates-to, to: ${escalation}\\}`));
+  assert.doesNotMatch(body, /type: resolves/);
+  const after = f.record();
+  assert.strictEqual(after.gate_state, "failed");
+  assert.strictEqual(after.gate_flake_regate.state, "failed");
+  const again = cli(["work", "--regate-flakes", "--factory", "factory-demo"], f.env);
+  assert.match(again.stdout, /already re-gated once against issue-flake-known/);
+  assert.strictEqual(f.record().gate_regate_count, 1, "the same fix is never tried twice");
+});
+
+test("an EMPTY-diff refusal whose item's resolver cites commits already on the trusted ref is retired without a re-gate", () => {
+  const fx = cliFixture({ factoryPayload: OK_FACTORY });
+  const { repo, nodes, home } = fx;
+  git(repo, "reset", "-q", "--hard", "main"); // the branch carries nothing: the work already landed on main
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, GATE_OUTFILE: fx.outfile, PATH: pathWithOnlyGitAndNode() };
+  const first = cli(["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--factory", "factory-demo"], env);
+  assert.strictEqual(first.status, 0, `${first.stderr}\n${first.stdout}`);
+  const runId = fs.readdirSync(path.join(home, "journal", "dispatch")).find((f) => f.endsWith(".run.json")).replace(".run.json", "");
+  const recordPath = path.join(home, "journal", "dispatch", `${runId}.run.json`);
+  const rec = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  assert.strictEqual(rec.gate_empty_diff, true, "the empty-diff refusal says so structurally");
+  const escalation = rec.gate_escalated_to;
+  // No resolver yet: left for a person.
+  const early = cli(["work", "--regate-flakes", "--factory", "factory-demo"], env);
+  assert.match(early.stdout, /empty diff, but task-ready has no live resolver/);
+  const sha = git(repo, "rev-parse", "main").trim();
+  fs.writeFileSync(path.join(nodes, "art-ready-done.md"), `---\nid: art-ready-done\ntype: artifact\ntitle: Ready is done\nsummary: Landed on main.\ncommits: [demo@${sha.slice(0, 12)}]\ndate: 2026-08-26\nedges:\n  - {type: resolves, to: task-ready}\n---\nDone.\n`);
+  const r = cli(["work", "--regate-flakes", "--factory", "factory-demo"], env);
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, new RegExp(`retired ${escalation} .* with art-gate-retire-ready-`));
+  const art = fs.readdirSync(nodes).find((n) => n.startsWith("art-gate-retire-ready-"));
+  assert.match(fs.readFileSync(path.join(nodes, art), "utf8"), new RegExp(`- \\{type: resolves, to: ${escalation}\\}`));
+  const after = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  assert.strictEqual(after.gate_state, "failed", "no verdict is laundered — only the escalation is retired");
+  assert.ok(after.gate_retired);
+});
+
+function runnerStamp(home, runId, patch) {
+  const runs = require("../lib/shell/agent-dispatch-runner.js");
+  runs.stampGateState(home, runId, patch, { allowSettledPatch: true });
+}
+
 test("stampGateState refuses to overwrite a settled verdict unless the caller is an explicit re-gate", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-stamp-"));
   const dir = path.join(home, "journal", "dispatch");
