@@ -11209,7 +11209,22 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     // a spawn's `cwd` moves the child's real working directory but leaves the
     // INHERITED `PWD` pointing at the launcher's — pin it to launchDir so the two
     // launch modes agree instead of disagreeing about which env var is authoritative.
-    const r = spawnPortableSync(harnessBin, nativeArgs, { cwd: launchDir, stdio: "inherit", env: dispatchRuns.judgedChildEnv({ ...u.gitEnv(), PWD: launchDir }) });
+    // Piped rather than inherited, so this launcher can inspect the child's own
+    // output for a recognized launch refusal (below) — e.g. the workspace-trust
+    // one `claude --bg` exits with in a never-opened repo
+    // (issue-spor-dispatch-bg-untrusted-workspace). Forwarded verbatim right
+    // after the (short-lived) launch call returns, so the operator still sees
+    // exactly what an inherited stdio would have shown, just not streamed live.
+    // `maxBuffer` must be raised explicitly: Node's spawnSync default (1MiB)
+    // would otherwise SIGTERM a chattier launch (verbose logging, a noisy MCP
+    // startup banner) that `stdio: "inherit"` had never bounded at all, turning
+    // mere output volume into a false launch failure (and a released claim).
+    const r = spawnPortableSync(harnessBin, nativeArgs, {
+      cwd: launchDir, stdio: ["inherit", "pipe", "pipe"], encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
+      env: dispatchRuns.judgedChildEnv({ ...u.gitEnv(), PWD: launchDir }),
+    });
+    if (r.stdout) process.stdout.write(r.stdout);
+    if (r.stderr) process.stderr.write(r.stderr);
     if (r.error) {
       dispatchRuns.updateRun(nativeRun, {
         state: "failed_launch", termination_class: "launch", termination_signal: "launch-failed",
@@ -11226,12 +11241,20 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       return 1;
     }
     const launcherOk = r.status === 0;
+    // A recognized, harness-declared reason the launcher itself refused
+    // (currently: claude-code's workspace-trust refusal) is told apart from an
+    // ordinary bad-args/crash nonzero exit so the run's recorded error names
+    // the actual cause instead of a generic 'launcher-nonzero'.
+    const refusal = !launcherOk && typeof harnessAdapter.launchRefusal === "function"
+      ? harnessAdapter.launchRefusal(`${r.stdout || ""}\n${r.stderr || ""}`)
+      : null;
     dispatchRuns.updateRun(nativeRun, launcherOk
       ? { state: "running", launched_at: new Date().toISOString(), launcher_exit: 0 }
       : {
           state: "failed_launch", launcher_exit: r.status == null ? null : r.status,
-          termination_class: "launch", termination_signal: "launcher-nonzero",
-          termination_reason: `${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`,
+          termination_class: "launch", termination_signal: refusal ? refusal.signal : "launcher-nonzero",
+          termination_reason: refusal ? refusal.reason : `${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`,
+          ...(refusal ? { error: refusal.reason } : null),
           finished_at: new Date().toISOString(),
           ...dispatchRuns.unenforcedOutcome("failed_launch", "the harness left no background agent, so nothing was verified against the graph"),
         });
@@ -11250,7 +11273,12 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       // behind — the same "no agent will ever attend this node" case the
       // spawn-error branch above already aborts on, so it needs the same
       // releaseClaimOnAbort() so the claim doesn't strand the node.
-      err(`${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`);
+      if (refusal) {
+        err(`${harnessBin} refused to launch: ${refusal.reason}`);
+        err(`  hint: ${refusal.hint}`);
+      } else {
+        err(`${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`);
+      }
       await abortLaunch();
       return r.status == null ? 1 : r.status;
     }

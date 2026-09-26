@@ -20,6 +20,10 @@ const { waitFor, waitForFile, stubExitTail } = require("./helpers/launch.js");
 // hazard) is a pure-ish helper (fs only, no CLI parsing) exported for direct
 // unit testing, same seam spor-cli.test.js uses for nodeFloor/nodeRuntimeCheck.
 const cli = require(CLI);
+// Read back a native-background run's own record for its recorded outcome —
+// the trust-refusal tests below assert on what the run record says, not just
+// on the CLI's own printed hint.
+const dispatchRunner = require(path.join(__dirname, "..", "lib", "shell", "agent-dispatch-runner.js"));
 
 // Env with no SPOR_*/SUBSTRATE_* leakage; force LOCAL mode (no server). Also
 // isolate the config-cascade homes to an empty temp dir so the developer's real
@@ -2590,6 +2594,34 @@ function claudeBoomStub(dir) {
   return writeSpawnableNodeStub(dir, "claude-boom", "process.exit(7);");
 }
 
+// A claude stub reproducing the workspace-trust refusal
+// (issue-spor-dispatch-bg-untrusted-workspace): prints the trust-refusal text
+// to stderr and exits 1 before ever leaving a background agent behind, the
+// same shape a real `claude --bg` takes in a directory whose trust dialog was
+// never accepted.
+function claudeTrustRefusalStub(dir) {
+  return writeSpawnableNodeStub(dir, "claude-untrusted", `
+process.stderr.write("Workspace not trusted\\n");
+process.exit(1);
+`);
+}
+
+// A claude stub that is merely CHATTY (>1MiB combined stdout+stderr — well
+// past Node's spawnSync default maxBuffer) before touching `sentinel` and
+// exiting 0. The native launch pipes this child's output to inspect it for a
+// recognized refusal (claudeWorkspaceTrustRefusal); piping without raising
+// maxBuffer would have Node SIGTERM a child this verbose, misreporting mere
+// output volume as a launch failure and releasing the claim it just
+// established.
+function claudeChattyStub(dir, sentinel) {
+  return writeSpawnableNodeStub(dir, "claude-chatty", `
+const fs = require("node:fs");
+process.stdout.write("x".repeat(2 * 1024 * 1024));
+process.stderr.write("y".repeat(2 * 1024 * 1024));
+fs.writeFileSync(${JSON.stringify(sentinel)}, "launched\\n");
+`);
+}
+
 test("dispatch <node-id> (remote): auto-claims the node, then launches the agent", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ claimStatus: 200 });
@@ -2703,6 +2735,54 @@ test("dispatch (remote): a harness that exits non-zero without leaving an agent 
     assert.ok(release, "the freshly-established claim was released");
     assert.match(release.url, /^\/v1\/nodes\/task-rotate\/release$/);
     assert.match(r.stdout, /released the claim/);
+  } finally {
+    srv.close();
+  }
+});
+
+// issue-spor-dispatch-bg-untrusted-workspace: a `claude --bg` refusal for an
+// untrusted workspace is a RECOGNIZED launch failure, not a generic
+// 'launcher-nonzero' — the run record must carry the trust-refusal reason and
+// the CLI must print a clear hint, so an operator hitting this on a fresh
+// clone or worktree knows what to do instead of a bare "failed_launch".
+test("dispatch (remote): a claude --bg workspace-trust refusal is recorded and hinted, not a generic launch failure", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const stub = claudeTrustRefusalStub(home);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub }));
+    assert.notStrictEqual(r.status, 0, "the refusal is surfaced, not swallowed");
+    assert.match(r.stderr, /refused to launch/i);
+    assert.match(r.stderr, /workspace.*trust/i);
+    assert.match(r.stderr, /hint:.*claude.*interactively/i, "prints the actionable hint (run claude once, or drop --bg)");
+    assert.ok(claimHit(hits), "the claim was established");
+    assert.ok(releaseHit(hits), "the freshly-established claim is still released on this launch failure");
+    const [record] = dispatchRunner.readRunRecords(home);
+    assert.ok(record, "a run record was written");
+    assert.strictEqual(record.state, "failed_launch");
+    assert.strictEqual(record.termination_signal, "workspace-not-trusted", "told apart from a generic 'launcher-nonzero'");
+    assert.match(record.termination_reason, /workspace.*trust/i);
+    assert.match(record.error, /workspace.*trust/i);
+  } finally {
+    srv.close();
+  }
+});
+
+// The maxBuffer regression this fix's own review caught: piping stdio to
+// inspect it for a refusal must not turn a merely CHATTY (but successful)
+// launch into a false launch failure.
+test("dispatch (remote): a claude --bg launch with >1MiB combined output still succeeds — piping never SIGTERMs a chatty child", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeChattyStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(fs.existsSync(sentinel), "the chatty bg agent still launched");
+    assert.ok(!releaseHit(hits), "a successful (if chatty) launch never releases its own lease");
+    const [record] = dispatchRunner.readRunRecords(home);
+    assert.strictEqual(record.state, "running", "not misreported as a launch failure from output volume alone");
   } finally {
     srv.close();
   }
