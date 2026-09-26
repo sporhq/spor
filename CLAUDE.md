@@ -71,8 +71,17 @@ are thin CLI wrappers over it. There's a zero-dep `node:test` suite under
 `test/` (including the conformance goldens). Run it from the repo root:
 
 ```bash
-npm test                                              # node --test test/*.test.js
+npm test                                              # scripts/test-run.js: node --test test/*.test.js
+npm run test:shard -- 2/4                             # one of n deterministic FILE shards
 ```
+
+`scripts/test-run.js` runs one test file per core (node's own default is
+cores-1, i.e. serial on a two-core box; `SPOR_TEST_CONCURRENCY` overrides),
+maps `--shard i/n` to node's `--test-shard` so n jobs cover every file exactly
+once, and preloads `test/helpers/compile-cache.js`, which points every spawned
+CLI at a shared V8 compile cache (task-spor-test-suite-runtime-budget). On a
+loaded box the suite's wall time is CPU starvation, not sleeps — a ~0.1
+CPU-second CLI spawn takes ~2s at load 30 — so per-spawn CPU is the lever.
 
 A full run under fleet load can outlast a caller's timeout (the Bash tool
 caps at 600s). A SIGTERM to the runner cancels every unfinished file, so the

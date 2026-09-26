@@ -42,7 +42,8 @@ See [CLAUDE.md](CLAUDE.md) for the full set of project rules and gotchas.
 ## Before you open a PR
 
 ```bash
-npm test            # the zero-dep node:test suite (test/*.test.js)
+npm test            # the zero-dep node:test suite (test/*.test.js), one file per core
+                    # (`npm run test:shard -- <i>/<n>` runs one of n file shards)
 npm run conformance # the byte-identical golden suite
 ```
 

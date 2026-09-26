@@ -29,6 +29,7 @@ const { spawn, spawnSync } = require("node:child_process");
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const { gitBlobSha } = require("../bin/spor.js");
 const { pathWithOnlyGitAndNode } = require("./helpers/portable");
+const { scale } = require("./helpers/launch.js");
 
 function cleanEnv(extra = {}) {
   const env = {};
@@ -68,8 +69,13 @@ function noopGate(id) {
   return { id, kind: "command", command: `${JSON.stringify(process.execPath)} -e "process.exit(0)"` };
 }
 
-async function waitFor(fn, { deadlineMs = 15000, stepMs = 200, label = "condition" } = {}) {
-  const deadline = Date.now() + deadlineMs;
+// Each reading is a synchronous CLI spawn (readWorker) that may itself take
+// seconds on a loaded box, and the deadline is only checked between readings,
+// so a flat 15s let a couple of slow spawns exhaust it. The base is generous
+// and scales with load like the shared launch waits (helpers/launch.js): a
+// ceiling here is a backstop against a hang, never a bound on a slow pass.
+async function waitFor(fn, { deadlineMs = 60000, stepMs = 200, label = "condition" } = {}) {
+  const deadline = Date.now() + scale(deadlineMs);
   let last;
   for (;;) {
     last = fn();

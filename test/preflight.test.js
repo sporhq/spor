@@ -34,7 +34,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const preflight = require("../lib/shell/preflight.js");
 const dispatchHarnesses = require("../lib/shell/dispatch-harnesses.js");
 const { writeSpawnableNodeStub, pathWithOnlyGitAndNode } = require("./helpers/portable");
-const { waitForFile, scale } = require("./helpers/launch.js");
+const { waitForFile } = require("./helpers/launch.js");
 
 // ------------------------------------------------------------- pure layer --
 
@@ -353,24 +353,41 @@ test("zero-wait concurrent candidate claims are exclusive and acquire after cont
     `const preflight = require(${JSON.stringify(path.join(__dirname, "..", "lib", "shell", "preflight.js"))});
 (async () => {
   const r = await preflight.acquireWorkspace(process.argv[2], process.argv[3], { waitMs: 0 });
-  process.stdout.write(JSON.stringify({ ok: r.ok, held: !!r.token, degraded: r.degraded || null }));
+  process.stdout.write(JSON.stringify({ ok: r.ok, held: !!r.token, degraded: r.degraded || null }) + "\\n");
   // Hold it: the point is whether BOTH believe they own it at the same moment.
-  // A loaded box can stretch node-spawn + require() latency past a fixed hold,
-  // so the loser's read can land after the winner already exited and its pid
-  // reads as recycled rather than alive — the hold must scale with load too.
-  await new Promise((res) => setTimeout(res, Number(process.argv[4])));
+  // The hold ends when the parent closes our stdin, which it does only once
+  // BOTH contenders have reported, so the loser's read can never land after
+  // the winner already exited (where its pid would read as recycled rather
+  // than alive). An ordering, not a fixed hold: a hold long enough for a
+  // loaded box cost this test a minute of sleeping on every run.
+  process.stdin.resume();
+  process.stdin.on("end", () => process.exit(0));
 })();
 `
   );
-  const contend = () =>
-    new Promise((resolve) => {
+  const contend = () => {
+    const c = spawn(process.execPath, [script, home, dir], { stdio: ["pipe", "pipe", "ignore"] });
+    const closed = new Promise((resolve) => c.on("close", resolve));
+    const reported = new Promise((resolve) => {
       let out = "";
-      const c = spawn(process.execPath, [script, home, dir, String(scale(1500))], { stdio: ["ignore", "pipe", "ignore"] });
-      c.stdout.on("data", (d) => (out += d));
-      c.on("close", () => resolve(JSON.parse(out || "{}")));
+      const settle = () => {
+        let parsed = {};
+        try { parsed = JSON.parse(out.split("\n")[0] || "{}"); } catch { /* a torn or crashed report fails the asserts below */ }
+        resolve(parsed);
+      };
+      c.stdout.on("data", (d) => {
+        out += d;
+        if (out.includes("\n")) settle();
+      });
+      c.on("close", settle);
     });
+    return { child: c, reported, closed };
+  };
   for (let attempt = 0; attempt < 5; attempt++) {
-    const [a, b] = await Promise.all([contend(), contend()]);
+    const racers = [contend(), contend()];
+    const [a, b] = await Promise.all(racers.map((r) => r.reported));
+    for (const r of racers) r.child.stdin.end();
+    await Promise.all(racers.map((r) => r.closed));
     const holders = [a, b].filter((r) => r.held).length;
     for (const result of [a, b]) {
       assert.strictEqual(typeof result.ok, "boolean", "a contender must report a real acquisition result");

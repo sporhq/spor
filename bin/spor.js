@@ -20,7 +20,6 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const https = require("https");
 const crypto = require("crypto");
 const { spawn, spawnSync } = require("child_process");
 const { parseArgs } = require("util");
@@ -7487,7 +7486,9 @@ async function npmLatest(timeoutMs = 4000) {
       }
     };
     try {
-      const req = https.get("https://registry.npmjs.org/@sporhq%2Fspor/latest", { headers: { accept: "application/json" } }, (res) => {
+      // Required here, not at the top: `https` (tls + http) is a measurable
+      // share of every CLI start, and only this version check ever uses it.
+      const req = require("https").get("https://registry.npmjs.org/@sporhq%2Fspor/latest", { headers: { accept: "application/json" } }, (res) => {
         if (res.statusCode !== 200) {
           res.resume();
           return finish(null);
