@@ -4,3 +4,10 @@
 .claude/settings.json
 # Playwright CLI page-snapshot scratch from browser-driven sessions.
 .playwright-cli/
+# The client is zero-dep, so node_modules is never source. No trailing slash:
+# a stray node_modules SYMLINK must be ignored too — 029263b committed
+# `node_modules -> ../spor/node_modules`, a self-loop in the main checkout that
+# npm's run-script PATH walk hit as `spawn ELOOP` (exit 216, no output) on every
+# `npm test` there and in every worktree beneath it
+# (issue-spor-npm-test-exit-216-non-tty).
+/node_modules
