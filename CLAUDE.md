@@ -371,6 +371,24 @@ residual sessions are bound by a terminal `done` dispatch record still on disk â
 the evidence channel covers the whole residual â€” and that none of those records
 carries a project/server/org, which is why attribution has to come from
 `origin.json` rather than from the record.
+**Why the default is still off** (dec-spor-nudge-async-default-stays-off-2026-09-04,
+superseding dec-spor-nudge-async-defer-sessionend): `scripts/analysis/measure-async-nudge-loss.js`
+replays the journal counterfactually against the shipped SessionEnd drain. Over
+2026-08-01..09-04 it puts 24.6% of classified findings beyond the prompt-time
+drain, and the SessionEnd drain recovers 73.7% of their facts verbatim. That
+leaves AT MOST 5 of 69 facts (0%-7.2%) durably lost. The residual is a BOUND,
+not a measured rate, because a SessionEnd firing is only observed indirectly:
+the distiller's llm-calls row or its `distill.log` line, and both sit BELOW
+`sessionEndPendingNudges` inside `distill()`. So `sessionEndOutcome` brackets
+the drain moment with evidence at both ends instead of a chosen lag:
+- `too-late` means the result was not on disk even at the observable.
+- `captured` means it was on disk before the session's own last transcript entry.
+- Everything between is `drain-time-unresolved` and is charged to the upper bound.
+`--drain-lag-sec` is only a what-if printed beside the range. Prompt-drain
+verdicts are scored on the ASYNC clock. The scored window is pinned in
+`scripts/analysis/sessionend-replay-2026-09-04.json` (every scored finding,
+drained ones included), so the denominator survives transcript pruning. Re-pin
+rather than re-cite. The flip lives in task-spor-flip-nudge-async-default-on.
 The default synchronous path is byte-identical (the drain and its
 syscalls are gated on the flag). See test/nudge-async.test.js and
 test/nudge-sweep.test.js.
