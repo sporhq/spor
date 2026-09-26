@@ -514,6 +514,32 @@ function batchStub({ results } = {}) {
   });
   return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
 }
+// batchStub's twin that also answers GET /v1/status, so the priority-POST
+// skip (task-spor-cli-put-node-skip-priority-post-when-server-stamps) can be
+// exercised with the capability advertised true or false.
+function capabilityStub({ capable, results } = {}) {
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      hits.push({ method: req.method, url: req.url, body });
+      const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+      if (req.url === "/v1/status" && req.method === "GET") {
+        return j(200, { capabilities: { priority_stamped_on_create: capable } });
+      }
+      if (req.url === "/v1/nodes" && req.method === "POST") {
+        const nodes = JSON.parse(body).nodes;
+        const rs = nodes.map((e, n) => (results && results[n]) || { ok: true, status: "created", id: /\nid: (\S+)/.exec("\n" + e.node.split("\n").slice(1).join("\n"))[1], revision: `rev-${n}`, warnings: [] });
+        return j(rs.some((x) => !x.ok) ? 207 : 200, { results: rs });
+      }
+      const m = /^\/v1\/nodes\/([^/]+)\/priority$/.exec(req.url);
+      if (m && req.method === "POST") return j(200, { ok: true, status: "updated", id: m[1], revision: "rev-prio" });
+      return j(404, { error: { code: "not_found" } });
+    });
+  });
+  return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
 function runStdinAsync(args, input, env) {
   return new Promise((resolve) => {
     let out = "", errOut = "";
@@ -571,6 +597,98 @@ test("put-node (remote) single create with a priority goes through the set_prior
     assert.strictEqual(r.status, 0, r.stderr);
     assert.strictEqual(r.stdout, `put-node created: task-one @ rev-0\npriority set: task-one -> p3\n  -> remote ${base}\n`);
     assert.ok(hits.some((h) => h.url === "/v1/nodes/task-one/priority"));
+  } finally {
+    srv.close();
+  }
+});
+
+// --- skip the follow-up priority POST when the server stamps on create ------
+// (task-spor-cli-put-node-skip-priority-post-when-server-stamps)
+
+test("put-node (remote) single create sends no priority POST when the server advertises priority_stamped_on_create", async () => {
+  const { srv, hits, base } = await capabilityStub({ capable: true });
+  try {
+    const file = tmpNodeFile(taskMd("task-stamped", "priority: p3\n"));
+    const r = await runAsync(["put-node", file], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stdout, `put-node created: task-stamped @ rev-0\n  -> remote ${base}\n`);
+    assert.ok(hits.some((h) => h.method === "GET" && h.url === "/v1/status"), "checked /v1/status");
+    assert.ok(!hits.some((h) => h.url.endsWith("/priority")), "no follow-up priority POST");
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) single create still POSTs priority when the server does not advertise the capability", async () => {
+  const { srv, hits, base } = await capabilityStub({ capable: false });
+  try {
+    const file = tmpNodeFile(taskMd("task-unstamped", "priority: p3\n"));
+    const r = await runAsync(["put-node", file], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stdout, `put-node created: task-unstamped @ rev-0\npriority set: task-unstamped -> p3\n  -> remote ${base}\n`);
+    assert.ok(hits.some((h) => h.url === "/v1/nodes/task-unstamped/priority"));
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) single create still POSTs priority against an older server with no capabilities field at all", async () => {
+  // batchStub answers 404 for GET /v1/status (no such route on an old server),
+  // the same "capability absent" reading capabilityStub({capable:false}) gives.
+  const { srv, hits, base } = await batchStub();
+  try {
+    const file = tmpNodeFile(taskMd("task-old-server", "priority: p3\n"));
+    const r = await runAsync(["put-node", file], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /priority set: task-old-server -> p3/);
+    assert.ok(hits.some((h) => h.url === "/v1/nodes/task-old-server/priority"));
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) batch sends no priority POST for any created node when the server stamps on create", async () => {
+  const done = taskMd("task-done-stamped", "status: done\npriority: p2\n");
+  const art = artMd("art-done-stamped", "task-done-stamped");
+  const { srv, hits, base } = await capabilityStub({ capable: true });
+  try {
+    const r = await runStdinAsync(["put-node", "--if-exists", "skip"], done + art, remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stdout,
+      "put-node created: art-done-stamped @ rev-0\nput-node created: task-done-stamped @ rev-1\n" +
+      `put-node batch: 2 created (2 entries)\n  -> remote ${base}\n`);
+    assert.ok(!hits.some((h) => h.url.endsWith("/priority")), "no follow-up priority POST for any entry");
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) a create with no priority never probes /v1/status", async () => {
+  const { srv, hits, base } = await capabilityStub({ capable: true });
+  try {
+    const file = tmpNodeFile(taskMd("task-no-priority"));
+    const r = await runAsync(["put-node", file], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stdout, `put-node created: task-no-priority @ rev-0\n  -> remote ${base}\n`);
+    assert.ok(!hits.some((h) => h.url === "/v1/status"), "the capability probe is only paid when a create actually carries a priority");
+  } finally {
+    srv.close();
+  }
+});
+
+// A bad priority under --if-exists skip/update is judged only AFTER the
+// create lands (--if-exists error is the only policy that pre-refuses it),
+// via the very call the capability skip guards — so the skip must never let
+// an invalid value through just because the server also stamps on create.
+test("put-node (remote) still refuses a bad priority on create even when the server advertises priority_stamped_on_create", async () => {
+  const { srv, hits, base } = await capabilityStub({ capable: true });
+  try {
+    const file = tmpNodeFile(taskMd("task-badprio-capable", "priority: high\n"));
+    const r = await runAsync(["put-node", file, "--if-exists", "skip"], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /priority 'high' not allowed — use p1, p2, or p3/);
+    assert.ok(!hits.some((h) => h.url === "/v1/status"), "an invalid priority is refused before the capability is ever probed");
+    assert.ok(!hits.some((h) => h.url.endsWith("/priority")), "no priority POST for a value that was never valid");
   } finally {
     srv.close();
   }

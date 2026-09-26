@@ -1536,6 +1536,43 @@ async function stampCreatedPriority(cfg, node, id) {
   return { ok: true, priority, revision: (r.json && r.json.revision) || null };
 }
 
+// GET /v1/status once per invocation and cache its `capabilities` map — narrow
+// on purpose (not a general status cache): the priority-POST skip below is its
+// first and only consumer. A transport failure or an old server with no
+// `capabilities` field caches as {} so a batch never retries the probe per
+// entry, and every capability reads as absent (fail open to the pre-capability
+// behavior below).
+let _remoteCapabilitiesCache = null;
+async function remoteCapabilities(cfg) {
+  if (_remoteCapabilitiesCache) return _remoteCapabilitiesCache;
+  const r = await remote.get(cfg, "/v1/status", { timeoutMs: 6000 });
+  _remoteCapabilitiesCache = (!r.transport && r.ok && r.json && r.json.capabilities) || {};
+  return _remoteCapabilitiesCache;
+}
+
+// Gate in front of stampCreatedPriority (task-spor-cli-put-node-skip-priority-
+// post-when-server-stamps): when the server advertises
+// capabilities.priority_stamped_on_create (fb3bde1, spor-server), _putNodeNow
+// already stamped priority_by/_at/_via from the create itself, so the
+// follow-up POST /v1/nodes/{id}/priority would only re-set an unchanged value
+// — a wasted round trip, harmless only because stampField now no-ops on it.
+// Against an older server (capability absent), fall through to the POST as
+// before. Returns null (no stamp to render) when skipped.
+//
+// checkCreatePriority runs FIRST, unconditionally: under --if-exists
+// skip/update carriesPriority (and so this whole path) is reached even for an
+// INVALID value (--if-exists error already refused it before any create, but
+// skip/update judge it only after the fact, per the call sites above). That
+// refusal is stampCreatedPriority's job, not the network call's — skipping
+// straight to `caps.priority_stamped_on_create` would let a bad priority on a
+// capable server through with no error and exit 0.
+async function stampCreatedPriorityIfNeeded(cfg, node, id) {
+  if (checkCreatePriority(node)) return stampCreatedPriority(cfg, node, id);
+  const caps = await remoteCapabilities(cfg);
+  if (caps.priority_stamped_on_create) return null;
+  return stampCreatedPriority(cfg, node, id);
+}
+
 function renderPriorityStamp(id, stamp) {
   if (!stamp) return;
   if (stamp.ok) out(`priority set: ${id} -> ${stamp.priority}`);
@@ -1778,7 +1815,8 @@ async function cmdPutNodeBatch(cfg, values, docs, policy) {
         if (res0 && res0.ok) {
           const node = byId.get(e.id).node;
           if (res0.status === "created" && carriesPriority(node)) {
-            res0.priority_stamp = await stampCreatedPriority(cfg, node, res0.id || e.id);
+            const stamp = await stampCreatedPriorityIfNeeded(cfg, node, res0.id || e.id);
+            if (stamp) res0.priority_stamp = stamp;
           }
           record(e, res0);
         } else {
@@ -1899,7 +1937,8 @@ async function cmdPutNode(cfg, { values, positionals }) {
       return 1;
     }
     if (res0.status === "created" && carriesPriority(parsed.node)) {
-      res0.priority_stamp = await stampCreatedPriority(cfg, parsed.node, res0.id || id);
+      const stamp = await stampCreatedPriorityIfNeeded(cfg, parsed.node, res0.id || id);
+      if (stamp) res0.priority_stamp = stamp;
     }
     renderPutNodeResult(cfg, res0, !!values.json);
     return res0.priority_stamp && !res0.priority_stamp.ok ? 1 : 0;
