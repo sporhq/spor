@@ -6445,6 +6445,31 @@ async function cmdAdminGardener(cfg, args) {
     return 1;
   }
   if (notAdminHint(r)) return 1;
+  // 429: the on-demand sweep cooldown refused a genuinely new sweep
+  // (task-spor-server-gardener-on-demand-cooldown) — read Retry-After (seconds)
+  // for when to retry, and the body's error message for why, rather than
+  // surfacing a bare HTTP error. 409 is the pre-existing in-flight guard (a
+  // caller that would only JOIN a sweep already running never reaches either
+  // of these — it gets the ordinary 200 join). Both are refusals, not
+  // transport/auth failures, so they're checked ahead of the generic !r.ok
+  // fallback below, which still covers every other status unchanged.
+  if (r.status === 429) {
+    const reason = (r.json && r.json.error && r.json.error.message) || null;
+    const retryAfterSeconds = Number(r.headers && r.headers["retry-after"]);
+    if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+      const retryAt = new Date(Date.now() + retryAfterSeconds * 1000);
+      err(`gardener sweep refused: cooldown — retry in ${retryAfterSeconds}s (at ${retryAt.toLocaleTimeString()})`);
+    } else {
+      err("gardener sweep refused: cooldown in effect");
+    }
+    if (reason) err(`  ${reason}`);
+    return 1;
+  }
+  if (r.status === 409) {
+    const reason = (r.json && r.json.error && r.json.error.message) || "a gardener sweep is already in flight";
+    err(`gardener sweep refused: ${reason}`);
+    return 1;
+  }
   if (!r.ok) {
     err(`gardener sweep failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
     return 1;

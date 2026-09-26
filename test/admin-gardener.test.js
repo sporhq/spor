@@ -44,17 +44,33 @@ function runAsync(args, env) {
 }
 
 // Records every request; serves a scriptable POST /v1/gardener so the method,
-// path, and bearer passthrough are all observable.
-function gardenerStub({ body = null, status = 200 } = {}) {
+// path, and bearer passthrough are all observable. `retryAfter`/`errorBody`
+// let the 429 (cooldown, task-spor-server-gardener-on-demand-cooldown) and 409
+// (in-flight) refusals be scripted with the server's real shape: a
+// Retry-After header (seconds) plus a `{error:{code,message}}` body.
+function gardenerStub({ body = null, status = 200, retryAfter = null, errorBody = null } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let raw = "";
     req.on("data", (d) => (raw += d));
     req.on("end", () => {
       hits.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: raw });
-      const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+      const j = (code, b, extraHeaders) => {
+        res.writeHead(code, { "content-type": "application/json", ...(extraHeaders || {}) });
+        res.end(JSON.stringify(b));
+      };
       if (req.method === "POST" && req.url === "/v1/gardener") {
         if (status === 403) return j(403, { error: { code: "forbidden", message: "admin privilege required: a stewards edge to the graph root" } });
+        if (status === 429) {
+          return j(
+            429,
+            errorBody || { error: { code: "rate_limited", message: `on-demand gardener sweep cooldown in effect; retry after ${retryAfter}s` } },
+            retryAfter != null ? { "retry-after": String(retryAfter) } : {}
+          );
+        }
+        if (status === 409) {
+          return j(409, errorBody || { error: { code: "conflict", message: "a gardener sweep is already in flight" } });
+        }
         if (status !== 200) return j(status, { error: { code: "server_error", message: "boom" } });
         return j(200, body);
       }
@@ -149,6 +165,65 @@ test("admin gardener (remote) a non-200 surfaces the server's message, exit 1", 
     const r = await runAsync(["admin", "gardener"], remoteEnv(base));
     assert.strictEqual(r.status, 1);
     assert.match(r.stderr, /gardener sweep failed \(500\): boom/);
+  } finally {
+    srv.close();
+  }
+});
+
+// 429: the on-demand sweep cooldown (task-spor-server-gardener-on-demand-cooldown,
+// this task's server-side sibling). The CLI must print the retry time it reads
+// off Retry-After, plus the server's reason, instead of a bare "failed (429)".
+test("admin gardener (remote) a 429 prints the cooldown retry time from Retry-After, exit 1, no bare HTTP error", async () => {
+  const { srv, base } = await gardenerStub({ status: 429, retryAfter: 120 });
+  try {
+    const r = await runAsync(["admin", "gardener"], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /gardener sweep refused: cooldown — retry in 120s \(at .+\)/);
+    assert.match(r.stderr, /on-demand gardener sweep cooldown in effect; retry after 120s/);
+    assert.doesNotMatch(r.stderr, /gardener sweep failed \(429\)/, "not the bare HTTP-error fallback");
+  } finally {
+    srv.close();
+  }
+});
+
+test("admin gardener (remote) a 429 with no Retry-After header still refuses clearly, exit 1", async () => {
+  const { srv, base } = await gardenerStub({
+    status: 429,
+    errorBody: { error: { code: "rate_limited", message: "cooldown in effect, try later" } },
+  });
+  try {
+    const r = await runAsync(["admin", "gardener"], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /gardener sweep refused: cooldown in effect/);
+    assert.match(r.stderr, /cooldown in effect, try later/);
+  } finally {
+    srv.close();
+  }
+});
+
+// 409: the pre-existing in-flight guard (a caller that only JOINS an in-flight
+// sweep still gets the unchanged 200 join — this is the genuinely-conflicting case).
+test("admin gardener (remote) a 409 says a sweep is already in flight, exit 1, no bare HTTP error", async () => {
+  const { srv, base } = await gardenerStub({ status: 409 });
+  try {
+    const r = await runAsync(["admin", "gardener"], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /gardener sweep refused: a gardener sweep is already in flight/);
+    assert.doesNotMatch(r.stderr, /gardener sweep failed \(409\)/, "not the bare HTTP-error fallback");
+  } finally {
+    srv.close();
+  }
+});
+
+test("admin gardener (remote) a 409 with a server message surfaces it verbatim, exit 1", async () => {
+  const { srv, base } = await gardenerStub({
+    status: 409,
+    errorBody: { error: { code: "conflict", message: "sweep xyz already running" } },
+  });
+  try {
+    const r = await runAsync(["admin", "gardener"], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /gardener sweep refused: sweep xyz already running/);
   } finally {
     srv.close();
   }
