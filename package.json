@@ -47,7 +47,7 @@
   ],
   "scripts": {
     "release": "node scripts/release.js",
-    "test": "node --require ./test/helpers/tmp-cleanup.js --test test/*.test.js",
+    "test": "node --require ./test/helpers/tmp-cleanup.js --require ./test/helpers/interrupt-notice.js --test test/*.test.js",
     "test:e2e": "node --require ./test/helpers/tmp-cleanup.js --test test/e2e-claude.test.js",
     "test:e2e:codex": "node --require ./test/helpers/tmp-cleanup.js --test test/e2e-codex-dispatch.test.js",
     "test:e2e:opencode": "node --require ./test/helpers/tmp-cleanup.js --test test/e2e-opencode-dispatch.test.js",

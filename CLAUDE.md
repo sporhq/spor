@@ -74,6 +74,13 @@ are thin CLI wrappers over it. There's a zero-dep `node:test` suite under
 npm test                                              # node --test test/*.test.js
 ```
 
+A full run under fleet load can outlast a caller's timeout (the Bash tool
+caps at 600s). A SIGTERM to the runner cancels every unfinished file, so the
+alphabetical tail of `test/` shows "Promise resolution is still pending but
+the event loop has already resolved". That is the outer stop, not a flake in
+those files, and `test/helpers/interrupt-notice.js` says so on stderr. Run a
+long suite detached to a log and poll it.
+
 Also verify by exercising the real CLI paths (unchanged contracts):
 
 ```bash
