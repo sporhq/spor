@@ -207,7 +207,11 @@ A few of these have enough surface to be worth a sentence:
   nodes on stdin submit them as one batch (`--if-exists error|skip`): every
   entry is parsed before anything is written, resolvers are moved ahead of the
   nodes they `resolves`/`answers`, and each node gets a created/skipped/error
-  line. A NEW node carrying `priority: p1|p2|p3` is stamped
+  line. Locally the batch is all-or-nothing: the whole batch is validated
+  against the graph it would produce, and one invalid entry means nothing is
+  written (a `skip`ped existing node never blocks it). Remotely each entry
+  lands or fails on its own, in resolver-first order — a later failure does
+  not roll back earlier entries, so re-run with `--if-exists skip`. A NEW node carrying `priority: p1|p2|p3` is stamped
   (`priority_by/_at/_via`) exactly as `spor priority` would stamp it.
 - **`spor compile`/`spor brief`/`spor search`** are mode-aware: local runs the
   in-repo compiler, remote dispatches to the server (this is what `/spor:brief`

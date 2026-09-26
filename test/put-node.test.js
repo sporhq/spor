@@ -467,6 +467,23 @@ test("put-node (local) batch refuses the whole input on one bad entry", () => {
   assert.ok(!fs.existsSync(path.join(nodes, "task-ok.md")));
 });
 
+test("put-node (local) batch is all-or-nothing: a structurally invalid later entry writes nothing", () => {
+  const { home, nodes } = fixtureGraph();
+  const noTitle = taskMd("task-three").replace("title: Task task-three\n", "");
+  const r = runStdin(["put-node"], taskMd("task-one") + taskMd("task-two") + noTitle, { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.match(r.stderr, /task-three.*\n.*missing title/);
+  assert.match(r.stderr, /nothing written/);
+  for (const id of ["task-one", "task-two", "task-three"]) assert.ok(!fs.existsSync(path.join(nodes, `${id}.md`)), `${id} leaked`);
+  // an existing entry skipped under --if-exists skip is never validated as a
+  // write and does not block the batch
+  fs.writeFileSync(path.join(nodes, "task-three.md"), taskMd("task-three"));
+  const ok = runStdin(["put-node", "--if-exists", "skip"], taskMd("task-one") + taskMd("task-two") + noTitle, { SPOR_HOME: home });
+  assert.strictEqual(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, /put-node batch: 2 created, 1 skipped \(3 entries\)/);
+  assert.strictEqual(readNode(nodes, "task-three"), taskMd("task-three"));
+});
+
 test("put-node batch refuses --if-exists update and a file plus --dir", () => {
   const { home } = fixtureGraph();
   const r = runStdin(["put-node", "--if-exists", "update", "--revision", "abc"], taskMd("task-a") + taskMd("task-b"), { SPOR_HOME: home });

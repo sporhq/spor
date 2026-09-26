@@ -1376,12 +1376,13 @@ function validatePutNodeLocal(nodesDir, node, raw) {
   }
 }
 
-// The single-node local write, shared by the one-node door and the batch loop:
-// collision policy -> revision check -> priority stamp -> validate -> write.
-// Returns {ok:true, res} or {ok:false, error}. `stampIdentity` is a thunk so
-// the git-config read only happens for a create that actually carries a
-// priority (task-spor-cli-put-node-batch).
-function putNodeLocal(nodesDir, raw, node, policy, revision, stampIdentity) {
+// The per-node half of a local write that needs no graph copy: collision
+// policy -> revision check -> priority stamp. Shared by the one-node door and
+// the batch. Returns {ok:false, error}, {ok:true, skip: res} for a skipped
+// entry, or {ok:true, file, exists, raw, node, priority} ready to validate.
+// `stampIdentity` is a thunk so the git-config read only happens for a create
+// that actually carries a priority (task-spor-cli-put-node-batch).
+function preparePutNodeLocal(nodesDir, raw, node, policy, revision, stampIdentity) {
   const id = node.id;
   const file = path.join(nodesDir, `${id}.md`);
   const exists = fs.existsSync(file);
@@ -1392,7 +1393,7 @@ function putNodeLocal(nodesDir, raw, node, policy, revision, stampIdentity) {
     return { ok: false, error: `node already exists: ${id} (use --if-exists update with --revision, or --if-exists skip)` };
   }
   if (policy === "skip" && exists) {
-    return { ok: true, res: { ok: true, status: "skipped", id, revision: gitBlobSha(fs.readFileSync(file)), warnings: [] } };
+    return { ok: true, skip: { ok: true, status: "skipped", id, revision: gitBlobSha(fs.readFileSync(file)), warnings: [] } };
   }
   if (policy === "update") {
     if (!exists) return { ok: false, error: `no such node: ${id}` };
@@ -1417,13 +1418,83 @@ function putNodeLocal(nodesDir, raw, node, policy, revision, stampIdentity) {
       return { ok: false, error: `invalid node after priority stamp: ${e.message}` };
     }
   }
+  return { ok: true, file, exists, raw, node, priority };
+}
 
-  const valid = validatePutNodeLocal(nodesDir, node, raw);
+function writePreparedPutNode(p, warnings) {
+  fs.writeFileSync(p.file, p.raw);
+  const res = { ok: true, status: p.exists ? "updated" : "created", id: p.node.id, revision: gitBlobSha(Buffer.from(p.raw)), warnings };
+  if (p.priority) res.priority_stamp = { ok: true, priority: p.priority };
+  return res;
+}
+
+// The single-node local write: prepare -> validate -> write.
+// Returns {ok:true, res} or {ok:false, error}.
+function putNodeLocal(nodesDir, raw, node, policy, revision, stampIdentity) {
+  const p = preparePutNodeLocal(nodesDir, raw, node, policy, revision, stampIdentity);
+  if (!p.ok) return p;
+  if (p.skip) return { ok: true, res: p.skip };
+  const valid = validatePutNodeLocal(nodesDir, p.node, p.raw);
   if (valid.error) return { ok: false, error: valid.error };
-  fs.writeFileSync(file, raw);
-  const res = { ok: true, status: exists ? "updated" : "created", id, revision: gitBlobSha(Buffer.from(raw)), warnings: valid.warnings || [] };
-  if (priority) res.priority_stamp = { ok: true, priority };
-  return { ok: true, res };
+  return { ok: true, res: writePreparedPutNode(p, valid.warnings || []) };
+}
+
+// Whole-batch local validation: every prepared write is applied to ONE temp
+// copy of the graph and the graph is linted once, so the batch is judged as
+// the state it would leave behind (one copy, not one per node). Returns
+// {errors: Map<id, string[]>, graphErrors: string[], warnings: Map<id,
+// string[]>, batchWarnings: string[]}. Pre-existing skipped files are carried
+// as warnings exactly as validatePutNodeLocal does.
+function validatePutNodeBatchLocal(nodesDir, prepared) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const errors = new Map();
+  const warnings = new Map();
+  const graphErrors = [];
+  const batchWarnings = [];
+  const add = (m, id, e) => (m.has(id) ? m.get(id).push(e) : m.set(id, [e]));
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    graphErrors.push(`could not load graph: ${e.message}`);
+    return { errors, graphErrors, warnings, batchWarnings };
+  }
+  for (const p of prepared) {
+    const v = graphLib.validateNode(g, p.node);
+    if (!v.ok) add(errors, p.node.id, `invalid node:\n  ${v.errors.join("\n  ")}`);
+  }
+  if (errors.size) return { errors, graphErrors, warnings, batchWarnings };
+
+  const files = new Map(prepared.map((p) => [`${p.node.id}.md`, p]));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "spor-put-node-"));
+  const tmpNodes = path.join(tmp, "nodes");
+  try {
+    fs.mkdirSync(tmpNodes, { recursive: true });
+    for (const ent of fs.readdirSync(nodesDir, { withFileTypes: true })) {
+      if (!ent.isFile() || !ent.name.endsWith(".md") || files.has(ent.name)) continue;
+      fs.copyFileSync(path.join(nodesDir, ent.name), path.join(tmpNodes, ent.name));
+    }
+    for (const [name, p] of files) fs.writeFileSync(path.join(tmpNodes, name), p.raw);
+    const vg = graphLib.validateGraph(tmpNodes);
+    const carried = (g.skipped || []).map((sk) => sk.file).filter((f) => !files.has(f));
+    const preExisting = (e) => carried.some((f) => String(e).startsWith(`${f}: `));
+    const owner = (e) => {
+      for (const name of files.keys()) if (String(e).startsWith(`${name}: `)) return name.slice(0, -3);
+      return null;
+    };
+    for (const e of vg.errors || []) {
+      if (preExisting(e)) batchWarnings.push(`pre-existing: ${e}`);
+      else if (owner(e)) add(errors, owner(e), `invalid graph after put-node:\n  ${e}`);
+      else graphErrors.push(e);
+    }
+    for (const w of vg.warnings || []) {
+      if (owner(w)) add(warnings, owner(w), w);
+      else batchWarnings.push(w);
+    }
+    return { errors, graphErrors, warnings, batchWarnings };
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 // The canonical priority a node CREATE carries in its frontmatter (p1|p2|p3),
@@ -1619,7 +1690,11 @@ function readPutNodeBatch(values, input) {
 
 async function cmdPutNodeBatch(cfg, values, docs, policy) {
   // Parse everything first: a malformed entry refuses the whole batch before
-  // anything is written, so a fix-and-rerun never meets a half-applied input.
+  // anything is written, in either mode. Beyond parsing the modes differ:
+  // LOCAL is all-or-nothing (the whole batch is validated against one temp
+  // graph before any write), REMOTE is per-entry by server contract — entries
+  // are sent in resolver-first order and each lands or fails on its own
+  // (dec-spor-batch-create-gate-resolver-first-ordering; no batch transaction).
   const entries = [];
   const problems = [];
   const seen = new Map();
@@ -1660,6 +1735,8 @@ async function cmdPutNodeBatch(cfg, values, docs, policy) {
   const ordered = resolverFirstOrder(entries, registry);
 
   const results = []; // one per entry, in submission order
+  let batchWarnings = [];
+  let graphFailed = false;
   const record = (entry, res) => {
     results.push(res);
     if (values.json) return;
@@ -1709,12 +1786,32 @@ async function cmdPutNodeBatch(cfg, values, docs, policy) {
       sent += chunk.length;
     }
   } else {
+    // Local is all-or-nothing: every entry is prepared (collision policy,
+    // priority stamp) and the whole batch validated against ONE temp copy of
+    // the graph with all of it applied BEFORE any file is written. One bad
+    // entry refuses the batch and nothing lands. A skipped entry is a no-op,
+    // never validated as a write, and never blocks the batch.
     let identity;
     const stampIdentity = () => (identity ??= gitIdentity(path.dirname(nodesDir)));
-    for (const e of ordered) {
-      const w = putNodeLocal(nodesDir, e.raw, e.node, policy, null, stampIdentity);
-      record(e, w.ok ? w.res : { ok: false, id: e.id, status: "error", message: w.error });
+    const prepared = ordered.map((e) => ({ e, p: preparePutNodeLocal(nodesDir, e.raw, e.node, policy, null, stampIdentity) }));
+    const writes = prepared.filter(({ p }) => p.ok && !p.skip).map(({ p }) => p);
+    const refused = prepared.filter(({ p }) => !p.ok);
+    const v = refused.length || !writes.length
+      ? { errors: new Map(), graphErrors: [], warnings: new Map(), batchWarnings: [] }
+      : validatePutNodeBatchLocal(nodesDir, writes);
+    const ok = !refused.length && !v.errors.size && !v.graphErrors.length;
+    for (const { e, p } of prepared) {
+      if (!p.ok) record(e, { ok: false, id: e.id, status: "error", message: p.error });
+      else if (p.skip) record(e, p.skip);
+      else if (v.errors.has(e.id)) record(e, { ok: false, id: e.id, status: "error", message: v.errors.get(e.id).join("\n  ") });
+      else if (!ok) record(e, { ok: false, id: e.id, status: "error", message: "not written — the batch was refused (local put-node is all-or-nothing)" });
+      else record(e, writePreparedPutNode(p, v.warnings.get(e.id) || []));
     }
+    for (const ge of v.graphErrors) err(`put-node error: invalid graph after batch: ${ge}`);
+    if (!values.json) for (const w of v.batchWarnings) err(`  warning: ${w}`);
+    if (!ok) err("put-node batch refused: nothing written");
+    batchWarnings = v.batchWarnings;
+    if (!ok && v.graphErrors.length) graphFailed = true;
   }
 
   const counts = {};
@@ -1722,9 +1819,9 @@ async function cmdPutNodeBatch(cfg, values, docs, policy) {
     const k = res.ok ? res.status || "ok" : "error";
     counts[k] = (counts[k] || 0) + 1;
   }
-  const failed = results.some((res) => !res.ok || (res.priority_stamp && !res.priority_stamp.ok));
+  const failed = graphFailed || results.some((res) => !res.ok || (res.priority_stamp && !res.priority_stamp.ok));
   if (values.json) {
-    out(JSON.stringify({ results, counts }, null, 2));
+    out(JSON.stringify(batchWarnings.length ? { results, counts, warnings: batchWarnings } : { results, counts }, null, 2));
   } else {
     const parts = Object.entries(counts).map(([k, n]) => `${n} ${k}`);
     out(`put-node batch: ${parts.join(", ")} (${results.length} entr${results.length === 1 ? "y" : "ies"})`);

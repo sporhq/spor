@@ -32,7 +32,9 @@ Method:
    call — `spor put-node --dir <dir> --if-exists skip` — not one `put-node`
    per node: it batches the POSTs, orders resolvers ahead of the nodes they
    resolve for you, prints a created/skipped/error line per node (so a re-run
-   is auditable), and stamps a `priority: p1|p2|p3` in a new node's frontmatter
+   is auditable — remote entries land or fail one by one, so a partial batch
+   is fixed by re-running with `--if-exists skip`; a local batch is
+   all-or-nothing and writes nothing if any entry is invalid), and stamps a `priority: p1|p2|p3` in a new node's frontmatter
    the way `spor priority` would, so priorities need no second pass.
 2. Aggregate, don't transcribe. One node per durable fact: a decision with its
    why, an issue with its full resolution lineage (found → fixed-in → verified),
