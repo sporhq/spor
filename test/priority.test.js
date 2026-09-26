@@ -109,6 +109,21 @@ test("priority (local) sets p1 and stamps priority_by/_at/_via, validates clean"
   assert.match(v.stdout, /0 errors/);
 });
 
+test("priority (local) on a CRLF node file succeeds and keeps CRLF endings", () => {
+  const { home, nodes } = fixtureGraph();
+  const file = path.join(nodes, "task-x.md");
+  const crlf = fs.readFileSync(file, "utf8").replace(/\n/g, "\r\n");
+  fs.writeFileSync(file, crlf);
+  const r = run(["priority", "task-x", "p1"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /priority set: task-x -> p1/);
+  const md = fs.readFileSync(file, "utf8");
+  assert.doesNotMatch(md, /[^\r]\n/, "every newline is still CRLF");
+  assert.match(md, /priority: p1\r\n/);
+  assert.match(md, /priority_via: cli\r\n/);
+  assert.match(md, /Body about the demo task\.\r\n/);
+});
+
 test("priority (local) clear removes the priority and all its stamps", () => {
   const { home, nodes } = fixtureGraph();
   run(["priority", "task-x", "p2"], { SPOR_HOME: home });

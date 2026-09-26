@@ -1409,7 +1409,10 @@ function preparePutNodeLocal(nodesDir, raw, node, policy, revision, stampIdentit
   }
   const priority = exists ? "" : createPriority(node);
   if (priority) {
-    // rewriteStamp's fence match is LF-only; parseFrontmatter also takes CRLF.
+    // rewriteStamp itself now accepts and preserves CRLF
+    // (issue-spor-rewrite-stamp-crlf-frontmatter); this path still normalizes
+    // to LF first because put-node's own byte-preservation contract is a
+    // separate, broader issue (issue-spor-put-node-crlf-preservation-violation).
     raw = rewriteStamp("priority", raw.replace(/\r\n/g, "\n"), priority, stampIdentity(), "cli");
     if (raw == null) return { ok: false, error: `could not locate frontmatter in ${id}` };
     try {
@@ -4344,8 +4347,14 @@ function gitIdentity(repoDir) {
 // (task-spor-priority-readiness-stamp-helper-dedup) — the only per-field
 // pieces are the field name itself, the allowed-value vocabulary (each
 // verb's own normalize*), and the provenance key prefix this derives from it.
+// A CRLF node file is otherwise valid (parseFrontmatter accepts `\r?\n`), so
+// the fence match here does too, and the file's line-ending style is
+// preserved on write rather than silently flattened to LF
+// (issue-spor-rewrite-stamp-crlf-frontmatter).
 function rewriteStamp(field, raw, value, identity, via) {
-  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
+  const crlf = /\r\n/.test(raw);
+  const norm = crlf ? raw.replace(/\r\n/g, "\n") : raw;
+  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(norm);
   if (!m) return null;
   let fm = m[1];
   const body = m[2];
@@ -4360,7 +4369,8 @@ function rewriteStamp(field, raw, value, identity, via) {
     stamps.push(`${field}_via: ${via}`);
   }
   const fmOut = stamps.length ? `${fm}\n${stamps.join("\n")}` : fm;
-  return `---\n${fmOut}\n---\n${body}`;
+  const rebuilt = `---\n${fmOut}\n---\n${body}`;
+  return crlf ? rebuilt.replace(/\n/g, "\r\n") : rebuilt;
 }
 
 // The set-a-stamp-field verb core: validate/normalize is caller-specific

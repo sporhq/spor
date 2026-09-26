@@ -109,6 +109,21 @@ test("ready (local) stamps readiness: agent with readiness_by/_at/_via, validate
   assert.match(v.stdout, /0 errors/);
 });
 
+test("ready (local) on a CRLF node file succeeds and keeps CRLF endings", () => {
+  const { home, nodes } = fixtureGraph();
+  const file = path.join(nodes, "task-x.md");
+  const crlf = fs.readFileSync(file, "utf8").replace(/\n/g, "\r\n");
+  fs.writeFileSync(file, crlf);
+  const r = run(["ready", "task-x"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /readiness set: task-x -> agent/);
+  const md = fs.readFileSync(file, "utf8");
+  assert.doesNotMatch(md, /[^\r]\n/, "every newline is still CRLF");
+  assert.match(md, /readiness: agent\r\n/);
+  assert.match(md, /readiness_via: cli\r\n/);
+  assert.match(md, /Body about the demo task\.\r\n/);
+});
+
 test("ready (local) --needs-input clears the readiness stamp and all its provenance", () => {
   const { home, nodes } = fixtureGraph();
   run(["ready", "task-x"], { SPOR_HOME: home });
