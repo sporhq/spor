@@ -2056,6 +2056,122 @@ test("reconcileCandidateSha is a no-op when nothing needed restoring — the com
   }
 });
 
+// issue-spor-integration-rebase-intermediate-protected-paths: amending only the
+// TIP left every EARLIER commit the landing makes reachable — a rebase's
+// replayed chain, a merge's second parent — carrying the tampered protected
+// file in its own tree. This branch tampers in its FIRST commit and puts the
+// file back in its second, so the tip is clean and the restore is a no-op: the
+// exact shape the tip-only amend could not see. Asserted over the WHOLE landed
+// range, every strategy.
+function tamperedHistoryRepo() {
+  const dir = integrationRepo();
+  git(dir, "checkout", "-q", "-b", "branch2", "main~1");
+  fs.writeFileSync(path.join(dir, "test", "acceptance.js"), "process.exit(0);\n");
+  fs.writeFileSync(path.join(dir, "test", "added.js"), "process.exit(0);\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "tamper");
+  git(dir, "checkout", "-q", "main~1", "--", "test/acceptance.js");
+  git(dir, "rm", "-q", "test/added.js");
+  fs.writeFileSync(path.join(dir, "lib", "mul.js"), "module.exports = (a, b) => a * b;\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "untamper + real work");
+  git(dir, "checkout", "-q", "main");
+  return dir;
+}
+
+function assertLandedRangeClean(dir, from, to, label) {
+  const trusted = git(dir, "show", `${from}:test/acceptance.js`);
+  for (const c of git(dir, "rev-list", `${from}..${to}`).split("\n").filter(Boolean)) {
+    const files = git(dir, "ls-tree", "-r", "--name-only", c).split("\n").filter((f) => f.startsWith("test/"));
+    assert.deepStrictEqual(files, ["test/acceptance.js"], `${label}: ${c.slice(0, 8)} carries only the trusted protected files`);
+    assert.strictEqual(git(dir, "show", `${c}:test/acceptance.js`), trusted, `${label}: ${c.slice(0, 8)} carries the trusted suite`);
+  }
+}
+
+test("no commit reachable from the landed ref carries a protected-path edit — an intermediate tamper is collapsed, every strategy", () => {
+  const dir = tamperedHistoryRepo();
+  const head = git(dir, "rev-parse", "branch2").trim();
+  for (const strategy of ["merge", "squash", "rebase"]) {
+    const built = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy, label: "task-x" });
+    assert.strictEqual(built.ok, true, `${strategy}: ${built.reason}`);
+    try {
+      const forced = gateRunner.forceProtectedPaths({ top: dir, dir: built.dir, trustedRef: "main", protectedPaths: ["test/**"] });
+      assert.strictEqual(forced.ok, true, `${strategy}: ${forced.reason}`);
+      const reconciled = integrationRunner.reconcileCandidateSha({ dir: built.dir, sha: built.sha, base: built.expectedSha, protectedPaths: ["test/**"], message: "Integrate task-x onto main" });
+      assert.strictEqual(reconciled.ok, true, `${strategy}: ${reconciled.reason}`);
+      if (strategy === "squash") {
+        assert.strictEqual(reconciled.collapsed, 0, "squash already lands one commit");
+      } else {
+        assert.ok(reconciled.collapsed > 1, `${strategy}: the range touched a protected path, so it collapses`);
+        assert.strictEqual(git(dir, "rev-parse", `${reconciled.sha}^@`).trim(), built.expectedSha, `${strategy}: one commit, parented on the target tip`);
+        assert.match(git(dir, "log", "-1", "--format=%s", reconciled.sha), /^Integrate task-x onto main \(\d+ commits collapsed/);
+      }
+      assert.match(git(dir, "show", `${reconciled.sha}:lib/mul.js`), /a \* b/, `${strategy}: the branch's honest work still lands`);
+      const landed = integrationRunner.landCandidate({ top: dir, dir: built.dir, sha: reconciled.sha, expectedSha: built.expectedSha, targetRef: "main", mode: "local" });
+      assert.strictEqual(landed.ok, true, `${strategy}: ${landed.reason}`);
+      assertLandedRangeClean(dir, built.expectedSha, "main", strategy);
+      git(dir, "update-ref", "refs/heads/main", built.expectedSha);
+    } finally {
+      built.cleanup();
+    }
+  }
+});
+
+test("a protected-path edit introduced only by a merge's own resolution inside the branch is still collapsed", () => {
+  const dir = integrationRepo();
+  git(dir, "checkout", "-q", "-b", "side", "main~1");
+  fs.writeFileSync(path.join(dir, "lib", "side.js"), "module.exports = 1;\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "side");
+  git(dir, "checkout", "-q", "-b", "evil", "main~1");
+  fs.writeFileSync(path.join(dir, "lib", "own.js"), "module.exports = 2;\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "own");
+  git(dir, "merge", "-q", "--no-ff", "--no-commit", "side");
+  fs.writeFileSync(path.join(dir, "test", "acceptance.js"), "process.exit(0);\n"); // neither parent has this
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "evil merge");
+  fs.writeFileSync(path.join(dir, "lib", "after.js"), "module.exports = 3;\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "after");
+  git(dir, "checkout", "-q", "main");
+  const head = git(dir, "rev-parse", "evil").trim();
+  const built = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy: "merge" });
+  assert.strictEqual(built.ok, true, built.reason);
+  try {
+    assert.strictEqual(gateRunner.forceProtectedPaths({ top: dir, dir: built.dir, trustedRef: "main", protectedPaths: ["test/**"] }).ok, true);
+    const reconciled = integrationRunner.reconcileCandidateSha({ dir: built.dir, sha: built.sha, base: built.expectedSha, protectedPaths: ["test/**"] });
+    assert.strictEqual(reconciled.ok, true, reconciled.reason);
+    assert.ok(reconciled.collapsed > 1, "the evil merge counts as touching the protected path");
+    assert.strictEqual(integrationRunner.landCandidate({ top: dir, dir: built.dir, sha: reconciled.sha, expectedSha: built.expectedSha, targetRef: "main", mode: "local" }).ok, true);
+    assertLandedRangeClean(dir, built.expectedSha, "main", "evil merge");
+  } finally {
+    built.cleanup();
+  }
+});
+
+test("a multi-commit range that never touched a protected path keeps its history shape", () => {
+  const dir = integrationRepo();
+  git(dir, "checkout", "-q", "-b", "clean", "main~1");
+  for (const n of ["a", "b"]) {
+    fs.writeFileSync(path.join(dir, "lib", `${n}.js`), `module.exports = "${n}";\n`);
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", n);
+  }
+  git(dir, "checkout", "-q", "main");
+  const head = git(dir, "rev-parse", "clean").trim();
+  for (const strategy of ["merge", "rebase"]) {
+    const built = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy });
+    assert.strictEqual(built.ok, true, built.reason);
+    try {
+      const reconciled = integrationRunner.reconcileCandidateSha({ dir: built.dir, sha: built.sha, base: built.expectedSha, protectedPaths: ["test/**"] });
+      assert.deepStrictEqual({ ok: reconciled.ok, sha: reconciled.sha, amended: reconciled.amended, collapsed: reconciled.collapsed }, { ok: true, sha: built.sha, amended: false, collapsed: 0 }, strategy);
+    } finally {
+      built.cleanup();
+    }
+  }
+});
+
 // Drives runIntegrationStage with REAL git plumbing end to end, composing
 // forceProtected exactly the way bin/spor.js's makeIntegrationDeps does
 // (forceProtectedPaths, then reconcileCandidateSha) — the one seam the faked
@@ -2079,10 +2195,10 @@ test("runIntegrationStage, wired with the real composed forceProtected dep, land
     releaseLease: async () => {},
     buildCandidate: async ({ head: h, targetRef: t, strategy: s }) => integrationRunner.buildCandidateTree({ top: dir, head: h, targetRef: t, strategy: s }),
     // The exact composition bin/spor.js's forceProtected dep uses.
-    forceProtected: ({ dir: candidateDir, sha }) => {
+    forceProtected: ({ dir: candidateDir, sha, base }) => {
       const forced = gateRunner.forceProtectedPaths({ top: dir, dir: candidateDir, trustedRef: factory.trustedRef, protectedPaths: factory.protectedPaths });
       if (!forced.ok) return forced;
-      return integrationRunner.reconcileCandidateSha({ dir: candidateDir, sha });
+      return integrationRunner.reconcileCandidateSha({ dir: candidateDir, sha, base, protectedPaths: factory.protectedPaths });
     },
     runSuite: async () => ({ ok: true }),
     land: async (args) => integrationRunner.landCandidate(args),
@@ -2098,7 +2214,9 @@ test("runIntegrationStage, wired with the real composed forceProtected dep, land
   const landedSha = git(dir, "rev-parse", targetRef).trim();
   assert.match(git(dir, "show", `${landedSha}:test/acceptance.js`), /add is broken/, "the landed commit carries the trusted suite, not the branch's tampered protected-path edit");
   assert.doesNotMatch(git(dir, "show", `${landedSha}:test/acceptance.js`), /process\.exit\(0\)/);
-  assert.match(git(dir, "show", `${landedSha}:lib/sub.js`), /a - b/, "the branch's own, non-protected work still landed");
+  assert.match(git(dir, "show", `${landedSha}:lib/sub.js`), /a - b/, "the branch's own, non-protected work still landed");  // …and so does every commit the landing made reachable, not just the tip:
+  // the merge's second parent was the tampering branch commit itself.
+  assertLandedRangeClean(dir, `${landedSha}^`, landedSha, "composed dep");
 });
 
 // issue-spor-integration-stale-head-across-fix-cycles: `tree` used to be

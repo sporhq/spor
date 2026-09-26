@@ -2673,6 +2673,26 @@ the invariant is enforced on the tree that gets landed, not inferred from a
 green run. A no-op restore costs nothing: the working tree already equals the
 candidate sha's tree, so there is nothing to amend.
 
+The tip is not the only commit a landing makes reachable, though: `rebase`
+lands every replayed commit, and `merge` brings the branch's own commits in
+behind its second parent. An earlier one that touched a protected path — with
+a later one leaving it alone, or putting it back — would still carry the
+tampered content in its own tree, reachable from `target_ref` with the tip
+perfectly clean (issue-spor-integration-rebase-intermediate-protected-paths).
+So the stage also reads every commit in `target..candidate`, and when the range
+is more than one commit and ANY of them touched a protected path, it collapses
+the range to a single commit on the target tip carrying the restored tree
+(squash-on-land) — never a per-commit rewrite, which could leave a commit
+behind that it missed. No commit reachable from the landed ref then carries a
+protected-path edit. This changes history shape only in the already-anomalous
+case (the command gate fails such a branch closed first); a range that never
+touched a protected path keeps its merge or its replayed commits exactly as
+built. "Touched" is read from each commit's own diff (a merge inside the
+branch counts a path it resolved to content neither parent had) and is
+over-inclusive —
+a touch that happens to restore the trusted copy still collapses — and a
+history read that fails refuses the stage.
+
 **The candidate suite runs on the merged tree**, full, every landing — never a
 slow tier skipped here and deferred to a service after the merge (the
 "replace your CI" observation dec-spor-factory-integration-step is built on: by

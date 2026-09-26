@@ -16001,7 +16001,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       }
       return built;
     },
-    forceProtected: ({ dir, sha }) => {
+    forceProtected: ({ dir, sha, base }) => {
       // Pin the trusted ref to ONE commit before touching the tree, and force
       // from that sha — never from the symbolic ref, which can advance between
       // this restore and the attestation naming it (cross-model review, major
@@ -16017,8 +16017,15 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       // as-is would ship the tampered protected-path edits the restore is
       // meant to strip (issue-spor-integration-landed-sha-pre-restoration), so
       // re-commit when the restore actually changed anything and land that
-      // sha instead; a no-op restore returns `sha` unchanged.
-      const reconciled = integrationRunner.reconcileCandidateSha({ dir, sha });
+      // sha instead; a no-op restore returns `sha` unchanged. `base` lets it
+      // also see the EARLIER commits the landing makes reachable (a rebase's
+      // replayed chain, a merge's second parent) and collapse them when one
+      // touched a protected path
+      // (issue-spor-integration-rebase-intermediate-protected-paths).
+      const reconciled = integrationRunner.reconcileCandidateSha({
+        dir, sha, base, protectedPaths: factory.protectedPaths,
+        message: `Integrate ${entry.node_id} onto ${integration.targetRef}`,
+      });
       return reconciled && reconciled.ok ? { ...reconciled, trusted_sha: trustedSha } : reconciled;
     },
     runSuite: ({ dir, base, head, attempt = 1 }) =>
