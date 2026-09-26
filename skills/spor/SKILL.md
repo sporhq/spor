@@ -102,6 +102,8 @@ spor get <id>                  # one node by id
 spor put-node [<file>|-] --if-exists <error|skip|update> [--revision <sha>]
                                # write a full node markdown file through validated put_node semantics;
                                # use `spor get <id> --json` first and pass its revision for updates
+spor put-node --dir <dir> --if-exists skip   # batch: every *.md in <dir> (or concatenated nodes
+                               #   on stdin) in one call, resolver-first, one status line per node
 spor blame <sha> [--repo <s>]  # which nodes reference a git commit (alias: spor commits <sha>)
 spor history <id> [<sha>]      # a node's commit lineage (actor/when/what); <sha> = that revision's diff (local git log / GET /v1/nodes/<id>/history)
 spor schema [<type>]           # introspect the live registry (types/prefixes/weights/flags/gates,
@@ -201,6 +203,12 @@ A few of these have enough surface to be worth a sentence:
   --json` so updates are optimistic-concurrency checked instead of last-writer
   wins. Prefer `spor edge`/`spor set-status` for narrow mutations; use
   `put-node` for full-node artifacts such as briefing versions or body edits.
+  For many nodes at once (a backfill), `--dir <dir>` or several concatenated
+  nodes on stdin submit them as one batch (`--if-exists error|skip`): every
+  entry is parsed before anything is written, resolvers are moved ahead of the
+  nodes they `resolves`/`answers`, and each node gets a created/skipped/error
+  line. A NEW node carrying `priority: p1|p2|p3` is stamped
+  (`priority_by/_at/_via`) exactly as `spor priority` would stamp it.
 - **`spor compile`/`spor brief`/`spor search`** are mode-aware: local runs the
   in-repo compiler, remote dispatches to the server (this is what `/spor:brief`
   pulls). `search "<text>"` is sugar for `compile --query "<text>" --digest` —

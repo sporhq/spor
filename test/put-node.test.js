@@ -336,3 +336,285 @@ Body.
   assert.match(r.stderr, /unparseable edge entry/);
   assert.ok(!fs.existsSync(path.join(nodes, "dec-bad.md")), "nothing written");
 });
+
+// --- batch put-node + priority at create (task-spor-cli-put-node-batch) ------
+const { splitNodeDocuments, resolverFirstOrder, chunkPutEntries } = require("../bin/spor.js");
+const graphLib = require("../lib/graph.js");
+
+function taskMd(id, extra = "", body = `Body for ${id}.`) {
+  return `---
+id: ${id}
+type: task
+project: demo
+title: Task ${id}
+summary: A task used by the batch put-node tests.
+date: 2026-06-01
+${extra}---
+${body}
+`;
+}
+function artMd(id, resolves) {
+  return `---
+id: ${id}
+type: artifact
+project: demo
+title: Resolver ${id}
+summary: An artifact resolving ${resolves}.
+date: 2026-06-01
+edges:
+  - {type: resolves, to: ${resolves}}
+---
+Resolution for ${resolves}.
+`;
+}
+function runStdin(args, input, extra) {
+  return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(extra), input });
+}
+
+test("splitNodeDocuments: one document comes back byte for byte", () => {
+  const raw = nodeMd("dec-one");
+  assert.deepStrictEqual(splitNodeDocuments(raw), [raw]);
+  assert.deepStrictEqual(splitNodeDocuments("no frontmatter"), ["no frontmatter"]);
+});
+
+test("splitNodeDocuments: a markdown rule in a body is not a document boundary", () => {
+  const raw = taskMd("task-rule", "", "Intro.\n\n---\n\nNote: this is prose, not frontmatter.\n\n---\n\nMore.");
+  assert.deepStrictEqual(splitNodeDocuments(raw), [raw]);
+});
+
+test("splitNodeDocuments: concatenated nodes split at each frontmatter fence", () => {
+  const a = taskMd("task-a", "", "A body.\n\n---\n\nstill A");
+  const b = nodeMd("dec-b");
+  const c = taskMd("task-c", "status: open\n");
+  const docs = splitNodeDocuments(a + "\n" + b + c);
+  assert.deepStrictEqual(docs, [a, b, c]);
+  // CRLF input splits the same way
+  assert.strictEqual(splitNodeDocuments((a + b).replace(/\n/g, "\r\n")).length, 2);
+});
+
+test("resolverFirstOrder: moves a resolver ahead of the node it resolves, otherwise stable", () => {
+  const mk = (raw) => { const node = graphLib.parseFrontmatter(raw, "x.md"); return { id: node.id, node }; };
+  const entries = [mk(taskMd("task-x", "status: done\n")), mk(nodeMd("dec-y")), mk(artMd("art-x", "task-x")), mk(nodeMd("dec-z"))];
+  const order = resolverFirstOrder(entries, graphLib.seedRegistry()).map((e) => e.id);
+  assert.deepStrictEqual(order, ["art-x", "task-x", "dec-y", "dec-z"]);
+  // inverse spelling on the TARGET: question answered-by a decision
+  const q = mk(`---\nid: question-q\ntype: question\nproject: demo\ntitle: Q\nsummary: A question.\ndate: 2026-06-01\nstatus: answered\nedges:\n  - {type: answered-by, to: dec-a}\n---\nQ?\n`);
+  const order2 = resolverFirstOrder([q, mk(nodeMd("dec-a"))], graphLib.seedRegistry()).map((e) => e.id);
+  assert.deepStrictEqual(order2, ["dec-a", "question-q"]);
+  // no resolving edges: input order untouched
+  const plain = [mk(nodeMd("dec-3")), mk(nodeMd("dec-1")), mk(nodeMd("dec-2"))];
+  assert.deepStrictEqual(resolverFirstOrder(plain, null).map((e) => e.id), ["dec-3", "dec-1", "dec-2"]);
+});
+
+test("chunkPutEntries: caps a chunk at 100 entries and preserves order", () => {
+  const wire = Array.from({ length: 250 }, (_, n) => ({ node: `n${n}`, if_exists: "skip" }));
+  const chunks = chunkPutEntries(wire);
+  assert.deepStrictEqual(chunks.map((c) => c.length), [100, 100, 50]);
+  assert.deepStrictEqual(chunks.flat(), wire);
+  const big = Array.from({ length: 4 }, (_, n) => ({ node: "x".repeat(300 * 1024) + n }));
+  assert.deepStrictEqual(chunkPutEntries(big).map((c) => c.length), [2, 2]);
+});
+
+test("put-node (local) --dir writes a batch, and a skip re-run is an auditable no-op", () => {
+  const { home, nodes } = fixtureGraph();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-put-node-dir-"));
+  fs.writeFileSync(path.join(dir, "a.md"), taskMd("task-done", "status: done\n"));
+  fs.writeFileSync(path.join(dir, "b.md"), artMd("art-done", "task-done"));
+  fs.writeFileSync(path.join(dir, "notes.txt"), "ignored");
+  const r = run(["put-node", "--dir", dir], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const lines = r.stdout.split("\n");
+  assert.match(lines[0], /^put-node created: art-done @ [0-9a-f]{40}$/); // resolver first
+  assert.match(lines[1], /^put-node created: task-done @ [0-9a-f]{40}$/);
+  assert.strictEqual(lines[2], "put-node batch: 2 created (2 entries)");
+  assert.strictEqual(lines[3], `  -> local ${home}`);
+  assert.strictEqual(readNode(nodes, "task-done"), taskMd("task-done", "status: done\n"));
+
+  const again = run(["put-node", "--dir", dir, "--if-exists", "skip"], { SPOR_HOME: home });
+  assert.strictEqual(again.status, 0, again.stderr);
+  assert.match(again.stdout, /put-node skipped: art-done/);
+  assert.match(again.stdout, /put-node batch: 2 skipped \(2 entries\)/);
+
+  const collide = run(["put-node", "--dir", dir, "--json"], { SPOR_HOME: home });
+  assert.strictEqual(collide.status, 1);
+  const j = JSON.parse(collide.stdout);
+  assert.deepStrictEqual(j.counts, { error: 2 });
+  assert.match(j.results[0].message, /node already exists: art-done/);
+});
+
+test("put-node (local) multi-document stdin stamps priority at create like `spor priority`", () => {
+  const { home, nodes } = fixtureGraph();
+  spawnSync("git", ["-C", home, "config", "user.name", "Batch Tester"]);
+  spawnSync("git", ["-C", home, "config", "user.email", "batch@example.com"]);
+  const input = taskMd("task-p1", "priority: P1\n") + taskMd("task-plain");
+  const r = runStdin(["put-node", "-"], input, { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /put-node created: task-p1 @ [0-9a-f]{40}\npriority set: task-p1 -> p1\n/);
+  const raw = readNode(nodes, "task-p1");
+  assert.match(raw, /\npriority: p1\npriority_by: Batch Tester <batch@example.com>\npriority_at: \S+\npriority_via: cli\n---\n/);
+  assert.strictEqual(readNode(nodes, "task-plain"), taskMd("task-plain"));
+  assert.strictEqual(validateGraph(nodes).status, 0);
+});
+
+test("put-node (local) batch refuses the whole input on one bad entry", () => {
+  const { home, nodes } = fixtureGraph();
+  const input = taskMd("task-ok") + taskMd("task-badprio", "priority: urgent\n") + taskMd("task-ok");
+  const r = runStdin(["put-node"], input, { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /priority 'urgent' not allowed/);
+  assert.match(r.stderr, /duplicate id 'task-ok'/);
+  assert.match(r.stderr, /nothing written/);
+  assert.ok(!fs.existsSync(path.join(nodes, "task-ok.md")));
+});
+
+test("put-node batch refuses --if-exists update and a file plus --dir", () => {
+  const { home } = fixtureGraph();
+  const r = runStdin(["put-node", "--if-exists", "update", "--revision", "abc"], taskMd("task-a") + taskMd("task-b"), { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /batch put-node takes --if-exists error\|skip/);
+  const both = run(["put-node", "x.md", "--dir", "."], { SPOR_HOME: home });
+  assert.strictEqual(both.status, 1);
+  assert.match(both.stderr, /not both/);
+});
+
+function batchStub({ results } = {}) {
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      hits.push({ method: req.method, url: req.url, body });
+      const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+      if (req.url === "/v1/nodes" && req.method === "POST") {
+        const nodes = JSON.parse(body).nodes;
+        const rs = nodes.map((e, n) => (results && results[n]) || { ok: true, status: "created", id: /\nid: (\S+)/.exec("\n" + e.node.split("\n").slice(1).join("\n"))[1], revision: `rev-${n}`, warnings: [] });
+        return j(rs.some((x) => !x.ok) ? 207 : 200, { results: rs });
+      }
+      const m = /^\/v1\/nodes\/([^/]+)\/priority$/.exec(req.url);
+      if (m && req.method === "POST") return j(200, { ok: true, status: "updated", id: m[1], revision: "rev-prio" });
+      return j(404, { error: { code: "not_found" } });
+    });
+  });
+  return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+function runStdinAsync(args, input, env) {
+  return new Promise((resolve) => {
+    let out = "", errOut = "";
+    const c = spawn(process.execPath, [CLI, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
+    c.stdout.on("data", (d) => (out += d));
+    c.stderr.on("data", (d) => (errOut += d));
+    c.on("close", (code) => resolve({ status: code, stdout: out, stderr: errOut }));
+    c.stdin.end(input);
+  });
+}
+
+test("put-node (remote) batch: ONE POST in resolver-first order, then the priority door per created node", async () => {
+  const done = taskMd("task-done", "status: done\npriority: p2\n");
+  const art = artMd("art-done", "task-done");
+  const { srv, hits, base } = await batchStub();
+  try {
+    const r = await runStdinAsync(["put-node", "--if-exists", "skip"], done + art, remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const posts = hits.filter((h) => h.url === "/v1/nodes");
+    assert.strictEqual(posts.length, 1);
+    assert.deepStrictEqual(JSON.parse(posts[0].body), { nodes: [{ node: art, if_exists: "skip" }, { node: done, if_exists: "skip" }] });
+    const prio = hits.filter((h) => h.url.endsWith("/priority"));
+    assert.deepStrictEqual(prio.map((h) => [h.url, JSON.parse(h.body)]), [["/v1/nodes/task-done/priority", { priority: "p2" }]]);
+    assert.strictEqual(r.stdout,
+      "put-node created: art-done @ rev-0\nput-node created: task-done @ rev-1\npriority set: task-done -> p2\n" +
+      `put-node batch: 2 created (2 entries)\n  -> remote ${base}\n`);
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) batch reports per-entry errors and skips, exit 1, no stamp on a skip", async () => {
+  const results = [
+    { ok: true, status: "skipped", id: "task-a", revision: "rev-a" },
+    { ok: false, status: "error", id: "task-b", code: "transition_denied", message: "resolver required", details: [] },
+  ];
+  const { srv, hits, base } = await batchStub({ results });
+  try {
+    const r = await runStdinAsync(["put-node", "--if-exists", "skip"], taskMd("task-a", "priority: p1\n") + taskMd("task-b"), remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stdout, /put-node skipped: task-a @ rev-a/);
+    assert.match(r.stderr, /put-node error: task-b: 207: resolver required; transition_denied/);
+    assert.match(r.stdout, /put-node batch: 1 skipped, 1 error \(2 entries\)/);
+    assert.ok(!hits.some((h) => h.url.endsWith("/priority")), "a skipped node is never re-stamped");
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) single create with a priority goes through the set_priority door", async () => {
+  const { srv, hits, base } = await batchStub();
+  try {
+    const file = tmpNodeFile(taskMd("task-one", "priority: p3\n"));
+    const r = await runAsync(["put-node", file], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stdout, `put-node created: task-one @ rev-0\npriority set: task-one -> p3\n  -> remote ${base}\n`);
+    assert.ok(hits.some((h) => h.url === "/v1/nodes/task-one/priority"));
+  } finally {
+    srv.close();
+  }
+});
+
+// review fixes: fenced examples, unindented list entries, positional files,
+// legacy priorities on non-creates, CRLF stamping.
+test("splitNodeDocuments: a node documenting the node format in a code fence stays one document", () => {
+  const raw = taskMd("task-doc", "", "How to write a node:\n\n```markdown\n---\nid: task-example\ntype: task\n---\nbody\n```\n\nDone.");
+  assert.deepStrictEqual(splitNodeDocuments(raw), [raw]);
+  const tilde = taskMd("task-doc2", "", "~~~\n---\nid: task-example\n---\n~~~");
+  assert.deepStrictEqual(splitNodeDocuments(tilde + nodeMd("dec-after")), [tilde, nodeMd("dec-after")]);
+  const inline = taskMd("task-inline", "", "Run ```bash npm test``` first.");
+  assert.deepStrictEqual(splitNodeDocuments(inline + nodeMd("dec-next")), [inline, nodeMd("dec-next")]);
+});
+
+test("splitNodeDocuments: an unindented `- ` edge list still opens a document", () => {
+  const b = "---\nid: task-b\ntype: task\nedges:\n- {type: blocks, to: task-a}\n---\nbody b\n";
+  assert.deepStrictEqual(splitNodeDocuments(taskMd("task-a") + b), [taskMd("task-a"), b]);
+});
+
+test("put-node (local) a positional file is one node even if it looks multi-document", () => {
+  const { home, nodes } = fixtureGraph();
+  const raw = taskMd("task-file", "", "Body.\n---\nid: task-ghost\ntype: task\n---\nghost");
+  const r = run(["put-node", tmpNodeFile(raw)], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(readNode(nodes, "task-file"), raw);
+  assert.ok(!fs.existsSync(path.join(nodes, "task-ghost.md")));
+});
+
+test("put-node (local) a legacy priority on an existing node does not block skip/update; refuses a create", () => {
+  const { home, nodes } = fixtureGraph();
+  fs.writeFileSync(path.join(nodes, "task-legacy.md"), taskMd("task-legacy", "priority: high\n"));
+  const skip = run(["put-node", tmpNodeFile(taskMd("task-legacy", "priority: high\n")), "--if-exists", "skip"], { SPOR_HOME: home });
+  assert.strictEqual(skip.status, 0, skip.stderr);
+  const rev = gitBlobSha(fs.readFileSync(path.join(nodes, "task-legacy.md")));
+  const upd = run(["put-node", tmpNodeFile(taskMd("task-legacy", "priority: high\n", "New body.")), "--if-exists", "update", "--revision", rev], { SPOR_HOME: home });
+  assert.strictEqual(upd.status, 0, upd.stderr);
+  const create = run(["put-node", tmpNodeFile(taskMd("task-new-legacy", "priority: high\n"))], { SPOR_HOME: home });
+  assert.strictEqual(create.status, 1);
+  assert.match(create.stderr, /priority 'high' not allowed/);
+  assert.ok(!fs.existsSync(path.join(nodes, "task-new-legacy.md")));
+});
+
+test("put-node (local) stamps a priority on a CRLF node", () => {
+  const { home, nodes } = fixtureGraph();
+  spawnSync("git", ["-C", home, "config", "user.name", "Batch Tester"]);
+  spawnSync("git", ["-C", home, "config", "user.email", "batch@example.com"]);
+  const r = run(["put-node", tmpNodeFile(taskMd("task-crlf", "priority: p2\n").replace(/\n/g, "\r\n"))], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(readNode(nodes, "task-crlf"), /\npriority: p2\npriority_by: Batch Tester <batch@example\.com>\npriority_at: \S+\npriority_via: cli\n---\n/);
+});
+
+test("put-node (remote) --if-exists error refuses a bad priority before writing", async () => {
+  const { srv, hits, base } = await batchStub();
+  try {
+    const r = await runAsync(["put-node", tmpNodeFile(taskMd("task-bad", "priority: high\n"))], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /priority 'high' not allowed/);
+    assert.strictEqual(hits.length, 0);
+  } finally {
+    srv.close();
+  }
+});

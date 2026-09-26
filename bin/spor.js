@@ -1310,17 +1310,23 @@ function renderPutNodeResult(cfg, res, json) {
   const id = res && res.id ? res.id : "(unknown)";
   const rev = res && res.revision ? ` @ ${res.revision}` : "";
   out(status === "skipped" ? `put-node skipped: ${id}${rev}` : `put-node ${status}: ${id}${rev}`);
+  renderPriorityStamp(id, res && res.priority_stamp);
   out(writeTargetLine(cfg));
   for (const w of (res && res.warnings) || []) err(`  warning: ${w}`);
 }
 
-function putNodeEntryError(res0, httpStatus, prefix = "put-node") {
+function putNodeEntryDetail(res0) {
   const parts = [];
   if (res0 && res0.message) parts.push(res0.message);
   if (res0 && res0.code && !parts.includes(res0.code)) parts.push(res0.code);
   if (res0 && Array.isArray(res0.details)) parts.push(...res0.details);
   if (res0 && res0.revision) parts.push(`current revision: ${res0.revision}`);
-  return `${prefix} error ${httpStatus}${parts.length ? `: ${parts.join("; ")}` : ""}`;
+  return parts.join("; ");
+}
+
+function putNodeEntryError(res0, httpStatus, prefix = "put-node") {
+  const detail = putNodeEntryDetail(res0);
+  return `${prefix} error ${httpStatus}${detail ? `: ${detail}` : ""}`;
 }
 
 function copyNodeFilesForValidation(srcNodes, dstNodes, targetId, raw) {
@@ -1370,6 +1376,363 @@ function validatePutNodeLocal(nodesDir, node, raw) {
   }
 }
 
+// The single-node local write, shared by the one-node door and the batch loop:
+// collision policy -> revision check -> priority stamp -> validate -> write.
+// Returns {ok:true, res} or {ok:false, error}. `stampIdentity` is a thunk so
+// the git-config read only happens for a create that actually carries a
+// priority (task-spor-cli-put-node-batch).
+function putNodeLocal(nodesDir, raw, node, policy, revision, stampIdentity) {
+  const id = node.id;
+  const file = path.join(nodesDir, `${id}.md`);
+  const exists = fs.existsSync(file);
+  if (!exists && id.length > MAX_ID_LENGTH) {
+    return { ok: false, error: `bad node id '${id}': ${id.length} chars exceeds ${MAX_ID_LENGTH} (new node ids must be at most ${MAX_ID_LENGTH} chars)` };
+  }
+  if (policy === "error" && exists) {
+    return { ok: false, error: `node already exists: ${id} (use --if-exists update with --revision, or --if-exists skip)` };
+  }
+  if (policy === "skip" && exists) {
+    return { ok: true, res: { ok: true, status: "skipped", id, revision: gitBlobSha(fs.readFileSync(file)), warnings: [] } };
+  }
+  if (policy === "update") {
+    if (!exists) return { ok: false, error: `no such node: ${id}` };
+    const current = gitBlobSha(fs.readFileSync(file));
+    if (current !== revision) return { ok: false, error: `put-node conflict: stale revision for ${id}; current revision: ${current}` };
+  }
+
+  // priority at create: the same stamp `spor priority` writes locally, so a
+  // backfilled priority is attributed rather than "source unrecorded".
+  if (!exists) {
+    const bad = checkCreatePriority(node);
+    if (bad) return { ok: false, error: bad };
+  }
+  const priority = exists ? "" : createPriority(node);
+  if (priority) {
+    // rewriteStamp's fence match is LF-only; parseFrontmatter also takes CRLF.
+    raw = rewriteStamp("priority", raw.replace(/\r\n/g, "\n"), priority, stampIdentity(), "cli");
+    if (raw == null) return { ok: false, error: `could not locate frontmatter in ${id}` };
+    try {
+      node = require(path.join(ROOT, "lib", "graph.js")).parseFrontmatter(raw, `${id}.md`);
+    } catch (e) {
+      return { ok: false, error: `invalid node after priority stamp: ${e.message}` };
+    }
+  }
+
+  const valid = validatePutNodeLocal(nodesDir, node, raw);
+  if (valid.error) return { ok: false, error: valid.error };
+  fs.writeFileSync(file, raw);
+  const res = { ok: true, status: exists ? "updated" : "created", id, revision: gitBlobSha(Buffer.from(raw)), warnings: valid.warnings || [] };
+  if (priority) res.priority_stamp = { ok: true, priority };
+  return { ok: true, res };
+}
+
+// The canonical priority a node CREATE carries in its frontmatter (p1|p2|p3),
+// or "" for none / a clearing form. An unrecognized value is caught earlier by
+// checkCreatePriority, so this never sees one.
+function createPriority(node) {
+  if (node.priority == null) return "";
+  const norm = normalizePriority(node.priority);
+  return norm.ok ? norm.value : "";
+}
+// A priority to set (valid) or to refuse (invalid) — anything but none/clear.
+function carriesPriority(node) {
+  return !!(createPriority(node) || checkCreatePriority(node));
+}
+function checkCreatePriority(node) {
+  if (node.priority == null || normalizePriority(node.priority).ok) return null;
+  return `priority '${node.priority}' not allowed — use p1, p2, or p3`;
+}
+
+// Remote twin of the local stamp: after a CREATE lands, re-set its priority
+// through POST /v1/nodes/{id}/priority — the set_priority door — so the server
+// stamps priority_by/_at/_via from the token exactly as `spor priority` does.
+// The create payload keeps its `priority:` line (the server accepts the value
+// on create but stamps nothing — only its own door may), so a failed stamp
+// still leaves the priority in place, honestly "source unrecorded".
+async function stampCreatedPriority(cfg, node, id) {
+  const bad = checkCreatePriority(node);
+  if (bad) return { ok: false, priority: "", error: bad };
+  const priority = createPriority(node);
+  const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/priority`, { priority }, { timeoutMs: 8000 });
+  if (r.transport) return { ok: false, priority, error: `offline — could not reach server (${r.error})` };
+  if (!r.ok) {
+    const msg = r.json && r.json.error && r.json.error.message;
+    return { ok: false, priority, error: `priority error ${r.status}${msg ? `: ${msg}` : ""}` };
+  }
+  return { ok: true, priority, revision: (r.json && r.json.revision) || null };
+}
+
+function renderPriorityStamp(id, stamp) {
+  if (!stamp) return;
+  if (stamp.ok) out(`priority set: ${id} -> ${stamp.priority}`);
+  else err(`  ${stamp.error} — ${id} was created but its priority is unstamped; run 'spor priority ${id} ${stamp.priority || "<p1|p2|p3>"}'`);
+}
+
+// --- batch put-node (task-spor-cli-put-node-batch) --------------------------
+// `--dir <dir>` (one node per *.md file) or multi-document stdin (nodes
+// concatenated, each opening with its own `---` frontmatter fence) submits
+// every node through ONE door invocation — remote: the existing multi-entry
+// POST /v1/nodes batch, chunked under the server's request cap — instead of a
+// process spawn + single-entry round trip per node.
+
+// Split concatenated node documents. A `---` line in a body is an ordinary
+// markdown rule, so a new document starts only where a `---` line OUTSIDE a
+// fenced code block opens a block that reads as frontmatter: closed by
+// another `---`, every non-blank line a `key:`, a `- ` list entry, or an
+// indented continuation, and carrying an `id:`. Input not opening with `---`, or holding one document, comes back
+// as the single original string, byte for byte.
+function splitNodeDocuments(raw) {
+  const lines = raw.split("\n");
+  const bare = (s) => s.replace(/\r$/, "");
+  if (bare(lines[0] || "") !== "---") return [raw];
+  const opensFrontmatter = (k) => {
+    let sawId = false;
+    for (let m = k + 1; m < lines.length; m++) {
+      const l = bare(lines[m]);
+      if (l === "---") return sawId;
+      if (l.trim() === "") continue;
+      if (/^id:\s*\S/.test(l)) sawId = true;
+      else if (!/^[A-Za-z_][\w-]*:(\s|$)/.test(l) && !/^\s+\S/.test(l) && !/^-\s/.test(l)) return false;
+    }
+    return false;
+  };
+  const starts = [0];
+  let i = 0;
+  while (i < lines.length) {
+    // skip this document's own frontmatter block
+    let j = i + 1;
+    while (j < lines.length && bare(lines[j]) !== "---") j++;
+    // a `---` inside a fenced code block (a node documenting the node format)
+    // is example text, never a boundary
+    let k = j + 1;
+    let fence = null;
+    for (; k < lines.length; k++) {
+      const l = bare(lines[k]);
+      const f = /^\s{0,3}(`{3,}|~{3,})(.*)$/.exec(l);
+      // CommonMark: a backtick opener's info string holds no backtick
+      // (```code``` on one line is an inline span, not a block)
+      if (f && !(!fence && f[1][0] === "`" && f[2].includes("`"))) {
+        if (!fence) fence = f[1];
+        else if (f[1][0] === fence[0] && f[1].length >= fence.length && l.trim() === f[1]) fence = null;
+        continue;
+      }
+      if (!fence && l === "---" && opensFrontmatter(k)) break;
+    }
+    if (k >= lines.length) break;
+    starts.push(k);
+    i = k;
+  }
+  if (starts.length === 1) return [raw];
+  return starts.map((s, n) => {
+    if (n === starts.length - 1) return lines.slice(s).join("\n");
+    return lines.slice(s, starts[n + 1]).join("\n").replace(/\n*$/, "\n");
+  });
+}
+
+// Resolver-first ordering (dec-spor-batch-create-gate-resolver-first-
+// ordering): the server gates each batch entry on create, sequentially, so a
+// born-terminal node must come AFTER the node resolving it. Stable
+// topological sort over the batch's own resolving edges (resolves/answers,
+// read through the registry's inverse/rename tables): every entry keeps its
+// input position unless a resolver behind it must move ahead, to just before
+// the node it resolves. A cycle is broken at its first member in input order.
+function resolverFirstOrder(entries, registry) {
+  const RESOLVING = new Set(["resolves", "answers"]);
+  const inverses = registry ? registry.edgeInverses() : {};
+  const renames = registry ? registry.edgeRenames() : {};
+  const index = new Map(entries.map((e, n) => [e.id, n]));
+  const before = entries.map(() => new Set()); // before[t] = resolvers of t in the batch
+  entries.forEach((e, n) => {
+    for (const edge of e.node.edges || []) {
+      if (!edge || !edge.type || !edge.to) continue;
+      let type = edge.type, src = n, dst = index.get(edge.to);
+      if (inverses[type]) {
+        type = inverses[type];
+        [src, dst] = [dst, src];
+      } else if (renames[type]) type = renames[type];
+      if (!RESOLVING.has(type) || src == null || dst == null || src === dst) continue;
+      before[dst].add(src);
+    }
+  });
+  // depth-first in input order: each entry pulls its unplaced resolvers in
+  // just ahead of itself, so nothing else moves. `seen` breaks a cycle.
+  const seen = new Set();
+  const order = [];
+  const visit = (n) => {
+    if (seen.has(n)) return;
+    seen.add(n);
+    for (const p of [...before[n]].sort((a, b) => a - b)) visit(p);
+    order.push(entries[n]);
+  };
+  entries.forEach((_, n) => visit(n));
+  return order;
+}
+
+// Chunk entries under the server's 1MB request cap (MAX_REQUEST_BYTES) with
+// headroom, and a count cap so one POST's sequential commits stay inside a
+// bounded timeout. Order is preserved across chunks, so resolver-first holds.
+const PUT_BATCH_MAX_ENTRIES = 100;
+const PUT_BATCH_MAX_BYTES = 768 * 1024;
+function chunkPutEntries(wire) {
+  const chunks = [];
+  let cur = [], bytes = 0;
+  for (const w of wire) {
+    const b = Buffer.byteLength(JSON.stringify(w));
+    if (cur.length && (cur.length >= PUT_BATCH_MAX_ENTRIES || bytes + b > PUT_BATCH_MAX_BYTES)) {
+      chunks.push(cur);
+      cur = [];
+      bytes = 0;
+    }
+    cur.push(w);
+    bytes += b;
+  }
+  if (cur.length) chunks.push(cur);
+  return chunks;
+}
+
+function readPutNodeBatch(values, input) {
+  if (values.dir) {
+    let names;
+    try {
+      names = fs.readdirSync(values.dir, { withFileTypes: true }).filter((d) => d.isFile() && d.name.endsWith(".md")).map((d) => d.name).sort();
+    } catch (e) {
+      return { error: `could not read ${values.dir}: ${e.message}` };
+    }
+    if (!names.length) return { error: `no *.md node files in ${values.dir}` };
+    const docs = [];
+    for (const name of names) {
+      const file = path.join(values.dir, name);
+      try {
+        docs.push({ raw: fs.readFileSync(file, "utf8"), label: file });
+      } catch (e) {
+        return { error: `could not read ${file}: ${e.message}` };
+      }
+    }
+    return { docs };
+  }
+  const inputRes = readPutNodeInput(input);
+  if (inputRes.error) return inputRes;
+  // a named file is ONE node, byte for byte; only stdin carries a stream
+  const parts = input === "-" ? splitNodeDocuments(inputRes.raw) : [inputRes.raw];
+  return { docs: parts.map((raw, n) => ({ raw, label: parts.length > 1 ? `${inputRes.label} (document ${n + 1})` : inputRes.label })) };
+}
+
+async function cmdPutNodeBatch(cfg, values, docs, policy) {
+  // Parse everything first: a malformed entry refuses the whole batch before
+  // anything is written, so a fix-and-rerun never meets a half-applied input.
+  const entries = [];
+  const problems = [];
+  const seen = new Map();
+  for (const d of docs) {
+    const parsed = parsePutNode(d.raw, d.label);
+    if (parsed.error) {
+      problems.push(`${d.label}: ${parsed.error}`);
+      continue;
+    }
+    const id = parsed.node.id;
+    // --if-exists error only ever creates, so a bad priority is known up
+    // front; under skip an existing node's legacy value is not ours to judge.
+    const bad = policy === "error" ? checkCreatePriority(parsed.node) : null;
+    if (bad) problems.push(`${d.label}: ${bad}`);
+    if (seen.has(id)) problems.push(`${d.label}: duplicate id '${id}' (also in ${seen.get(id)})`);
+    seen.set(id, d.label);
+    entries.push({ id, raw: d.raw, node: parsed.node, label: d.label });
+  }
+  if (problems.length) {
+    for (const p of problems) err(p);
+    err(`put-node batch refused: ${problems.length} invalid entr${problems.length === 1 ? "y" : "ies"} — nothing written`);
+    return 1;
+  }
+
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const isRemote = cfg.mode() === "remote";
+  const nodesDir = isRemote ? null : cfg.nodesDir();
+  if (!isRemote && !fs.existsSync(nodesDir)) {
+    err(`no graph at ${nodesDir} — run 'spor init' first`);
+    return 1;
+  }
+  let registry = null;
+  try {
+    registry = isRemote ? graphLib.seedRegistry() : graphLib.loadGraph(nodesDir).registry;
+  } catch {
+    registry = null;
+  }
+  const ordered = resolverFirstOrder(entries, registry);
+
+  const results = []; // one per entry, in submission order
+  const record = (entry, res) => {
+    results.push(res);
+    if (values.json) return;
+    if (res.ok) {
+      const rev = res.revision ? ` @ ${res.revision}` : "";
+      out(`put-node ${res.status || "ok"}: ${res.id || entry.id}${rev}`);
+      for (const w of res.warnings || []) err(`  warning: ${w}`);
+      renderPriorityStamp(entry.id, res.priority_stamp);
+    } else {
+      err(`put-node error: ${entry.id}: ${res.message}`);
+    }
+  };
+
+  if (isRemote) {
+    const byId = new Map(ordered.map((e) => [e.id, e]));
+    const wire = ordered.map((e) => ({ node: e.raw, if_exists: policy }));
+    let sent = 0;
+    for (const chunk of chunkPutEntries(wire)) {
+      const batch = ordered.slice(sent, sent + chunk.length);
+      const r = await remote.post(cfg, "/v1/nodes", { nodes: chunk }, { timeoutMs: Math.min(120000, 15000 + 1000 * chunk.length) });
+      const rs = r.json && Array.isArray(r.json.results) ? r.json.results : null;
+      if (r.transport || !rs) {
+        const why = r.transport
+          ? `offline — could not reach server (${r.error})`
+          : `put-node error ${r.status}${r.json && r.json.error && r.json.error.message ? `: ${r.json.error.message}` : ""}`;
+        err(why);
+        // outcome unknown for this chunk (a transport failure may have landed
+        // it) and nothing after it was sent: re-run with --if-exists skip.
+        for (const e of ordered.slice(sent)) record(e, { ok: false, id: e.id, status: "error", message: `not confirmed (${why})` });
+        sent = ordered.length;
+        break;
+      }
+      for (let n = 0; n < batch.length; n++) {
+        const e = batch[n];
+        const res0 = rs[n];
+        if (res0 && res0.ok) {
+          const node = byId.get(e.id).node;
+          if (res0.status === "created" && carriesPriority(node)) {
+            res0.priority_stamp = await stampCreatedPriority(cfg, node, res0.id || e.id);
+          }
+          record(e, res0);
+        } else {
+          const detail = res0 ? putNodeEntryDetail(res0) : "no result returned for this entry";
+          record(e, { ...(res0 || {}), ok: false, id: e.id, status: "error", message: `${r.status}${detail ? `: ${detail}` : ""}` });
+        }
+      }
+      sent += chunk.length;
+    }
+  } else {
+    let identity;
+    const stampIdentity = () => (identity ??= gitIdentity(path.dirname(nodesDir)));
+    for (const e of ordered) {
+      const w = putNodeLocal(nodesDir, e.raw, e.node, policy, null, stampIdentity);
+      record(e, w.ok ? w.res : { ok: false, id: e.id, status: "error", message: w.error });
+    }
+  }
+
+  const counts = {};
+  for (const res of results) {
+    const k = res.ok ? res.status || "ok" : "error";
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  const failed = results.some((res) => !res.ok || (res.priority_stamp && !res.priority_stamp.ok));
+  if (values.json) {
+    out(JSON.stringify({ results, counts }, null, 2));
+  } else {
+    const parts = Object.entries(counts).map(([k, n]) => `${n} ${k}`);
+    out(`put-node batch: ${parts.join(", ")} (${results.length} entr${results.length === 1 ? "y" : "ies"})`);
+    out(writeTargetLine(cfg));
+  }
+  return failed ? 1 : 0;
+}
+
 async function cmdPutNode(cfg, { values, positionals }) {
   const input = positionals[0] || "-";
   const ifExists = normalizeIfExists(values["if-exists"]);
@@ -1387,19 +1750,38 @@ async function cmdPutNode(cfg, { values, positionals }) {
     err("--revision is only valid with --if-exists update");
     return 1;
   }
-
-  const inputRes = readPutNodeInput(input);
-  if (inputRes.error) {
-    err(inputRes.error);
+  if (values.dir && positionals[0]) {
+    err("put-node takes either <file>|- or --dir <dir>, not both");
     return 1;
   }
-  const raw = inputRes.raw;
-  const parsed = parsePutNode(raw, inputRes.label);
+
+  const batch = readPutNodeBatch(values, input);
+  if (batch.error) {
+    err(batch.error);
+    return 1;
+  }
+  if (values.dir || batch.docs.length > 1) {
+    if (policy === "update") {
+      err("a batch put-node takes --if-exists error|skip; update nodes one at a time with --revision");
+      return 1;
+    }
+    return cmdPutNodeBatch(cfg, values, batch.docs, policy);
+  }
+
+  const { raw, label } = batch.docs[0];
+  const parsed = parsePutNode(raw, label);
   if (parsed.error) {
     err(parsed.error);
     return 1;
   }
   const id = parsed.node.id;
+  // under --if-exists error a write is always a create, so refuse a bad
+  // priority before anything lands (skip/update judge it per outcome)
+  const badPriority = policy === "error" ? checkCreatePriority(parsed.node) : null;
+  if (badPriority) {
+    err(badPriority);
+    return 1;
+  }
 
   if (cfg.mode() === "remote") {
     const entry = { node: raw, if_exists: policy };
@@ -1416,8 +1798,11 @@ async function cmdPutNode(cfg, { values, positionals }) {
       else err(putNodeEntryError(res0, r.status));
       return 1;
     }
+    if (res0.status === "created" && carriesPriority(parsed.node)) {
+      res0.priority_stamp = await stampCreatedPriority(cfg, parsed.node, res0.id || id);
+    }
     renderPutNodeResult(cfg, res0, !!values.json);
-    return 0;
+    return res0.priority_stamp && !res0.priority_stamp.ok ? 1 : 0;
   }
 
   const nodesDir = cfg.nodesDir();
@@ -1425,41 +1810,12 @@ async function cmdPutNode(cfg, { values, positionals }) {
     err(`no graph at ${nodesDir} — run 'spor init' first`);
     return 1;
   }
-  const file = path.join(nodesDir, `${id}.md`);
-  const exists = fs.existsSync(file);
-  if (!exists && id.length > MAX_ID_LENGTH) {
-    err(`bad node id '${id}': ${id.length} chars exceeds ${MAX_ID_LENGTH} (new node ids must be at most ${MAX_ID_LENGTH} chars)`);
+  const w = putNodeLocal(nodesDir, raw, parsed.node, policy, revision, () => gitIdentity(path.dirname(nodesDir)));
+  if (!w.ok) {
+    err(w.error);
     return 1;
   }
-  if (policy === "error" && exists) {
-    err(`node already exists: ${id} (use --if-exists update with --revision, or --if-exists skip)`);
-    return 1;
-  }
-  if (policy === "skip" && exists) {
-    const res = { ok: true, status: "skipped", id, revision: gitBlobSha(fs.readFileSync(file)), warnings: [] };
-    renderPutNodeResult(cfg, res, !!values.json);
-    return 0;
-  }
-  if (policy === "update") {
-    if (!exists) {
-      err(`no such node: ${id}`);
-      return 1;
-    }
-    const current = gitBlobSha(fs.readFileSync(file));
-    if (current !== revision) {
-      err(`put-node conflict: stale revision for ${id}; current revision: ${current}`);
-      return 1;
-    }
-  }
-
-  const valid = validatePutNodeLocal(nodesDir, parsed.node, raw);
-  if (valid.error) {
-    err(valid.error);
-    return 1;
-  }
-  fs.writeFileSync(file, raw);
-  const res = { ok: true, status: exists ? "updated" : "created", id, revision: gitBlobSha(Buffer.from(raw)), warnings: valid.warnings || [] };
-  renderPutNodeResult(cfg, res, !!values.json);
+  renderPutNodeResult(cfg, w.res, !!values.json);
   return 0;
 }
 
@@ -20892,8 +21248,8 @@ const COMMANDS = {
     run: (cfg, p) => cmdGet(cfg, p),
   },
   "put-node": {
-    group: "Graph", parse: "strict", args: "[<file>|-]",
-    summary: "write a full node markdown file (local validated write; remote: /v1/nodes)",
+    group: "Graph", parse: "strict", args: "[<file>|-] | --dir <dir>",
+    summary: "write full node markdown file(s), one or a batch (local validated write; remote: /v1/nodes)",
     help:
       "Create, skip, or update one complete node markdown file (frontmatter + body)\n" +
       "through the same validated full-node write path as MCP put_node / REST\n" +
@@ -20905,9 +21261,24 @@ const COMMANDS = {
       "Remote mode sends one-entry batch put_node to /v1/nodes, so server attribution,\n" +
       "schema transition gates, edge normalization, and validation all apply. Local\n" +
       "mode writes nodes/<id>.md after parsing and validating the candidate against a\n" +
-      "temporary graph view, so a malformed full node never lands on disk.",
+      "temporary graph view, so a malformed full node never lands on disk.\n\n" +
+      "Batch: --dir <dir> writes every *.md node file in <dir> (one node per file),\n" +
+      "and stdin holding several concatenated nodes (each opening its own `---`\n" +
+      "frontmatter block, outside any code fence) writes all of them — one invocation, and remotely one\n" +
+      "multi-entry POST /v1/nodes per ~100 nodes instead of a round trip per node.\n" +
+      "Every entry is parsed first (a malformed one refuses the batch, nothing\n" +
+      "written); entries are then written in resolver-first order — a node carrying\n" +
+      "a resolves/answers edge to another entry is moved ahead of it, since the\n" +
+      "server gates each create in turn and a born-terminal node needs its resolver\n" +
+      "to exist already. One status line per entry (created/skipped/error) plus a\n" +
+      "tally; exit 1 if any entry failed. A batch takes --if-exists error|skip.\n\n" +
+      "Priority at create: a new node carrying `priority: p1|p2|p3` is stamped with\n" +
+      "priority_by/_at/_via exactly as 'spor priority' would (remote: the server's\n" +
+      "set_priority door, from your token; local: your git identity), so a backfill\n" +
+      "needs no second priority pass. Skipped and updated nodes are not re-stamped.",
     options: {
       "if-exists": { type: "string", value: "error|skip|update", desc: "collision policy (default: error)" },
+      dir: { type: "string", value: "dir", desc: "write every *.md node file in <dir> as one batch" },
       revision: { type: "string", value: "sha", desc: "required with --if-exists update; from 'spor get <id> --json'" },
       json: { type: "boolean", desc: "machine-readable result envelope" },
     },
@@ -20916,6 +21287,8 @@ const COMMANDS = {
       "spor get dec-x --json",
       "spor put-node ./dec-x.md --if-exists update --revision <blob-sha>",
       "cat ./task-new.md | spor put-node --if-exists error",
+      "spor put-node --dir ./backfill --if-exists skip",
+      "cat ./backfill/*.md | spor put-node --if-exists skip",
     ],
     run: (cfg, p) => cmdPutNode(cfg, p),
   },
@@ -22316,7 +22689,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
+module.exports = { forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
 
 if (require.main === module) {
   main()

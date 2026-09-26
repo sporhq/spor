@@ -27,7 +27,13 @@ Method:
    rejected unless its resolving `decision`/`artifact` already exists on the
    graph (the completion-resolver gate, GRAPH.md), so emit each resolver BEFORE
    the terminal node it resolves, or build the node open→resolve→done. Local
-   file writes (the default below) are ungated and order-free.
+   file writes (the default below) are ungated and order-free. To push many
+   nodes to a remote graph, write them to a directory and submit them in ONE
+   call — `spor put-node --dir <dir> --if-exists skip` — not one `put-node`
+   per node: it batches the POSTs, orders resolvers ahead of the nodes they
+   resolve for you, prints a created/skipped/error line per node (so a re-run
+   is auditable), and stamps a `priority: p1|p2|p3` in a new node's frontmatter
+   the way `spor priority` would, so priorities need no second pass.
 2. Aggregate, don't transcribe. One node per durable fact: a decision with its
    why, an issue with its full resolution lineage (found → fixed-in → verified),
    a spec with its current status. NEVER one node per commit; collapse
