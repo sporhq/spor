@@ -2812,7 +2812,15 @@ as well: with no tracking item on the graph the rollback is withheld and the
 `proposed` fact says so, and it is the per-pass proposal check (below) that
 completes it — the moment it heals the missing tracking item from the run
 record's `gate_proposal_*` stamps, the blocker exists, so the demotion runs
-then. Nothing is marked for a person: the heal is the retry. The same pass is
+then. Nothing is marked for a person: the heal is the retry. The tracker's id is
+deterministic over the node and run (`proposalTrackingId`), so the `proposed`
+fact written on that failing pass still NAMES it — a `Tracking item:` line and
+the stage result's `tracking_pending`, unless the write failed on an id
+already occupied, where no heal will file — but as prose, never an edge: the node
+does not exist yet, and the fact's `relates-to` only ever points at a tracker
+that is on the graph. The `blocks` edge and the tracker's own links arrive with
+the heal, one pass later; the `proposed` fact is not rewritten then (it is a
+record of that pass). The same pass is
 also the retry for a demotion that FAILED beside a tracker that did file (a
 transient write error, at park time or during the heal itself): the run record
 carries `gate_demote_pending: true` until the rollback lands, and every

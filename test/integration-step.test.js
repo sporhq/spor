@@ -606,8 +606,42 @@ test("a park whose tracking item could not be filed withholds the demotion, reco
   assert.strictEqual(res.demote_reason, null);
   assert.strictEqual(res.escalation_failed, undefined, "a park is healed by the next checkProposals pass, not re-gated by a person");
   assert.strictEqual(seen.facts.length, 1);
-  assert.match(seen.facts[0].markdown, /Demotion: not attempted — no tracking item could be filed to block task-demo, so its status is left as the run left it/);
+  assert.match(seen.facts[0].markdown, /Demotion: not attempted — no tracking item could be filed to block task-demo \(it is re-filed as task-integration-proposed-x by a later pass, which completes the demotion then\), so its status is left as the run left it/);
   assert.doesNotMatch(seen.facts[0].markdown, /rolled back/);
+  // issue-spor-propose-healed-tracking-one-pass-edge-lag: the tracker's id is
+  // deterministic, so the same-pass fact names the id the heal pass will file
+  // — as prose and a result field, never an edge to a node that is not there.
+  assert.strictEqual(res.tracking_pending, "task-integration-proposed-x");
+  assert.match(seen.facts[0].markdown, /Tracking item: task-integration-proposed-x — not on the graph yet/);
+  assert.doesNotMatch(seen.facts[0].markdown, /to: task-integration-proposed-x/, "no edge to a tracker that does not exist yet");
+  assert.doesNotMatch(seen.facts[0].markdown, /Escalated to/);
+});
+
+test("a park whose tracking write collided with an occupied id names no pending id — no heal will file there", async () => {
+  const { deps, seen } = integrationFakes({ parkForReview: () => ({ ok: false, existing: true, reason: "refusing to adopt another gate's node", id: "task-integration-proposed-x" }) });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_PROPOSE, deps });
+  assert.strictEqual(res.state, "parked");
+  assert.strictEqual(res.tracking_pending, undefined);
+  assert.doesNotMatch(seen.facts[0].markdown, /Tracking item:|re-filed as/);
+  assert.strictEqual(seen.demotions.length, 0);
+});
+
+test("a park whose tracking write threw names no pending id — there is none to name", async () => {
+  const { deps, seen } = integrationFakes({ parkForReview: () => { throw new Error("boom"); } });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_PROPOSE, deps });
+  assert.strictEqual(res.state, "parked");
+  assert.strictEqual(res.tracking_pending, undefined);
+  assert.doesNotMatch(seen.facts[0].markdown, /Tracking item:/);
+  assert.match(seen.facts[0].markdown, /Demotion: not attempted — no tracking item could be filed to block task-demo, so its status/);
+});
+
+test("a park WITH a tracking item carries no pending id", async () => {
+  const { deps, seen } = integrationFakes();
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_PROPOSE, deps });
+  assert.strictEqual(res.escalated_to, "task-integration-proposed-x");
+  assert.strictEqual(res.tracking_pending, undefined);
+  assert.doesNotMatch(seen.facts[0].markdown, /Tracking item:/);
+  assert.match(seen.facts[0].markdown, /to: task-integration-proposed-x/);
 });
 
 test("a park WITH a tracking item demotes naming it, as before", async () => {
