@@ -69,7 +69,7 @@ Body about the demo decision.
 }
 
 // Records every request; POST /v1/questions echoes an ask_question result.
-function askStub({ status = 201, routed_to = "person-steward", via = "mentions", unrouted = false, errCode = "invalid_node", message = "x", details = [] } = {}) {
+function askStub({ status = 201, routed_to = "person-steward", via = "mentions", routed_by = null, warnings = [], unrouted = false, errCode = "invalid_node", message = "x", details = [] } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -79,7 +79,17 @@ function askStub({ status = 201, routed_to = "person-steward", via = "mentions",
       const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
       if (req.url === "/v1/questions" && req.method === "POST") {
         if (status >= 400) return j(status, { error: { code: errCode, message, details } });
-        return j(status, { status: "created", id: "question-42", project: "spor", routed_to: unrouted ? null : routed_to, via: unrouted ? null : via, asker: "person-alice", revision: "abc123", warnings: [] });
+        return j(status, {
+          status: "created",
+          id: "question-42",
+          project: "spor",
+          routed_to: unrouted ? null : routed_to,
+          via: unrouted ? null : via,
+          routed_by: unrouted ? null : routed_by,
+          asker: "person-alice",
+          revision: "abc123",
+          warnings,
+        });
       }
       return j(404, { error: { code: "not_found" } });
     });
@@ -271,4 +281,140 @@ test("ask (remote) fails open against an unreachable server (no stack trace)", a
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /offline/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
+// task-spor-ask-to-flag-and-routing-warnings: --to sends an explicit routing
+// target (no such field exists server-side, so it rides as a leading mention —
+// see 626f2c8 in spor-server), and the response's routed_by/warnings surface.
+
+test("ask (remote) --to is sent as a leading mention, ahead of --mention", async () => {
+  const { srv, hits, base } = await askStub();
+  try {
+    const r = await runAsync(["ask", "Is this still on for Friday?", "--to", "person-ada", "--mention", "dec-x"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const post = hits.find((h) => h.method === "POST" && h.url === "/v1/questions");
+    const body = JSON.parse(post.body);
+    assert.deepStrictEqual(body.mentions, ["person-ada", "dec-x"]);
+    assert.ok(!("to" in body), "--to has no server-side field of its own — it only ever travels as a mention");
+  } finally {
+    srv.close();
+  }
+});
+
+test("ask (remote) --to deduplicates against an identical --mention", async () => {
+  const { srv, hits, base } = await askStub();
+  try {
+    await runAsync(["ask", "q", "--to", "person-ada", "--mention", "person-ada"], remoteEnv(base));
+    const post = hits.find((h) => h.method === "POST" && h.url === "/v1/questions");
+    assert.deepStrictEqual(JSON.parse(post.body).mentions, ["person-ada"]);
+  } finally {
+    srv.close();
+  }
+});
+
+test("ask (remote) prints routed_by alongside via when the server sends it", async () => {
+  const { srv, base } = await askStub({ routed_to: "person-ada", via: "task-x", routed_by: "claim" });
+  try {
+    const r = await runAsync(["ask", "q", "--to", "person-ada"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /routed to person-ada \(via task-x, by claim\)/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("ask (remote) prints the owner-fallback routed_by with no via", async () => {
+  const { srv, base } = await askStub({ routed_to: "person-owner", via: null, routed_by: "owner" });
+  try {
+    const r = await runAsync(["ask", "q"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /routed to person-owner \(by owner\)/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("ask (remote) prints each routing warning to stderr", async () => {
+  const { srv, base } = await askStub({
+    routed_to: "person-owner",
+    via: null,
+    routed_by: "owner",
+    warnings: ["no one in the question's neighborhood matched; routed to person-owner, the tenant owner, as a fallback — mention the node whose owner should answer"],
+  });
+  try {
+    const r = await runAsync(["ask", "q"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stderr, /warning: no one in the question's neighborhood matched; routed to person-owner, the tenant owner, as a fallback/);
+    assert.doesNotMatch(r.stdout, /warning:/, "warnings are stderr-only, not duplicated on stdout");
+  } finally {
+    srv.close();
+  }
+});
+
+test("ask (remote) prints an unrouted question's warning too", async () => {
+  const { srv, base } = await askStub({ unrouted: true, warnings: ["no one in the question's neighborhood matched and no other owner is resolvable; the question is unrouted and surfaces in everyone's queue"] });
+  try {
+    const r = await runAsync(["ask", "q"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /unrouted — no steward matched; visible to everyone/);
+    assert.match(r.stderr, /warning: no one in the question's neighborhood matched and no other owner is resolvable/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("ask (remote) no-warning path is unchanged: no routed_by, no warnings -> same plain (via X) line", async () => {
+  const { srv, base } = await askStub(); // routed_by defaults null, warnings []
+  try {
+    const r = await runAsync(["ask", "q"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /routed to person-steward \(via mentions\)/);
+    assert.doesNotMatch(r.stdout, /by /);
+    assert.strictEqual(r.stderr, "", "no warnings printed when the server sends none");
+  } finally {
+    srv.close();
+  }
+});
+
+// ---------------- --to (local mode) ----------------
+
+test("ask (local) --to writes a mentions edge on the person id, same as --mention", () => {
+  const { home, nodes } = fixtureGraph();
+  const r = run(["ask", "Is this still the right call", "--to", "person-ada", "--project", "demo"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const file = fs.readdirSync(nodes).find((f) => f.startsWith("question-is-this-still"));
+  assert.ok(file, "question node written");
+  const md = fs.readFileSync(path.join(nodes, file), "utf8");
+  assert.match(md, /- \{type: mentions, to: person-ada\}/);
+});
+
+test("ask (local) rejects a --to id that would not round-trip", () => {
+  const { home, nodes } = fixtureGraph();
+  const r = run(["ask", "a question with a broken target", "--to", "person:ada", "--project", "demo"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid --to id "person:ada"/);
+  assert.ok(!fs.readdirSync(nodes).some((f) => f.startsWith("question-a-question-with")), "no node written on a bad --to id");
+});
+
+test("ask (local) a valid --to plus a bad --mention id still names --mention, not --to", () => {
+  const { home, nodes } = fixtureGraph();
+  const r = run(["ask", "a question with a good target and a bad mention", "--to", "person-ada", "--mention", "dec:bad", "--project", "demo"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid --mention id "dec:bad"/);
+  assert.ok(!fs.readdirSync(nodes).some((f) => f.startsWith("question-a-question-with")), "no node written");
+});
+
+test("ask (local) a bad --to id is named --to even with a valid --mention alongside it", () => {
+  const { home, nodes } = fixtureGraph();
+  const r = run(["ask", "a question with a bad target and a good mention", "--to", "person:bad", "--mention", "dec-x", "--project", "demo"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid --to id "person:bad"/);
+  assert.ok(!fs.readdirSync(nodes).some((f) => f.startsWith("question-a-question-with")), "no node written");
+});
+
+test("ask --help documents --to as a best-effort nudge, not a guaranteed override", () => {
+  const r = run(["ask", "--help"]);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /--to/);
+  assert.match(r.stdout, /not a guaranteed override/);
 });

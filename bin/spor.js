@@ -4005,11 +4005,22 @@ async function cmdAdd(cfg, { values, positionals }) {
 async function cmdAsk(cfg, { values, positionals }) {
   const text = positionals[0];
   if (!text) {
-    err('usage: spor ask "<question>" [--title ...] [--mention ID]... [--project S]');
+    err('usage: spor ask "<question>" [--title ...] [--to PERSON] [--mention ID]... [--project S]');
     return 1;
   }
   const toList = (v) => (v == null ? [] : Array.isArray(v) ? v : [v]);
-  const mentions = toList(values.mention);
+  // --to is a best-effort routing nudge, not a real override: askQuestion (spor-
+  // server server/questions.js) takes no explicit routing-target field, only
+  // {text, title, mentions, project} — routing is derived entirely from the
+  // question's relevance neighborhood (mention -> live claim/assigned/author/
+  // steward -> one-hop neighbors -> owner fallback). So --to is sent as a
+  // leading mention: it wins only when the person themselves is stewarded by
+  // someone, or the routing walk otherwise lands on them; it does not force the
+  // route the way a real target field would. Listed first so it gets first look
+  // in the neighborhood walk.
+  const toTargets = toList(values.to);
+  const mentionIds = toList(values.mention);
+  const mentions = [...new Set([...toTargets, ...mentionIds])];
   const title = values.title || null;
   // --project is OPTIONAL on purpose: remote routing derives the project from the
   // question's relevance neighborhood (then the asker's home project), so only an
@@ -4046,9 +4057,21 @@ async function cmdAsk(cfg, { values, positionals }) {
     out(j.id ? `question filed: ${j.id}` : `question filed (${j.status || "ok"})`);
     out(writeTargetLine(cfg));
     // Report routing so the asker knows who it reached, or that it's unrouted and
-    // visible to everyone (no steward matched its neighborhood).
-    if (j.routed_to) out(`  routed to ${j.routed_to}${j.via ? ` (via ${j.via})` : ""}`);
-    else out(`  unrouted — no steward matched; visible to everyone`);
+    // visible to everyone (no steward matched its neighborhood). routed_by (added
+    // alongside warnings — issue-spor-ask-question-routing-ignores-author-
+    // assigned-claim) says HOW the routee was picked (steward|claim|assigned|
+    // author|owner); older servers that don't send it keep the plain "(via X)"
+    // form unchanged.
+    if (j.routed_to) {
+      const detail = [];
+      if (j.via) detail.push(`via ${j.via}`);
+      if (j.routed_by) detail.push(`by ${j.routed_by}`);
+      out(`  routed to ${j.routed_to}${detail.length ? ` (${detail.join(", ")})` : ""}`);
+    } else {
+      out(`  unrouted — no steward matched; visible to everyone`);
+    }
+    // Warnings (fallback fired, question left unrouted, …) go to stderr — they're
+    // a caution about the routing outcome, not part of the success report on stdout.
     for (const w of (j.warnings || [])) err(`  warning: ${w}`);
     return 0;
   }
@@ -4061,10 +4084,10 @@ async function cmdAsk(cfg, { values, positionals }) {
     err(`no graph at ${nodesDir} — run 'spor init' first`);
     return 1;
   }
-  // Reject a --mention id that wouldn't round-trip through the frontmatter parser
-  // before writing, so the mentions edge can't silently vanish on read
+  // Reject a --to/--mention id that wouldn't round-trip through the frontmatter
+  // parser before writing, so the mentions edge can't silently vanish on read
   // (issue-spor-local-add-ask-project-normalization-edge-validation).
-  const badMention = firstBadEdgeId(mentions.map((m) => ["--mention", m]));
+  const badMention = firstBadEdgeId([...toTargets.map((m) => ["--to", m]), ...mentionIds.map((m) => ["--mention", m])]);
   if (badMention) {
     err(edgeIdErr(badMention));
     return 1;
@@ -21271,13 +21294,20 @@ const COMMANDS = {
       "mode writes an open, queueable question node file so a solo user's question\n" +
       "still surfaces in 'spor next'.\n\n" +
       "--mention names a node the question is about (repeatable); routing considers\n" +
-      "mentions first, and locally each becomes a mentions edge. --project overrides\n" +
-      "the derived project — pass it for a mention-less question whose neighborhood is\n" +
-      "empty. --title/--id apply to the local node.\n\n" +
+      "mentions first, and locally each becomes a mentions edge. --to names a person\n" +
+      "you want this routed to; the server has no explicit routing-target field, so\n" +
+      "it's sent as a leading mention — a nudge, not a guaranteed override, since the\n" +
+      "actual route still follows the person's live claim/assigned/author/steward\n" +
+      "signals over the question's neighborhood. --project overrides the derived\n" +
+      "project — pass it for a mention-less question whose neighborhood is empty.\n" +
+      "--title/--id apply to the local node. The response's routing line shows who it\n" +
+      "reached and, when the server reports it, routed_by (steward|claim|assigned|\n" +
+      "author|owner); any routing warnings print to stderr.\n\n" +
       "Answer a question by writing a node with an answers edge to it, then\n" +
       "'spor set-status <id> answered'.",
     options: {
       title: { type: "string", value: "...", desc: "short question title (default: first 10 words)" },
+      to: { type: "string", value: "id", desc: "person to route this to (best-effort — sent as a leading mention; not a guaranteed override)" },
       mention: { type: "string", value: "id", desc: "a node the question is about (repeatable; routing weighs these first)", multiple: true },
       project: { type: "string", value: "S", desc: "override the derived project (for a mention-less question)" },
       id: { type: "string", value: "id", desc: "explicit node id (local only)" },
@@ -21286,6 +21316,7 @@ const COMMANDS = {
       'spor ask "Why does the gardener skip resident schema nodes?"',
       'spor ask "Did the OAuth phase B token-rotation hook land?" --mention dec-cc-authz-rebac-fga',
       'spor ask "Where do tenant OTEL spans get dropped?" --project spor-server',
+      'spor ask "Is this migration still on for Friday?" --to person-ada',
     ],
     run: (cfg, p) => cmdAsk(cfg, p),
   },
