@@ -1,0 +1,27 @@
+{
+  "task": "task-spor-test-suite-runtime-budget",
+  "box": "spor-dev, 2 vCPU (availableParallelism 2), node v24.21.0, shared with other agents' suites (loadavg 10-36 throughout)",
+  "note": "The box was never unloaded, so every comparison is like-for-like on a loaded box, not an absolute. Wall time there is CPU starvation: a ~0.1 CPU-second CLI spawn measured 1.8s wall at load 30.",
+  "method": "node --test with a JSONL reporter (per-test duration_ms) or --test-reporter=tap, wrapped in /usr/bin/time for wall and CPU (user+sys, includes reaped children).",
+  "sequential": {
+    "baseline": { "ref": "ec5c957 (npm test: default concurrency = 1 file at a time on 2 cores)", "wall_s": 4243, "loadavg_samples": [11.8, 13.5, 15.2, 18.1, 20.9, 36.8, 30.7], "tests_passed": 3419, "failed": 0 },
+    "candidate": { "ref": "this branch (scripts/test-run.js)", "wall_s": 1760, "cpu_s": 302, "loadavg_mean": 20.0, "tests_passed": 3440, "failed": 0 },
+    "speedup": 2.41
+  },
+  "paired_same_time": {
+    "note": "Both suites launched together from separate checkouts, so both saw the same load (mean 14.8 while overlapping). The baseline had the box to itself after the candidate finished, which favors the baseline.",
+    "baseline": { "ref": "main 2f8a2b0", "wall_s": 2435, "cpu_s": 333, "failed": 0, "progress_when_candidate_finished": "1309 of 3413 ok lines (38%)" },
+    "candidate": { "ref": "this branch", "wall_s": 1280, "cpu_s": 297, "failed": 0 },
+    "speedup": 1.90
+  },
+  "tests_by_name": "Every baseline test name (3419) is present and passing in the candidate; the extra names are tests main gained since ec5c957 plus test/test-run.test.js.",
+  "baseline_top_files_s": [["dispatch.test.js", 612], ["spor-cli.test.js", 459], ["work-loop.test.js", 414], ["preflight.test.js", 165], ["integration-step.test.js", 141], ["set-status-edge.test.js", 133], ["agent-identity.test.js", 109], ["gate-pipeline.test.js", 89], ["hookcli.test.js", 82], ["e2e-claude.test.js", 75]],
+  "baseline_slowest_test": { "name": "preflight.test.js: zero-wait concurrent candidate claims are exclusive and acquire after contention clears", "wall_s": 69.1, "after_s": "3-6 (ordering replaces a load-scaled 1.5s x up-to-8 hold, 5 rounds)" },
+  "levers": {
+    "concurrency": "node --test defaults to availableParallelism()-1 = 1 on 2 cores; test-run.js uses max(2, cores).",
+    "compile_cache": "NODE_COMPILE_CACHE for every spawned node process: bin/spor.js --version 0.08-0.10 -> 0.06-0.07 CPU-s; whole-suite CPU 333 -> 297 s (-11%, with the lazy https require).",
+    "lazy_https": "require('https') is ~4ms CPU on top of what the CLI already loads, used only by the npm version check.",
+    "fixed_sleeps": "Minor overall; the one large one was the preflight race hold."
+  },
+  "unloaded_projection": "Not measured (no idle window). Suite CPU is ~300 s, so an idle 2-core box is bounded below by ~150 s wall at concurrency 2 versus >=333 s serial for the baseline."
+}
