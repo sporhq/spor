@@ -383,6 +383,15 @@ test('getBool honors the shell "0"/"false" convention', () => {
   assert.strictEqual(cd.getBool('nudge.enabled', true), true); // fallback
 });
 
+test('getBool treats a JSON null as unset, falling through to the fallback (issue-spor-config-getbool-null-reads-true)', () => {
+  const dir = tmp();
+  write(path.join(dir, '.spor.json'), { digest: { async: null } });
+  const cNullFalse = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir }) });
+  assert.strictEqual(cNullFalse.getBool('digest.async', false), false); // fallback, not true
+  const cNullTrue = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir }) });
+  assert.strictEqual(cNullTrue.getBool('digest.async', true), true); // fallback, not stringified "null"
+});
+
 test('queue.front: structural defaults, env override, and disable convention', () => {
   // task-cc-local-front-productionize: the local git-derived front window/toggle
   // live in the cascade. Defaults are baked into DEFAULTS (not get() fallbacks).
