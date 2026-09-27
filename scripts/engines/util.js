@@ -15,7 +15,7 @@ const CODEX_NUDGE_MODEL = "gpt-5.4-mini";
 
 const home = require(path.join(ROOT, "lib", "shell", "home.js"));
 const { writeFileAtomic } = require(path.join(ROOT, "lib", "shell", "atomic-write.js"));
-const { gitEnv, gitSpawn } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
+const { gitEnv, gitSpawn, gitToplevelAndCommonDir } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 // The harness vocabulary the capability probe emits — owned by the pure matcher
 // so the probe, the matcher, and the future fleet scheduler agree on one set of
 // names (dec-spor-machine-profile-satisfiability). Never re-hardcode it here.
@@ -247,8 +247,7 @@ function structuralWorktreeRoot(cwd) {
 // so structuralWorktreeRoot() recovers the enclosing checkout from the path
 // convention before falling back to raw cwd.
 function inferenceRoot(cwd) {
-  const raw = git(cwd, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]) ?? "";
-  const [top, common] = raw.trim().split("\n").map((l) => l.trim());
+  const { top, common } = gitToplevelAndCommonDir(cwd);
   if (!top) return structuralWorktreeRoot(cwd) || cwd || "";
   // In a linked worktree git-common-dir is the main repo's `.git`, sitting
   // one level under the main worktree; in the main checkout it is `<top>/.git`
@@ -280,8 +279,7 @@ function inferenceRoot(cwd) {
 // TOCTOU-safe trick as inferenceRoot. Fail-open to null (not a worktree, not
 // git, or git couldn't resolve it at all) — never invented from a path alone.
 function linkedWorktreeMainRoot(dir) {
-  const raw = git(dir, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]) ?? "";
-  const [top, common] = raw.trim().split("\n").map((l) => l.trim());
+  const { top, common } = gitToplevelAndCommonDir(dir);
   if (!top || !common || path.basename(common) !== ".git") return null;
   // git prints `C:/...` on Windows; resolve both to the platform's own form so
   // the root this hands back reads (and persists) like every other path we print.

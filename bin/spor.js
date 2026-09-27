@@ -25,31 +25,79 @@ const { spawn, spawnSync } = require("child_process");
 const { parseArgs } = require("util");
 
 const ROOT = path.resolve(__dirname, "..");
+
+// Most `spor` verbs (priority, get, next, set-status, …) never touch the
+// dispatch/gate/attestation machinery, but every hook invocation spawns this
+// CLI, so requiring all of it unconditionally at the top costs every command
+// the full compile-and-load of every command's dependencies
+// (task-spor-cli-lazy-load-modules). lazyModule() defers the real require()
+// to the first property access, behind a Proxy so every existing call site
+// (`mod.fn(...)`) is untouched; the module is required at most once, then
+// cached like any other require. Only safe for a module whose OWN top-level
+// code never touches it outside a function body — the few exceptions
+// (destructured constants computed at load time) get thin wrapper functions
+// below instead, so they still defer the require.
+function lazyModule(id) {
+  let mod = null;
+  function load() {
+    if (mod === null) mod = require(id);
+    return mod;
+  }
+  return new Proxy(
+    {},
+    {
+      get(_t, prop, receiver) {
+        return Reflect.get(load(), prop, receiver);
+      },
+      set(_t, prop, value, receiver) {
+        return Reflect.set(load(), prop, value, receiver);
+      },
+      has(_t, prop) {
+        return Reflect.has(load(), prop);
+      },
+      ownKeys() {
+        return Reflect.ownKeys(load());
+      },
+      getOwnPropertyDescriptor(_t, prop) {
+        return Reflect.getOwnPropertyDescriptor(load(), prop);
+      },
+      deleteProperty(_t, prop) {
+        return Reflect.deleteProperty(load(), prop);
+      },
+    },
+  );
+}
+
 const { loadConfig, DEFAULT_SERVER } = require(path.join(ROOT, "lib", "config.js"));
 const remote = require(path.join(ROOT, "lib", "remote.js"));
 const auth = require(path.join(ROOT, "lib", "auth.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const { gitSpawn } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
-const dispatchRuns = require(path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js"));
-const dispatchTerminal = require(path.join(ROOT, "lib", "shell", "dispatch-terminal.js"));
-const dispatchHarnesses = require(path.join(ROOT, "lib", "shell", "dispatch-harnesses.js"));
-const preflight = require(path.join(ROOT, "lib", "shell", "preflight.js"));
-const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
-const workLoop = require(path.join(ROOT, "lib", "shell", "work-loop.js"));
-const gatesKernel = require(path.join(ROOT, "lib", "kernel", "gates.js"));
-const candidateKernel = require(path.join(ROOT, "lib", "kernel", "candidate.js"));
-const completionKernel = require(path.join(ROOT, "lib", "kernel", "completion.js"));
-const completionShell = require(path.join(ROOT, "lib", "shell", "completion.js"));
-const executionStore = require(path.join(ROOT, "lib", "shell", "execution-store.js"));
-const executionKernel = require(path.join(ROOT, "lib", "kernel", "execution.js"));
-const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
-const candidatePublish = require(path.join(ROOT, "lib", "shell", "candidate-publish.js"));
-const factoryAvailability = require(path.join(ROOT, "lib", "shell", "factory-availability.js"));
-const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
-const implementationStage = require(path.join(ROOT, "lib", "shell", "implementation-stage.js"));
-const workerContractLib = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
-const { workerContract } = workerContractLib;
-const attestation = require(path.join(ROOT, "lib", "shell", "attestation.js"));
+const dispatchRuns = lazyModule(path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js"));
+const dispatchTerminal = lazyModule(path.join(ROOT, "lib", "shell", "dispatch-terminal.js"));
+const dispatchHarnesses = lazyModule(path.join(ROOT, "lib", "shell", "dispatch-harnesses.js"));
+const preflight = lazyModule(path.join(ROOT, "lib", "shell", "preflight.js"));
+const sat = lazyModule(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
+const workLoop = lazyModule(path.join(ROOT, "lib", "shell", "work-loop.js"));
+const gatesKernel = lazyModule(path.join(ROOT, "lib", "kernel", "gates.js"));
+const candidateKernel = lazyModule(path.join(ROOT, "lib", "kernel", "candidate.js"));
+const completionKernel = lazyModule(path.join(ROOT, "lib", "kernel", "completion.js"));
+const completionShell = lazyModule(path.join(ROOT, "lib", "shell", "completion.js"));
+const executionStore = lazyModule(path.join(ROOT, "lib", "shell", "execution-store.js"));
+const executionKernel = lazyModule(path.join(ROOT, "lib", "kernel", "execution.js"));
+const gateRunner = lazyModule(path.join(ROOT, "lib", "shell", "gate-runner.js"));
+const candidatePublish = lazyModule(path.join(ROOT, "lib", "shell", "candidate-publish.js"));
+const factoryAvailability = lazyModule(path.join(ROOT, "lib", "shell", "factory-availability.js"));
+const integrationRunner = lazyModule(path.join(ROOT, "lib", "shell", "integration-runner.js"));
+const implementationStage = lazyModule(path.join(ROOT, "lib", "shell", "implementation-stage.js"));
+const workerContractLib = lazyModule(path.join(ROOT, "lib", "shell", "worker-contract.js"));
+// workerContractLib is lazy, so this can't be a destructure (that would force
+// the require right here, at every startup) — a thin wrapper defers it like
+// every other call site below.
+function workerContract(...args) {
+  return workerContractLib.workerContract(...args);
+}
+const attestation = lazyModule(path.join(ROOT, "lib", "shell", "attestation.js"));
 // Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
 // queue ranker and read surfaces use. The dispatch guard reads it so it never
@@ -66,7 +114,7 @@ const { deriveReadiness, readinessOf } = require(path.join(ROOT, "lib", "kernel"
 // the SAME renderer local mode uses, so output matches (task-spor-analytics-
 // remote-cli-dispatch). Requiring the module only pulls its exports — its CLI
 // block is require.main-guarded.
-const analyticsLib = require(path.join(ROOT, "lib", "analytics.js"));
+const analyticsLib = lazyModule(path.join(ROOT, "lib", "analytics.js"));
 
 // The CLI surface is a single declarative table (COMMANDS, defined below): it is
 // the one source of truth for dispatch, flag parsing (Node's built-in
@@ -13101,8 +13149,18 @@ async function loadFactoryDefinition(cfg, id) {
 // The git plumbing for a command gate — reading the change under judgement,
 // materializing the trusted-ref tree, running the suite — lives in
 // lib/shell/gate-runner.js beside the pipeline it serves (and is unit-tested
-// against a real temp repo there).
-const { gateChangeSet, prepareGateTree, runGateCommand } = gateRunner;
+// against a real temp repo there). gateRunner is lazy, so these stay thin
+// wrappers rather than a destructure — a destructure here would force the
+// require at startup for every command (task-spor-cli-lazy-load-modules).
+function gateChangeSet(...args) {
+  return gateRunner.gateChangeSet(...args);
+}
+function prepareGateTree(...args) {
+  return gateRunner.prepareGateTree(...args);
+}
+function runGateCommand(...args) {
+  return gateRunner.runGateCommand(...args);
+}
 
 // Follow a gate's own dispatched run (a review, a fix cycle) to its terminal
 // state. Bounded — a review that never ends must fail its gate rather than hold
@@ -13478,7 +13536,19 @@ function gateShortRun(runId) {
 
 // The id suffix and the two body-safety helpers are the gate runner's, so the
 // facts it mints and the work nodes minted here can never drift apart.
-const { gateIdSuffix, fenceSafe, capBytes: gateCapBytes, NODE_BODY_CAP_BYTES } = gateRunner;
+// Thin wrappers, not a destructure, for the same reason as gateChangeSet above.
+function gateIdSuffix(...args) {
+  return gateRunner.gateIdSuffix(...args);
+}
+function fenceSafe(...args) {
+  return gateRunner.fenceSafe(...args);
+}
+function gateCapBytes(...args) {
+  return gateRunner.capBytes(...args);
+}
+function nodeBodyCapBytes() {
+  return gateRunner.NODE_BODY_CAP_BYTES;
+}
 
 // One work-node template for the three items a gate can file. All three are
 // ordinary queue items — an escalation and an approval carry `requires: [human]`
@@ -13526,7 +13596,7 @@ function buildGateWorkNode({ id, type = "task", title, summary, body, project, d
   // bodies are unbounded by construction — 20 findings, a suite tail, one line
   // per protected path. An escalation nobody could file is a gate refusal
   // nobody is told about, so the body is trimmed here rather than lost there.
-  return gateCapBytes(lines.join("\n"), NODE_BODY_CAP_BYTES - 512);
+  return gateCapBytes(lines.join("\n"), nodeBodyCapBytes() - 512);
 }
 
 // How an approval item is READ (WORKERS.md §10.5). Deliberately not the
@@ -13841,10 +13911,17 @@ function gateWorkItemText(node) {
 // Derived from the harness module's ONE flag list (HARNESS_OPTION_FLAGS), so a
 // new harness flag lands here without a second edit
 // (issue-spor-rescue-posture-foreign-restrictive-flag-becomes-bypass).
-const REVIEW_HARNESS_FLAGS = Object.keys(dispatchHarnesses.HARNESS_OPTION_FLAGS).concat(["model"]);
+// Memoized lazy getters, not top-level consts — dispatchHarnesses is lazy, and
+// a plain `const X = dispatchHarnesses.foo` here would force its require at
+// startup for every command (task-spor-cli-lazy-load-modules).
+let _reviewHarnessFlags = null;
+function reviewHarnessFlags() {
+  if (!_reviewHarnessFlags) _reviewHarnessFlags = Object.keys(dispatchHarnesses.HARNESS_OPTION_FLAGS).concat(["model"]);
+  return _reviewHarnessFlags;
+}
 function reviewPassthrough(passthrough) {
   const out = { ...(passthrough || {}) };
-  for (const k of REVIEW_HARNESS_FLAGS) delete out[k];
+  for (const k of reviewHarnessFlags()) delete out[k];
   return out;
 }
 
@@ -13859,10 +13936,18 @@ function reviewPassthrough(passthrough) {
 // worker's posture exactly as a fix cycle does: a claude-code rescue launched
 // without the worker's `--permission-mode bypassPermissions` stalls on its
 // first write prompt with nobody there to answer it.
-const RESCUE_ROUTING_FLAGS = ["model"].concat(Object.keys(dispatchHarnesses.harnessOptionFlags("routing")));
+let _rescueRoutingFlags = null;
+function rescueRoutingFlags() {
+  if (!_rescueRoutingFlags) _rescueRoutingFlags = ["model"].concat(Object.keys(dispatchHarnesses.harnessOptionFlags("routing")));
+  return _rescueRoutingFlags;
+}
 // The posture flags, each mapped to the option key an adapter's
 // `validateOptions` reads it under.
-const RESCUE_POSTURE_FLAGS = dispatchHarnesses.harnessOptionFlags("posture");
+let _rescuePostureFlags = null;
+function rescuePostureFlags() {
+  if (!_rescuePostureFlags) _rescuePostureFlags = dispatchHarnesses.harnessOptionFlags("posture");
+  return _rescuePostureFlags;
+}
 
 // The worker's passthrough as the rescue's own harness can read it. The
 // posture is spelled in the WORKER's harness vocabulary and the lane routinely
@@ -13906,15 +13991,15 @@ const RESCUE_POSTURE_FLAGS = dispatchHarnesses.harnessOptionFlags("posture");
 // an unattended agent may do has to be visible.
 function rescuePassthrough(passthrough, adapter) {
   const out = { ...(passthrough || {}) };
-  for (const k of RESCUE_ROUTING_FLAGS) delete out[k];
+  for (const k of rescueRoutingFlags()) delete out[k];
   const dropped = [];
   const applied = [];
   let translated = null;
   if (!adapter || typeof adapter.validateOptions !== "function") return { values: out, dropped, applied, translated };
   // The worker's whole posture, as the adapters read it.
   const posture = {};
-  for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) if (out[flag]) posture[option] = out[flag];
-  for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
+  for (const [flag, option] of Object.entries(rescuePostureFlags())) if (out[flag]) posture[option] = out[flag];
+  for (const [flag, option] of Object.entries(rescuePostureFlags())) {
     if (!out[flag]) continue;
     // `agent` is already gone above, and Codex checks it BEFORE the permission
     // mode it translates — passing it here would mask that translation with a
@@ -13932,16 +14017,16 @@ function rescuePassthrough(passthrough, adapter) {
     const meaning = dispatchHarnesses.postureMeaning(posture) || "attended";
     translated = { meaning, from: spelled(dropped) };
     if (meaning === "read-only") {
-      for (const flag of Object.keys(RESCUE_POSTURE_FLAGS)) delete out[flag];
+      for (const flag of Object.keys(rescuePostureFlags())) delete out[flag];
       out["read-only"] = true;
       applied.push({ flag: "read-only", value: true });
     } else if (meaning === "attended") {
       // Displace what survived (a bypass beside the foreign attended flag
       // would otherwise stand), then say attended the lane's own way — or,
       // where the lane has no attended spelling, narrow to read-only.
-      for (const flag of Object.keys(RESCUE_POSTURE_FLAGS)) delete out[flag];
+      for (const flag of Object.keys(rescuePostureFlags())) delete out[flag];
       if (adapter.attended) {
-        for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
+        for (const [flag, option] of Object.entries(rescuePostureFlags())) {
           if (!adapter.attended[option]) continue;
           out[flag] = adapter.attended[option];
           applied.push({ flag, value: adapter.attended[option] });
@@ -13952,7 +14037,7 @@ function rescuePassthrough(passthrough, adapter) {
         applied.push({ flag: "read-only", value: true });
       }
     } else if (meaning === "unattended" && adapter.unattended) {
-      for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
+      for (const [flag, option] of Object.entries(rescuePostureFlags())) {
         if (!adapter.unattended[option] || out[flag]) continue;
         out[flag] = adapter.unattended[option];
         applied.push({ flag, value: adapter.unattended[option] });
@@ -13966,7 +14051,7 @@ function rescuePassthrough(passthrough, adapter) {
     // (`adapter.unattended`, beside `readOnly` — never a table here); empty
     // for every harness that needs no flag, the bypass on claude-code, and
     // said out loud because a posture nobody typed is being applied.
-    for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
+    for (const [flag, option] of Object.entries(rescuePostureFlags())) {
       if (!adapter.unattended[option]) continue;
       out[flag] = adapter.unattended[option];
       applied.push({ flag, value: adapter.unattended[option] });
@@ -16185,7 +16270,7 @@ async function writeEscalationRetryArtifact(cfg, { entry, payload, gate, factory
     "read about this refusal.",
     "",
   ];
-  const written = await writeGateNode(cfg, id, gateCapBytes(lines.join("\n"), NODE_BODY_CAP_BYTES - 512));
+  const written = await writeGateNode(cfg, id, gateCapBytes(lines.join("\n"), nodeBodyCapBytes() - 512));
   return { ...written, id };
 }
 
@@ -19417,7 +19502,7 @@ async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, re
       : "This is a gate outcome, not a resolution of the work item: the item's own resolver already stands, and the\nescalation this resolves was the refusal's blocker, now answered.",
     "",
   ];
-  const written = await writeGateNode(cfg, id, gateCapBytes(lines.join("\n"), NODE_BODY_CAP_BYTES - 512));
+  const written = await writeGateNode(cfg, id, gateCapBytes(lines.join("\n"), nodeBodyCapBytes() - 512));
   return { ...written, id };
 }
 
@@ -19570,7 +19655,7 @@ async function writeSweepNote(cfg, { kind, record, factoryId, escalations, relat
     body,
     "",
   ];
-  const written = await writeGateNode(cfg, id, gateCapBytes(lines.join("\n"), NODE_BODY_CAP_BYTES - 512));
+  const written = await writeGateNode(cfg, id, gateCapBytes(lines.join("\n"), nodeBodyCapBytes() - 512));
   return { ...written, id };
 }
 
