@@ -2172,9 +2172,20 @@ diagnoses a defect, and a reviewer whose harness never answered found none.
 An `unroutable` reading is off that ladder entirely: waiting buys nothing for a
 dispatch this box refused, so it refuses at once, still without charging a fix
 cycle. Whichever way it stops, the refusal records WHY it did not ask again —
-the pool is spent, the factory declared none, the charge would not land, the
-worker was asked to stop — and the escalation says that rather than reporting
-every reason as an exhausted budget.
+the pool is spent, the factory declared none, the charge would not land — and
+the escalation says that rather than reporting every reason as an exhausted
+budget.
+
+A worker asked to STOP while a gate is waiting out an outage is not one of
+those refusals: nothing judged the change, so the pipeline reports
+`interrupted` and settles nothing — no fact, no escalation, no demotion, no
+attestation. The retry it was about to take is CHARGED first, with its due time
+(`gate_progress.pools.retry.due_at`), and the run's gating slot stays in the
+stopped worker's status, so the next gate-armed worker resumes it (§10.8),
+waits out whatever is left of that backoff before dispatching anything, and
+takes the retry already paid for rather than a fresh, uncharged one. A pool
+already spent, or a charge that will not land, still refuses as above — a stop
+does not turn an exhausted budget into a pause.
 
 A FIXER's own dispatch is read through the same classifier, and what its class
 means depends on what it left behind: a fix whose harness died on the

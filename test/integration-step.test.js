@@ -4513,6 +4513,27 @@ test("a re-gate that FAILS at the moved head settles the stage failed — nothin
   assert.strictEqual(res.head_matches_gated, false);
 });
 
+test("a re-gate a STOP caught inside an outage settles nothing — the stage hands the interruption up unrecorded", async () => {
+  // issue-spor-review-gate-reviewer-outage-read-as-rejection: the gate
+  // pipeline answers a stop during an outage backoff with an unsettled
+  // `interrupted`; reading it here as a failed re-gate would escalate and
+  // demote an item over an outage nobody judged.
+  const heads = ["head-v1", "head-v2"];
+  let reads = 0;
+  const { deps, seen } = integrationFakes({ build: [{ ok: false, conflict: true, reason: "merging onto main conflicts" }, { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" }] });
+  deps.changedTree = async () => ({ ok: true, top: "/repo", head: heads[Math.min(reads++, heads.length - 1)], cwd: "/repo/wt" });
+  deps.regate = async () => ({ state: "interrupted", outage_interrupted: true, reason: "the worker was asked to stop while gate review was waiting out an outage", gates: [], facts: [] });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps, gatedHead: "head-v1" });
+  assert.strictEqual(res.state, "interrupted");
+  assert.strictEqual(res.outage_interrupted, true);
+  assert.match(res.reason, /waiting out an outage/);
+  assert.strictEqual(seen.lands, 0, "nothing lands");
+  assert.strictEqual(seen.escalations.length, 0, "no escalation");
+  assert.strictEqual(seen.facts.length, 0, "no merge fact — nothing was judged");
+  assert.strictEqual(seen.demotions.length, 0, "no demotion");
+  assert.strictEqual(seen.leaseReleased, seen.leaseAcquired, "and the serialize lease is handed back on the way out");
+});
+
 test("a re-gate that passes at a DIFFERENT head than the moved one is not a pass for the moved head", async () => {
   const heads = ["head-v1", "head-v2"];
   let reads = 0;
