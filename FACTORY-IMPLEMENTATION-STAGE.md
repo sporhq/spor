@@ -427,6 +427,11 @@ Under `publish: both` the candidate carries `reference` (the bundle) and
 is `git bundle create` of `base.merge_base..commit`, so the reader needs
 `base.merge_base` present, which the trusted ref's history guarantees.
 
+**Reconciled (D3):** as above (§2.1), the `bundle` row's default locator is
+`file://<userConfigHome>/candidates` in both modes, not
+`file://<SPOR_HOME>/candidates` — everything else in the row (content
+verification, the shared-filesystem/`https://` escape) is unchanged.
+
 **What is refused as a reference** (checked at submission by the producer,
 and again by every reader before a fetch): a locator that is not an absolute
 URI with scheme `file` or `https`; a `file://` locator that does not resolve
