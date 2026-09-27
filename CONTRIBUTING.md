@@ -50,6 +50,11 @@ npm run conformance # the byte-identical golden suite
 Both must pass. Add tests for new behavior, and keep new code in the style of
 the code around it.
 
+CI (`.github/workflows/test.yaml`) runs the suite as a 4-way shard matrix
+(`npm run test:shard -- <1..4>/4`) crossed with the OS matrix, plus a separate
+conformance job, so a PR shows per-shard/per-OS jobs rather than one long
+`npm test` run; a final `CI` job aggregates them into one required check.
+
 ## Skill eval suites
 
 Some shipped skills carry an `evals/evals.json` (currently `skills/factory/` and
