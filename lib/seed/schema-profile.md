@@ -2,7 +2,7 @@
 id: schema-profile
 type: schema
 kind: node-schema
-schema_version: 2026.09.06.1
+schema_version: 2026.09.27.1
 title: Seed schema for profile nodes
 summary: Node schema for the profile type — a reusable runtime+capability bundle (harness, model, skills, plugins, mcp) an agent runs under. The runtime fields ARE the dispatch satisfiability spec the machine-capabilities matcher reads; there is no separate requirements block. Personal AND org-published with personal override. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-18
@@ -27,6 +27,14 @@ already supports:
   (claude-code → `claude -p` under the shared supervisor, codex/opencode →
   their CLIs). A flat scalar.
 - `model:` — the model id passed to the harness (`--model`). A flat scalar.
+- `model_family:` — optional (2026.09.27.1): the canonical MODEL FAMILY the
+  model belongs to (`gpt-5`, `claude`, …), compared lowercased with runs of
+  non-alphanumerics collapsed to `-`. It is what a review gate's declared
+  `fallback_profile` is judged INDEPENDENT on — never the provider or the
+  harness, since two harnesses can front one model — and a profile that
+  declares none cannot be shown to differ, so it is never selected as a
+  fallback reviewer (dec-spor-reviewer-reset-pause-budget-and-provenance). Not
+  a satisfiability field: it constrains nothing a machine must have.
 - `skills:` / `plugins:` / `mcp:` — inline lists of the skills, plugins, and MCP
   servers the harness preloads; `mcp` is merged into the strict `--mcp-config`
   dispatch writes so the agent's toolset is exactly the profile plus the

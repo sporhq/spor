@@ -2,7 +2,7 @@
 id: schema-gate
 type: schema
 kind: node-schema
-schema_version: 2026.09.06.1
+schema_version: 2026.09.27.1
 title: Shareable factory gate
 summary: One reusable gate — command, agent-review or human — that any factory definition can reference by id, so an org vets a gate once (a `gate-security-review`) and reuses it product-wide instead of copying it into every factory.
 date: 2026-08-26
@@ -71,7 +71,21 @@ Keys by kind:
   convention; the machine's declared binding decides what that actually
   executes), `instructions`, `await_ms`, and `risk`. The reviewer answers with a
   fenced JSON verdict which the runner parses in code — an unreadable verdict is
-  a failure, never a pass.
+  a failure, never a pass. Three optional keys (2026.09.27.1, task-spor-review-
+  gate-quota-outage-reset-aware-pause-and-fallback-reviewer) govern a review
+  that produced NO verdict because its backend was out: `pause_max_ms` (default
+  48h) bounds how far ahead the outage's own stated reset ("try again at
+  <date>", `Retry-After`) may park the pipeline — slot freed, nothing settled —
+  before the gate refuses instead; `fallback_profile` names a second review
+  lane the runner routes to after `fallback_after` (default 1, max 5)
+  no-verdict readings under `profile`, and only when that lane's declared
+  `model_family` differs from the implementer's (unknown or equal refuses it —
+  the gate then pauses or refuses as if none were declared). The fallback is
+  never a satisfiability-time substitution; each dispatch after a pause or
+  under the fallback is charged to the factory's shared
+  `implementation.retry.attempts` pool (a pool of zero authorizes none), and
+  every verdict it gives names it on the gate fact and the attested step.
+  Omitted, none of the three changes the gate's definition digest.
 - **human** — `approval_timeout_ms`, `poll_ms`, `instructions`, and `risk`.
 
 `risk` is common to all three kinds: the factory-declared risk classes that ARM

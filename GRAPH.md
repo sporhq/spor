@@ -1081,6 +1081,11 @@ date: 2026-06-18
   `mcp` is merged into the strict `--mcp-config` dispatch writes, so the agent's
   toolset is exactly the profile plus the agent-spor server, nothing ambient
   (dec-spor-session-identity-active-record).
+- `model_family:` (optional) names the canonical model family (`gpt-5`,
+  `claude`, …). It is not a satisfiability field; it is what a review gate's
+  `fallback_profile` is judged independent of the implementer on — an unknown
+  or equal family refuses the fallback
+  (dec-spor-reviewer-reset-pause-budget-and-provenance).
 - **The graph names the harness; the MACHINE binds what that name runs**
   (task-spor-dispatch-declarative-custom-harness). `harness:` may name a
   launcher the client ships no in-code adapter for — a team's modified build,
