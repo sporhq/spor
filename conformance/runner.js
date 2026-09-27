@@ -31,6 +31,7 @@ const path = require("path");
 const kgraph = require("../lib/kernel/graph.js");
 const kfm = require("../lib/kernel/frontmatter.js");
 const kqueue = require("../lib/kernel/queue.js");
+const ktok = require("../lib/kernel/tokenizer.js");
 const { sandboxFor } = require("../lib/sandbox.js");
 
 const ROOT = __dirname;
@@ -197,6 +198,21 @@ const KINDS = {
       out.push({ op, result });
     }
     return json(out);
+  },
+
+  // the text fold / tokenizer / slugifier (task-spor-unicode-slugify-and-
+  // tokenizer) — one record per pinned input string: the case-preserving
+  // fold, the raw word split, the filtered tf-idf terms, and the id stem at
+  // the case's pinned max length. No corpus: the edge cases ARE the input.
+  tokenizer(c) {
+    return json(c.input.strings.map((s) => ({
+      input: s,
+      fold: ktok.fold(s),
+      words: ktok.words(s),
+      tokens: ktok.tokens(s),
+      slug: ktok.slugify(s),
+      slugMax: ktok.slugify(s, c.input.slugMax),
+    })));
   },
 
   // validator diagnostics — JSON of the reportable surface (the parsed nodes

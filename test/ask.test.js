@@ -146,6 +146,17 @@ test("ask (local) with no mention writes no edges block", () => {
   assert.doesNotMatch(md, /edges:/);
 });
 
+// task-spor-unicode-slugify-and-tokenizer: the minted id stem goes through the
+// shared Unicode-aware slugifier — diacritics transliterate instead of
+// hyphenating ("sv-ljer"), and a long title is cut on a word boundary.
+test("ask (local) mints a transliterated, word-boundary-truncated id from a Swedish title", () => {
+  const { home, nodes } = fixtureGraph();
+  const r = run(["ask", "Varför sväljer betalningsflödet felet när kunden trycker på knappen igen", "--project", "demo"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /question filed: question-varfor-svaljer-betalningsflodet-felet-nar-kunden \(open\)/);
+  assert.ok(fs.existsSync(path.join(nodes, "question-varfor-svaljer-betalningsflodet-felet-nar-kunden.md")));
+});
+
 test("ask (local) honors --title and --id, uniquifies a colliding id", () => {
   const { home, nodes } = fixtureGraph();
   const a = run(["ask", "first", "--id", "question-dup", "--project", "demo"], { SPOR_HOME: home });

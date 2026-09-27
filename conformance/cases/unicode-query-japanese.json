@@ -1,0 +1,11 @@
+{
+  "id": "unicode-query-japanese",
+  "kind": "compile",
+  "corpus": "unicode",
+  "input": {
+    "query": "東京 会議 予算 日程",
+    "digest": true
+  },
+  "expected": "unicode-query-japanese.txt",
+  "covers": "Intl.Segmenter splits unspaced Japanese into dictionary words, 2-char kanji words survive the length floor"
+}

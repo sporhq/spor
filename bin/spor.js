@@ -109,6 +109,7 @@ const resolution = require(path.join(ROOT, "lib", "kernel", "resolution.js"));
 // fields, status, tags, edge add/remove — goes through kernel/frontmatter.js,
 // never a regex over the raw text (test/frontmatter-lint.test.js enforces it).
 const frontmatter = require(path.join(ROOT, "lib", "kernel", "frontmatter.js"));
+const tokenizer = require(path.join(ROOT, "lib", "kernel", "tokenizer.js"));
 const { isTerminalStatus, resolutionOf, openFindingsFor } = resolution;
 // Agent-readiness (dec-spor-agent-readiness-derived-classification): the same
 // derivation rankQueue uses per queue item, reused here for ONE node so the
@@ -3844,6 +3845,12 @@ function kebab(s) {
     .slice(0, 48)
     .replace(/-+$/g, "");
 }
+// The id stem a local `spor add`/`spor ask` mints from its title: the shared
+// Unicode-aware slugifier (task-spor-unicode-slugify-and-tokenizer), so
+// "Sväljer fel" stems `svaljer-fel` rather than `sv-ljer-fel`, and a long title
+// is cut on a word boundary instead of mid-word. kebab() above stays for the
+// agent-id sites, whose ids must keep matching what was already minted.
+const titleStem = (s) => tokenizer.slugify(s, 48);
 function optVal(args, name) {
   const i = args.indexOf(`--${name}`);
   return i >= 0 && args[i + 1] != null ? args[i + 1] : null;
@@ -4088,7 +4095,7 @@ async function cmdAdd(cfg, { values, positionals }) {
   }
   const prefixes = (g.registry && g.registry.prefixesFor(type)) || null;
   const prefix = prefixes && prefixes[0] ? prefixes[0] : `${type}-`;
-  let id = values.id || `${prefix}${kebab(title) || today()}`;
+  let id = values.id || `${prefix}${titleStem(title) || today()}`;
   // uniquify against existing files
   let n = 1;
   let base = id;
@@ -4255,7 +4262,7 @@ async function cmdAsk(cfg, { values, positionals }) {
   }
   const prefixes = (g.registry && g.registry.prefixesFor("question")) || null;
   const prefix = prefixes && prefixes[0] ? prefixes[0] : "question-";
-  let id = values.id || `${prefix}${kebab(titleText) || today()}`;
+  let id = values.id || `${prefix}${titleStem(titleText) || today()}`;
   let n = 1;
   let base = id;
   while (fs.existsSync(path.join(nodesDir, `${id}.md`))) id = `${base}-${++n}`;

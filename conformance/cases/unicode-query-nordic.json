@@ -1,0 +1,11 @@
+{
+  "id": "unicode-query-nordic",
+  "kind": "compile",
+  "corpus": "unicode",
+  "input": {
+    "query": "møtereferat østergaard æble straße",
+    "digest": true
+  },
+  "expected": "unicode-query-nordic.txt",
+  "covers": "non-decomposing Nordic/German letters (ø æ ß) transliterate on both sides and match"
+}

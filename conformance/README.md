@@ -40,6 +40,14 @@ artifact (REFACTOR.md §2).
     ranges, recorded faults), the canonical serialization and the round-trip
     law; `grammar-edits` pins the structure-aware editors (edge add/remove,
     stamp, key set) to the byte.
+  - `unicode` — a small multilingual compile corpus (Swedish, Norwegian/
+    German, Japanese, and an English control whose only non-ASCII characters
+    are separators) for the Unicode-aware tokenizer
+    (lib/kernel/tokenizer.js, task-spor-unicode-slugify-and-tokenizer): the
+    `unicode-query-*` cases pin that a diacritic query, the same query typed
+    without accents, non-decomposing letters (ø æ ß) and unspaced Japanese
+    all seed the right node. The tokenizer's own edge-case corpus is the
+    corpus-less `tokenizer-unicode` case: its input strings ARE the fixture.
   - `meridian` — the self-contained example org from wf/lenses/examples
     (dec-demo-vocab-in-fixtures): graph-resident schema vocabulary, lenses,
     workspaces.
@@ -49,7 +57,7 @@ artifact (REFACTOR.md §2).
     not content).
 - `cases/<id>.json` — one pinned invocation each: `kind`
   (compile | skeleton | queue | validate | frontmatter | frontmatter-edit |
-  viewtree | queue-viewtree | runs),
+  tokenizer | viewtree | queue-viewtree | runs),
   `corpus`, `input`, `expected`, and a `covers` note.
 - `expected/` — the goldens. Treat diffs here like source diffs in review.
 - `runner.js` — runner one: the JS kernel. `--update` regenerates goldens,

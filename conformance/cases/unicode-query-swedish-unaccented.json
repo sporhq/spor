@@ -1,0 +1,11 @@
+{
+  "id": "unicode-query-swedish-unaccented",
+  "kind": "compile",
+  "corpus": "unicode",
+  "input": {
+    "query": "omvarldsanalys for vagverket varje kvartal",
+    "digest": true
+  },
+  "expected": "unicode-query-swedish-unaccented.txt",
+  "covers": "the same query typed without diacritics folds to the same terms and ranks the same node"
+}

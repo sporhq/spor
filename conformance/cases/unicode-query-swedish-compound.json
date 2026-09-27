@@ -1,0 +1,11 @@
+{
+  "id": "unicode-query-swedish-compound",
+  "kind": "compile",
+  "corpus": "unicode",
+  "input": {
+    "query": "ändringsbegäran godkännande leverans behörighet",
+    "digest": true
+  },
+  "expected": "unicode-query-swedish-compound.txt",
+  "covers": "Swedish words whose diacritics sit mid-word (ndring/godk/beh fragments pre-fix) match the task"
+}

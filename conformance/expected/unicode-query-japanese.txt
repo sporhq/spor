@@ -1,0 +1,3 @@
+Spor graph nodes relevant to this prompt (auto-compiled; node files live in /graph/unicode/nodes; run /spor:brief for a full briefing):
+
+- **art-tokyo-kaigi — 東京会議の議事録** (artifact, unicode, 2026-09-27): 東京で会議をしました。予算と日程を確認しました。

@@ -1,0 +1,11 @@
+{
+  "id": "unicode-query-swedish",
+  "kind": "compile",
+  "corpus": "unicode",
+  "input": {
+    "query": "omvärldsanalys för vägverket varje kvartal",
+    "digest": true
+  },
+  "expected": "unicode-query-swedish.txt",
+  "covers": "Swedish query with diacritics seeds the Swedish decision (pre-fix: shredded into omv/rldsanalys fragments below the gate)"
+}

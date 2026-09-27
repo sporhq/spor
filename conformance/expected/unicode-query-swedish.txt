@@ -1,0 +1,4 @@
+Spor graph nodes relevant to this prompt (auto-compiled; node files live in /graph/unicode/nodes; run /spor:brief for a full briefing):
+
+- **dec-omvarldsanalys — Omvärldsanalys körs kvartalsvis** (decision, unicode, 2026-09-27): Omvärldsanalysen för vägverket körs varje kvartal och granskas av ledningsgruppen.
+- **task-leveransgodkannande — Leveransgodkännande för ändringsbegäran** (task, unicode, 2026-09-27): Behandla ändringsbegäran och få godkännande av beställaren innan leverans.

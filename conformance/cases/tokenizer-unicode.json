@@ -1,0 +1,31 @@
+{
+  "id": "tokenizer-unicode",
+  "kind": "tokenizer",
+  "input": {
+    "slugMax": 24,
+    "strings": [
+      "",
+      "plain ascii: don't foo_bar 3.14 e.g. constructor toString",
+      "Omvärldsanalys för väg och låda",
+      "omvarldsanalys for vag och lada",
+      "Ändringsbegäran behöver godkännande — behörighet",
+      "Møtereferat fra Østergaard: Æble, Œuvre, Straße, STRASSE",
+      "Łódź, Đuro, Þórr, İstanbul, ılık",
+      "decomposed été vs precomposed été",
+      "compatibility: ﬁle ﬂow Ａｂｃ１２３ x² log₂ ½ ① ℹ",
+      "Spor™ launch © 2026 — “quoted” → arrow",
+      "Привет мир, это тест",
+      "Γειά σου κόσμε",
+      "東京で会議をしました。予算と日程を確認しました。",
+      "カタカナ ﾊﾝｶｸ",
+      "한국어 문장입니다",
+      "ภาษาไทยง่ายมาก",
+      "हिन्दी भाषा",
+      "emoji 👍🏽 mixed 🇸🇪 flags",
+      "Sväljer fel när kunden trycker på knappen för betalning",
+      "supercalifragilisticexpialidociousextraordinarily long"
+    ]
+  },
+  "expected": "tokenizer-unicode.json",
+  "covers": "the Unicode edge-case corpus for the ONE client text fold/tokenizer/slugifier (task-spor-unicode-slugify-and-tokenizer): ASCII byte-identity (apostrophes, underscores, decimals, prototype keys), Swedish/Norwegian/Danish/German/Polish/Icelandic/Turkish letters incl. the non-decomposing ones (ø æ œ ß ł đ þ ı), decomposed vs precomposed accents, NFKD compatibility forms (ligatures, full-width, super/subscripts, fractions, ™ separating rather than gluing), non-Latin spaced scripts kept as words (Cyrillic, Greek, Devanagari with its vowel signs intact, Hangul recomposed), Intl.Segmenter splitting unspaced scripts (Japanese, Thai) with 2-char ideographic words surviving the length floor, emoji as separators, and word-boundary slug truncation incl. a first word longer than the limit"
+}

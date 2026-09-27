@@ -1,0 +1,387 @@
+[
+  {
+    "input": "",
+    "fold": "",
+    "words": [],
+    "tokens": [],
+    "slug": "",
+    "slugMax": ""
+  },
+  {
+    "input": "plain ascii: don't foo_bar 3.14 e.g. constructor toString",
+    "fold": "plain ascii: don't foo_bar 3.14 e.g. constructor toString",
+    "words": [
+      "plain",
+      "ascii",
+      "don",
+      "t",
+      "foo",
+      "bar",
+      "3",
+      "14",
+      "e",
+      "g",
+      "constructor",
+      "tostring"
+    ],
+    "tokens": [
+      "plain",
+      "ascii",
+      "don",
+      "foo",
+      "bar",
+      "constructor",
+      "tostring"
+    ],
+    "slug": "plain-ascii-don-t-foo-bar-3-14-e-g-constructor-tostring",
+    "slugMax": "plain-ascii-don-t-foo"
+  },
+  {
+    "input": "Omvärldsanalys för väg och låda",
+    "fold": "Omvarldsanalys for vag och lada",
+    "words": [
+      "omvarldsanalys",
+      "for",
+      "vag",
+      "och",
+      "lada"
+    ],
+    "tokens": [
+      "omvarldsanalys",
+      "vag",
+      "och",
+      "lada"
+    ],
+    "slug": "omvarldsanalys-for-vag-och-lada",
+    "slugMax": "omvarldsanalys-for-vag"
+  },
+  {
+    "input": "omvarldsanalys for vag och lada",
+    "fold": "omvarldsanalys for vag och lada",
+    "words": [
+      "omvarldsanalys",
+      "for",
+      "vag",
+      "och",
+      "lada"
+    ],
+    "tokens": [
+      "omvarldsanalys",
+      "vag",
+      "och",
+      "lada"
+    ],
+    "slug": "omvarldsanalys-for-vag-och-lada",
+    "slugMax": "omvarldsanalys-for-vag"
+  },
+  {
+    "input": "Ändringsbegäran behöver godkännande — behörighet",
+    "fold": "Andringsbegaran behover godkannande — behorighet",
+    "words": [
+      "andringsbegaran",
+      "behover",
+      "godkannande",
+      "behorighet"
+    ],
+    "tokens": [
+      "andringsbegaran",
+      "behover",
+      "godkannande",
+      "behorighet"
+    ],
+    "slug": "andringsbegaran-behover-godkannande-behorighet",
+    "slugMax": "andringsbegaran-behover"
+  },
+  {
+    "input": "Møtereferat fra Østergaard: Æble, Œuvre, Straße, STRASSE",
+    "fold": "Motereferat fra Ostergaard: AEble, OEuvre, Strasse, STRASSE",
+    "words": [
+      "motereferat",
+      "fra",
+      "ostergaard",
+      "aeble",
+      "oeuvre",
+      "strasse",
+      "strasse"
+    ],
+    "tokens": [
+      "motereferat",
+      "fra",
+      "ostergaard",
+      "aeble",
+      "oeuvre",
+      "strasse",
+      "strasse"
+    ],
+    "slug": "motereferat-fra-ostergaard-aeble-oeuvre-strasse-strasse",
+    "slugMax": "motereferat-fra"
+  },
+  {
+    "input": "Łódź, Đuro, Þórr, İstanbul, ılık",
+    "fold": "Lodz, Duro, THorr, Istanbul, ilik",
+    "words": [
+      "lodz",
+      "duro",
+      "thorr",
+      "istanbul",
+      "ilik"
+    ],
+    "tokens": [
+      "lodz",
+      "duro",
+      "thorr",
+      "istanbul",
+      "ilik"
+    ],
+    "slug": "lodz-duro-thorr-istanbul-ilik",
+    "slugMax": "lodz-duro-thorr-istanbul"
+  },
+  {
+    "input": "decomposed été vs precomposed été",
+    "fold": "decomposed ete vs precomposed ete",
+    "words": [
+      "decomposed",
+      "ete",
+      "vs",
+      "precomposed",
+      "ete"
+    ],
+    "tokens": [
+      "decomposed",
+      "ete",
+      "precomposed",
+      "ete"
+    ],
+    "slug": "decomposed-ete-vs-precomposed-ete",
+    "slugMax": "decomposed-ete-vs"
+  },
+  {
+    "input": "compatibility: ﬁle ﬂow Ａｂｃ１２３ x² log₂ ½ ① ℹ",
+    "fold": "compatibility: file flow Abc123 x2 log2 1⁄2 1 i",
+    "words": [
+      "compatibility",
+      "file",
+      "flow",
+      "abc123",
+      "x2",
+      "log2",
+      "1",
+      "2",
+      "1",
+      "i"
+    ],
+    "tokens": [
+      "compatibility",
+      "file",
+      "flow",
+      "abc123",
+      "log2"
+    ],
+    "slug": "compatibility-file-flow-abc123-x2-log2-1-2-1-i",
+    "slugMax": "compatibility-file-flow"
+  },
+  {
+    "input": "Spor™ launch © 2026 — “quoted” → arrow",
+    "fold": "SporTM launch © 2026 — “quoted” → arrow",
+    "words": [
+      "spor",
+      "launch",
+      "2026",
+      "quoted",
+      "arrow"
+    ],
+    "tokens": [
+      "spor",
+      "launch",
+      "2026",
+      "quoted",
+      "arrow"
+    ],
+    "slug": "spor-launch-2026-quoted-arrow",
+    "slugMax": "spor-launch-2026-quoted"
+  },
+  {
+    "input": "Привет мир, это тест",
+    "fold": "Привет мир, это тест",
+    "words": [
+      "привет",
+      "мир",
+      "это",
+      "тест"
+    ],
+    "tokens": [
+      "привет",
+      "мир",
+      "это",
+      "тест"
+    ],
+    "slug": "",
+    "slugMax": ""
+  },
+  {
+    "input": "Γειά σου κόσμε",
+    "fold": "Γεια σου κοσμε",
+    "words": [
+      "γεια",
+      "σου",
+      "κοσμε"
+    ],
+    "tokens": [
+      "γεια",
+      "σου",
+      "κοσμε"
+    ],
+    "slug": "",
+    "slugMax": ""
+  },
+  {
+    "input": "東京で会議をしました。予算と日程を確認しました。",
+    "fold": "東京で会議をしました。予算と日程を確認しました。",
+    "words": [
+      "東京",
+      "で",
+      "会議",
+      "を",
+      "しま",
+      "した",
+      "予算",
+      "と",
+      "日程",
+      "を",
+      "確認",
+      "しま",
+      "した"
+    ],
+    "tokens": [
+      "東京",
+      "会議",
+      "しま",
+      "した",
+      "予算",
+      "日程",
+      "確認",
+      "しま",
+      "した"
+    ],
+    "slug": "",
+    "slugMax": ""
+  },
+  {
+    "input": "カタカナ ﾊﾝｶｸ",
+    "fold": "カタカナ ハンカク",
+    "words": [
+      "カタカナ",
+      "ハン",
+      "カク"
+    ],
+    "tokens": [
+      "カタカナ",
+      "ハン",
+      "カク"
+    ],
+    "slug": "",
+    "slugMax": ""
+  },
+  {
+    "input": "한국어 문장입니다",
+    "fold": "한국어 문장입니다",
+    "words": [
+      "한국어",
+      "문장입니다"
+    ],
+    "tokens": [
+      "한국어",
+      "문장입니다"
+    ],
+    "slug": "",
+    "slugMax": ""
+  },
+  {
+    "input": "ภาษาไทยง่ายมาก",
+    "fold": "ภาษาไทยง่ายมาก",
+    "words": [
+      "ภาษา",
+      "ไทย",
+      "ง่าย",
+      "มาก"
+    ],
+    "tokens": [
+      "ภาษา",
+      "ไทย",
+      "ง่าย",
+      "มาก"
+    ],
+    "slug": "",
+    "slugMax": ""
+  },
+  {
+    "input": "हिन्दी भाषा",
+    "fold": "हिन्दी भाषा",
+    "words": [
+      "हिन्दी",
+      "भाषा"
+    ],
+    "tokens": [
+      "हिन्दी",
+      "भाषा"
+    ],
+    "slug": "",
+    "slugMax": ""
+  },
+  {
+    "input": "emoji 👍🏽 mixed 🇸🇪 flags",
+    "fold": "emoji 👍🏽 mixed 🇸🇪 flags",
+    "words": [
+      "emoji",
+      "mixed",
+      "flags"
+    ],
+    "tokens": [
+      "emoji",
+      "mixed",
+      "flags"
+    ],
+    "slug": "emoji-mixed-flags",
+    "slugMax": "emoji-mixed-flags"
+  },
+  {
+    "input": "Sväljer fel när kunden trycker på knappen för betalning",
+    "fold": "Svaljer fel nar kunden trycker pa knappen for betalning",
+    "words": [
+      "svaljer",
+      "fel",
+      "nar",
+      "kunden",
+      "trycker",
+      "pa",
+      "knappen",
+      "for",
+      "betalning"
+    ],
+    "tokens": [
+      "svaljer",
+      "fel",
+      "nar",
+      "kunden",
+      "trycker",
+      "knappen",
+      "betalning"
+    ],
+    "slug": "svaljer-fel-nar-kunden-trycker-pa-knappen-for-betalning",
+    "slugMax": "svaljer-fel-nar-kunden"
+  },
+  {
+    "input": "supercalifragilisticexpialidociousextraordinarily long",
+    "fold": "supercalifragilisticexpialidociousextraordinarily long",
+    "words": [
+      "supercalifragilisticexpialidociousextraordinarily",
+      "long"
+    ],
+    "tokens": [
+      "supercalifragilisticexpialidociousextraordinarily",
+      "long"
+    ],
+    "slug": "supercalifragilisticexpialidociousextraordinarily-long",
+    "slugMax": "supercalifragilisticexpi"
+  }
+]
