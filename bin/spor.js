@@ -613,6 +613,14 @@ function renderQueueLocalText(q, hidden = 0) {
   if (q.count > items.length) out(`(${q.count - items.length} more — raise --limit)`);
   if (q.muted > 0) out(`(${q.muted} muted — your queue_mute)`);
   if (q.blocked > 0) out(`(${q.blocked} blocked — gated by live work, hidden until unblocked)`);
+  // Agent-readiness breakdown (issue-spor-local-queue-render-mirror-missing-
+  // readiness-counts): the lead line lib/queue.js's human render prints
+  // (queue.js:210-213), present only when the kernel emits counts_by_readiness
+  // (the graph carries readiness signal, or a --readiness facet was asked for).
+  if (q.counts_by_readiness) {
+    const c = q.counts_by_readiness;
+    out(`readiness: ${c.agent} agent-ready, ${c.human} need human, ${c.untriaged} untriaged`);
+  }
   if (hidden > 0) out(`(${hidden} in-flight hidden — --hide-dispatched)`);
 }
 

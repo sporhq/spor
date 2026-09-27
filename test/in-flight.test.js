@@ -162,6 +162,33 @@ test("local next --hide-dispatched human text == queue.js human render when noth
   assert.strictEqual(viaCli.stdout, viaLib.stdout);
 });
 
+// issue-spor-local-queue-render-mirror-missing-readiness-counts: the
+// reconstructed human render must also carry the counts_by_readiness lead
+// line lib/queue.js's own render prints (queue.js:210-213) — this only shows
+// up once the graph carries readiness signal, which fixture() above deliberately
+// lacks, so a dedicated fixture is needed to pin the gap.
+function fixtureReadiness() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-inflight-readiness-"));
+  const nodes = path.join(dir, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const w = (id, title, date, extra = "") =>
+    fs.writeFileSync(
+      path.join(nodes, `${id}.md`),
+      `---\nid: ${id}\ntype: task\nrepo: demo\ntitle: ${title}\nsummary: ${title} for the in-flight surface test.\nstatus: open\ndate: ${date}\n${extra}---\nBody.\n`
+    );
+  w("task-a", "First demo task", "2026-06-01", "readiness: agent\n");
+  w("task-b", "Second demo task", "2026-06-02", "requires: [human]\n");
+  return { dir, nodes };
+}
+
+test("local next --readiness agent --hide-dispatched human text == queue.js human render byte-for-byte (readiness lead line)", () => {
+  const { nodes } = fixtureReadiness();
+  const viaCli = run(["next", "--readiness", "agent", "--hide-dispatched", "--nodes", nodes], { SPOR_FAKE_AGENTS_JSON: "[]" });
+  const viaLib = runLib("queue.js", ["--readiness", "agent", "--nodes", nodes]);
+  assert.strictEqual(viaCli.stdout, viaLib.stdout);
+  assert.match(viaCli.stdout, /^readiness: \d+ agent-ready, \d+ need human, \d+ untriaged$/m, "readiness lead line present");
+});
+
 test("local next --hide-dispatched human text drops the item and notes the hide", () => {
   const { nodes } = fixture();
   const r = run(["next", "--hide-dispatched", "--nodes", nodes], { SPOR_FAKE_AGENTS_JSON: AGENTS() });
