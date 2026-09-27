@@ -464,5 +464,76 @@ test("a stopping worker records the fallback route but dispatches nothing under 
   assert.strictEqual(res.state, "interrupted");
   assert.deepStrictEqual(w.seen.reviews.map((r) => r.profile), ["profile-codex-review"]);
   assert.strictEqual(w.seen.pools.routes.review.profile, "profile-claude-review", "the resume takes the route");
+  assert.strictEqual(res.fallback_route, true, "the loop reads the resume as a fresh attempt, not a re-offer");
   assert.strictEqual(w.seen.pools.retry.spent, 1);
+});
+
+// ------------------------------------- the parked re-offer cap (1abaa30) --
+//
+// How a reviewer pause and a fallback hand-off combine with
+// task-spor-work-loop-parked-reoffer-cap: a pause inside its bound is a known,
+// time-boxed outage and is not counted; an expired pause or an outage with no
+// stated reset counts as usual and still escalates at the cap; a fallback
+// hand-off is a fresh attempt, never a re-offer.
+function capLoop({ results, max = 3 }) {
+  const marks = [];
+  const logs = [];
+  const escalations = [];
+  const state = { clock: T0, ticks: 0, record: { run_id: "run-task-a", node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true } };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  let dispatched = false;
+  let call = 0;
+  const deps = {
+    now: () => state.clock,
+    log: (l) => logs.push(l),
+    publish: () => {},
+    candidates: async () => (dispatched ? [] : [{ id: "task-a", readiness: "agent" }]),
+    dispatch: async () => ((dispatched = true), { ok: true, run: { run_id: "run-task-a", harness: "fake" } }),
+    pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { ...state.record } })),
+    gate: async () => {
+      const r = results(call++, state.clock);
+      if (!r) { control.stopping = true; return { state: "passed", gates: [], facts: [] }; }
+      return r;
+    },
+    markGate: (runId, patch) => {
+      marks.push({ ...patch });
+      state.record = { ...state.record, ...patch };
+      return { ...state.record };
+    },
+    escalateParked: async (args) => { escalations.push(args); control.stopping = true; return { ok: true, id: "task-gate-parked-x" }; },
+    sleep: async (ms) => {
+      state.clock += ms;
+      await new Promise((r) => setImmediate(r));
+      if ((state.ticks += 1) >= 400) control.stopping = true;
+    },
+  };
+  return { deps, control, marks, logs, escalations, state, run: () => workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, maxIntervalMs: 60000, retryAfterMs: 5000, parkedReofferMax: max }, deps, control }) };
+}
+const PAUSED = (at) => ({ state: "interrupted", outage_interrupted: true, gates: [], facts: [], reason: "the review lane profile-codex-review is out", paused_until: at + 10 * 60000, paused_profile: "profile-codex-review" });
+
+test("re-offer cap: a pause inside its bound is NOT counted, however many times it recurs", async () => {
+  const w = capLoop({ results: (n, at) => (n < 5 ? PAUSED(at) : null), max: 3 });
+  await w.run();
+  assert.strictEqual(w.escalations.length, 0, "five identical pauses never reach a cap of 3");
+  assert.ok(w.marks.every((m) => m.gate_interrupt_count === undefined), "a pause stamps no count");
+  assert.strictEqual(w.marks.filter((m) => m.gate_paused_until).length, 5);
+});
+
+test("re-offer cap: an expired pause or an outage with no stated reset IS counted, and escalates with the cap", async () => {
+  const noReset = { state: "interrupted", outage_interrupted: true, gates: [], facts: [], reason: "the worker was asked to stop while gate review waited" };
+  const w = capLoop({ results: (n, at) => (n === 0 ? { ...noReset, paused_until: at - 1000 } : noReset), max: 3 });
+  await w.run();
+  assert.deepStrictEqual(w.marks.filter((m) => m.gate_interrupt_count != null).map((m) => m.gate_interrupt_count), [1, 2, 3]);
+  assert.strictEqual(w.escalations.length, 1, "the cap escalates to a person as before");
+  assert.strictEqual(w.escalations[0].count, 3);
+});
+
+test("re-offer cap: a fallback hand-off is a fresh attempt — it resets the count, never increments it", async () => {
+  const plain = { state: "interrupted", gates: [], facts: [], reason: "flake occurrence evidence is pending graph publication" };
+  const handoff = { state: "interrupted", outage_interrupted: true, fallback_route: true, gates: [], facts: [], reason: "routed to the fallback profile-claude-review" };
+  const seq = [plain, plain, handoff, plain, plain];
+  const w = capLoop({ results: (n) => seq[n] || null, max: 3 });
+  await w.run();
+  assert.deepStrictEqual(w.marks.filter((m) => m.gate_state === "interrupted").map((m) => m.gate_interrupt_count), [1, 2, 0, 1, 2], "the hand-off restarts the count, so the cap of 3 is never reached");
+  assert.strictEqual(w.escalations.length, 0);
 });
