@@ -19693,8 +19693,23 @@ function flakeSweepPlan(records, graph, { trustedRef, scope = null, isController
     if (record.gate_empty_diff) {
       if (record.gate_retired) continue;
       const main = resolverOnTrustedRef(graph, record.node_id, record.cwd, trustedRef);
-      if (main.onMain) plan.push({ record, action: "retire", why: main.why, resolver: main.resolver });
-      else skip(`empty diff, but ${main.why}`);
+      if (!main.onMain) { skip(`empty diff, but ${main.why}`); continue; }
+      // Retiring the escalation directly is a shortcut around the gate
+      // pipeline — the same shortcut the "regate" action below refuses for a
+      // controller-completion run or an integration-stage factory, since a
+      // real re-gate there does more than remove a block (it writes the
+      // item's own completion, or lands/proposes the branch). An empty-diff
+      // retire must stay a person's call in exactly those two cases too
+      // (issue-spor-regate-flakes-review-defects).
+      if (isController(record)) {
+        skip(`empty diff and ${main.why}, but a passing re-gate would write the item's completion itself — re-gate it by hand ('spor work --regate ${record.run_id}')`);
+        continue;
+      }
+      if (hasIntegration) {
+        skip(`empty diff and ${main.why}, but this factory's integration stage would land the branch on a pass — re-gate it by hand ('spor work --regate ${record.run_id}')`);
+        continue;
+      }
+      plan.push({ record, action: "retire", why: main.why, resolver: main.resolver });
       continue;
     }
     // The refusal's own run record is the primary source — it is what this
@@ -19786,6 +19801,26 @@ async function writeSweepNote(cfg, { kind, record, factoryId, escalations, relat
   return { ...written, id };
 }
 
+// CAS write of a flake-sweep reservation: the patch lands only if
+// `gate_flake_regate` on disk still equals `prior` exactly, as it stood when
+// the caller planned this reservation. Without this, two concurrent sweeps
+// (or a sweep racing a stale re-run of itself) that both read the SAME prior
+// state can both pass the naive "did my write land" check and both proceed to
+// `cmdWorkRegate` the same run — the duplicate-run hazard
+// issue-spor-flake-sweep-unconditional-reservation-overwrite exists for.
+// `withRecordLock` (inside stampGateState) makes the read-compare-write
+// atomic across processes on this box. Returns the settled record (whether or
+// not the write landed) or null when there was nothing to stamp.
+function casFlakeRegateReservation(home, runId, prior, reservation) {
+  const priorJson = JSON.stringify(prior || null);
+  return dispatchRuns.stampGateState(
+    home,
+    runId,
+    (fresh) => (JSON.stringify(fresh.gate_flake_regate || null) === priorJson ? { gate_flake_regate: reservation } : {}),
+    { allowSettledPatch: true }
+  );
+}
+
 async function cmdWorkRegateFlakes(cfg, values, ctx) {
   const { factory, factoryId, home, factoryRepos = [] } = ctx;
   if (!factory) {
@@ -19852,7 +19887,7 @@ async function cmdWorkRegateFlakes(cfg, values, ctx) {
     const prior = record.gate_flake_regate || null;
     const tried = [...new Set([...((prior && prior.issues) || []), ...step.issues])].sort();
     const reservation = { issues: tried, tests: step.failingTests || record.gate_failing_tests, at: new Date().toISOString(), state: "running" };
-    const reserved = dispatchRuns.stampGateState(home, record.run_id, { gate_flake_regate: reservation }, { allowSettledPatch: true });
+    const reserved = casFlakeRegateReservation(home, record.run_id, prior, reservation);
     if (!reserved || !reserved.gate_flake_regate || reserved.gate_flake_regate.at !== reservation.at) {
       out(`work: could not record the unattended re-gate of run ${short} on its record — not re-gating it`);
       failed += 1;
@@ -23795,7 +23830,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
+module.exports = { forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
 
 if (require.main === module) {
   main()

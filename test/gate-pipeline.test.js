@@ -4176,6 +4176,126 @@ test("an EMPTY-diff refusal whose item's resolver cites commits already on the t
   assert.ok(after.gate_retired);
 });
 
+// issue-spor-regate-flakes-review-defects, defect 1: the empty-diff retire
+// path must honor the SAME controller-completion/integration-stage skips the
+// "regate" action already applies — retiring the escalation directly (with no
+// re-run of gates/integration/completion) is exactly the shortcut those skips
+// exist to prevent for a controller-completion run or an integration-stage
+// factory.
+function emptyDiffOnMainFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-emptydiff-"));
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  git(dir, "config", "user.email", "t@t");
+  git(dir, "config", "user.name", "Test");
+  fs.writeFileSync(path.join(dir, "f.txt"), "x\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "the work, already landed");
+  const sha = git(dir, "rev-parse", "main").trim();
+
+  const nodesDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-emptydiff-nodes-"));
+  const write = (id, front, body) => fs.writeFileSync(path.join(nodesDir, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-26\n---\n${body}\n`);
+  write("task-ready", "type: task\ntitle: Ready\nsummary: The gated work item.\nstatus: open\n", "Work.");
+  write(
+    "art-ready-done",
+    `type: artifact\ntitle: Ready is done\nsummary: Landed on main.\ncommits: [demo@${sha.slice(0, 12)}]\nedges:\n  - {type: resolves, to: task-ready}\n`,
+    "Done."
+  );
+  write(
+    "task-gate-acceptance-ready-x",
+    "type: task\ntitle: Gate escalation\nsummary: The gate refused task-ready.\nstatus: open\nrequires: [human]\nedges:\n  - {type: blocks, to: task-ready}\n",
+    "Refused."
+  );
+  const graphLib = require("../lib/graph.js");
+  return { dir, graph: graphLib.loadGraph(nodesDir) };
+}
+
+test("flakeSweepPlan does not plan a direct empty-diff retire for a controller-completion record", () => {
+  const { dir, graph } = emptyDiffOnMainFixture();
+  const completionKernel = require("../lib/kernel/completion.js");
+  const record = {
+    run_id: "22222222-3333-4444-5555-666666666601",
+    node_id: "task-ready",
+    gate_state: "failed",
+    gate_empty_diff: true,
+    gate_escalated_to: "task-gate-acceptance-ready-x",
+    cwd: dir,
+    impl_claim: { completion: { by: "controller" } },
+  };
+  const sporCli = require("../bin/spor.js");
+  const plan = sporCli.flakeSweepPlan([record], graph, { trustedRef: "main", isController: completionKernel.isControllerRecord });
+  assert.strictEqual(plan.length, 1);
+  assert.strictEqual(plan[0].action, "skip", "a controller-completion run must not be retired unattended, even on an empty diff");
+  assert.match(plan[0].why, /re-gate it by hand/);
+});
+
+test("flakeSweepPlan does not plan a direct empty-diff retire for a factory with an integration stage", () => {
+  const { dir, graph } = emptyDiffOnMainFixture();
+  const record = {
+    run_id: "22222222-3333-4444-5555-666666666602",
+    node_id: "task-ready",
+    gate_state: "failed",
+    gate_empty_diff: true,
+    gate_escalated_to: "task-gate-acceptance-ready-x",
+    cwd: dir,
+  };
+  const sporCli = require("../bin/spor.js");
+  const plan = sporCli.flakeSweepPlan([record], graph, { trustedRef: "main", hasIntegration: true });
+  assert.strictEqual(plan.length, 1);
+  assert.strictEqual(plan[0].action, "skip", "a factory with an integration stage must not be retired unattended, even on an empty diff");
+  assert.match(plan[0].why, /integration stage would land the branch/);
+});
+
+test("flakeSweepPlan still retires an empty-diff refusal directly for an ordinary agent-completion, non-integration factory", () => {
+  const { dir, graph } = emptyDiffOnMainFixture();
+  const record = {
+    run_id: "22222222-3333-4444-5555-666666666603",
+    node_id: "task-ready",
+    gate_state: "failed",
+    gate_empty_diff: true,
+    gate_escalated_to: "task-gate-acceptance-ready-x",
+    cwd: dir,
+  };
+  const sporCli = require("../bin/spor.js");
+  const plan = sporCli.flakeSweepPlan([record], graph, { trustedRef: "main" });
+  assert.strictEqual(plan.length, 1);
+  assert.strictEqual(plan[0].action, "retire", "the ordinary case (no controller-completion, no integration stage) is unchanged");
+});
+
+// issue-spor-regate-flakes-review-defects / issue-spor-flake-sweep-
+// unconditional-reservation-overwrite, defect 2: the reservation write must
+// be a CAS on gate_flake_regate, not an unconditional stamp — two concurrent
+// sweeps reading the same stale prior must not both land a reservation (which
+// would let the same run be re-gated twice).
+test("the flake-sweep reservation CAS refuses a write when gate_flake_regate has moved since the caller's read", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-cas-"));
+  const dir = path.join(home, "journal", "dispatch");
+  fs.mkdirSync(dir, { recursive: true });
+  const runId = "33333333-4444-5555-6666-777777777777";
+  const recordPath = path.join(dir, `${runId}.run.json`);
+  fs.writeFileSync(recordPath, JSON.stringify({ run_id: runId, node_id: "task-ready", gate_state: "failed" }));
+
+  const sporCli = require("../bin/spor.js");
+  const firstReservation = { issues: ["issue-flake-a"], tests: ["test/a.test.js"], at: "2026-09-27T00:00:00.000Z", state: "running" };
+  // Sweep #1 reads gate_flake_regate as absent (prior: null) and reserves.
+  const r1 = sporCli.casFlakeRegateReservation(home, runId, null, firstReservation);
+  assert.ok(r1 && r1.gate_flake_regate && r1.gate_flake_regate.at === firstReservation.at, "the first sweep's reservation lands");
+
+  // Sweep #2 read the SAME stale snapshot (prior: null, taken before sweep #1
+  // wrote) and tries to reserve the same run against the same issue.
+  const secondReservation = { issues: ["issue-flake-a"], tests: ["test/a.test.js"], at: "2026-09-27T00:00:01.000Z", state: "running" };
+  const r2 = sporCli.casFlakeRegateReservation(home, runId, null, secondReservation);
+  assert.strictEqual(r2, null, "a stale-prior reservation must be refused, never overwrite a live one");
+
+  const onDisk = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  assert.strictEqual(onDisk.gate_flake_regate.at, firstReservation.at, "the first sweep's reservation still stands on disk");
+
+  // A THIRD sweep that reads the CURRENT (post-r1) state as its prior may
+  // still legitimately update it (e.g. handing the reservation back).
+  const r3 = sporCli.casFlakeRegateReservation(home, runId, r1.gate_flake_regate, null);
+  assert.notStrictEqual(r3, null, "a correctly-CAS'd write against the current value is accepted");
+  assert.strictEqual(r3.gate_flake_regate, null);
+});
+
 function runnerStamp(home, runId, patch) {
   const runs = require("../lib/shell/agent-dispatch-runner.js");
   runs.stampGateState(home, runId, patch, { allowSettledPatch: true });
