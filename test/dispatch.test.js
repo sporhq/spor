@@ -3,6 +3,17 @@
 // briefing compilation, directory resolution (incl. cross-repo via the map),
 // the --print dry run, and a real (stubbed) spawn. Everything runs against a
 // throwaway graph home — never the live graph.
+//
+// Two copies of this file (`node --test test/dispatch.test.js`, run twice
+// concurrently from one checkout) share no state — every scratch home is its
+// own mkdtempSync, every lock is scoped under that home, every listener binds
+// port 0 — but they DO share the box's CPU, so each takes roughly 2x as long
+// under contention. A bounded caller timeout sized for a solo run (e.g.
+// ~90s) cuts both off mid-flight and prints the same generic "Promise
+// resolution is still pending…", with whatever output had buffered so far —
+// which reads as a collision but is the CLAUDE.md "Verifying changes" outer-
+// timeout artifact one file early (issue-spor-dispatch-test-concurrent-runs-collide).
+// Give a paired run the same headroom you'd give a full suite.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert");

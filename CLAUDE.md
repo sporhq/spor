@@ -90,6 +90,22 @@ the event loop has already resolved". That is the outer stop, not a flake in
 those files, and `test/helpers/interrupt-notice.js` says so on stderr. Run a
 long suite detached to a log and poll it.
 
+The same outer-stop shape shows up one file at a time, not just at the suite
+tail (issue-spor-dispatch-test-concurrent-runs-collide): two copies of
+`test/dispatch.test.js` (or any single-checkout-worth of subprocess-spawning
+tests) running concurrently share NO state — no fixed path, port, lockfile,
+or daemon socket; every scratch home is its own `mkdtempSync`, every lock is
+scoped under that home, every listener binds port 0. What they DO share is
+the box's CPU, so two copies each take roughly 2x as long as one under
+contention. A caller with a bounded timeout sized for a solo run (e.g. ~90s)
+kills both mid-flight, and the interrupted parent prints the same generic
+"Promise resolution is still pending…" — with whatever subtest output had
+been buffered so far, which can be little to none. That reads as a
+collision between the two runs; it is the outer-timeout artifact above,
+reproduced one file early. Give a paired concurrent run of one file the same
+headroom (or the same detach-to-log-and-poll treatment) you'd give a full
+suite, and don't read the cancellation as shared state.
+
 Also verify by exercising the real CLI paths (unchanged contracts):
 
 ```bash
