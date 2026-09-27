@@ -4984,11 +4984,15 @@ async function cmdReady(cfg, { values, positionals }) {
 const NODE_ID_RE = /^[a-z0-9][a-z0-9-]*$/; // mirrors the server's ID_RE/SLUG_RE
 
 // The local-mode path-confinement guard (issue-spor-ready-identifier-directory-
-// traversal): every local door that builds `nodes/<id>.md` from a caller-supplied
-// id checks it against NODE_ID_RE FIRST, before touching the filesystem. The
-// grammar admits no `/`, `\`, or `.`, so a conforming id can only name a file
-// directly inside the nodes dir — `../x` or an absolute path never reaches
-// path.join. Returns the refusal message, or null for a well-formed id.
+// traversal): the local write/get doors that build `nodes/<id>.md` from a
+// caller-supplied id — cmdGet, stampField (ready/priority), and setStatusLocal
+// (set-status) — check it against NODE_ID_RE FIRST, before touching the
+// filesystem. The grammar admits no `/`, `\`, or `.`, so a conforming id can
+// only name a file directly inside the nodes dir — `../x` or an absolute path
+// never reaches path.join. Returns the refusal message, or null for a
+// well-formed id. Other local doors built on resolveNode (e.g. `spor dispatch
+// --node`) are NOT all covered yet — tracked in
+// issue-spor-node-id-guard-remaining-read-paths.
 function badNodeIdReason(id) {
   return NODE_ID_RE.test(String(id)) ? null : `bad node id '${id}' — expected kebab-case`;
 }
