@@ -426,6 +426,12 @@ async function cmdNext(cfg, args) {
   };
   const inclTypes = collectMulti("type");
   const exclTypes = collectMulti("exclude-type");
+  // Agent-readiness filter (task-spor-queue-remote-readiness-ignored): the
+  // remote twin of local mode's --readiness (lib/queue.js), forwarded as
+  // ?readiness= to GET /v1/queue — comma-separated/repeatable like
+  // --type/--exclude-type, but a fixed enum the SERVER validates (an unknown
+  // value is the server's own 422, not silently dropped here).
+  const readinessFilter = collectMulti("readiness");
 
   // In-flight agent surface (task-spor-cli-in-flight-surface). `spor next --json`
   // stamps each item with an `in_flight` flag by cross-referencing the live
@@ -452,6 +458,7 @@ async function cmdNext(cfg, args) {
       if (slug) qs.set("project", slug);
       if (inclTypes.length) qs.set("type", inclTypes.join(","));
       if (exclTypes.length) qs.set("exclude_type", exclTypes.join(","));
+      if (readinessFilter.length) qs.set("readiness", readinessFilter.join(","));
       return qs;
     };
     // Page size (task-spor-next-limit-flag): --limit N defaults to DEFAULT_LIMIT
@@ -465,7 +472,8 @@ async function cmdNext(cfg, args) {
       return 1;
     }
     if (!r.ok) {
-      err(`queue error ${r.status}`);
+      const msg = r.json && r.json.error && r.json.error.message;
+      err(`queue error ${r.status}${msg ? `: ${msg}` : ""}`);
       return 1;
     }
     // Zero-match handling. Unknown-token detection is authoritative only where
@@ -1057,6 +1065,14 @@ function renderQueue(q, hidden = 0) {
   // (dec-spor-queue-hide-blocked), reported so their disappearance is never
   // silent. Present only when the server forwards r.blocked; absent => no line.
   if (q && q.blocked > 0) out(`(${q.blocked} blocked — gated by live work, hidden until unblocked)`);
+  // Agent-readiness breakdown (task-spor-queue-remote-readiness-ignored): the
+  // remote mirror of lib/queue.js's own readiness lead line — present only
+  // when the server sends counts_by_readiness (graph has readiness signal, or
+  // a --readiness facet was asked for).
+  if (q && q.counts_by_readiness) {
+    const c = q.counts_by_readiness;
+    out(`readiness: ${c.agent} agent-ready, ${c.human} need human, ${c.untriaged} untriaged`);
+  }
   // Never-silent truncation (task-spor-cli-in-flight-surface): report what
   // --hide-dispatched removed, the way queue.js surfaces the muted count.
   if (hidden > 0) out(`(${hidden} in-flight hidden — --hide-dispatched)`);
@@ -22378,19 +22394,20 @@ const COMMANDS = {
     run: (cfg, p) => cmdDrain(cfg, p),
   },
   next: {
-    group: "Graph", parse: "raw", args: "[--project S | --all-projects] [--type T] [--exclude-type T] [--limit N]", aliases: ["queue"],
+    group: "Graph", parse: "raw", args: "[--project S | --all-projects] [--type T] [--exclude-type T] [--readiness C] [--limit N]", aliases: ["queue"],
     summary: "the decision queue (local: lib/queue; remote: /v1/queue)",
-    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --name-only, --nodes).\n\nSCOPE. --project accepts a repo slug (-> its home-project grouping union), a\nrepo-<slug> node id (-> that single repo), or a grouping id (-> the grouping\nunion); an unknown token warns and yields an empty queue. Pin a default scope\nfor both modes with the queue.project config key (SPOR_QUEUE_PROJECT or\n.spor.json {\"queue\":{\"project\":\"...\"}}); an explicit --project still wins.\n--all-projects (alias --all) widens to the whole-graph cross-project firehose,\ndropping the cwd/pinned default scope (an explicit --project still wins over it).\n\nPAGE SIZE. --limit N caps the queue at N items (default 20, both modes);\n--limit 0 shows ALL. Remote mode pages the server at 100 items/request, so\n--limit 0 (or any N>100) is assembled by walking offset across pages; the\naggregate counts always describe the full ranked set regardless of the page.\n\nNODE TYPES. --type/--exclude-type whitelist/blacklist node types from the\nranking; both are repeatable and comma-splittable (--type task,issue). Given\nboth, the include set is narrowed and then the excludes are removed (exclude\nwins on overlap). They compose with --project/--all-projects.\n\nIN-FLIGHT. --json stamps each item with an `in_flight` flag (and a `dispatched`\nagent summary when true) by cross-referencing live background agents from\n`claude agents --json` — `spor dispatch` names each agent after its node id, so\nan active agent on a queued item is detectable without model guidance.\n--hide-dispatched drops the items that already have an agent in flight. Both are\nclient-side (the server can't see local agents) and fail soft when the claude\nbinary is absent (every item then reads in_flight:false).",
+    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --name-only, --nodes).\n\nSCOPE. --project accepts a repo slug (-> its home-project grouping union), a\nrepo-<slug> node id (-> that single repo), or a grouping id (-> the grouping\nunion); an unknown token warns and yields an empty queue. Pin a default scope\nfor both modes with the queue.project config key (SPOR_QUEUE_PROJECT or\n.spor.json {\"queue\":{\"project\":\"...\"}}); an explicit --project still wins.\n--all-projects (alias --all) widens to the whole-graph cross-project firehose,\ndropping the cwd/pinned default scope (an explicit --project still wins over it).\n\nPAGE SIZE. --limit N caps the queue at N items (default 20, both modes);\n--limit 0 shows ALL. Remote mode pages the server at 100 items/request, so\n--limit 0 (or any N>100) is assembled by walking offset across pages; the\naggregate counts always describe the full ranked set regardless of the page.\n\nNODE TYPES. --type/--exclude-type whitelist/blacklist node types from the\nranking; both are repeatable and comma-splittable (--type task,issue). Given\nboth, the include set is narrowed and then the excludes are removed (exclude\nwins on overlap). They compose with --project/--all-projects.\n\nAGENT-READINESS. --readiness C narrows to a derived readiness class —\nagent|human|untriaged, comma-separated/repeatable (--readiness agent,untriaged)\n— a hard scope like --type/--exclude-type; an unknown value is rejected (the\nserver's 422 in remote mode, same as local). When the graph carries readiness\nsignal (or a --readiness facet was asked for), the output leads with a\n`readiness: N agent-ready, N need human, N untriaged` line, in both modes.\n\nIN-FLIGHT. --json stamps each item with an `in_flight` flag (and a `dispatched`\nagent summary when true) by cross-referencing live background agents from\n`claude agents --json` — `spor dispatch` names each agent after its node id, so\nan active agent on a queued item is detectable without model guidance.\n--hide-dispatched drops the items that already have an agent in flight. Both are\nclient-side (the server can't see local agents) and fail soft when the claude\nbinary is absent (every item then reads in_flight:false).",
     options: {
       project: { type: "string", value: "S", desc: "scope to a project slug (default: queue.project config, else inferred)" },
       "all-projects": { type: "boolean", desc: "cross-project firehose — drop the default project scope (alias --all)" },
       type: { type: "string", value: "T", desc: "include only these node types (repeatable, comma-ok)" },
       "exclude-type": { type: "string", value: "T", desc: "exclude these node types from the ranking (repeatable, comma-ok)" },
+      readiness: { type: "string", value: "C", desc: "narrow to a derived readiness class: agent|human|untriaged (repeatable, comma-ok)" },
       limit: { type: "string", value: "N", desc: "max items to show (default 20; 0 = all)" },
       json: { type: "boolean", desc: "machine-readable JSON output (adds the in_flight flag per item)" },
       "hide-dispatched": { type: "boolean", desc: "drop items that already have a background agent in flight" },
     },
-    examples: ["spor next", "spor next --limit 50", "spor next --limit 0", "spor next --json", "spor next --json --hide-dispatched", "spor next --all-projects --type task,issue", "spor next --exclude-type capture-pending"],
+    examples: ["spor next", "spor next --limit 50", "spor next --limit 0", "spor next --json", "spor next --json --hide-dispatched", "spor next --all-projects --type task,issue", "spor next --exclude-type capture-pending", "spor next --readiness agent,untriaged"],
     run: (cfg, args) => cmdNext(cfg, args),
   },
   get: {
