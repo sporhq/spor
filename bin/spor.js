@@ -18895,7 +18895,9 @@ async function cmdAttestation(cfg, args) {
   const noGraph = args.includes("--no-graph");
   if (!noGraph) {
     const id = att.id;
+    const idBad = id ? badNodeIdReason(id) : null;
     if (!id || !/^art-attest-/.test(String(id))) extra.push({ check: "trusted", ok: false, detail: `the attestation names no art-attest-* graph artifact (id: ${id || "none"})` });
+    else if (idBad) extra.push({ check: "trusted", ok: false, detail: `the attestation names an invalid graph artifact id — ${idBad}` });
     else {
       let node = null;
       try {

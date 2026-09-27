@@ -4874,6 +4874,58 @@ test("spor attestation verify: binds a PR body to the graph artifact, verifies t
   assert.match(cli(["attestation", "frobnicate"], env).stderr, /usage: spor attestation verify/);
 });
 
+// issue-spor-attestation-verify-id-traversal: the attestation's `id` comes
+// from a caller-supplied PR body or file, and cmdAttestation used to check
+// only the /^art-attest-/ prefix before handing it to resolveNode, which
+// path.join's it into nodes/<id>.md — a crafted id can carry `../` segments
+// past the prefix. It must be refused by badNodeIdReason (kebab-case only)
+// before any read, exactly like the other local id-guarded doors.
+test("spor attestation verify refuses a traversal attestation id before reading outside nodes/", () => {
+  const attestation = require("../lib/shell/attestation.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-verify-traversal-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  // A file outside nodes/ that an unguarded traversal would pull in.
+  const secretPath = path.join(home, "secret.md");
+  const secretContents = "---\nid: secret\n---\nSECRET CONTENTS\n```json\n{}\n```\n";
+  fs.writeFileSync(secretPath, secretContents);
+  const item = { node_id: "task-verify", run_id: "11111111-2222-3333-4444-000000000077", attempt: 0, project: "demo" };
+  const factory = { id: "factory-v", trustedRef: "main", integration: null, protectedPaths: [], gates: [{ id: "acceptance", kind: "command", command: "npm test" }], definition: { factory: { id: "factory-v", revision: "r1", digest: "sha256:abcd" }, gates: [{ id: "acceptance", source: "inline", revision: "r1", digest: "sha256:ef01" }] } };
+  const gate = { state: "passed", head: "c0ffee00", base: "b", trusted_ref: "main", trusted_sha: "t", branch: "task-verify", definition: factory.definition, facts: [], gates: [{ gate: "acceptance", kind: "command", verdict: "passed", head: "c0ffee00", base: "b", digest: "sha256:ef01", revision: "r1", fact: null }] };
+  const node = attestation.buildAttestationNode({ item, factory, gate, signing: { key: "team-key", keyId: "ci" } });
+  // A crafted copy whose id carries a traversal past the art-attest- prefix
+  // (the `/` right after the prefix makes each `..` its own path segment, so
+  // this one genuinely resolves to home/secret.md — verified with a raw
+  // path.join, not just glued onto the prefix), re-bound so its own
+  // digest/signature are internally consistent — the traversal must be
+  // caught before any graph read, not merely fail a later check.
+  const traversal = JSON.parse(JSON.stringify(node.attestation));
+  traversal.id = "art-attest-/../../secret";
+  attestation.bindAttestation(traversal, { key: "team-key", keyId: "ci" });
+  const prFile = path.join(home, "pr.md");
+  fs.writeFileSync(prFile, attestation.renderPrBody({ attestation: traversal, branch: "task-verify", base: "main" }));
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_ATTESTATION_KEY: "team-key" };
+
+  const result = cli(["attestation", "verify", "--pr-body", prFile, "--json"], env);
+  assert.strictEqual(result.status, 1, result.stdout + result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.strictEqual(parsed.ok, false);
+  const trustedCheck = parsed.checks.find((c) => c.check === "trusted");
+  assert.ok(trustedCheck && !trustedCheck.ok, JSON.stringify(parsed.checks));
+  assert.match(trustedCheck.detail, /invalid graph artifact id/);
+  assert.doesNotMatch(trustedCheck.detail, /SECRET/);
+  // The file outside nodes/ was never touched.
+  assert.strictEqual(fs.readFileSync(secretPath, "utf8"), secretContents);
+
+  // A valid attestation (well-formed art-attest-* id) still verifies fine —
+  // the guard doesn't overreach onto legitimate ids.
+  const goodPrFile = path.join(home, "good.md");
+  fs.writeFileSync(goodPrFile, attestation.renderPrBody({ attestation: node.attestation, branch: "task-verify", base: "main" }));
+  fs.writeFileSync(path.join(nodes, `${node.id}.md`), node.markdown);
+  const good = cli(["attestation", "verify", "--pr-body", goodPrFile, "--require-signature"], env);
+  assert.strictEqual(good.status, 0, good.stdout + good.stderr);
+});
+
 // The REMOTE door: `if_exists: skip` reports the id existed, not that this
 // fact landed. The node is read back and compared; a different fact under the
 // same id is a collision to refuse, never evidence to adopt.
