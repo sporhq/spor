@@ -23340,7 +23340,12 @@ const COMMANDS = {
     group: "Dispatch (background agents)", parse: "raw", aliases: ["caps", "profiles"],
     args: "[list [--json] | show <agent-id> | probe | publish | hosts <profile-id> | set <axis> <v...> | allow-mcp <m...> | deny <profile-id...> | clear]",
     summary: "this machine's dispatch capability map (profile satisfiability)",
-    help:
+    // A function, not a plain string: the last line reads sat.CAP_AXES, and
+    // sat is lazy-loaded (task-spor-cli-lazy-load-modules) — COMMANDS is built
+    // once at module load, so a plain string here would force satisfiability.js
+    // to load on every `spor` invocation, not just `spor capabilities --help`.
+    // renderCmdHelp() calls this only when this command's help is actually shown.
+    help: () =>
       "Show or edit the per-machine capability map dispatch matches against an\n" +
       "agent's profile (dec-spor-machine-profile-satisfiability). Harnesses, plugins,\n" +
       "and skills self-probe each session; declare what a probe can't decide (reachable\n" +
@@ -23498,7 +23503,7 @@ function renderCmdHelp(verb) {
   const sig = `spor ${verb}${e.args ? " " + e.args : ""}${opts.length ? " [options]" : ""}`;
   const lines = [sig, "", e.summary];
   if (e.aliases && e.aliases.length) lines.push(`Aliases: ${e.aliases.join(", ")}`);
-  if (e.help) lines.push("", e.help);
+  if (e.help) lines.push("", typeof e.help === "function" ? e.help() : e.help);
   if (opts.length) {
     const rendered = opts.map(([name, o]) => [`--${name}${o.type === "string" ? ` <${o.value || "value"}>` : ""}`, o.desc || ""]);
     const w = Math.min(26, Math.max(...rendered.map((r) => r[0].length)));
