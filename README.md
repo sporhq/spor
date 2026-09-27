@@ -321,8 +321,8 @@ attestation paths — the resolving edge, and the terminal own-status a
 status-only type is retired by — are judged, and a target that either path finds
 unfinished takes the same file-then-hand-back route, whichever one judged it.
 What does cost it is a posture where nothing could be verified at all: a
-native-background run (`spor dispatch --bg`, the opt-in `claude --bg` launch), a
-free-text dispatch with no target node, and a graph that could not be reached are
+legacy native-background run record (from the retired `spor dispatch --bg`
+launch), a free-text dispatch with no target node, and a graph that could not be reached are
 classified best-effort and marked `terminal_enforced: false` — an unenforced run
 can never read `resolved`. Local mode is not excluded: it has no server door to
 file a report or hand a lease back through, but it does have a graph, so a local
@@ -384,15 +384,13 @@ is what keeps two workers off one node, so a loop always takes it. Stopping
 (`SIGINT`/`SIGTERM`, or `--once`/`--max`) stops picking up new work; runs
 already in flight are detached, keep going, and self-report through `spor runs`.
 
-A native-background run (`claude --bg`, reached only through `spor dispatch
---bg` or a standing `dispatch.claudeLaunchMode: native-background`) is the weak
-spot, for the same reason its outcome is unenforced: its termination is not
-deterministically observable, so a slot is freed from the harness's own
-live-agent listing. If that listing cannot be read, the slot stays held and the
-worker says so; `--run-max` (default 24 hours) is the backstop that stops
-following such a run. A supervised harness — Claude Code by default, Codex,
-OpenCode, Copilot CLI, or a declared one — has none of this, which is why the
-worker never passes `--bg`.
+Every run is supervised — Claude Code, Codex, OpenCode, Copilot CLI, or a
+declared harness — so a slot frees when the run's own supervisor closes its
+record; `--run-max` (default 24 hours) is the backstop that stops following a
+run that never goes terminal. (The native `claude --bg` launch, whose ending
+could only be inferred by scraping `claude agents --json` and the session
+transcript, is retired; a legacy record from it is judged from the record alone
+and closed an hour after its launch.)
 
 Run it as a service and read it back:
 
@@ -473,13 +471,12 @@ By default, `spor dispatch` launches a Claude Code agent in headless print mode
 prompt goes in on stdin, the run's session id and final report are read off its
 event stream, the run record goes terminal when the process does, and the
 terminal-state contract judges the outcome like any other supervised harness.
-Pass `--bg` (or set `dispatch.claudeLaunchMode: native-background` in your user
-config) to launch the native background session instead (`claude --bg`) — the
-attachable, interactive form (`claude attach`), at the cost of an unenforced
-outcome and no report channel. Both are `spor dispatch`'s alone: `spor work`
-launches every run supervised (its runs must be followed, judged and gated),
-and a worker started under a standing `native-background` says so once on
-stderr rather than silently ignoring it. To dispatch under a different coding-agent CLI —
+This is the only launch mode: the native background session (`spor dispatch
+--bg`, `claude --bg`) is retired — its outcome could only be inferred by
+scraping `claude agents --json` and the session transcript, which shifted with
+every Claude Code release. `--bg` is now refused (run `claude --bg` yourself
+for an attachable session), and a leftover `dispatch.claudeLaunchMode:
+native-background` is ignored with a warning. To dispatch under a different coding-agent CLI —
 Codex, OpenCode, and GitHub Copilot CLI are also supported — resolve a
 **profile**: a node that bundles a harness, model, and toolset.
 

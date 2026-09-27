@@ -977,10 +977,12 @@ while the supervisor is demonstrably alive (pid identity-checked) AND inside
 `contractGraceMs` (60s, the contract's own worst case), because a supervisor
 killed mid-contract leaves the flag set forever and a recycled pid satisfies the
 bare probe a non-Linux host degrades to. The mirror hazard
-is a slot held FOREVER: a native-background run whose harness can no longer be
-enumerated never goes terminal at all, so `work.runMaxMs` (`--run-max`, default
-24h) is the watchdog and the un-enumerable case is warned about rather than
-hidden. That watchdog bounds a run's LENGTH and only ever stops FOLLOWING it,
+is a slot held FOREVER: a run that never goes terminal at all, so
+`work.runMaxMs` (`--run-max`, default 24h) is the watchdog. (Every run is
+supervised: the native `claude --bg` launch — and its `claude agents --json` /
+transcript-JSONL outcome scraping — is retired, task-spor-deprecate-native-bg-
+dispatch; `--bg` is refused and a legacy native record is judged from the
+record alone, closed `native-retired` an hour after launch.) That watchdog bounds a run's LENGTH and only ever stops FOLLOWING it,
 which is the wrong instrument for a WEDGED one, so `work.runIdleMs`
 (`--run-idle`, default 45min, 0 disables) bounds its SILENCE and actually ends
 it (task-spor-work-idle-run-detection): a run whose OBSERVED output has not

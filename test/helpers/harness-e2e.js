@@ -114,7 +114,6 @@ function dispatch(harness, { home, repo, cmdEnv, binEnv, extraArgs = [] }) {
     SPOR_HOME: home,
     XDG_CONFIG_HOME: home,
     [cmdEnv]: harnessCommand(harness, binEnv),
-    SPOR_FAKE_AGENTS_JSON: "[]",
   });
   const args = [
     CLI, "dispatch", `task-${harness}-e2e`, "--dir", repo,

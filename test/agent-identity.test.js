@@ -33,13 +33,10 @@ function localEnv(extra = {}) {
   }
   env.SPOR_HOME = ISO;
   env.XDG_CONFIG_HOME = ISO;
-  env.SPOR_FAKE_AGENTS_JSON = "[]";
   env.SPOR_DISTILLING = "1";
-  // The launcher tests here run against the SUPERVISED default (`claude -p
-  // --output-format stream-json` under the shared supervisor,
-  // task-spor-claude-adapter-headless-supervised); the few whose subject is the
-  // native `claude --bg` opt-in (its `claude agents --json` session capture)
-  // merge NATIVE_BG into their env (see below).
+  // The launcher tests here run against the SUPERVISED launch (`claude -p
+  // --output-format stream-json` under the shared supervisor) — the only one
+  // (task-spor-deprecate-native-bg-dispatch).
   return Object.assign(env, extra);
 }
 function remoteEnv(home, server, extra = {}) {
@@ -50,15 +47,9 @@ function run(args, env, cwd) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: localEnv(env), cwd });
 }
 
-// The launch-mode pin for the handful of tests whose SUBJECT is the native
-// `claude --bg` launch (its argv, its $PWD pin, its exit-code/lease coupling,
-// its `claude agents --json` session capture): merge into a test's env. Every
-// other launcher test here runs against the SUPERVISED default
-// (`claude -p --output-format stream-json` under the shared supervisor,
-// task-spor-claude-adapter-headless-supervised), whose harness child is a
-// DETACHED grandchild — so a launch is observed by waiting for the stub's
-// marker file rather than reading it the instant the CLI returns.
-const NATIVE_BG = { SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "native-background" };
+// A supervised launcher test's harness child is a DETACHED grandchild, so a
+// launch is observed by waiting for the stub's marker file rather than reading
+// it the instant the CLI returns.
 function runAsync(args, env, cwd) {
   return new Promise((resolve) => {
     let out = "", errOut = "";
@@ -874,93 +865,13 @@ test("dispatch --as: a prefix-less id is refused before launch with a 'did you m
   assert.match(r.stderr, /did you mean '--as agent-anthony-shark-november'/);
 });
 
-test("dispatch (remote, real): mints a session-DEFERRED token + 0600 mcp-config, NO --session-id, binds the run session after launch", async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d2-"));
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d2r-"));
-  const outFile = path.join(home, "argv.out");
-  fs.mkdirSync(home, { recursive: true });
-  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
-  const stub = argvStub(home, outFile);
-  const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
-  try {
-    // SPOR_SESSION_ID pins the captured session, short-circuiting `claude agents --json`.
-    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
-    assert.strictEqual(r.status, 0, r.stderr);
-    assert.match(r.stdout, /agent:  agent-anthony-laptop \(writes attributed/);
-    assert.match(r.stdout, new RegExp(`session: ${SID} \\(bound`)); // late-bound to the real run
-
-    // argv: --bg … --mcp-config <file> --strict-mcp-config <prompt> — NO --session-id
-    const lines = fs.readFileSync(outFile, "utf8").split("\n");
-    const argv = lines.slice(1);
-    assert.strictEqual(argv[0], "--bg");
-    assert.ok(!argv.includes("--session-id"), "--session-id is never passed (claude --bg ignores it)");
-    const mi = argv.indexOf("--mcp-config");
-    assert.ok(mi >= 0, "--mcp-config present");
-    assert.ok(argv.includes("--strict-mcp-config"), "--strict-mcp-config present");
-
-    // the mcp-config file is 0600 and carries the agent-scoped bearer
-    const mcpFile = argv[mi + 1];
-    const st = fs.statSync(mcpFile);
-    if (process.platform !== "win32") assert.strictEqual(st.mode & 0o777, 0o600, "mcp-config is 0600");
-    const conf = JSON.parse(fs.readFileSync(mcpFile, "utf8"));
-    assert.strictEqual(conf.mcpServers.spor.type, "http");
-    assert.match(conf.mcpServers.spor.url, /\/mcp$/);
-    assert.match(conf.mcpServers.spor.headers.Authorization, /^Bearer agtok_/);
-
-    // the mint hit the self-serve owner-gated route, SESSION-DEFERRED (empty body)
-    const mint = hits.find((h) => h.url === "/v1/agents/agent-anthony-laptop/token" && h.method === "POST");
-    assert.ok(mint, "POSTed to /v1/agents/{id}/token (self-serve, not the admin route)");
-    assert.deepStrictEqual(JSON.parse(mint.body), {}, "token minted session-deferred (no session up front)");
-    assert.ok(!hits.some((h) => h.url === "/v1/admin/tokens"), "did NOT use the admin token route");
-
-    // the claim is PERSON-SCOPED (no session up front); the real session is bound LATE.
-    // It carries the per-invocation dispatch nonce (inc-spor-dispatch-duplicate-task-2026-06-18).
-    const claim = hits.find((h) => /\/claim$/.test(h.url) && h.method === "POST");
-    const claimBody = JSON.parse(claim.body);
-    assert.ok(!("session" in claimBody), "claim is person-scoped (session bound later)");
-    assert.ok(claimBody.dispatch && typeof claimBody.dispatch === "string", "claim carries a per-invocation dispatch nonce");
-    // late bind: the token's session rebound via POST /v1/agents/session, and the lease renewed to it
-    const bind = hits.find((h) => h.url === "/v1/agents/session" && h.method === "POST");
-    assert.ok(bind, "POSTed to /v1/agents/session to bind the captured run session");
-    assert.deepStrictEqual(JSON.parse(bind.body), { session: SID }, "the real session is bound to the token");
-    const renew = hits.find((h) => /\/renew$/.test(h.url) && h.method === "POST");
-    assert.ok(renew, "renewed the lease to the captured run session");
-    assert.strictEqual(JSON.parse(renew.body).session, SID, "lease renewed with the real session");
-  } finally {
-    srv.close();
-  }
-});
-
-// issue-spor-remote-stale-socket-after-blocking-spawn: a failed session bind
-// used to be swallowed in total silence (a comment saying so, no output at
-// all) — exactly how the stale-pooled-socket failure after a blocking launch
-// went unnoticed. It must now warn on stderr, and the run still succeeds
-// (best-effort: the lease self-heals via heartbeat) rather than failing the
-// dispatch.
-test("dispatch (remote, real): a failed session bind now warns loudly on stderr instead of skipping in silence", async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-bindfail-"));
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-bindfailr-"));
-  const outFile = path.join(home, "argv.out");
-  fs.mkdirSync(home, { recursive: true });
-  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
-  const stub = argvStub(home, outFile);
-  const { srv, hits, base } = await dispatchStub({ mintStatus: 201, sessionBindStatus: 500 });
-  try {
-    const r = await runAsync(
-      ["dispatch", "dec-x", "--dir", repo, "--no-brief"],
-      remoteEnv(home, base, { ...NATIVE_BG, SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub })
-    );
-    assert.strictEqual(r.status, 0, r.stderr);
-    assert.match(r.stderr, /warning: could not bind the run session \(HTTP 500 \(boom\)\)/);
-    assert.doesNotMatch(r.stdout, /\(bound/, "not reported as bound — the bind genuinely failed");
-    // best-effort: the lease still renews to the captured session regardless of the bind outcome
-    const renew = hits.find((h) => /\/renew$/.test(h.url) && h.method === "POST");
-    assert.ok(renew, "the lease renew still runs even though the bind failed");
-    assert.strictEqual(JSON.parse(renew.body).session, SID);
-  } finally {
-    srv.close();
-  }
-});
+// The supervised twin of the late session bind (session-DEFERRED token, 0600
+// --mcp-config, no --session-id, the stream's session bound and the lease
+// renewed to it) is pinned in claude-supervised-dispatch.test.js ("remote
+// claude-code dispatch carries the agent token…"). The native `claude --bg`
+// variants that lived here — the `claude agents --json` session capture, its
+// stale-agent/ambient-pin guards, and the launcher-side bind warning — went
+// with that launch (task-spor-deprecate-native-bg-dispatch).
 
 // dec-spor-worker-strictness-split-interactive-lenient: a mint failure on a
 // REAL run now HARD-FAILS by default — no launch, no lease, no side effect
@@ -1208,172 +1119,6 @@ test("dispatch (remote, --print): a prefix-less dispatch.agent previews person-s
   }
 });
 
-// Capture path: with NO SPOR_SESSION_ID, dispatch reads the REAL run session from
-// `claude agents --json` post-launch and binds it (dec-spor-dispatch-bg-session-
-// late-bind). This exercises the actual capture/match logic (newestDispatchedSession:
-// cwd filter, state!=="done" filter, newest-by-startedAt) that the SPOR_SESSION_ID
-// pin short-circuits in every other test. The fake agents list (SPOR_FAKE_AGENTS_JSON)
-// is the same seam the dup-guard uses; --force is needed because that static list
-// represents the POST-launch agent set, which the PRE-launch dup-guard also sees.
-test("dispatch (remote, real): captures the run session from `claude agents --json` and binds it (no SPOR_SESSION_ID)", async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-cap-"));
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-capr-"));
-  const outFile = path.join(home, "argv.out");
-  fs.mkdirSync(home, { recursive: true });
-  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
-  const stub = argvStub(home, outFile);
-  const REAL = "aaaaaaaa-1111-2222-3333-444444444444";
-  // The candidates the capture must pick among. Only the newest, this-repo,
-  // not-done agent should win — the others probe each filter. "old" predates
-  // this dispatch's own launch (an EARLIER run of the same name+cwd — the
-  // reusable-name scenario, issue-spor-dispatch-unbound-run-identity-not-
-  // unique) so it must lose even though it shares name+cwd with "new"; "new"
-  // is stamped well into the future so it reliably clears the "since this
-  // launch" floor regardless of how long test setup takes.
-  const past = Date.now() - 3600000;
-  const future = Date.now() + 3600000;
-  const agents = JSON.stringify([
-    { id: "other", kind: "background", state: "working", name: "dec-x", cwd: "/some/other/repo", sessionId: "WRONG-other-repo", startedAt: future },
-    { id: "old",   kind: "background", state: "working", name: "dec-x", cwd: repo,                sessionId: "WRONG-older-run",  startedAt: past },
-    { id: "new",   kind: "background", state: "working", name: "dec-x", cwd: repo,                sessionId: REAL,               startedAt: future },
-    { id: "done",  kind: "background", state: "done",    name: "dec-x", cwd: repo,                sessionId: "WRONG-finished",   startedAt: future },
-  ]);
-  const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
-  try {
-    const r = await runAsync(
-      ["dispatch", "dec-x", "--dir", repo, "--no-brief", "--force"],
-      remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents })
-    );
-    assert.strictEqual(r.status, 0, r.stderr);
-    // it reported binding the captured session
-    assert.match(r.stdout, new RegExp(`session: ${REAL} \\(bound`));
-
-    // the token was rebound to the REAL captured session (not a decoy)
-    const bind = hits.find((h) => h.url === "/v1/agents/session" && h.method === "POST");
-    assert.ok(bind, "POSTed /v1/agents/session to bind the captured session");
-    assert.strictEqual(JSON.parse(bind.body).session, REAL, "bound the NEWEST this-repo non-done session");
-
-    // and the lease was renewed to the same captured session
-    const renew = hits.find((h) => /\/renew$/.test(h.url) && h.method === "POST");
-    assert.ok(renew, "renewed the lease");
-    assert.strictEqual(JSON.parse(renew.body).session, REAL, "lease renewed with the captured session");
-
-    // none of the decoys (other-repo / older / done) leaked through
-    assert.ok(!hits.some((h) => h.method === "POST" && /"session":"WRONG/.test(h.body || "")), "no decoy session was bound");
-  } finally {
-    srv.close();
-  }
-});
-
-// issue-spor-dispatch-unbound-run-identity-not-unique: a launch NAME is
-// derived from the node id, so re-dispatching the SAME node into the SAME
-// checkout produces a candidate that matches on name+cwd exactly like the
-// run just launched would — the only thing telling them apart is that the
-// stale one started BEFORE this launch even began. Session capture must
-// reject it rather than adopting it the instant it sees ANY same-name
-// candidate, which is what an unbounded "newest so far" pick would do.
-test("dispatch (remote, real): a STALE same-name agent from an EARLIER dispatch is never captured as this run's session", async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-stale-"));
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-staler-"));
-  fs.mkdirSync(home, { recursive: true });
-  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
-  const stub = argvStub(home, path.join(home, "argv.out"));
-  // Only a STALE candidate exists — same name, same cwd, but its startedAt
-  // predates this dispatch's own launch, exactly as an earlier, still-
-  // registered (or zombie) agent from a prior dispatch of the same node
-  // would look. No "real" candidate for THIS launch ever appears.
-  const agents = JSON.stringify([
-    { id: "stale", kind: "background", state: "working", name: "dec-x", cwd: repo, sessionId: "WRONG-earlier-run", startedAt: Date.now() - 3600000 },
-  ]);
-  const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
-  try {
-    const r = await runAsync(
-      ["dispatch", "dec-x", "--dir", repo, "--no-brief", "--force"],
-      remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents })
-    );
-    assert.strictEqual(r.status, 0, r.stderr);
-    // no session was captured — the honest miss, never the stale decoy
-    assert.doesNotMatch(r.stdout, /session: WRONG-earlier-run/);
-    assert.match(r.stderr, /could not read the run session/);
-    assert.ok(!hits.some((h) => h.method === "POST" && (h.body || "").includes("WRONG-earlier-run")), "the stale earlier-run session never reached the server");
-  } finally {
-    srv.close();
-  }
-});
-
-// A `claude` stub whose "agents --json" answer changes over calls: it reports
-// NOTHING for the first `emptyCalls` invocations (simulating the real launched
-// agent not having registered with the daemon yet — the exact race the poll
-// loop exists to ride out), then reports `agentsJson` from then on. Any other
-// invocation (the `--bg` launch itself) just exits 0. Distinguishing "agents
-// --json" from other subcommands mirrors dispatchHarnesses' activeDiscovery
-// args, so this drives the SAME code path enumerateHarnessAgents does against
-// a real claude binary — SPOR_FAKE_AGENTS_JSON would instead answer identically
-// on every call, which can't reproduce a registration-lag race.
-function delayedAgentsStub(dir, counterFile, emptyCalls, agentsJson) {
-  return writeSpawnableNodeStub(dir, "claude-delayed-agents", `
-const fs = require("node:fs");
-const argv = process.argv.slice(2);
-if (argv.includes("agents") && argv.includes("--json")) {
-  let n = 0;
-  try { n = parseInt(fs.readFileSync(${JSON.stringify(counterFile)}, "utf8"), 10) || 0; } catch {}
-  fs.writeFileSync(${JSON.stringify(counterFile)}, String(n + 1));
-  process.stdout.write(n < ${JSON.stringify(emptyCalls)} ? "[]" : ${JSON.stringify(agentsJson)});
-}
-process.exit(0);
-`);
-}
-
-// issue-spor-dispatch-ambient-session-id-borrows-caller-transcript: an ambient
-// SPOR_SESSION_ID (e.g. a caller's own session, leaked into the env a real
-// dispatch runs under) must never be trusted once discovery PROVES it isn't the
-// launched agent's session — even when the real agent only shows up in `claude
-// agents --json` a couple of poll iterations after launch, not instantly. A
-// one-shot check taken before the poll starts would see nothing yet and
-// rubber-stamp the pin; verification has to live INSIDE the poll to catch this.
-test("dispatch (remote, real): a SPOR_SESSION_ID that doesn't match the launched agent is ignored, even if the real agent registers a couple of poll ticks late", async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-pinmismatch-"));
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-pinmismatchr-"));
-  const counterFile = path.join(home, "agents-calls.count");
-  fs.mkdirSync(home, { recursive: true });
-  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
-  const REAL = "aaaaaaaa-1111-2222-3333-444444444444";
-  const CALLER_PIN = "ffffffff-0000-0000-0000-ffffffffffff"; // an unrelated live session, e.g. the caller's own
-  const agents = JSON.stringify([
-    { id: "new", kind: "background", state: "working", name: "dec-x", cwd: repo, sessionId: REAL, startedAt: Date.now() + 3600000 },
-  ]);
-  // The pre-launch dup-guard also calls "agents --json" once before the launch
-  // even happens, so the empty answer must outlast that call too — 2 empty
-  // calls (dup-guard + the poll's first tick) before the real agent "appears".
-  const stub = delayedAgentsStub(home, counterFile, 2, agents);
-  const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
-  try {
-    // remoteEnv/localEnv default SPOR_FAKE_AGENTS_JSON to "[]" so ordinary tests
-    // never spawn a real "agents --json" process — but that same seam would
-    // short-circuit THIS test's delayed stub, so drop it and let discovery
-    // actually invoke delayedAgentsStub.
-    const env = remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub, SPOR_SESSION_ID: CALLER_PIN });
-    delete env.SPOR_FAKE_AGENTS_JSON;
-    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], env);
-    assert.strictEqual(r.status, 0, r.stderr);
-    // it really did take more than one poll tick to appear
-    const calls = parseInt(fs.readFileSync(counterFile, "utf8"), 10);
-    assert.ok(calls >= 3, `expected the real agent to register after the first poll tick (saw ${calls} "agents --json" calls)`);
-    // the pin's mismatch is called out, and the REAL discovered session wins —
-    // never the caller's pinned session/transcript
-    assert.match(r.stderr, /SPOR_SESSION_ID.*does not match the launched agent's session/);
-    assert.match(r.stdout, new RegExp(`session: ${REAL} \\(bound`));
-    assert.doesNotMatch(r.stdout, new RegExp(CALLER_PIN));
-
-    const bind = hits.find((h) => h.url === "/v1/agents/session" && h.method === "POST");
-    assert.ok(bind, "POSTed /v1/agents/session to bind the captured session");
-    assert.strictEqual(JSON.parse(bind.body).session, REAL, "bound the discovered session, not the mismatched pin");
-    assert.ok(!hits.some((h) => h.method === "POST" && (h.body || "").includes(CALLER_PIN)), "the caller's pinned session never reached the server");
-  } finally {
-    srv.close();
-  }
-});
-
 // ===========================================================================
 // 3b. spor work inherits the identity hard-fail (dec-spor-worker-strictness-
 //     split-interactive-lenient) — every launch it makes goes through the same
@@ -1407,9 +1152,7 @@ test("spor work --once (remote): no agent configured => the dispatch hard-fails,
 
 // The --allow-person-token PASSTHROUGH itself (cmdWork's `passthrough` object,
 // bin/spor.js) is exercised directly at the dispatch level above (identical CLI
-// flag, identical cmdDispatch call) — a full native-background spor-work run
-// here would need to wait out the harness's live-agent reconciliation cadence
-// for very little extra signal, so this stays a dispatch-level check.
+// flag, identical cmdDispatch call), so this stays a dispatch-level check.
 
 // ===========================================================================
 // 4. authorship read-out (authorshipLine + renderNorm)

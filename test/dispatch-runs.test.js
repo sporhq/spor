@@ -1,9 +1,10 @@
 // Durable terminal records for dispatched runs
-// (inc-spor-dispatch-session-vanished-2026-07-18). A `native-background` launch
-// hands the child to the harness daemon and returns, so the launcher never sees
-// it exit and `claude agents --json` lists only what is still LIVE — before this
-// a finished run and a dead one were indistinguishable afterwards. Every case
-// below must leave a queryable terminal record, or an explicit refusal.
+// (inc-spor-dispatch-session-vanished-2026-07-18). Every dispatch writes its run
+// record before its child starts and every case below must leave a queryable
+// terminal record, or an explicit refusal. The native `claude --bg` launch —
+// whose ending was inferred by scraping `claude agents --json` and the session
+// transcript — is retired (task-spor-deprecate-native-bg-dispatch); a legacy
+// native record is judged from the record alone.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const test = require("node:test");
 const assert = require("node:assert");
@@ -18,7 +19,7 @@ const gates = require("../lib/kernel/gates.js");
 const { writeSpawnableNodeStub, pathWithOnlyGit } = require("./helpers/portable");
 
 // Isolated env: no SPOR_*/SUBSTRATE_* leakage, local mode, and a scratch
-// CLAUDE_CONFIG_DIR so transcript lookup never touches the real ~/.claude.
+// CLAUDE_CONFIG_DIR so nothing here can touch the real ~/.claude.
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-runs-iso-"));
 function bare(extra = {}) {
   const env = {};
@@ -28,16 +29,6 @@ function bare(extra = {}) {
   }
   env.SPOR_HOME = ISO_HOME;
   env.XDG_CONFIG_HOME = ISO_HOME;
-  env.SPOR_FAKE_AGENTS_JSON = "[]";
-  // These tests pin the LAUNCHER — cwd, worktree, $PWD, argv, claim ordering,
-  // session capture through `claude agents --json` — against the native
-  // `claude --bg` launch they were written for, now the explicit opt-in
-  // (`--bg` / dispatch.claudeLaunchMode, task-spor-claude-adapter-headless-
-  // supervised). The supervised default (`claude -p --output-format
-  // stream-json` under the shared supervisor) is covered in
-  // test/claude-supervised-dispatch.test.js; every guard exercised here runs
-  // before the launch branch forks, so it is shared by both.
-  env.SPOR_DISPATCH_CLAUDE_LAUNCH_MODE = "native-background";
   return Object.assign(env, extra);
 }
 function cli(args, env, cwd) {
@@ -65,6 +56,17 @@ function fixture() {
 
 function runRecords(home) {
   return runner.readRunRecords(home);
+}
+
+// A LEGACY native-background record, as the retired `claude --bg` launcher
+// wrote it (task-spor-deprecate-native-bg-dispatch): nothing writes these any
+// more, but the journal can still hold them.
+function legacyNativeRecord(home, runId, extra = {}) {
+  runner.atomicJson(runner.runPaths(home, runId).record, {
+    run_id: runId, harness: "claude-code", launch_mode: "native-background", state: "running",
+    cwd: "/tmp/spor-runs-legacy", created_at: new Date().toISOString(), ...extra,
+  });
+  return runId;
 }
 
 // A pid that is genuinely gone: spawnSync returns only after the child has been
@@ -110,20 +112,6 @@ function supervisedRecord(home, runId, extra = {}) {
   runner.atomicJson(p.record, record);
   return record;
 }
-
-// One JSONL transcript under a scratch CLAUDE_CONFIG_DIR, at the path the
-// harness itself uses: projects/<cwd with non-alphanumerics dashed>/<sid>.jsonl.
-function writeTranscript(configDir, cwd, sessionId, lines) {
-  const dir = path.join(configDir, "projects", String(cwd).replace(/[^A-Za-z0-9]/g, "-"));
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `${sessionId}.jsonl`);
-  fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
-  return file;
-}
-
-const TOOL_RESULT = { type: "user", timestamp: "2026-07-18T09:59:59.638Z", message: { role: "user", content: [{ type: "tool_result", content: "Exit code 2", is_error: true }] } };
-const CLEAN_END = { type: "system", subtype: "turn_duration", durationMs: 159575, timestamp: "2026-07-18T10:25:37.180Z" };
-const BOOKKEEPING = { type: "last-prompt", lastPrompt: "You are a delegated implementation agent." };
 
 // --- classification (pure) -------------------------------------------------
 
@@ -194,238 +182,27 @@ test("classifyTerminalText: a provider's OWN wording of exhaustion is environmen
   }
 });
 
-test("transcriptOutcome: a mid-turn stop is 'vanished' and names the last record; a clean turn is 'done'", () => {
-  const vanished = runner.transcriptOutcome([JSON.stringify({ type: "assistant" }), JSON.stringify(TOOL_RESULT), JSON.stringify(BOOKKEEPING)].join("\n"));
-  assert.strictEqual(vanished.state, "vanished");
-  assert.strictEqual(vanished.termination_signal, "mid-turn");
-  assert.match(vanished.termination_reason, /stops mid-turn after a 'user' record at 2026-07-18T09:59:59\.638Z/);
-
-  const done = runner.transcriptOutcome([JSON.stringify(TOOL_RESULT), JSON.stringify(CLEAN_END), JSON.stringify(BOOKKEEPING)].join("\n"));
-  assert.strictEqual(done.state, "done");
-  assert.strictEqual(done.termination_class, "completed");
-});
-
-test("transcriptOutcome: a session that completed EARLIER turns and then died mid-turn is still vanished", () => {
-  // Every turn ends with a marker, so only the trailing records say how the
-  // SESSION stopped — reading the whole tail would call this a clean finish.
-  const text = [
-    JSON.stringify({ type: "assistant", timestamp: "2026-07-18T09:00:00Z" }),
-    JSON.stringify(CLEAN_END),
-    JSON.stringify({ type: "assistant", timestamp: "2026-07-18T09:58:00Z" }),
-    JSON.stringify({ type: "assistant", timestamp: "2026-07-18T09:59:00Z" }),
-    JSON.stringify(TOOL_RESULT),
-  ].join("\n");
-  const o = runner.transcriptOutcome(text);
-  assert.strictEqual(o.state, "vanished");
-  assert.strictEqual(o.termination_signal, "mid-turn");
-});
-
-test("transcriptOutcome: session bookkeeping written AFTER the final turn does not fake a vanish", () => {
-  // The harness appends metadata records freely once the turn is over. These
-  // are the real trailing types seen on the dev box (queue-operation and
-  // pr-link even carry timestamps, so "has a timestamp" cannot separate them);
-  // before the turn-record allowlist they pushed the end-of-turn marker out of
-  // the trailing window and reported 52 cleanly-finished sessions as vanished.
-  const text = [
-    JSON.stringify({ type: "assistant", timestamp: "2026-07-18T10:25:00Z" }),
-    JSON.stringify({ type: "system", subtype: "stop_hook_summary", timestamp: "2026-07-18T10:25:36Z" }),
-    JSON.stringify(CLEAN_END),
-    JSON.stringify({ type: "queue-operation", timestamp: "2026-07-18T10:25:38Z", operation: "drain" }),
-    JSON.stringify({ type: "bridge-session" }),
-    JSON.stringify({ type: "ai-title", title: "some session" }),
-    JSON.stringify({ type: "mode", mode: "default" }),
-    JSON.stringify({ type: "permission-mode", permissionMode: "bypassPermissions" }),
-    JSON.stringify({ type: "pr-link", timestamp: "2026-07-18T10:25:40Z", url: "https://example.invalid/pr/1" }),
-  ].join("\n");
-  const o = runner.transcriptOutcome(text);
-  assert.strictEqual(o.state, "done");
-  assert.strictEqual(o.termination_class, "completed");
-});
-
-test("transcriptOutcome: a NEW turn that starts after a clean one and never answers is still vanished", () => {
-  // The counterpart guard: user input after the marker is a turn that genuinely
-  // began and never finished, so the allowlist must not launder it into 'done'.
-  const text = [
-    JSON.stringify({ type: "assistant", timestamp: "2026-07-18T10:25:00Z" }),
-    JSON.stringify(CLEAN_END),
-    JSON.stringify({ type: "user", timestamp: "2026-07-18T10:30:00Z", message: { role: "user", content: "one more thing" } }),
-    JSON.stringify({ type: "attachment", timestamp: "2026-07-18T10:30:01Z" }),
-  ].join("\n");
-  const o = runner.transcriptOutcome(text);
-  assert.strictEqual(o.state, "vanished");
-  assert.strictEqual(o.termination_signal, "mid-turn");
-});
-
-test("transcriptOutcome: a transcript of pure bookkeeping has no turn state to read", () => {
-  const text = [
-    JSON.stringify({ type: "custom-title", title: "x" }),
-    JSON.stringify({ type: "agent-name", name: "y" }),
-    JSON.stringify({ type: "permission-mode", permissionMode: "default" }),
-  ].join("\n");
-  const o = runner.transcriptOutcome(text);
-  assert.strictEqual(o.state, "vanished");
-  assert.strictEqual(o.termination_signal, "empty-transcript");
-});
-
-test("transcriptOutcome: an agent that merely DISCUSSED credit exhaustion and finished cleanly is not an environment failure", () => {
-  const text = [
-    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "the Fable run died: out of usage credits" }] } }),
-    JSON.stringify(CLEAN_END),
-  ].join("\n");
-  assert.strictEqual(runner.transcriptOutcome(text).termination_class, "completed");
-});
-
-test("transcriptOutcome: a credit death at the tail of an unfinished turn IS classified environment", () => {
-  const text = [
-    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "working" }] } }),
-    JSON.stringify({ type: "system", subtype: "error", timestamp: "2026-07-18T10:00:00Z", content: "out of usage credits" }),
-  ].join("\n");
-  const o = runner.transcriptOutcome(text);
-  assert.strictEqual(o.state, "failed");
-  assert.strictEqual(o.termination_class, "environment");
-  assert.match(o.termination_reason, /out of usage credits/);
-});
-
-test("transcriptOutcome: an unreadable/empty transcript still yields a terminal record, never silence", () => {
-  const o = runner.transcriptOutcome("");
-  assert.strictEqual(o.state, "vanished");
-  assert.strictEqual(o.termination_signal, "empty-transcript");
-  assert.ok(o.termination_reason);
-});
-
 // --- liveness + finalization ----------------------------------------------
-
-test("isRunLive: matches a bound session by id, an unbound one by launch NAME, and rejects a pre-launch agent", () => {
-  const bound = { session_id: "s1", cwd: "/w", created_at: "2026-07-18T10:00:00.000Z" };
-  assert.ok(runner.isRunLive(bound, [{ sessionId: "s1", cwd: "/other" }]));
-  assert.ok(!runner.isRunLive(bound, [{ sessionId: "s2", cwd: "/w" }]));
-  const unbound = { name: "task-a", cwd: "/w", created_at: "2026-07-18T10:00:00.000Z" };
-  assert.ok(runner.isRunLive(unbound, [{ name: "task-a", cwd: "/w", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }]));
-  assert.ok(!runner.isRunLive(unbound, [{ name: "task-a", cwd: "/w", startedAt: Date.parse("2026-07-18T09:00:00.000Z") }]));
-  assert.ok(!runner.isRunLive(unbound, [{ name: "task-a", cwd: "/elsewhere", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }]));
-  assert.ok(!runner.isRunLive(unbound, []));
-});
-
-test("isRunLive: a SIBLING agent sharing the checkout never holds an unbound run open", () => {
-  // issue-spor-dispatch-run-liveness-same-cwd-misattribution: two `--no-worktree`
-  // dispatches into one repo share a cwd, so co-location is not evidence about
-  // THIS run. task-a is dead; task-b is very much alive in the same directory.
-  const dead = { name: "task-a", cwd: "/repo", created_at: "2026-07-18T10:00:00.000Z" };
-  const sibling = { name: "task-b", cwd: "/repo", sessionId: "s-b", startedAt: Date.parse("2026-07-18T10:00:05.000Z") };
-  assert.ok(!runner.isRunLive(dead, [sibling]), "a sibling in the same checkout is not this run");
-  // …and the sibling's own record is still correctly live.
-  assert.ok(runner.isRunLive({ name: "task-b", cwd: "/repo", created_at: "2026-07-18T10:00:00.000Z" }, [sibling]));
-});
-
-test("isRunLive: a run with no identity at all is never inferred alive from co-location", () => {
-  const anonymous = { cwd: "/repo", created_at: "2026-07-18T10:00:00.000Z" };
-  assert.ok(!runner.isRunLive(anonymous, [{ name: "task-b", cwd: "/repo", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }]));
-});
-
-test("isRunLive: RE-DISPATCHING the same node into the same checkout never keeps the prior unbound run alive", () => {
-  // issue-spor-dispatch-unbound-run-identity-not-unique: a launch NAME is
-  // derived from the node id, so it is REUSED across re-dispatches — unlike a
-  // session id it is not unique. dead-run's own agent vanished long ago; a
-  // LATER re-dispatch of the SAME node (same name, same cwd) is now live. The
-  // later agent must never be read as evidence that the EARLIER run is alive.
-  const first = { name: "issue-x", cwd: "/repo", created_at: "2026-07-18T10:00:00.000Z" };
-  const second = { name: "issue-x", cwd: "/repo", created_at: "2026-07-18T10:15:00.000Z" };
-  const laterAgent = { name: "issue-x", cwd: "/repo", startedAt: Date.parse("2026-07-18T10:15:03.000Z") };
-  assert.ok(!runner.isRunLive(first, [laterAgent]), "the earlier, dead run is not resurrected by a later same-named agent");
-  assert.ok(runner.isRunLive(second, [laterAgent]), "…while the run that agent actually belongs to reads live");
-});
-
-test("finalizeRun: a live run, an already-terminal run, and a run inside its grace window are left alone", () => {
-  const now = () => "2026-07-18T10:00:30.000Z";
-  const rec = { state: "running", cwd: "/w", created_at: "2026-07-18T10:00:00.000Z" };
-  assert.strictEqual(runner.finalizeRun(rec, { alive: true, now }), null);
-  assert.strictEqual(runner.finalizeRun({ ...rec, state: "done" }, { alive: false, now }), null);
-  assert.strictEqual(runner.finalizeRun(rec, { alive: false, now }), null, "30s in: still registering, not vanished");
-});
-
-test("finalizeRun: a child that exited BEFORE session binding is terminal, and says exactly that", () => {
-  const configDir = scratch("spor-runs-cc-");
-  const patch = runner.finalizeRun(
-    { state: "running", cwd: path.join(configDir, "nowhere"), created_at: "2026-07-18T10:00:00.000Z" },
-    { alive: false, env: { CLAUDE_CONFIG_DIR: configDir }, now: () => "2026-07-18T10:10:00.000Z" }
-  );
-  assert.strictEqual(patch.state, "vanished");
-  assert.strictEqual(patch.termination_signal, "session-unbound");
-  assert.match(patch.termination_reason, /never bound a session/);
-  assert.ok(patch.finished_at, "a terminal record always carries when it ended");
-});
-
-test("finalizeRun: a BOUND run is resolved from its own transcript, named by its session id", () => {
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-demo";
-  const file = writeTranscript(configDir, cwd, "sid-late", [TOOL_RESULT, CLEAN_END]);
-  const patch = runner.finalizeRun(
-    { state: "running", cwd, session_id: "sid-late", created_at: "2026-07-18T10:00:00.000Z" },
-    { alive: false, env: { CLAUDE_CONFIG_DIR: configDir }, now: () => "2026-07-18T10:10:00.000Z" }
-  );
-  assert.strictEqual(patch.state, "done");
-  assert.strictEqual(patch.transcript_path, file, "the record points at the transcript it was read from");
-});
-
-test("finalizeRun: an unbound run NEVER borrows a transcript from its checkout", () => {
-  // issue-spor-dispatch-run-liveness-same-cwd-misattribution, harm 2: a project
-  // dir is one CHECKOUT. This transcript belongs to whoever else ran here — it
-  // postdates the launch and would have been adopted as newest-in-dir. A record
-  // that confidently points at the wrong transcript is worse than no record.
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-shared";
-  writeTranscript(configDir, cwd, "sid-of-a-different-run", [TOOL_RESULT, CLEAN_END]);
-  const patch = runner.finalizeRun(
-    { state: "running", name: "task-a", cwd, created_at: "2026-07-18T10:00:00.000Z" },
-    { alive: false, env: { CLAUDE_CONFIG_DIR: configDir }, now: () => "2026-07-18T10:10:00.000Z" }
-  );
-  assert.strictEqual(patch.state, "vanished", "it is terminal — never left hanging");
-  assert.strictEqual(patch.termination_signal, "session-unbound");
-  assert.ok(!patch.transcript_path, "no transcript is attributed without identity");
-  assert.match(patch.termination_reason, /how it ended is unknown/);
-});
-
-test("finalizeRun: a bound run whose transcript is missing says so, and does not fall back to a sibling's", () => {
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-gone";
-  writeTranscript(configDir, cwd, "sid-of-a-different-run", [TOOL_RESULT, CLEAN_END]);
-  const patch = runner.finalizeRun(
-    { state: "running", cwd, session_id: "sid-mine", created_at: "2026-07-18T10:00:00.000Z" },
-    { alive: false, env: { CLAUDE_CONFIG_DIR: configDir }, now: () => "2026-07-18T10:10:00.000Z" }
-  );
-  assert.strictEqual(patch.termination_signal, "no-transcript");
-  assert.ok(!patch.transcript_path);
-  assert.match(patch.termination_reason, /sid-mine/);
-});
 
 // --- reconciliation over the record store ---------------------------------
 
-test("reconcileRuns: resolves dead native runs, keeps live ones, and leaves a live supervisor's run alone", () => {
+test("reconcileRuns: retires an aged-out legacy native record, keeps a young one, and leaves a live supervisor's run alone", () => {
   const home = scratch("spor-runs-store-");
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-recon";
-  writeTranscript(configDir, cwd, "sid-dead", [TOOL_RESULT]);
-  const dead = runner.beginNativeRun(home, { harness: "claude-code", name: "n-dead", nodeId: "issue-dead", cwd, now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(dead, { state: "running", session_id: "sid-dead" });
-  const live = runner.beginNativeRun(home, { harness: "claude-code", name: "n-live", nodeId: "issue-live", cwd, now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(live, { state: "running", session_id: "sid-live" });
+  legacyNativeRecord(home, "n-old", { name: "n-old", node_id: "issue-dead", session_id: "sid-dead", created_at: "2026-07-18T08:00:00.000Z" });
+  legacyNativeRecord(home, "n-young", { name: "n-young", node_id: "issue-live", created_at: "2026-07-18T09:50:00.000Z" });
   // A supervised record whose supervisor is still up: its own runner owns
-  // finalization, so reconciliation must leave it exactly as found. Its liveness
-  // is its supervisor's pid, never the native agent list — which is empty of it.
+  // finalization, so reconciliation must leave it exactly as found.
   runner.atomicJson(runner.runPaths(home, "sup-1").record, { run_id: "sup-1", harness: "codex", launch_mode: "supervised-jsonl", state: "running", runner_pid: process.pid, created_at: "2026-07-18T10:00:00.000Z" });
 
-  const out = runner.reconcileRuns(home, {
-    agents: [{ sessionId: "sid-live", cwd, kind: "background" }],
-    env: { CLAUDE_CONFIG_DIR: configDir },
-    now: () => "2026-07-18T10:10:00.000Z",
-  });
+  const out = runner.reconcileRuns(home, { now: () => "2026-07-18T10:10:00.000Z" });
   const byId = new Map(out.map((r) => [r.run_id, r]));
-  assert.strictEqual(byId.get(dead.runId).state, "vanished");
-  assert.strictEqual(byId.get(dead.runId).termination_signal, "mid-turn");
-  assert.strictEqual(byId.get(live.runId).state, "running");
+  assert.strictEqual(byId.get("n-old").state, "vanished");
+  assert.strictEqual(byId.get("n-old").termination_signal, "native-retired");
+  assert.strictEqual(byId.get("n-old").terminal_enforced, false);
+  assert.strictEqual(byId.get("n-young").state, "running", "inside the retirement horizon a legacy record is still believed");
   assert.strictEqual(byId.get("sup-1").state, "running");
   // Durable: the derived outcome is written back, not just returned.
-  assert.strictEqual(runRecords(home).find((r) => r.run_id === dead.runId).state, "vanished");
+  assert.strictEqual(runRecords(home).find((r) => r.run_id === "n-old").state, "vanished");
   assert.strictEqual(runRecords(home).find((r) => r.run_id === "sup-1").state, "running", "a healthy supervised run is never prematurely finalized");
 });
 
@@ -436,159 +213,6 @@ test("reconcileRuns: resolves dead native runs, keeps live ones, and leaves a li
 // edge, which the work-loop slot never carries — is stamped on the run
 // record at launch so a later candidate pin can read what really produced
 // the tree, instead of only ever seeing the worker's own `--profile` flag.
-
-test("beginNativeRun: stamps resolved_profile when the launcher resolved one, and omits the key when it did not", () => {
-  const home = scratch("spor-runs-resolved-profile-");
-  const routed = runner.beginNativeRun(home, {
-    harness: "claude-code", name: "n-routed", nodeId: "issue-routed", cwd: "/tmp/nope",
-    resolvedProfile: "profile-lane-strict", now: () => "2026-09-06T10:00:00.000Z",
-  });
-  assert.strictEqual(routed.record.resolved_profile, "profile-lane-strict");
-  assert.strictEqual(runRecords(home).find((r) => r.run_id === routed.runId).resolved_profile, "profile-lane-strict");
-
-  const unrouted = runner.beginNativeRun(home, {
-    harness: "claude-code", name: "n-unrouted", nodeId: "issue-unrouted", cwd: "/tmp/nope",
-    now: () => "2026-09-06T10:00:00.000Z",
-  });
-  assert.strictEqual("resolved_profile" in unrouted.record, false, "a launch that resolved no profile stamps no key, not null");
-});
-
-test("reconcileRuns: two concurrent dispatches in ONE checkout resolve independently", () => {
-  // The `--no-worktree` shape from issue-spor-dispatch-run-liveness-same-cwd-
-  // misattribution: both runs share a cwd and neither bound a session. The dead
-  // one must reach a terminal state even though its sibling is alive beside it,
-  // and it must not be handed the sibling's transcript as its evidence.
-  const home = scratch("spor-runs-store-");
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-shared-checkout";
-  // The only transcript here belongs to the LIVE sibling.
-  const siblingTranscript = writeTranscript(configDir, cwd, "sid-live-sibling", [TOOL_RESULT, CLEAN_END]);
-  const dead = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-dead", nodeId: "issue-dead", cwd, now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(dead, { state: "running" });
-  const live = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-live", nodeId: "issue-live", cwd, now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(live, { state: "running" });
-
-  const out = runner.reconcileRuns(home, {
-    agents: [{ name: "issue-live", cwd, kind: "background", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }],
-    env: { CLAUDE_CONFIG_DIR: configDir },
-    now: () => "2026-07-18T10:10:00.000Z",
-  });
-  const byId = new Map(out.map((r) => [r.run_id, r]));
-  assert.strictEqual(byId.get(live.runId).state, "running", "the live sibling is still live");
-  const d = byId.get(dead.runId);
-  assert.ok(runner.TERMINAL_STATES.has(d.state), "the dead run reaches a terminal state regardless of its sibling");
-  assert.strictEqual(d.termination_signal, "session-unbound");
-  assert.notStrictEqual(d.transcript_path, siblingTranscript, "and is never handed the sibling's transcript");
-  assert.ok(!d.transcript_path);
-});
-
-test("reconcileRuns: RE-DISPATCHING the same node into the same checkout never keeps the prior unbound run alive", () => {
-  // issue-spor-dispatch-unbound-run-identity-not-unique: unlike the "two
-  // concurrent dispatches" case above (different names), a re-dispatch of the
-  // SAME node into the SAME checkout launches an agent under the SAME launch
-  // name (cmdDispatch derives it from the node id). The first run's session
-  // never bound and its agent is long gone by the time the second launches;
-  // the second run's own live agent must not be read as the first run's
-  // evidence of life just because it shares that name and cwd.
-  const home = scratch("spor-runs-store-");
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-redispatch";
-  const secondTranscript = writeTranscript(configDir, cwd, "sid-second-run", [TOOL_RESULT, CLEAN_END]);
-  const first = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-x", nodeId: "issue-x", cwd, now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(first, { state: "running" });
-  const second = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-x", nodeId: "issue-x", cwd, now: () => "2026-07-18T10:20:00.000Z" });
-  runner.updateRun(second, { state: "running", session_id: "sid-second-run" });
-
-  const out = runner.reconcileRuns(home, {
-    agents: [{ sessionId: "sid-second-run", name: "issue-x", cwd, kind: "background", startedAt: Date.parse("2026-07-18T10:20:05.000Z") }],
-    env: { CLAUDE_CONFIG_DIR: configDir },
-    now: () => "2026-07-18T10:30:00.000Z",
-  });
-  const byId = new Map(out.map((r) => [r.run_id, r]));
-  assert.strictEqual(byId.get(second.runId).state, "running", "the re-dispatched (later) run is still live");
-  const f = byId.get(first.runId);
-  assert.ok(runner.TERMINAL_STATES.has(f.state), "the earlier run reaches a terminal state despite sharing name+cwd with the later one");
-  assert.strictEqual(f.termination_signal, "session-unbound");
-  assert.notStrictEqual(f.transcript_path, secondTranscript, "and is never handed the later run's transcript");
-  assert.ok(!f.transcript_path);
-});
-
-test("reconcileRuns: a QUICK re-dispatch, both still unbound, does not let the older run borrow the newer one's liveness", () => {
-  // issue-spor-dispatch-unbound-run-identity-not-unique: the grace window that
-  // covers the harness's own registration lag is symmetric around EACH
-  // record's created_at, so a re-dispatch only 15s later — well INSIDE that
-  // window on both sides — would otherwise satisfy the OLDER record's
-  // identity test too, from the SAME live agent. Unlike the original
-  // unbounded bug this wouldn't even self-correct with time: created_at and
-  // startedAt are fixed, so the older record would stay wrongly non-terminal
-  // for as long as the newer run's own agent keeps running. Only the more
-  // recently launched record may claim a shared name+cwd agent.
-  const home = scratch("spor-runs-store-");
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-quick-redispatch";
-  const first = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-x", nodeId: "issue-x", cwd, now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(first, { state: "running" });
-  const second = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-x", nodeId: "issue-x", cwd, now: () => "2026-07-18T10:00:15.000Z" });
-  runner.updateRun(second, { state: "running" });
-
-  const out = runner.reconcileRuns(home, {
-    // Only the SECOND run's own agent is alive — but its startedAt sits
-    // within the 60s grace window of BOTH records' created_at.
-    agents: [{ name: "issue-x", cwd, kind: "background", startedAt: Date.parse("2026-07-18T10:00:16.000Z") }],
-    env: { CLAUDE_CONFIG_DIR: configDir },
-    now: () => "2026-07-18T10:05:00.000Z", // past the FIRST record's own 60s grace window
-  });
-  const byId = new Map(out.map((r) => [r.run_id, r]));
-  assert.strictEqual(byId.get(second.runId).state, "running", "the newer run correctly reads live");
-  const f = byId.get(first.runId);
-  assert.ok(runner.TERMINAL_STATES.has(f.state), "the older run reaches a terminal state even though the live agent falls within ITS OWN grace window too");
-  assert.strictEqual(f.termination_signal, "session-unbound");
-});
-
-test("reconcileRuns: a same-name TERMINAL or cross-harness record never outranks a genuinely-live native run for ownership of its own agent", () => {
-  // The owner tie-break only needs to arbitrate between records that would
-  // otherwise both consume the ownership map — a supervised-jsonl record
-  // reconciles off its own pid (never off `agents`), and an already-terminal
-  // record's own `finalizeRun` short-circuits before ever consulting `scoped`.
-  // Neither benefits from winning a tie-break, but letting either win one
-  // wrongly DENIES the shared name+cwd agent to a currently-alive native
-  // record — worse than the residual same-mode ambiguity, since here there
-  // was never an actual second live native dispatch to be ambiguous about.
-  const home = scratch("spor-runs-store-");
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-cross-mode-steal";
-  const first = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-x", nodeId: "issue-x", cwd, now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(first, { state: "running" });
-  // A same-name, same-cwd SUPERVISED-JSONL record, created later than `first`
-  // but still within the 60s grace window of the one live agent below — if it
-  // were eligible to win the tie-break (later `created_at`), it would steal
-  // that agent from `first` despite never itself consulting `agents` at all.
-  runner.atomicJson(runner.runPaths(home, "sup-cross-1").record, {
-    run_id: "sup-cross-1", node_id: "issue-x", name: "issue-x", harness: "codex",
-    launch_mode: "supervised-jsonl", state: "running", cwd,
-    runner_pid: 999999999, // guaranteed-dead pid — its own outcome isn't the point here
-    created_at: "2026-07-18T10:00:30.000Z",
-  });
-  const out = runner.reconcileRuns(home, {
-    // The ONLY live agent, genuinely `first`'s own: started 5s after `first`
-    // was created (well within grace), and 25s before the supervised record
-    // above — also well within ITS 60s grace window, which is the whole hazard.
-    agents: [{ name: "issue-x", cwd, kind: "background", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }],
-    env: { CLAUDE_CONFIG_DIR: configDir },
-    now: () => "2026-07-18T10:10:00.000Z", // past `first`'s own 60s grace window
-  });
-  const byId = new Map(out.map((r) => [r.run_id, r]));
-  assert.strictEqual(byId.get(first.runId).state, "running", "the genuinely-live native run keeps its own agent as evidence");
-});
-
-test("reconcileRuns: a harness that could not be listed reconciles NOTHING (stale child state is not death)", () => {
-  const home = scratch("spor-runs-store-");
-  const rec = runner.beginNativeRun(home, { harness: "claude-code", name: "n", nodeId: "issue-x", cwd: "/tmp/nope", now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(rec, { state: "running" });
-  const out = runner.reconcileRuns(home, { agents: [], enumerated: false, now: () => "2026-07-18T11:00:00.000Z" });
-  assert.strictEqual(out[0].state, "running");
-  assert.strictEqual(runRecords(home)[0].state, "running", "nothing written back");
-});
 
 // --- the supervised path (issue-spor-dispatch-supervised-runs-never-reconciled)
 // A Codex dispatch is supervised by a DETACHED process of ours. When it dies
@@ -746,20 +370,6 @@ test("reconcileRuns: a supervised run inside the grace window, or already termin
   const byId = new Map(out.map((r) => [r.run_id, r]));
   assert.strictEqual(byId.get("sup-fresh").state, "launching", "the supervisor is still being given time to report");
   assert.strictEqual(byId.get("sup-done").termination_signal, "supervised-exit", "an observed outcome is never overwritten");
-});
-
-test("reconcileRuns: supervised runs reconcile even when the native agent listing FAILED", () => {
-  // A Codex-only box has no `claude` to enumerate, and a supervised run's
-  // liveness never depended on that listing — so `enumerated: false` must not
-  // strand it. The native run beside it still waits for trustworthy evidence.
-  const home = scratch("spor-runs-store-");
-  supervisedRecord(home, "sup-orphan", { runner_pid: deadPid() });
-  const native = runner.beginNativeRun(home, { harness: "claude-code", name: "n", nodeId: "issue-n", cwd: "/tmp/nope", now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(native, { state: "running" });
-  const out = runner.reconcileRuns(home, { agents: [], enumerated: false, now: () => "2026-07-18T10:10:00.000Z" });
-  const byId = new Map(out.map((r) => [r.run_id, r]));
-  assert.strictEqual(byId.get("sup-orphan").state, "vanished");
-  assert.strictEqual(byId.get(native.runId).state, "running", "stale native state is still not death");
 });
 
 test("reconcileRuns: a record in neither launch mode is passed through untouched", () => {
@@ -1097,7 +707,7 @@ test("finalizeSupervisedRun: only the log's TAIL is evidence — a recovered mid
   // An agent that hit a rate limit hours and thousands of events earlier and
   // carried on did not die of it; filing that as the reason sends a real crash
   // to the wrong triage (and a credit-dead run must still BE classified, which
-  // is why the window is wider than transcriptOutcome's 5 filtered records).
+  // is why the window is still generous).
   const home = scratch("spor-runs-store-");
   const rec = supervisedRecord(home, "sup-recovered", { runner_pid: deadPid() });
   fs.mkdirSync(path.dirname(rec.log_path), { recursive: true });
@@ -1158,47 +768,6 @@ test("pruneRuns: ages out terminal records only — an unresolved run is never s
 
 // --- the CLI surface -------------------------------------------------------
 
-test("dispatch (native, stubbed): writes a durable run record at launch, and 'spor runs' reports it", () => {
-  const { home, repo } = fixture();
-  const configDir = scratch("spor-runs-cc-");
-  cli(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const stub = writeSpawnableNodeStub(home, "claude-ok", "process.exit(0);");
-  const d = cli(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, CLAUDE_CONFIG_DIR: configDir });
-  assert.strictEqual(d.status, 0, d.stderr);
-  assert.match(d.stdout, /^run: {5}[0-9a-f-]{36} \(Claude Code; 'spor runs' for its outcome\)$/m);
-
-  const records = runRecords(home);
-  assert.strictEqual(records.length, 1);
-  assert.strictEqual(records[0].state, "running");
-  assert.strictEqual(records[0].node_id, "dec-x");
-  assert.strictEqual(records[0].launch_mode, "native-background");
-  assert.strictEqual(records[0].cwd, fs.realpathSync(repo));
-
-  const r = cli(["runs", "--json"], { SPOR_HOME: home, CLAUDE_CONFIG_DIR: configDir });
-  assert.strictEqual(r.status, 0, r.stderr);
-  const parsed = JSON.parse(r.stdout);
-  assert.strictEqual(parsed.count, 1);
-  assert.strictEqual(parsed.runs[0].node_id, "dec-x");
-});
-
-test("spor runs: a launched agent that left no transcript ends up queryable as vanished, with a reason", () => {
-  const { home, repo } = fixture();
-  const configDir = scratch("spor-runs-cc-");
-  cli(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const stub = writeSpawnableNodeStub(home, "claude-ok", "process.exit(0);");
-  cli(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, CLAUDE_CONFIG_DIR: configDir });
-  // Age the record past the registration grace window, then reconcile with an
-  // empty (but successful) live-agent listing.
-  const rec = runRecords(home)[0];
-  runner.atomicJson(runner.runPaths(home, rec.run_id).record, { ...rec, created_at: "2026-07-18T10:00:00.000Z" });
-
-  const r = cli(["runs"], { SPOR_HOME: home, CLAUDE_CONFIG_DIR: configDir });
-  assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stdout, /vanished — unknown\/session-unbound/);
-  assert.match(r.stdout, /why: {8}the run never bound a session/);
-  assert.strictEqual(runRecords(home)[0].state, "vanished", "the outcome is durable, not just printed");
-});
-
 test("spor runs (text): a reaped orphaned child is legible without --json", async () => {
   const home = scratch("spor-runs-store-");
   const child = liveChild();
@@ -1227,74 +796,18 @@ test("spor runs (text): report_path is legible without --json", () => {
   assert.match(r.stdout, new RegExp(`  report:     ${rec.report_path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 });
 
-test("spor runs --json: 'reconciled' is false only when a NATIVE run was actually left unresolved", () => {
-  // A Codex-only box has no `claude` to enumerate, and supervised runs never
-  // needed that listing — reporting reconciled:false there would tell a caller
-  // to distrust states that were in fact just resolved.
+test("spor runs --json: 'reconciled' is always true — every run's evidence is local, nothing waits on a harness listing", () => {
   const home = scratch("spor-runs-store-");
   supervisedRecord(home, "sup-only", { runner_pid: deadPid() });
-  // Unparseable agent output is the "could not ask at all" case (enumerated: false).
-  const blind = { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: "not json" };
-  const supervisedOnly = JSON.parse(cli(["runs", "--json"], blind).stdout);
-  assert.strictEqual(supervisedOnly.reconciled, true, "nothing was left unresolved");
-  assert.strictEqual(supervisedOnly.runs[0].state, "vanished");
-
-  // Add a non-terminal NATIVE run: now the failed listing really does leave
-  // something unresolved, and the caller must be told.
-  const native = runner.beginNativeRun(home, { harness: "claude-code", name: "n", nodeId: "issue-n", cwd: "/tmp/nope", now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(native, { state: "running" });
-  const withNative = cli(["runs", "--json"], blind);
-  assert.strictEqual(JSON.parse(withNative.stdout).reconciled, false);
-  assert.match(cli(["runs"], blind).stderr, /native run states may be stale/);
-});
-
-test("spor runs: the harness listing is taken only when a non-terminal NATIVE record needs it (task-spor-retire-native-bg-enumerated-skip-after-supervised-default)", () => {
-  // The listing is the native path's evidence alone: a supervised run is
-  // reconciled against its own supervisor, so a store holding only supervised
-  // (or already-terminal) records must not boot a harness CLI to read it.
-  const home = scratch("spor-runs-store-");
-  const mark = path.join(home, "agents-listed");
-  const stub = writeSpawnableNodeStub(home, "claude-agents", `require("fs").writeFileSync(${JSON.stringify(mark)}, process.argv.slice(2).join(" ")); console.log("[]");`);
-  const env = bare({ SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
-  delete env.SPOR_FAKE_AGENTS_JSON; // let the CLI really decide whether to shell out
-  const runs = (...args) => spawnSync(process.execPath, [CLI, "runs", ...args], { encoding: "utf8", env });
-
-  supervisedRecord(home, "sup-only", { runner_pid: deadPid() });
-  let r = runs("--json");
-  assert.strictEqual(r.status, 0, r.stderr);
-  assert.strictEqual(JSON.parse(r.stdout).runs[0].state, "vanished", "the supervised run is reconciled off its supervisor");
-  assert.ok(!fs.existsSync(mark), "no harness was asked for a live-agent listing");
-
-  // A terminal native record needs no listing either.
-  const done = runner.beginNativeRun(home, { harness: "claude-code", name: "d", nodeId: "issue-d", cwd: "/tmp/nope", now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(done, { state: "vanished", termination_class: "unknown", termination_signal: "session-unbound" });
-  r = runs("--json");
-  assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(!fs.existsSync(mark), "a terminal native record spends no listing");
-
-  // A non-terminal native record (the `--bg` opt-in) is the one case that does.
-  const native = runner.beginNativeRun(home, { harness: "claude-code", name: "n", nodeId: "issue-n", cwd: "/tmp/nope", now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(native, { state: "running" });
-  r = runs("--json");
-  assert.strictEqual(r.status, 0, r.stderr);
-  assert.strictEqual(fs.readFileSync(mark, "utf8"), "agents --json", "the harness was enumerated for the live native record");
-  const parsed = JSON.parse(r.stdout);
+  legacyNativeRecord(home, "n-young");
+  // A harness listing that would once have been unreadable is simply not an input.
+  const env = { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: "not json" };
+  const parsed = JSON.parse(cli(["runs", "--json"], env).stdout);
   assert.strictEqual(parsed.reconciled, true);
-  assert.strictEqual(parsed.runs.find((x) => x.run_id === native.runId).state, "vanished", "and the empty listing resolved it");
-});
-
-test("spor runs: an agent the harness still lists as 'done' does not hold its run open", () => {
-  const { home, repo } = fixture();
-  const configDir = scratch("spor-runs-cc-");
-  cli(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const stub = writeSpawnableNodeStub(home, "claude-ok", "process.exit(0);");
-  cli(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, CLAUDE_CONFIG_DIR: configDir });
-  const rec = runRecords(home)[0];
-  runner.atomicJson(runner.runPaths(home, rec.run_id).record, { ...rec, created_at: "2026-07-18T10:00:00.000Z" });
-  const agents = JSON.stringify([{ kind: "background", cwd: rec.cwd, state: "done", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }]);
-
-  cli(["runs"], { SPOR_HOME: home, CLAUDE_CONFIG_DIR: configDir, SPOR_FAKE_AGENTS_JSON: agents });
-  assert.strictEqual(runRecords(home)[0].state, "vanished");
+  const byId = new Map(parsed.runs.map((r) => [r.run_id, r]));
+  assert.strictEqual(byId.get("sup-only").state, "vanished");
+  assert.strictEqual(byId.get("n-young").state, "running");
+  assert.doesNotMatch(cli(["runs"], env).stderr, /may be stale/);
 });
 
 // (issue-spor-native-run-done-state-unreachable-and-contract-pending-invisible)
@@ -1304,22 +817,13 @@ test("spor runs: an agent the harness still lists as 'done' does not hold its ru
 // operator staring at "outcome: reported (unenforced)" had no way to tell
 // whether that was the FINAL best-effort reading or a provisional beat still
 // owed a verified verdict.
-test("spor runs: a native record still owing its terminal-state contract shows a pending marker, in text and JSON", () => {
+test("spor runs: a record still owing its terminal-state contract shows a pending marker, in text and JSON", () => {
   const home = scratch("spor-runs-store-");
-  const run = runner.beginNativeRun(home, {
-    harness: "claude-code", name: "task-x", nodeId: "task-x", cwd: "/tmp/spor-runs-pending",
-    now: () => "2026-07-18T10:00:00.000Z",
-  });
-  runner.updateRun(run, {
-    state: "done",
-    terminal_state: "reported",
-    terminal_enforced: false,
-    contract_pending: true,
-    // A server this LOCAL-mode call can never match (nativeContractDoor
-    // refuses whenever `!isRemote`, regardless of `want`) — the door this
-    // record's contract belongs to is not this box's, so settleNativeContracts
-    // must skip it rather than silently resolve (or force-settle) the debt.
-    server: "https://example.invalid",
+  // A supervised record whose supervisor wrote the provisional outcome and
+  // is still (by pid) around to merge the verified one.
+  supervisedRecord(home, "sup-pending", {
+    name: "task-x", node_id: "task-x", runner_pid: process.pid,
+    state: "done", terminal_state: "reported", terminal_enforced: false, contract_pending: true,
   });
 
   const jsonOut = cli(["runs", "--json"], { SPOR_HOME: home });
@@ -1334,32 +838,6 @@ test("spor runs: a native record still owing its terminal-state contract shows a
     /outcome:\s+reported \(unenforced\) \(contract pending\)/,
     "the operator can see the run still owes its contract, not just its best-effort reading"
   );
-});
-
-test("spor runs: a credit-dead run reads as an ENVIRONMENT failure with the provider's own line retained", () => {
-  const { home, repo } = fixture();
-  const configDir = scratch("spor-runs-cc-");
-  cli(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const stub = writeSpawnableNodeStub(home, "claude-ok", "process.exit(0);");
-  // A LOCAL-mode dispatch binds its session too, so the run has the identity
-  // that ties it to its own transcript (rather than to whatever else ran in
-  // this checkout) — issue-spor-dispatch-run-liveness-same-cwd-misattribution.
-  cli(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, CLAUDE_CONFIG_DIR: configDir, SPOR_SESSION_ID: "sid-credit" });
-  const rec = runRecords(home)[0];
-  assert.strictEqual(rec.session_id, "sid-credit", "local mode records the run's session identity");
-  runner.atomicJson(runner.runPaths(home, rec.run_id).record, { ...rec, created_at: "2026-07-18T10:00:00.000Z" });
-  writeTranscript(configDir, rec.cwd, "sid-credit", [
-    { type: "assistant", timestamp: "2026-07-18T10:01:00Z", message: { content: [{ type: "text", text: "starting" }] } },
-    { type: "system", subtype: "error", timestamp: "2026-07-18T10:02:00Z", content: "API Error: out of usage credits" },
-  ]);
-
-  const r = cli(["runs", "--json"], { SPOR_HOME: home, CLAUDE_CONFIG_DIR: configDir });
-  const run = JSON.parse(r.stdout).runs[0];
-  assert.strictEqual(run.state, "failed");
-  assert.strictEqual(run.termination_class, "environment", "not a capability or implementation failure");
-  assert.strictEqual(run.termination_signal, "credit-exhausted");
-  assert.match(run.termination_reason, /out of usage credits/);
-  assert.ok(run.transcript_path, "and a pointer to the evidence");
 });
 
 test("dispatch: a SIBLING agent's session is never adopted as this run's identity", () => {
@@ -1410,46 +888,12 @@ test("dispatch: a spawn that fails AFTER the record is opened is recorded as fai
   assert.ok(rec.termination_reason, "the failure keeps its reason");
 });
 
-test("dispatch: a harness that exits non-zero without leaving an agent is recorded as failed_launch", () => {
-  const { home, repo } = fixture();
-  const configDir = scratch("spor-runs-cc-");
-  cli(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const stub = writeSpawnableNodeStub(home, "claude-boom", "process.exit(7);");
-  cli(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, CLAUDE_CONFIG_DIR: configDir });
-  const rec = runRecords(home)[0];
-  assert.strictEqual(rec.state, "failed_launch");
-  assert.strictEqual(rec.termination_class, "launch");
-  assert.strictEqual(rec.launcher_exit, 7);
-  assert.match(rec.termination_reason, /exited 7 without leaving a background agent/);
-});
-
 // --- idleness (task-spor-work-idle-run-detection) ---------------------------
 // Reconciliation only ever asks "is this over?", and answers NO for a live,
 // identity-confirmed supervisor however long it has been wedged — deliberately,
 // since a long job may legitimately go quiet. A WORKER holding a slot, a lease
 // and a worktree for that run needs the other question answered too, and these
 // are the pieces it uses.
-
-test("lastActivityAt: a native run's TRANSCRIPT counts as a sign of life, not just a supervisor's log", () => {
-  // `log_path` is a supervised-only field, so a silence check that looked there
-  // alone would read every native-background run as quiet since launch.
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-native-idle";
-  const file = writeTranscript(configDir, cwd, "sid-idle", [CLEAN_END]);
-  const twoHoursAgo = Date.parse("2026-07-20T08:00:00.000Z") / 1000;
-  fs.utimesSync(file, twoHoursAgo, twoHoursAgo);
-  const rec = { run_id: "nat-idle", launch_mode: "native-background", cwd, session_id: "sid-idle", created_at: "2026-07-18T10:00:00.000Z" };
-  assert.strictEqual(
-    runner.lastActivityAt(rec, fs.statSync, { CLAUDE_CONFIG_DIR: configDir }),
-    twoHoursAgo * 1000,
-    "the transcript's mtime is the run's freshness, not the launch two days earlier"
-  );
-  // A record with nothing to stat at all still falls back to its own launch.
-  assert.strictEqual(
-    runner.lastActivityAt({ ...rec, session_id: null }, fs.statSync, { CLAUDE_CONFIG_DIR: configDir }),
-    Date.parse("2026-07-18T10:00:00.000Z")
-  );
-});
 
 test("stopRun: the whole process GROUP is signalled, escalated to SIGKILL, and identity-checked", async () => {
   const alive = () => spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], { stdio: "ignore" });
@@ -1602,7 +1046,7 @@ test("finalizeIdleRun: an environment cause in the log still wins over the gener
   const plain = supervisedRecord(home, "sup-idle-plain");
   const idle = runner.finalizeIdleRun(plain, { idleMs: 2700000, quietAt: Date.parse("2026-07-20T09:00:00.000Z"), now: () => "2026-07-20T10:00:00.000Z", stopped: { child: true, supervisor: true } });
   assert.strictEqual(idle.termination_signal, "idle-timeout");
-  assert.match(idle.termination_reason, /nothing to its log or transcript for 60m \(the idle ceiling is 45m\)/);
+  assert.match(idle.termination_reason, /nothing to its log for 60m \(the idle ceiling is 45m\)/);
   assert.strictEqual(idle.child_reaped, true);
   assert.strictEqual(idle.terminal_state, "failed");
   assert.strictEqual(idle.terminal_enforced, false);
@@ -1625,236 +1069,3 @@ test("stopIdleRun: a supervisor that finished in the same instant keeps its own 
   assert.strictEqual(out.terminal_state, "reported");
 });
 
-// --- native background: turn-complete detection ----------------------------
-// (task-spor-dispatch-native-bg-terminal-detection). A finished `claude --bg`
-// agent does NOT leave the daemon: it sits at `status: "idle"` while `state`
-// still reads `"working"`, so the run record stayed open and a worker
-// following it waited out the 24h watchdog on work that ended hours ago (the
-// 2026-09-02 evidence: two factory pipelines stalled five hours until a
-// `claude stop` on each session released them).
-
-const IDLE_AGENT = { kind: "background", sessionId: "sid-idle", state: "working", status: "idle" };
-// A minute of transcript quiet, then "now" two hours later: well past the
-// default quiet window, so these cases turn on the OTHER two signals.
-const QUIET_NOW = () => "2026-07-18T12:00:00.000Z";
-// Pin a transcript's mtime into that same fixed clock: the quiet window is
-// measured against the file, so a fixture written "now" would otherwise read as
-// activity two months in the future.
-function quiet(file, at = "2026-07-18T10:05:00.000Z") {
-  const t = new Date(at);
-  fs.utimesSync(file, t, t);
-  return file;
-}
-
-function nativeTurnCompleteFixture(lines, agentPatch = {}) {
-  const home = scratch("spor-runs-turn-");
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-turn";
-  quiet(writeTranscript(configDir, cwd, "sid-idle", lines));
-  const run = runner.beginNativeRun(home, {
-    harness: "claude-code", name: "task-x", nodeId: "task-x", cwd, now: () => "2026-07-18T10:00:00.000Z",
-  });
-  runner.updateRun(run, { state: "running", session_id: "sid-idle" });
-  const stopped = [];
-  const out = runner.reconcileRuns(home, {
-    agents: [{ ...IDLE_AGENT, cwd, ...agentPatch }],
-    env: { CLAUDE_CONFIG_DIR: configDir },
-    now: QUIET_NOW,
-    stopAgent: (record, agent) => { stopped.push({ session: record.session_id, agent }); return true; },
-  });
-  return { home, record: out.find((r) => r.run_id === run.runId), stopped };
-}
-
-test("reconcileRuns: an IDLE agent whose last turn closed cleanly is finished, stopped, and left owing the contract", () => {
-  const { record, stopped } = nativeTurnCompleteFixture([TOOL_RESULT, CLEAN_END]);
-  assert.strictEqual(record.state, "done", "the transcript's own clean end is the outcome, as for a vanished run");
-  assert.strictEqual(record.termination_signal, "turn-complete");
-  assert.strictEqual(record.stopped_for, "turn-complete");
-  assert.strictEqual(record.agent_stopped, true);
-  assert.strictEqual(stopped.length, 1, "the daemon slot is freed — nothing reconciles this record again");
-  assert.strictEqual(stopped[0].session, "sid-idle");
-  // The contract is OWED, not skipped: the store holds no credential, so the
-  // caller that does settles it (settleNativeContracts).
-  assert.strictEqual(record.contract_pending, true);
-  assert.strictEqual(record.terminal_enforced, false, "the provisional beat is honest about not having verified anything");
-});
-
-test("reconcileRuns: an idle agent whose transcript is MID-TURN is a waiting tool call, not a finished run", () => {
-  const { record, stopped } = nativeTurnCompleteFixture([CLEAN_END, TOOL_RESULT]);
-  assert.strictEqual(record.state, "running", "idle alone is not the signal");
-  assert.strictEqual(stopped.length, 0, "a live agent is never stopped");
-});
-
-test("reconcileRuns: a turn-complete transcript under a WORKING agent leaves the run live", () => {
-  // The agent has picked up the next turn; the marker closed the previous one.
-  const { record, stopped } = nativeTurnCompleteFixture([TOOL_RESULT, CLEAN_END], { status: "working" });
-  assert.strictEqual(record.state, "running");
-  assert.strictEqual(stopped.length, 0);
-});
-
-test("reconcileRuns: an agent listing with NO status field never reads as finished", () => {
-  // An older CLI, or another harness's listing shape. An unreadable signal must
-  // leave the run live — the same fail-safe direction as `enumerated: false`.
-  const { record } = nativeTurnCompleteFixture([TOOL_RESULT, CLEAN_END], { status: undefined });
-  assert.strictEqual(record.state, "running");
-});
-
-// (issue-spor-native-run-done-state-unreachable-and-contract-pending-invisible)
-// The harness's OWN `state: "done"` is a separate, independent terminal
-// signal from the idle+turn-complete+quiet triple above — it must be finished,
-// stopped, and left owing the contract even when none of those three would
-// (yet) agree: a MID-turn transcript and a `status` that still reads
-// "working". A prior revision dropped a `state: "done"` agent out of the
-// listing before it ever reached `matchingAgents`, so it could never be
-// matched here at all — the agent sat registered in the harness daemon
-// forever, never reaped.
-test("reconcileRuns: the harness's own state:'done' on a matched agent is finished, reaped, and left owing the contract — even mid-turn and non-idle", () => {
-  const { record, stopped } = nativeTurnCompleteFixture([TOOL_RESULT], { state: "done", status: "working" });
-  assert.strictEqual(stopped.length, 1, "a done agent is reaped exactly like a turn-complete one");
-  assert.strictEqual(stopped[0].session, "sid-idle");
-  assert.strictEqual(record.stopped_for, "turn-complete");
-  assert.strictEqual(record.agent_stopped, true);
-  assert.strictEqual(record.contract_pending, true, "still owed the terminal-state contract's second write");
-  assert.strictEqual(record.terminal_enforced, false, "the provisional beat is honest about not having verified anything");
-});
-
-test("nativeTurnComplete: a matched agent's state:'done' fires immediately, without waiting on the quiet window", () => {
-  const home = scratch("spor-runs-turn-done-immediate-");
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-turn-done-immediate";
-  const file = writeTranscript(configDir, cwd, "sid-idle", [TOOL_RESULT, CLEAN_END]);
-  const record = {
-    run_id: "d1", node_id: "task-x", harness: "claude-code", launch_mode: "native-background",
-    state: "running", cwd, session_id: "sid-idle", created_at: "2026-07-18T10:00:00.000Z",
-  };
-  const agents = [{ kind: "background", sessionId: "sid-idle", state: "done", status: "working", cwd }];
-  const opts = { env: { CLAUDE_CONFIG_DIR: configDir } };
-  // "now" is one second after the transcript's own mtime — well inside the
-  // 2-minute quiet window the idle+turn-complete path would require.
-  const justAfter = fs.statSync(file).mtimeMs + 1000;
-  const fired = runner.nativeTurnComplete(record, agents, { ...opts, now: () => new Date(justAfter).toISOString() });
-  assert.ok(fired, "state: done needs no quiet window to corroborate it");
-  assert.strictEqual(fired.agent.sessionId, "sid-idle");
-});
-
-test("nativeTurnComplete: the quiet window is what makes the three signals ONE observation", () => {
-  const home = scratch("spor-runs-turn-quiet-");
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-turn-quiet";
-  const file = writeTranscript(configDir, cwd, "sid-idle", [TOOL_RESULT, CLEAN_END]);
-  const record = {
-    run_id: "q1", node_id: "task-x", harness: "claude-code", launch_mode: "native-background",
-    state: "running", cwd, session_id: "sid-idle", created_at: "2026-07-18T10:00:00.000Z",
-  };
-  const agents = [{ ...IDLE_AGENT, cwd }];
-  const opts = { env: { CLAUDE_CONFIG_DIR: configDir } };
-  const quietAt = fs.statSync(file).mtimeMs;
-  // Read a beat after the marker landed: the next turn may be opening right now.
-  assert.strictEqual(
-    runner.nativeTurnComplete(record, agents, { ...opts, now: () => new Date(quietAt + 1000).toISOString() }),
-    null
-  );
-  const fired = runner.nativeTurnComplete(record, agents, {
-    ...opts, now: () => new Date(quietAt + runner.NATIVE_QUIET_MS + 1000).toISOString(),
-  });
-  assert.ok(fired, "past the window all three signals are one consistent reading");
-  assert.strictEqual(fired.agent.sessionId, "sid-idle");
-});
-
-test("nativeTurnComplete: an UNBOUND run is never judged finished — it has no transcript of its own", () => {
-  // The identity rule the whole run store rests on: a project dir is one
-  // checkout, and a sibling's transcript is not evidence about this run.
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-turn-unbound";
-  writeTranscript(configDir, cwd, "sid-of-a-sibling", [TOOL_RESULT, CLEAN_END]);
-  const record = {
-    run_id: "u1", node_id: "task-x", name: "task-x", harness: "claude-code",
-    launch_mode: "native-background", state: "running", cwd, created_at: "2026-07-18T10:00:00.000Z",
-  };
-  const agents = [{ kind: "background", name: "task-x", cwd, status: "idle", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }];
-  assert.strictEqual(
-    runner.nativeTurnComplete(record, agents, { env: { CLAUDE_CONFIG_DIR: configDir }, now: QUIET_NOW }),
-    null
-  );
-});
-
-test("reconcileRuns: a stopAgent that throws still leaves the record terminal", () => {
-  const home = scratch("spor-runs-turn-throw-");
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-turn-throw";
-  quiet(writeTranscript(configDir, cwd, "sid-idle", [TOOL_RESULT, CLEAN_END]));
-  const run = runner.beginNativeRun(home, { harness: "claude-code", name: "task-x", nodeId: "task-x", cwd, now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(run, { state: "running", session_id: "sid-idle" });
-  const [record] = runner.reconcileRuns(home, {
-    agents: [{ ...IDLE_AGENT, cwd }],
-    env: { CLAUDE_CONFIG_DIR: configDir },
-    now: QUIET_NOW,
-    stopAgent: () => { throw new Error("claude stop is not on this box"); },
-  });
-  assert.strictEqual(record.state, "done", "reaping is a courtesy; it never costs the record its outcome");
-  assert.strictEqual(record.agent_stopped, false);
-});
-
-// --- a native run's own final report ---------------------------------------
-
-test("transcriptFinalText: the LAST assistant text is the report, and a torn tail line is skipped", () => {
-  const text = [
-    '{"type":"assist',                                                    // a bounded tail starts mid-line
-    JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "first pass" }] } }),
-    JSON.stringify({ type: "user", message: { role: "user", content: "carry on" } }),
-    JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "MERGE-READY" }, { type: "text", text: "resolver: dec-y" }] } }),
-    JSON.stringify(CLEAN_END),
-  ].join("\n");
-  assert.strictEqual(runner.transcriptFinalText(text), "MERGE-READY\nresolver: dec-y");
-});
-
-test("nativeRunReportText: a run with no attributable transcript reports nothing", () => {
-  assert.strictEqual(runner.nativeRunReportText({ cwd: "/tmp/nowhere" }, { CLAUDE_CONFIG_DIR: scratch("spor-runs-cc-") }), "");
-});
-
-test("nativeRunReportText: a DECLINE in the transcript survives into the provisional outcome", () => {
-  // The reading that keeps a declined native run out of the gates even in the
-  // beat before the contract settles it (dispatch-terminal's decline arm).
-  const home = scratch("spor-runs-decline-");
-  const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-decline";
-  quiet(writeTranscript(configDir, cwd, "sid-idle", [
-    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "DECLINED: this belongs in spor-server" }] } },
-    CLEAN_END,
-  ]));
-  const run = runner.beginNativeRun(home, { harness: "claude-code", name: "task-x", nodeId: "task-x", cwd, now: () => "2026-07-18T10:00:00.000Z" });
-  runner.updateRun(run, { state: "running", session_id: "sid-idle" });
-  const [record] = runner.reconcileRuns(home, {
-    agents: [{ ...IDLE_AGENT, cwd }], env: { CLAUDE_CONFIG_DIR: configDir }, now: QUIET_NOW,
-  });
-  assert.strictEqual(record.terminal_state, "declined");
-  assert.strictEqual(record.declined_reason, "this belongs in spor-server");
-});
-
-test("stopNativeAgent: reaps through the ADAPTER's declared stop argv, resolved off the cascade", () => {
-  // The reap is the CLI's leg of the detector above: the run store says a
-  // native run finished, and this frees the daemon slot it still holds. WHAT to
-  // run is `activeStop` on the harness adapter — never a spelling hardcoded in
-  // the store — and WHERE the launcher lives comes from the same cascade the
-  // agent listing resolves through, so a box whose claude sits at
-  // `dispatch.bin.claude-code` still reaps.
-  const sporCli = require("../bin/spor.js");
-  const { loadConfig } = require("../lib/config.js");
-  const dir = scratch("spor-runs-stop-");
-  const seen = path.join(dir, "argv.json");
-  const stub = writeSpawnableNodeStub(dir, "claude-stub", `require("fs").writeFileSync(${JSON.stringify(seen)}, JSON.stringify(process.argv.slice(2)));`);
-  // Through the config cascade, not the env: `dispatch.bin` is a machine-local
-  // user-config key by design (never a committable repo `.spor.json`).
-  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ dispatch: { bin: { "claude-code": stub } } }));
-  const cfg = loadConfig({ cwd: dir, env: { SPOR_HOME: dir, XDG_CONFIG_HOME: dir } });
-
-  assert.strictEqual(sporCli.stopNativeAgent(cfg, { harness: "claude-code", session_id: "sid-done" }, null), true);
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(seen, "utf8")), ["stop", "sid-done"]);
-
-  // No identity, nothing to stop: an agent is never reaped by co-location.
-  fs.rmSync(seen);
-  assert.strictEqual(sporCli.stopNativeAgent(cfg, { harness: "claude-code" }, {}), false);
-  assert.ok(!fs.existsSync(seen));
-  // A harness that declares no stop is simply not reaped.
-  assert.strictEqual(sporCli.stopNativeAgent(cfg, { harness: "codex", session_id: "sid-done" }, null), false);
-});

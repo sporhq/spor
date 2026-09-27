@@ -108,7 +108,7 @@ test("remote next --readiness agent forwards ?readiness=agent to GET /v1/queue",
   const items = mkItems(3).map((it, i) => ({ ...it, readiness: i === 0 ? "agent" : "human" }));
   const { srv, base, requests } = await fakeServer(items);
   try {
-    const r = await runAsync(["next", "--readiness", "agent", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: "[]" });
+    const r = await runAsync(["next", "--readiness", "agent", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t" });
     assert.strictEqual(r.status, 0, r.stderr);
     assert.deepStrictEqual(requests, [{ readiness: "agent" }], "the query param was sent exactly once");
     const q = JSON.parse(r.stdout);
@@ -122,7 +122,7 @@ test("remote next --readiness agent,untriaged forwards a comma-joined value", as
   const items = mkItems(3).map((it, i) => ({ ...it, readiness: ["agent", "human", "untriaged"][i] }));
   const { srv, base, requests } = await fakeServer(items);
   try {
-    const r = await runAsync(["next", "--readiness", "agent,untriaged", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: "[]" });
+    const r = await runAsync(["next", "--readiness", "agent,untriaged", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t" });
     assert.strictEqual(r.status, 0, r.stderr);
     assert.deepStrictEqual(requests, [{ readiness: "agent,untriaged" }]);
     const q = JSON.parse(r.stdout);
@@ -136,7 +136,7 @@ test("remote next repeated --readiness flags are joined the same as local's comm
   const items = mkItems(2).map((it, i) => ({ ...it, readiness: ["agent", "human"][i] }));
   const { srv, base, requests } = await fakeServer(items);
   try {
-    const r = await runAsync(["next", "--readiness", "agent", "--readiness", "human", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: "[]" });
+    const r = await runAsync(["next", "--readiness", "agent", "--readiness", "human", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t" });
     assert.strictEqual(r.status, 0, r.stderr);
     assert.deepStrictEqual(requests, [{ readiness: "agent,human" }]);
   } finally {
@@ -171,7 +171,7 @@ test("remote next --readiness with no filter still shows counts when the graph h
 test("remote next --readiness <invalid> surfaces the server's 422, never a silent unfiltered queue", async () => {
   const { srv, base, requests } = await fakeServer(mkItems(3));
   try {
-    const r = await runAsync(["next", "--readiness", "bogus", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: "[]" });
+    const r = await runAsync(["next", "--readiness", "bogus", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t" });
     assert.notStrictEqual(r.status, 0, "a 422 must not exit 0");
     assert.deepStrictEqual(requests, [{ readiness: "bogus" }], "the bad value still reached the server, not filtered client-side");
     assert.match(r.stderr, /422/);

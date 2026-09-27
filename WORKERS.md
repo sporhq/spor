@@ -730,61 +730,28 @@ reading gets:
   any repo);
 - a dispatch with no target node to verify, report against, or release;
 - an unreachable — or unauthenticated — server;
-- a **native-background** launch whose run this box could not judge to be over
-  — the harness listing could not be read at all, or the run named no target
-  node (a free-text `--bg` dispatch), or the record was closed with no
-  attributable transcript to classify it from. A native launch that IS judged
-  over now gets the whole contract, same as a supervised one — see below.
+- a **legacy native-background** record — see below.
 
-**A native-background launch is inside the contract now**
-(task-spor-dispatch-native-bg-terminal-detection). It was excluded in v1 for
-one reason: a `claude --bg` run's termination could not be deterministically
-observed. It can be. A finished background agent does **not** leave the
-harness daemon — it sits at `status: "idle"` while `state` still reads
-`"working"` — which is why such a run used to hold its worker's slot until the
-24-hour watchdog (two factory pipelines stalled five hours on exactly this on
-2026-09-02, released only by a manual `claude stop`). A run is judged over when
-three independent signals agree: every listed agent that identifies as it reads
-`status: "idle"`, its transcript's LAST turn closed with an end-of-turn marker,
-and nothing has been appended for a short quiet window. Idle with a mid-turn
-transcript is a waiting tool call, and stays live; a listing with no `status` at
-all never satisfies the first signal. `state: "done"` remains an independent
-terminal signal, as before.
+**The native-background launch is retired**
+(task-spor-deprecate-native-bg-dispatch). `spor dispatch --bg` — a `claude
+--bg` session detached into the harness's own daemon — could only be judged
+over by scraping `claude agents --json` (liveness, matched on session id or
+name+cwd+start time) and the harness's session transcript JSONL (how the run
+ended, and its final report). Both are moving targets that shifted with every
+Claude Code release and were the persistent source of red. Every dispatch is
+now supervised, `--bg` is refused, and `dispatch.claudeLaunchMode:
+native-background` is ignored with a warning.
 
-Two consequences ride with it. The daemon slot is freed — the agent is stopped
-through its harness adapter's own declared stop argv, and the record says
-`stopped_for: "turn-complete"` with `agent_stopped` reporting whether that
-took. And the contract then runs against the run's target: the record is closed
-FIRST, synchronously, carrying a provisional unenforced outcome plus
-`contract_pending` (the run store is synchronous and holds no credential), and
-the verified verdict merges in a beat later from whoever holds a graph door —
-the same two-write shape a supervised run already uses. The agent's final
-report is the LAST assistant text in its own session transcript, by the same
-`--output-last-message` rule the supervised stream applies (subagent sidechain
-records excluded, which that stream never sees either), so a native run can
-reach `reported` with its hand-back filed and a `DECLINED:` one routes to
-triage instead of every unresolved run reading `failed`.
-
-Three rules bound that second write, because unlike a supervisor it has no
-owning process and runs from whichever client next reconciles the record:
-
-- **The debt is spent only when it is discharged.** An unreachable or
-  unauthenticated graph leaves `contract_pending` set (and the honest
-  unenforced verdict written) for the next caller, rather than losing the
-  report and the lease handback permanently — bounded at `contract_attempts`
-  = 3, after which the unenforced reading stands.
-- **The record names the graph it was launched against** (`server` + `org`, or
-  `local_nodes_dir` for a local launch), and a client resolving a different
-  one SKIPS it — matching the org too, since a hosted deployment gives every
-  tenant the same front door. On a multi-tenant box the same node id exists in more than
-  one graph, and settling through the wrong one files a report where the run
-  never ran and releases a lease that is not the run's.
-- **A filtered read settles only what it asked about.** `spor runs --node x`
-  and a worker following its own runs settle those; an unfiltered `spor runs`
-  is the whole store's reconciler and settles everything it just closed. And
-  the lease handback is skipped once the record has been terminal longer than
-  the lease's own 45m TTL — by then the item may legitimately belong to
-  someone else.
+A **legacy** native-background record still in the journal is judged from the
+RECORD alone — no listing, no transcript: it is believed live for one hour
+after its launch stamp (`launched_at`, else `started_at`/`created_at`), which
+is also the preflight occupancy horizon and the in-flight surface's, and past
+that it is closed `vanished` / `termination_signal: "native-retired"` with an
+unenforced, outcome-unknown reading. A legacy record a pre-retirement reconcile
+left owing the contract (`contract_pending`) has that debt retired
+(`contract_retired: true`): its provisional verdict stands, and its lease lapses
+at its own TTL. A legacy reviewer record has no readable report, so an
+agent-review gate over one fails closed.
 
 A `reported` or `failed` value on an unenforced record is a best-effort
 classification of the *process* outcome, not a checked verdict;
@@ -874,9 +841,10 @@ run log for the full text]` notice), summary at **460 chars**, id stem at
 ## 8. `spor runs --json` — the run-record schema
 
 Every dispatched run gets one persistent JSON record. `spor runs --json`
-prints `{reconciled: bool, count: N, runs: [<record>, ...]}` — `reconciled:
-false` means a native-harness live-agent listing failed for this call, so
-any shown native-background record that isn't yet terminal may be stale.
+prints `{reconciled: bool, count: N, runs: [<record>, ...]}`. `reconciled` is
+always `true` now — every run's evidence is local (a supervisor probe, or a
+legacy native record's launch stamp); the key once flagged a failed
+native-harness listing, which is no longer taken.
 Each `<record>` spans two independent dimensions: **process** (how the run's
 *process* ended — always present) and **outcome** (what the run did to the
 *graph* — present once the terminal-state contract has run, §6). Consumers
@@ -891,7 +859,7 @@ violation — new fields may be added additively.
 | `node_id` | string \| null | the target node, or `null` for a free-text dispatch |
 | `name` | string \| null | the launch name (defaults to the node id, or the first few words of free text) |
 | `harness` | string | adapter id: `claude-code`, `codex`, `opencode`, `copilot`, … |
-| `launch_mode` | string | `"native-background"` (detaches into the harness's own daemon) or `"supervised-jsonl"` (runs under a supervisor Spor owns) |
+| `launch_mode` | string | `"supervised-jsonl"` (runs under a supervisor Spor owns) — the only mode a new record is written in — or `"native-background"` on a LEGACY record from the retired `claude --bg` launch |
 | `state` | string | `"launching"` → `"running"` → one of the **terminal** process states: `"done"`, `"failed"`, `"failed_launch"`, `"vanished"` |
 | `cwd` | string | the run's working directory |
 | `item_repo` | string \| null | optional, supervised node-mode runs only — the target ITEM's own `repo:`/`project:` stamp **as claimed**, recorded at launch. It is the "before" value the no-code-outcome re-stamp check compares against (§10.11), so it must not be re-read from the item later, and it is deliberately not the dispatch's launch target (which `--slug` overrides for a cross-repo dispatch). Absent on a record predating it, on a free-text dispatch, and on a node carrying no stamp |
@@ -923,6 +891,7 @@ violation — new fields may be added additively.
 | `org` | string | optional, native runs only, remote mode — the tenant org that base URL was resolved under. A hosted deployment routes every tenant through ONE front door and separates them by the token's org claim, so §6 matches this too when the record names one |
 | `contract_attempts` | int | optional, native runs only — how many times §6 has been attempted for this record (see the debt rule above) |
 | `contract_settled_at` | ISO 8601 | optional, native runs only — when the outcome dimension stopped being provisional |
+| `contract_retired` | bool | optional, legacy native runs only — the pending contract was retired unrun when the native launch was (task-spor-deprecate-native-bg-dispatch); the provisional verdict stands |
 
 **The two launch modes carry different fields, and that asymmetry IS the
 schema — not an omission to read around.** A `native-background` record
@@ -1809,13 +1778,9 @@ The runner then parses that block **in code** from the run's final report
 (`parseReviewVerdict`, lib/kernel/gates.js). Fail-closed throughout: a review
 that could not be dispatched, that never finished, that left no report to read
 (an agent-review gate needs a harness whose report is readable — a supervised
-run's `report_path`, or a native-background run's own session transcript
-through the same last-assistant-text reading that `nativeRunReportText`
-applies elsewhere, dec-spor-native-bg-turn-complete-and-contract,
-task-spor-agent-review-gate-accept-native-bg-reviewer. Every built-in launches
-supervised by default and a worker's own dispatches are always supervised, so
-this stays a run-time failure rather than a load-time refusal either way — a
-native record with no bound transcript to read is exactly as unreadable as a
+run's `report_path`; every dispatch launches supervised, so this stays a
+run-time failure rather than a load-time refusal — a legacy native-background
+record, whose transcript is no longer read, is exactly as unreadable as a
 supervised run whose report file never landed), or whose verdict is
 unparseable or unrecognized is a gate FAILURE. An unread review is not an
 approval. Nor is a review of nothing: a branch that carries **no committed

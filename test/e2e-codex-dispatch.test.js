@@ -95,7 +95,6 @@ Live test profile.
     SPOR_HOME: home,
     XDG_CONFIG_HOME: home,
     SPOR_CODEX_CMD: codexCommand(),
-    SPOR_FAKE_AGENTS_JSON: "[]",
   });
   const args = [
     CLI, "dispatch", "task-codex-e2e", "--dir", repo,

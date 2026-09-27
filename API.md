@@ -794,13 +794,11 @@ anything with a token.
   /v1/agents/session` (§3) — the one place an agent token's session is set,
   write-once. The session can't be forged a-priori (it isn't known until the run
   exists) and can't ride the write payload (token-derived, §1), so the binding
-  is always the actual run. For the opt-in native launch (`spor dispatch --bg`,
-  `claude --bg` ignores `--session-id`) the launcher reads it from `claude agents
-  --json`. A **supervised**-harness dispatch (Claude Code by default, Codex,
-  OpenCode, GitHub Copilot CLI) follows
-  the same late-bind contract from its own supervisor process instead: it reads
-  the session id out of the run's supervised JSONL log rather than
-  `claude agents --json` — Claude Code off the `session_id` every stream-json
+  is always the actual run. Every dispatch is **supervised** (Claude Code,
+  Codex, OpenCode, GitHub Copilot CLI; the native `spor dispatch --bg` launch,
+  which read the session from `claude agents --json`, is retired), so the
+  supervisor process binds it: it reads the session id out of the run's
+  supervised JSONL log — Claude Code off the `session_id` every stream-json
   event carries (first on its `system`/`init` event), Codex off its
   `thread.started` event, OpenCode off
   the `sessionID` every event carries, Copilot off the `sessionId` on its

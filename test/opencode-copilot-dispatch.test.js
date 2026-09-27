@@ -37,7 +37,7 @@ function cleanEnv(extra = {}) {
     if (key.startsWith("SPOR_") || key.startsWith("SUBSTRATE_") || key === "XDG_CONFIG_HOME") continue;
     env[key] = value;
   }
-  return { ...env, SPOR_FAKE_AGENTS_JSON: "[]", ...extra };
+  return { ...env, ...extra };
 }
 
 function run(args, env, cwd) {
@@ -138,7 +138,7 @@ test("the two new harnesses are ADDITIVE registry entries under the same uniform
     assert.strictEqual(typeof adapter.validateOptions, "function", `${adapter.id} validates flags`);
     assert.strictEqual(typeof adapter.identityNote, "string", `${adapter.id} describes its own identity mechanism`);
     assert.ok(adapter.activeDiscovery && adapter.activeDiscovery.kind, `${adapter.id} declares active-run discovery`);
-    assert.ok(["native-background", "supervised-jsonl"].includes(adapter.launchMode));
+    assert.strictEqual(adapter.launchMode, "supervised-jsonl");
   }
   for (const id of ["opencode", "copilot"]) {
     const adapter = getHarness(id);
@@ -150,16 +150,16 @@ test("the two new harnesses are ADDITIVE registry entries under the same uniform
   assert.strictEqual(getHarness("gemini"), null, "a harness with no adapter still never silently substitutes");
 });
 
-test("the shipped claude-code (--bg variant) and codex launch behavior is byte-identical", () => {
-  // The claude-code adapter launches supervised by default since
-  // task-spor-claude-adapter-headless-supervised; the argv this test always
-  // pinned is now its native-background VARIANT's, byte-identical.
+test("the shipped claude-code and codex launch behavior is byte-identical", () => {
+  // The claude-code adapter launches supervised only (its native `claude --bg`
+  // variant is retired, task-spor-deprecate-native-bg-dispatch); the prompt is
+  // never an argv element.
   assert.deepStrictEqual(
-    getHarness("claude-code").nativeVariant.buildArgs({
+    getHarness("claude-code").buildArgs({
       name: "n", model: "m", permissionMode: "p", agent: "a", mcpConfig: "/mcp.json", prompt: "P",
     }),
-    ["--bg", "--name", "n", "--model", "m", "--permission-mode", "p", "--agent", "a",
-      "--mcp-config", "/mcp.json", "--strict-mcp-config", "P"]
+    ["-p", "--output-format", "stream-json", "--verbose", "--name", "n", "--model", "m", "--permission-mode", "p", "--agent", "a",
+      "--mcp-config", "/mcp.json", "--strict-mcp-config"]
   );
   assert.deepStrictEqual(
     getHarness("codex").buildArgs({ model: "m", reportPath: "/r.md" }),

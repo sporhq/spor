@@ -18,7 +18,7 @@ const path = require("node:path");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const dispatchHarnesses = require("../lib/shell/dispatch-harnesses.js");
-const { getHarness, launchVariant, discoveryAdapters } = dispatchHarnesses;
+const { getHarness } = dispatchHarnesses;
 const { writeSpawnableNodeStub } = require("./helpers/portable.js");
 const { waitFor, awaitJson } = require("./helpers/launch.js");
 
@@ -30,7 +30,7 @@ function cleanEnv(extra = {}) {
     if (key.startsWith("SPOR_") || key.startsWith("SUBSTRATE_") || key === "XDG_CONFIG_HOME") continue;
     env[key] = value;
   }
-  return { ...env, SPOR_FAKE_AGENTS_JSON: "[]", ...extra };
+  return { ...env, ...extra };
 }
 
 function run(args, env, cwd) {
@@ -109,16 +109,6 @@ process.stdin.on("end", () => {
 `);
 }
 
-// The native launch's stub: `claude --bg` returns at once, so the launcher
-// spawns it SYNCHRONOUSLY and the record is written before it returns — the
-// invocation file is complete by the time `run` resolves.
-function claudeBgStub(home) {
-  return writeSpawnableNodeStub(home, "claude-bg-stub", `
-const fs = require("node:fs");
-fs.writeFileSync(process.env.OUTFILE, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd() }, null, 2));
-`);
-}
-
 function runRecordFile(home) {
   const runDir = path.join(home, "journal", "dispatch");
   return waitFor(() => {
@@ -130,7 +120,7 @@ function runRecordFile(home) {
 
 // ---- the registry contract -------------------------------------------------
 
-test("claude-code is a supervised-jsonl adapter by default, with the native launch as a declared variant", () => {
+test("claude-code is a supervised-jsonl adapter, and no adapter has a native launch any more", () => {
   const adapter = getHarness("claude-code");
   assert.strictEqual(adapter.launchMode, "supervised-jsonl", "joins the supervised arm");
   assert.strictEqual(adapter.identityMode, "mcp-file", "identity still rides the 0600 --mcp-config");
@@ -145,32 +135,15 @@ test("claude-code is a supervised-jsonl adapter by default, with the native laun
   // The registry itself is unchanged in identity and order.
   assert.deepStrictEqual(dispatchHarnesses.harnesses().map((a) => a.id), ["claude-code", "codex", "opencode", "copilot"]);
 
-  const native = adapter.nativeVariant;
-  assert.ok(native, "the `claude --bg` launch is kept as a variant");
-  assert.strictEqual(native.id, "claude-code");
-  assert.strictEqual(native.launchMode, "native-background");
-  assert.strictEqual(native.activeDiscovery.kind, "cli-json");
-  assert.deepStrictEqual(native.activeDiscovery.args, ["agents", "--json"]);
-  assert.strictEqual(native.buildArgs({ prompt: "P" })[0], "--bg");
-  assert.strictEqual(native.buildArgs({ prompt: "P" }).at(-1), "P", "the native launch still carries the prompt positionally");
-  assert.strictEqual(native.validateOptions({ sandbox: "x" }).message, adapter.validateOptions({ sandbox: "x" }).message, "one option contract for both launches");
-  for (const other of ["codex", "opencode", "copilot"]) assert.strictEqual(getHarness(other).nativeVariant, undefined, `${other} has no native launch`);
-});
-
-test("launchVariant picks the launch, and discoveryAdapters folds the native variant back in for run discovery", () => {
-  const adapter = getHarness("claude-code");
-  assert.strictEqual(launchVariant(adapter, null), adapter);
-  assert.strictEqual(launchVariant(adapter, "supervised"), adapter);
-  assert.strictEqual(launchVariant(adapter, "supervised-jsonl"), adapter);
-  assert.strictEqual(launchVariant(adapter, "native-background"), adapter.nativeVariant);
-  assert.strictEqual(launchVariant(getHarness("codex"), "native-background"), null, "a harness with no background mode answers null — the caller decides refusal vs no-op");
-  assert.strictEqual(launchVariant(adapter, "bogus"), null);
-  assert.strictEqual(launchVariant(null, "native-background"), null);
-  assert.deepStrictEqual(
-    discoveryAdapters().map((a) => `${a.id}:${a.activeDiscovery.kind}`),
-    ["claude-code:run-records", "claude-code:cli-json", "codex:run-records", "opencode:run-records", "copilot:run-records"],
-    "both claude-code discoveries are consulted, told apart by kind"
-  );
+  // The native `claude --bg` launch is retired (task-spor-deprecate-native-bg-dispatch):
+  // no adapter carries a background variant, and the variant plumbing is gone.
+  for (const a of dispatchHarnesses.harnesses()) {
+    assert.strictEqual(a.nativeVariant, undefined, `${a.id} has no native launch`);
+    assert.strictEqual(a.launchMode, "supervised-jsonl", `${a.id} launches supervised`);
+    assert.notStrictEqual((a.activeDiscovery || {}).kind, "cli-json", `${a.id} is never discovered by polling a harness CLI`);
+  }
+  assert.strictEqual(dispatchHarnesses.launchVariant, undefined);
+  assert.strictEqual(dispatchHarnesses.discoveryAdapters, undefined);
 });
 
 test("claude-code reads its session from any stream event and its report from result/assistant text", () => {
@@ -381,7 +354,7 @@ test("a default claude-code dispatch launches supervised: print-mode argv, promp
   assert.doesNotMatch(settled.terminal_note || "", /native-background runs are outside the terminal-state contract/);
 });
 
-test("--print previews the supervised launch (prompt on stdin) and, with --bg, the native one", () => {
+test("--print previews the supervised launch (prompt on stdin); --bg is refused even on a preview", () => {
   const { home, repo } = fixture();
   const sup = run(["dispatch", "task-cc", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
   assert.strictEqual(sup.status, 0, sup.stderr);
@@ -389,49 +362,52 @@ test("--print previews the supervised launch (prompt on stdin) and, with --bg, t
   assert.match(sup.stdout, /^session: \(read from claude -p --output-format stream-json session_id, bound by supervisor\)$/m);
 
   const bg = run(["dispatch", "task-cc", "--dir", repo, "--no-brief", "--print", "--bg"], { SPOR_HOME: home });
-  assert.strictEqual(bg.status, 0, bg.stderr);
-  assert.match(bg.stdout, /^run: {4}claude --bg --name task-cc <prompt>$/m);
-  assert.match(bg.stdout, /^session: \(allocated by claude --bg at launch, bound after\)$/m);
+  assert.strictEqual(bg.status, 1);
+  assert.match(bg.stderr, /'spor dispatch --bg' \(the native claude --bg launch\) is retired/);
+  assert.doesNotMatch(bg.stdout, /^run: /m, "no launch preview for a refused dispatch");
 });
 
-test("--bg opts into the native launch: claude --bg with the prompt positional, a native-background run record", () => {
+test("--bg is refused before any side effect, for every harness — nothing launched, no run record", () => {
   const { home, repo } = fixture();
-  const outfile = path.join(home, "claude-bg.json");
-  const stub = claudeBgStub(home);
-  const result = run(["dispatch", "task-cc", "--dir", repo, "--no-brief", "--bg"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outfile });
-  assert.strictEqual(result.status, 0, result.stderr);
-  assert.match(result.stdout, /\(Claude Code; 'spor runs' for its outcome\)/);
-  const invocation = JSON.parse(fs.readFileSync(outfile, "utf8"));
-  assert.strictEqual(invocation.args[0], "--bg");
-  assert.match(invocation.args.at(-1), /Work on task-cc/, "the native launch carries the prompt positionally");
-  const runDir = path.join(home, "journal", "dispatch");
-  const record = JSON.parse(fs.readFileSync(path.join(runDir, fs.readdirSync(runDir).find((f) => f.endsWith(".run.json"))), "utf8"));
-  assert.strictEqual(record.launch_mode, "native-background");
+  const configBefore = fs.readFileSync(path.join(home, "config.json"), "utf8");
+  for (const extra of [[], ["--profile", "profile-codex"]]) {
+    const outfile = path.join(home, "claude-invocation.json");
+    const r = run(["dispatch", "task-cc", "--dir", repo, "--no-brief", "--bg", ...extra], { SPOR_HOME: home, SPOR_CLAUDE_CMD: claudeStreamStub(home), OUTFILE: outfile });
+    assert.strictEqual(r.status, 1, `${extra.join(" ")}: ${r.stdout}`);
+    assert.match(r.stderr, /is retired — every dispatch now runs supervised/);
+    assert.match(r.stderr, /run 'claude --bg' yourself/, "points at the attachable alternative");
+    assert.ok(!fs.existsSync(outfile), "the harness never ran");
+    assert.ok(!fs.existsSync(path.join(home, "journal", "dispatch")), "no run record");
+    assert.strictEqual(fs.readFileSync(path.join(home, "config.json"), "utf8"), configBefore, "no config write (repo registration, capability probe)");
+  }
 });
 
-test("the run-record schema's launch-mode asymmetry is real: `model`+`launched_at` on native, `started_at` on supervised", async () => {
+test("a legacy native-background record rides `spor runs --json` verbatim, asymmetric fields included, beside a supervised one", async () => {
   // WORKERS.md §8 documents the two launch modes as carrying DIFFERENT field
   // sets, and a consumer reads an absent field as absent rather than as a
-  // violation — so which fields each writer actually emits is a contract, not
-  // an implementation detail, and the table drifts silently without this
-  // (issue-spor-unjudgeable-type-leases-never-released F3).
-  const { home, repo } = fixture();
+  // violation (issue-spor-unjudgeable-type-leases-never-released F3). No new
+  // native record is ever written (the launch is retired), but a legacy one
+  // still in the journal must come out of `spor runs` as it went in.
+  const { home } = fixture();
+  const runDir = path.join(home, "journal", "dispatch");
+  fs.mkdirSync(runDir, { recursive: true });
+  const launchedAt = new Date().toISOString();
+  fs.writeFileSync(path.join(runDir, "legacy.run.json"), JSON.stringify({
+    run_id: "legacy", node_id: "task-cc", name: "task-cc", harness: "claude-code", launch_mode: "native-background",
+    state: "running", cwd: home, model: "opus", created_at: launchedAt, launched_at: launchedAt, launcher_exit: 0,
+  }));
+  const shown = (h) => {
+    const r = run(["runs", "--json"], { SPOR_HOME: h });
+    assert.strictEqual(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout).runs[0];
+  };
+  const nativeJson = shown(home);
+  assert.strictEqual(nativeJson.launch_mode, "native-background");
+  assert.strictEqual(nativeJson.state, "running", "inside its retirement horizon, still believed");
+  assert.strictEqual(nativeJson.model, "opus");
+  assert.ok(Object.prototype.hasOwnProperty.call(nativeJson, "launched_at"));
+  assert.ok(!Object.prototype.hasOwnProperty.call(nativeJson, "started_at"));
 
-  const bgOut = path.join(home, "claude-bg.json");
-  const bgResult = run(
-    ["dispatch", "task-cc", "--dir", repo, "--no-brief", "--bg", "--model", "opus"],
-    { SPOR_HOME: home, SPOR_CLAUDE_CMD: claudeBgStub(home), OUTFILE: bgOut }
-  );
-  assert.strictEqual(bgResult.status, 0, bgResult.stderr);
-  const nativePath = await runRecordFile(home);
-  const native = JSON.parse(fs.readFileSync(nativePath, "utf8"));
-  assert.strictEqual(native.launch_mode, "native-background");
-  assert.strictEqual(native.model, "opus", "a native record carries the model override this launch resolved");
-  assert.ok(Object.prototype.hasOwnProperty.call(native, "launched_at"), "native: the launcher stamps the hand-off, not a child start");
-  assert.ok(!Object.prototype.hasOwnProperty.call(native, "started_at"), "native: `started_at` is the supervised field");
-
-  // A second, SUPERVISED dispatch into its own home, so the two records are
-  // told apart by their launch mode rather than by listing order.
   const sup = fixture();
   const supOut = path.join(sup.home, "claude-invocation.json");
   const supResult = run(
@@ -446,67 +422,41 @@ test("the run-record schema's launch-mode asymmetry is real: `model`+`launched_a
     return record.contract_pending === false ? record : null;
   });
   assert.ok(settled, "the supervised run settled");
-  assert.strictEqual(settled.launch_mode, "supervised-jsonl");
-  assert.ok(Object.prototype.hasOwnProperty.call(settled, "started_at"), "supervised: the supervisor stamps the child's real start");
-  assert.ok(!Object.prototype.hasOwnProperty.call(settled, "launched_at"), "supervised: `launched_at` is the native field");
-  assert.ok(
-    !Object.prototype.hasOwnProperty.call(settled, "model"),
-    "supervised: the model is fixed into the harness argv at launch and is NOT echoed onto the record — the same --model was passed"
-  );
-
-  // §8 documents the schema of `spor runs --json`, not of the file on disk, so
-  // pin it at that door too: the records ride out verbatim, asymmetry included.
-  const shown = (h) => {
-    const r = run(["runs", "--json"], { SPOR_HOME: h });
-    assert.strictEqual(r.status, 0, r.stderr);
-    return JSON.parse(r.stdout).runs[0];
-  };
-  const nativeJson = shown(home);
-  assert.strictEqual(nativeJson.launch_mode, "native-background");
-  assert.strictEqual(nativeJson.model, "opus");
-  assert.ok(!Object.prototype.hasOwnProperty.call(nativeJson, "started_at"));
   const supJson = shown(sup.home);
   assert.strictEqual(supJson.launch_mode, "supervised-jsonl");
-  assert.ok(!Object.prototype.hasOwnProperty.call(supJson, "model"));
-  assert.ok(Object.prototype.hasOwnProperty.call(supJson, "started_at"));
+  assert.ok(Object.prototype.hasOwnProperty.call(supJson, "started_at"), "supervised: the supervisor stamps the child's real start");
+  assert.ok(!Object.prototype.hasOwnProperty.call(supJson, "launched_at"), "supervised: `launched_at` is the native field");
+  assert.ok(!Object.prototype.hasOwnProperty.call(supJson, "model"), "supervised: the model rides the argv, not the record");
 });
 
-test("dispatch.claudeLaunchMode: native-background is the standing twin of --bg, and a no-op for a harness with no background mode", () => {
+test("a standing dispatch.claudeLaunchMode: native-background is retired: warned about, ignored, the dispatch runs supervised", () => {
   const { home, repo } = fixture();
-  const outfile = path.join(home, "claude-cfg.json");
-  const stub = claudeBgStub(home);
-  const viaEnv = run(["dispatch", "task-cc", "--dir", repo, "--no-brief"], {
-    SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outfile, SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "native-background",
-  });
+  const viaEnv = run(["dispatch", "task-cc", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home, SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "native-background" });
   assert.strictEqual(viaEnv.status, 0, viaEnv.stderr);
-  assert.strictEqual(JSON.parse(fs.readFileSync(outfile, "utf8")).args[0], "--bg");
+  assert.match(viaEnv.stderr, /dispatch.claudeLaunchMode 'native-background' is retired/);
+  assert.match(viaEnv.stdout, /^run: {4}claude -p /m);
 
   const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
   cfg.dispatch.claudeLaunchMode = "native-background";
   fs.writeFileSync(path.join(home, "config.json"), JSON.stringify(cfg, null, 2) + "\n");
   const viaFile = run(["dispatch", "task-cc", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
   assert.strictEqual(viaFile.status, 0, viaFile.stderr);
-  assert.match(viaFile.stdout, /^run: {4}claude --bg /m, "the user config.json knob routes the same way");
-
-  // The knob is Claude-specific: a Codex dispatch under it stays supervised, unrefused.
-  const codex = run(["dispatch", "task-cc", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--print"], { SPOR_HOME: home });
-  assert.strictEqual(codex.status, 0, codex.stderr);
-  assert.match(codex.stdout, /^run: {4}codex .*# prompt on stdin$/m);
-  assert.match(codex.stdout, /^session: \(read from codex exec thread.started, bound by supervisor\)$/m);
+  assert.match(viaFile.stderr, /is retired/, "the user config.json knob is ignored the same way");
+  assert.match(viaFile.stdout, /^run: {4}claude -p /m);
 });
 
 test("an unrecognized dispatch.claudeLaunchMode value warns and is ignored (supervised)", () => {
   const { home, repo } = fixture();
   const r = run(["dispatch", "task-cc", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home, SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "nativebackground" });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stderr, /warning: dispatch.claudeLaunchMode 'nativebackground' is not recognized/);
+  assert.match(r.stderr, /warning: dispatch.claudeLaunchMode 'nativebackground' is not recognized \(supervised is the only launch mode\)/);
   assert.match(r.stdout, /^run: {4}claude -p /m);
 });
 
 test("spor work ignores dispatch.claudeLaunchMode: a worker's claude-code run is always supervised", async () => {
   // The worker loop's runs must be followable and judgeable (a report channel,
-  // an enforced outcome), so a box-wide native-background knob — which cmdDispatch
-  // honours for an interactive dispatch — must not route them to `claude --bg`.
+  // an enforced outcome); the retired native-background knob is said once at
+  // worker start and never routes a run to `claude --bg`.
   const { home, repo } = fixture();
   fs.writeFileSync(path.join(home, "nodes", "agent-box.md"), "---\nid: agent-box\ntype: agent\ntitle: box\nsummary: A test agent identity.\ndate: 2026-09-03\n---\nTest agent.\n");
   fs.writeFileSync(path.join(home, "nodes", "task-cc.md"), fs.readFileSync(path.join(home, "nodes", "task-cc.md"), "utf8").replace(
@@ -532,14 +482,6 @@ test("spor work ignores dispatch.claudeLaunchMode: a worker's claude-code run is
   assert.deepStrictEqual(invocation.args.slice(0, 4), ["-p", "--output-format", "stream-json", "--verbose"], "supervised, despite the knob");
   const recordPath = await runRecordFile(home);
   assert.strictEqual(JSON.parse(fs.readFileSync(recordPath, "utf8")).launch_mode, "supervised-jsonl");
-});
-
-test("an explicit --bg on a harness with no background mode is refused before any side effect", () => {
-  const { home, repo } = fixture();
-  const r = run(["dispatch", "task-cc", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--bg"], { SPOR_HOME: home });
-  assert.strictEqual(r.status, 1);
-  assert.match(r.stderr, /cannot use --bg with a Codex dispatch — only Claude Code has a native background/);
-  assert.ok(!fs.existsSync(path.join(home, "journal", "dispatch")), "nothing launched, no run record");
 });
 
 test("a supervised claude-code run whose supervisor is KILLED mid-run is finalized by 'spor runs' exactly as a codex run is", async () => {

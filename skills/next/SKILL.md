@@ -83,17 +83,17 @@ re-dispatches a task an agent is already doing.
 **`spor next --json` does this cross-reference for you**
 (task-spor-cli-in-flight-surface): it stamps each item with an `in_flight`
 boolean — and a `dispatched` summary (`{id, name, state, status, cwd}`) on the
-in-flight ones — by matching live background agents to node ids. Add
-`--hide-dispatched` to drop the in-flight items entirely (it reports a
+in-flight ones — by matching this machine's live dispatch run records to node
+ids. Add `--hide-dispatched` to drop the in-flight items entirely (it reports a
 `hidden_dispatched` count, never silently). This is best-effort and
-Claude-Code-only: the `show_queue` / server queue can't see local background
-agents, so the flag fails soft (every item reads `in_flight:false`) when the
-`claude` binary is absent (e.g. in Cowork or a plain shell).
+machine-local: the `show_queue` / server queue can't see local runs, so the
+flag fails soft (every item reads `in_flight:false`) when there is no local
+run journal to read (e.g. in Cowork).
 
 Prefer reading that flag over shelling out yourself. When you only have the raw
 `show_queue` output (which doesn't carry the flag), an item is **in flight** when
-a `kind: "background"` agent from `claude agents --json` has `name` equal to the
-item's id and `state` is not `"done"`. For those items: badge them "🤖 agent
+`spor runs --json` lists a run whose `node_id` is the item's id and whose
+`state` is `"launching"` or `"running"`. For those items: badge them "🤖 agent
 dispatched — in progress" and keep them OUT of the top "pick this next"
 recommendation (the work is already moving; surfacing it invites duplication).
 Mention them so the human can still choose to look — counted, never silently

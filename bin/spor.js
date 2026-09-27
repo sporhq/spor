@@ -434,12 +434,12 @@ async function cmdNext(cfg, args) {
   const readinessFilter = collectMulti("readiness");
 
   // In-flight agent surface (task-spor-cli-in-flight-surface). `spor next --json`
-  // stamps each item with an `in_flight` flag by cross-referencing the live
-  // background agents (`claude agents --json`); --hide-dispatched drops the items
-  // that already have one. Both are CLIENT-SIDE presentation: the server's queue
-  // can't see local agents, so this is computed here over either render path. The
-  // cross-reference only runs when one of the two flags asks for it, so the
-  // default queue path stays byte-identical (and never shells out to claude).
+  // stamps each item with an `in_flight` flag by cross-referencing this box's
+  // live dispatch run records (dispatchedAgents); --hide-dispatched drops the
+  // items that already have one. Both are CLIENT-SIDE presentation: the server's
+  // queue can't see local runs, so this is computed here over either render
+  // path. The cross-reference only runs when one of the two flags asks for it,
+  // so the default queue path stays byte-identical.
   const wantJson = args.includes("--json");
   const hideDispatched = args.includes("--hide-dispatched");
   const needAgents = wantJson || hideDispatched;
@@ -624,329 +624,39 @@ function renderQueueLocalText(q, hidden = 0) {
   if (hidden > 0) out(`(${hidden} in-flight hidden — --hide-dispatched)`);
 }
 
-// Enumerate one cli-json harness's background agents: {ok, agents}. `ok` answers
-// "could I ask at all?" — a binary that's absent, exits nonzero, or prints
-// garbage says NOTHING about liveness, and run reconciliation
-// (inc-spor-dispatch-session-vanished-2026-07-18) must not read that silence as
-// "every run is dead". SPOR_FAKE_AGENTS_JSON is the same test seam as before.
-function enumerateHarnessAgents(adapter, cfg = null) {
-  const discovery = adapter.activeDiscovery || {};
-  if (discovery.kind !== "cli-json") return { ok: false, agents: [] };
-  let text = process.env.SPOR_FAKE_AGENTS_JSON;
-  if (text == null) {
-    // Resolve through the cascade like the dispatch launcher does, so a box
-    // whose launcher lives at `dispatch.bin.<harness>` rather than on PATH is
-    // still enumerable — otherwise the in-flight surface would go permanently
-    // blank on exactly the machines that key exists to serve
-    // (task-spor-dispatch-adapters-opencode-copilot).
-    const cmd = adapter.command(process.env, cfg);
-    if (cmd === "claude" && !hasCmd(cmd)) return { ok: false, agents: [] };
-    const r = spawnPortableSync(cmd, discovery.args, { encoding: "utf8", timeout: 5000 });
-    if (r.status !== 0 || !r.stdout) return { ok: false, agents: [] };
-    text = r.stdout;
-  }
-  let arr;
-  try { arr = JSON.parse(text); } catch { return { ok: false, agents: [] }; }
-  if (!Array.isArray(arr)) return { ok: false, agents: [] };
-  return { ok: true, agents: arr };
-}
-
-// The live-agent listing is the NATIVE path's evidence and nobody else's: a
-// `native-background` record — a `spor dispatch --bg` opt-in, or one written
-// before the supervised default (task-spor-claude-adapter-headless-supervised)
-// — is reconciled against `claude agents --json`, while a supervised run is
-// reconciled against its own supervisor process and never reads the listing.
-// So the listing is only worth taking (a CLI boot per cli-json harness, on
-// every `spor runs` and every work-loop poll) when some record still needs it:
-// a NON-TERMINAL native one among `records`. Otherwise nothing is listed and
-// `enumerated: false` is the honest answer — reconcileRuns consults it only
-// for the native records there are none of, so the outcome is identical to a
-// successful empty listing at zero cost (task-spor-retire-native-bg-
-// enumerated-skip-after-supervised-default). A worker's own dispatches are all
-// supervised (cmdDispatch's `supervisedOnly`), so a worker following only its
-// own runs never spawns a harness here at all.
-function nativeAgentEvidence(cfg, records) {
-  const needed = (records || []).some(
-    (r) => r && r.launch_mode === "native-background" && !dispatchRuns.TERMINAL_STATES.has(r.state)
-  );
-  if (!needed) return { agents: [], enumerated: false };
-  let enumerated = false;
-  const agents = [];
-  for (const adapter of dispatchHarnesses.discoveryAdapters({ cfg })) {
-    if ((adapter.activeDiscovery || {}).kind !== "cli-json") continue;
-    const e = enumerateHarnessAgents(adapter, cfg);
-    if (!e.ok) continue;
-    enumerated = true;
-    // A finished agent the harness still lists is NOT live, but it is still
-    // THIS record's evidence: `state: "done"` is its own independent terminal
-    // signal (WORKERS.md, dec-spor-native-bg-turn-complete-and-contract), and
-    // `reconcileRuns`'s `nativeTurnComplete` is what acts on it to reap the
-    // daemon slot and hand the record to the terminal-state contract. An
-    // earlier revision dropped it here instead — the same `done` filter the
-    // in-flight surface (`dispatchedAgents`) applies for an unrelated reason —
-    // which hid it from `matchingAgents` entirely: never matched, never
-    // reaped, so a daemon accumulating done-but-registered agents kept those
-    // slots forever
-    // (issue-spor-native-run-done-state-unreachable-and-contract-pending-invisible).
-    // `liveWorkspaceWriters`'s own occupancy check is the one consumer that
-    // must NOT count a done agent as still writing, and it filters for that
-    // itself rather than relying on this listing to have done it already.
-    for (const a of e.agents) if (a && a.kind === "background") agents.push(a);
-  }
-  return { agents, enumerated };
-}
-
-// Stop a FINISHED background agent, freeing the daemon slot it still occupies
-// (task-spor-dispatch-native-bg-terminal-detection). `claude --bg` leaves a
-// turn-complete agent registered forever, so a run reconciled terminal on that
-// signal reaps its own agent here — the mirror of `enumerateHarnessAgents`,
-// down to resolving the launcher through the cascade so a box whose `claude`
-// lives at `dispatch.bin.claude-code` still reaps.
-//
-// WHAT to run is the adapter's declaration (`activeStop`), never a spelling
-// hardcoded here; a harness that declares none is simply not reaped. Best-
-// effort by contract: the record is already terminal and stays so whether or
-// not this works, and `agent_stopped` on it says which happened. `claude stop`
-// leaves the daemon and its spare pty workers up — it ends one agent, not the
-// harness.
-function stopNativeAgent(cfg, record, agent) {
-  const sessionId = (record && record.session_id) || (agent && agent.sessionId) || null;
-  if (!sessionId) return false; // no identity to name — never stop by co-location
-  const adapter = dispatchHarnesses
-    .discoveryAdapters({ cfg })
-    .find((a) => a.id === (record && record.harness) && a.activeStop && a.activeStop.kind === "cli-args");
-  if (!adapter) return false;
-  const cmd = adapter.command(process.env, cfg);
-  if (cmd === "claude" && !hasCmd(cmd)) return false;
-  const r = spawnPortableSync(cmd, [...adapter.activeStop.args, sessionId], { encoding: "utf8", timeout: 5000 });
-  return !!r && r.status === 0;
-}
-
-// The reaper `reconcileRuns` calls when it closes a native run on the turn-
-// complete signal, or null when nothing here could reap: the store must not
-// pay a harness lookup per record for a machine that has no way to stop one.
-function makeAgentReaper(cfg) {
-  return (record, agent) => {
-    try {
-      return stopNativeAgent(cfg, record, agent);
-    } catch {
-      return false;
-    }
-  };
-}
-
-// Run the terminal-state contract for the NATIVE-background runs a reconcile
-// left owing it (task-spor-dispatch-native-bg-terminal-detection). The store
-// is synchronous and holds no credential, so it closes such a record with a
-// provisional unenforced outcome and flags `contract_pending`; this is the
-// second write, and the same one the supervised finalizer makes for itself —
-// so a `--bg` run now ends in exactly one of resolved-verified / reported /
-// failed / declined with `terminal_enforced: true`, instead of a permanent
-// best-effort guess (dec-spor-dispatch-terminal-states-supervised-first's v1
-// scope).
-//
-// The door is this box's own config, as `verifyRunResolution`'s is: same
-// machine, same tenant. What it CANNOT re-derive it reads off the record — the
-// lease this dispatch established (`release_node`), the project the report
-// artifact is stamped with, and the local graph home the launcher resolved —
-// because a repo `graph:` binding, an `--org`, or a different cwd can all make
-// this process's own answers differ from the launch's. A record written before
-// those stamps existed simply carries none, and the contract then omits the
-// legs they feed (an absent `releaseNode` releases nothing, and says nothing
-// about a lease that was never ours).
-//
-// The agent's final report is the last assistant text in its own transcript,
-// the same rule the supervised stream applies (`nativeRunReportText`) — so a
-// native run can reach `reported` with its hand-back filed, and a `DECLINED:`
-// one routes to triage, instead of every unresolved run reading `failed`.
-// The DOOR a native record must be settled through, or null when this process
-// is not it. The record names the graph its run was launched against — a server
-// base for a remote launch, a nodes dir for a local one — and the settle must
-// match, because the ambient config here belongs to whoever happens to be
-// running `spor runs`, not to the run. On a multi-tenant box (`--org`,
-// `SPOR_ORG`, a repo `org:` marker) a mismatch is not a near miss: the same
-// node id routinely exists in two tenants, so settling through the wrong one
-// files a report into a graph the run never touched and releases a lease that
-// belongs to someone else's work. A record whose door this is not is SKIPPED,
-// not discharged — it keeps its debt for the caller that owns it.
-//
-// A record naming NEITHER predates those stamps; it falls back to the ambient
-// config, which is the best-effort reading it has always had.
-function nativeContractDoor(cfg, record) {
-  // `cfg.mode()`, not "does a server resolve": an explicitly configured
-  // `mode: "local"` is what the LAUNCHER branched on when it stamped the
-  // record, and a logged-in user with a deliberately local repo still resolves
-  // a credential. Asking the two questions differently would leave every such
-  // record's debt permanently unclaimable — skipped by every caller, including
-  // the one running in the very config that launched it.
-  const isRemote = cfg.mode() === "remote";
-  const base = isRemote ? String(remote.base(cfg) || "").replace(/\/+$/, "") : null;
-  const tenant = isRemote && typeof cfg.tenant === "function" ? cfg.tenant() : null;
-  const org = String((tenant && tenant.org) || "");
-  const want = String((record && record.server) || "").replace(/\/+$/, "");
-  const wantOrg = String((record && record.org) || "");
-  if (want) {
-    if (!isRemote || base !== want) return null;
-    // A hosted deployment routes every tenant through ONE front door and
-    // separates them by the token's org claim, so the same base URL under a
-    // different org is a DIFFERENT graph and the org must match too. A record
-    // naming none — a flat `SPOR_SERVER`+`SPOR_TOKEN` launch, or one written
-    // before this stamp — can only be matched on the base, which is the
-    // reading it has always had.
-    if (wantOrg && wantOrg !== org) return null;
-    return { base, token: cfg.token(), nodesDir: null };
-  }
-  if (record && record.local_nodes_dir) {
-    return isRemote ? null : { base: null, token: "", nodesDir: record.local_nodes_dir };
-  }
-  return isRemote
-    ? { base, token: cfg.token(), nodesDir: null }
-    : { base: null, token: "", nodesDir: cfg.nodesDir() };
-}
-
-// How long after a run went terminal its lease is still ours to hand back.
-// Nothing reconciles a native record on a timer — it happens when someone runs
-// `spor runs`, or while a worker follows that run — so a `--bg` run can sit
-// unreconciled for hours, by which time its lease has lapsed at the documented
-// 45m TTL and the item may have been claimed by someone else, quite possibly
-// another worker of the SAME person (whom the server's 409-on-another-holder
-// answer does not protect). Past this window the handback is simply not
-// attempted: the key is omitted, which already means "no lease of ours",
-// rather than yanking a live claim.
-const NATIVE_LEASE_HANDBACK_MS = 2700000; // 45m — dec-cc-task-claim-lease's default TTL
-
-// Run the terminal-state contract for the NATIVE-background runs a reconcile
-// left owing it (task-spor-dispatch-native-bg-terminal-detection). The store
-// is synchronous and holds no credential, so it closes such a record with a
-// provisional unenforced outcome and flags `contract_pending`; this is the
-// second write, and the same one the supervised finalizer makes for itself —
-// so a `--bg` run now ends in exactly one of resolved-verified / reported /
-// failed / declined with `terminal_enforced: true`, instead of a permanent
-// best-effort guess (dec-spor-dispatch-terminal-states-supervised-first's v1
-// scope).
-//
-// `scope` bounds WHICH records are settled: this files nodes and releases
-// leases, so a caller that asked about specific runs must not have that done
-// on its behalf for unrelated ones (`spor runs --node x`, a worker following
-// its own runs). A record left unsettled keeps its debt for the next caller
-// that does own it. Omit `scope` for the unfiltered reconcile — `spor runs`
-// with no filter IS the whole store's reconciler.
-//
-// What the contract cannot re-derive it reads off the record: the lease this
-// dispatch established (`release_node`), the project a report artifact is
-// stamped with, the local graph home the launcher resolved, and the graph the
-// run was launched against (`nativeContractDoor`).
-//
-// The agent's final report is the last assistant text in its own transcript,
-// the same rule the supervised stream applies (`nativeRunReportText`) — so a
-// native run can reach `reported` with its hand-back filed, and a `DECLINED:`
-// one routes to triage, instead of every unresolved run reading `failed`.
-async function settleNativeContracts(cfg, records, { scope = null, now = () => Date.now() } = {}) {
-  const home = cfg.userConfigHome();
-  const out = [];
-  for (const record of records || []) {
-    if (
-      !record ||
-      record.launch_mode !== "native-background" ||
-      !record.contract_pending ||
-      !record.node_id ||
-      !dispatchRuns.TERMINAL_STATES.has(record.state) ||
-      (scope && !scope.has(record.run_id))
-    ) {
-      out.push(record);
-      continue;
-    }
-    const door = nativeContractDoor(cfg, record);
-    if (!door) {
-      out.push(record); // not this process's graph to answer for
-      continue;
-    }
-    // A concurrent reconciler may have settled it between the read above and
-    // now; the contract writes to the graph, so skip rather than re-run it.
-    const fresh = dispatchRuns.readJson(dispatchRuns.runPaths(home, record.run_id).record);
-    if (!fresh || !fresh.contract_pending) {
-      out.push(fresh || record);
-      continue;
-    }
-    const closedAt = Date.parse(fresh.finished_at || "") || 0;
-    const leaseOurs = !!fresh.release_node && (!closedAt || now() - closedAt <= NATIVE_LEASE_HANDBACK_MS);
-    let contract = null;
-    try {
-      contract = await dispatchTerminal.applyTerminalContract({
-        base: door.base,
-        token: door.token,
-        nodesDir: door.nodesDir,
-        nodeId: fresh.node_id,
-        releaseNode: leaseOurs ? fresh.release_node : null,
-        project: fresh.project || null,
-        runId: fresh.run_id,
-        harness: fresh.harness,
-        state: fresh.state,
-        reportText: dispatchRuns.nativeRunReportText(fresh),
-      });
-    } catch (e) {
-      contract = dispatchTerminal.unenforcedOutcome(fresh.state, `the terminal-state contract failed to run: ${e.message}`);
-    }
-    out.push(dispatchRuns.settleNativeOutcome(home, fresh, contract) || fresh);
-  }
-  return out;
-}
-
-// preflight.liveWorkspaceWriters's own caller-side half
-// (issue-spor-native-bg-run-record-believed-without-liveness-probe): a
-// native-background record has no supervisor pid to probe, so occupancy for it
-// is only exact when reconciled against the harness's own live-agent listing —
-// the same evidence `spor runs` and the work loop already reconcile native
-// records against — rather than believed for the fallback horizon regardless.
+// preflight.liveWorkspaceWriters's caller-side half. Occupancy is read off the
+// run records alone: a supervised record is probed through its own supervisor
+// identity, and a legacy `native-background` record (the retired `spor dispatch
+// --bg` launch, task-spor-deprecate-native-bg-dispatch) is believed only inside
+// the retirement horizon its launch stamp bounds — no harness listing is ever
+// taken to decide it.
 function liveWorkspaceWriters(cfg, records, dir) {
-  const { agents, enumerated } = nativeAgentEvidence(cfg, records);
-  return preflight.liveWorkspaceWriters(records, { dir, nativeAgents: agents, nativeEnumerated: enumerated });
+  return preflight.liveWorkspaceWriters(records, { dir });
 }
 
-// Active background agents keyed by node id (task-spor-cli-in-flight-surface).
-// `spor dispatch` names each background agent after the node id it works
-// (cmdDispatch: name = name || nodeId), so `claude agents --json` lets the queue
-// CLI mark which items already have an agent in flight — a NO-LLM, parseable
-// cross-reference that needs no model guidance. Returns Map<node-id, agent[]> of
-// the BACKGROUND agents still active (state !== "done"), each summarized to
-// {id, name, state, status, cwd}. FAIL-SOFT by contract (the feature is a pure
-// enhancement): the claude binary absent / a nonzero exit / a timeout /
-// unparseable output all yield an EMPTY map, never an error — so `spor next
-// --json` still works in Cowork and plain-shell contexts where claude is absent
-// (every item then reads in_flight:false). SPOR_FAKE_AGENTS_JSON injects canned
-// output for tests, mirroring SPOR_FAKE_MCP_LIST; all claude shell-outs route
-// through claudeCmd() so an SPOR_CLAUDE_CMD stub works too.
+// Active dispatched runs keyed by node id (task-spor-cli-in-flight-surface).
+// `spor dispatch` names each run after the node id it works (cmdDispatch: name
+// = name || nodeId), so the run records let the queue CLI mark which items
+// already have an agent in flight — a NO-LLM, parseable cross-reference that
+// needs no model guidance. Returns Map<node-id, run[]> of the non-terminal
+// runs (dispatchRuns.activeRuns), each with its harness id.
+//
+// Read from the RUN RECORDS only (task-spor-deprecate-native-bg-dispatch): the
+// in-flight surface used to shell out to `claude agents --json` for the
+// retired native-background launch, which cost a CLI boot per call, hung on a
+// daemon-spawning claude, and shifted shape with every Claude Code release.
+// Every dispatch now writes a durable record before its child starts, so the
+// records are the whole answer. FAIL-SOFT by contract (the feature is a pure
+// enhancement): an unreadable journal yields an EMPTY map, never an error.
 function dispatchedAgents(cfg) {
   try {
     const map = new Map();
-    const add = (name, summary) => {
-      const list = map.get(name) || [];
-      list.push(summary);
-      map.set(name, list);
-    };
     const home = cfg && typeof cfg.userConfigHome === "function" ? cfg.userConfigHome() : u.userConfigHome();
-    // discoveryAdapters, not harnesses: a `--bg` claude-code run (and every
-    // native record from before the supervised default) is enumerated through
-    // the adapter's native variant, while its supervised runs come off run records.
-    for (const adapter of dispatchHarnesses.discoveryAdapters({ cfg })) {
-      const discovery = adapter.activeDiscovery || {};
-      if (discovery.kind === "run-records") {
-        for (const a of dispatchRuns.activeRuns(home)) {
-          if (a && a.harness === adapter.id && typeof a.name === "string") add(a.name, a);
-        }
-        continue;
-      }
-      if (discovery.kind !== "cli-json") continue;
-      const { ok, agents: arr } = enumerateHarnessAgents(adapter, cfg);
-      if (!ok) continue;
-      for (const a of arr) {
-        if (!a || a.kind !== "background" || typeof a.name !== "string") continue;
-        if (a.state === "done") continue;
-        add(a.name, {
-          id: a.id, name: a.name, harness: adapter.id, state: a.state,
-          status: a.status, cwd: a.cwd, sessionId: a.sessionId, startedAt: a.startedAt,
-        });
-      }
+    for (const a of dispatchRuns.activeRuns(home)) {
+      if (!a || typeof a.name !== "string") continue;
+      const list = map.get(a.name) || [];
+      list.push(a);
+      map.set(a.name, list);
     }
     return map;
   } catch {
@@ -955,77 +665,6 @@ function dispatchedAgents(cfg) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// The candidate agents `spor dispatch` could have just launched in `dir`
-// (dec-spor-dispatch-bg-session-late-bind), newest first. `claude --bg`
-// self-allocates and prints only a SHORT id, but `claude agents --json`
-// reports the full `sessionId` + `cwd` + `startedAt` — the reliable capture
-// path. Match on cwd (the strong signal — we just launched there), then on
-// name when given.
-//
-// A launch name is derived from the node id (or truncated task text), so it
-// is REUSED by every re-dispatch of that node into the same dir — it is not
-// unique across runs (issue-spor-dispatch-unbound-run-identity-not-unique). A
-// stale agent from an EARLIER dispatch of the same node can still be listed
-// (a slow-to-finish or zombie entry) and would otherwise look like a valid
-// candidate the moment this poll starts, before our own agent has even
-// registered. `since` (this launch's own record.created_at) filters those
-// out: nothing that started before we launched can be the run we just
-// started, so only a genuinely NEW agent counts as a candidate.
-function dispatchedSessionCandidates(cfg, name, dir, since = 0) {
-  const all = [];
-  for (const arr of dispatchedAgents(cfg).values()) {
-    for (const a of arr) if (!a.harness || a.harness === "claude-code") all.push(a);
-  }
-  let cands = all.filter((a) => a.sessionId && (!dir || a.cwd === dir));
-  // A launch name is an exact identity, so REQUIRE it rather than preferring it.
-  // Several dispatches share one checkout (every `--no-worktree` dispatch into
-  // the same repo does), so "newest in this directory" can be a sibling's
-  // session — and during the poll window our own agent is often not registered
-  // yet while a sibling already is, which is exactly when the fallback fires and
-  // stamps the run with someone else's session
-  // (issue-spor-dispatch-run-liveness-same-cwd-misattribution). An empty result
-  // just keeps polling until ours appears; an honest miss beats a wrong id.
-  if (name) cands = cands.filter((a) => a.name === name);
-  if (since) cands = cands.filter((a) => (Number(a.startedAt) || 0) >= since);
-  cands.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
-  return cands;
-}
-
-// Capture the launched run's session, polling briefly while the daemon registers
-// it. Returns the sessionId or null (fail-open — the caller degrades to session-null).
-//
-// `since` bounds candidates to this launch (see dispatchedSessionCandidates).
-//
-// `pinned` (SPOR_SESSION_ID) exists for tests/reproducibility and used to
-// short-circuit the poll unconditionally — but an ambient env var is not proof
-// it names THIS launch's session; left exported in a real shell it would
-// otherwise stamp a dispatched run with the CALLER's own session and transcript
-// (issue-spor-dispatch-ambient-session-id-borrows-caller-transcript). So the pin
-// is now verified INSIDE the same poll used for ordinary discovery, not checked
-// once up front: registration lags the launch by an uncertain amount (the whole
-// reason the poll loop exists), so a single pre-loop check would see an empty
-// candidate set on every real dispatch and rubber-stamp the pin before the real,
-// contradicting session had a chance to register. Each iteration: candidates
-// found and the pin is among them => confirmed, return it; candidates found and
-// the pin is NOT among them => proven wrong, drop it and return the newest
-// discovered session instead (never the pin); no candidates yet => keep
-// waiting. If the whole poll never finds any candidate, discovery had nothing
-// to contradict the pin with, so it falls back to trusting it (the fast path
-// tests rely on, where no agent is ever faked into existence).
-async function captureDispatchSession(cfg, name, dir, pinned, since = 0) {
-  for (let i = 0; i < 6; i++) {
-    const cands = dispatchedSessionCandidates(cfg, name, dir, since);
-    if (cands.length) {
-      if (!pinned) return cands[0].sessionId;
-      if (cands.some((a) => a.sessionId === pinned)) return pinned;
-      err(`warning: SPOR_SESSION_ID (${pinned}) does not match the launched agent's session — ignoring the pin.`);
-      return cands[0].sessionId;
-    }
-    await sleep(300);
-  }
-  return pinned || null;
-}
 
 // Stamp items[].in_flight from the dispatched-agent map, optionally dropping the
 // in-flight ones (--hide-dispatched). Every kept item gets an in_flight boolean
@@ -7836,6 +7475,37 @@ function spawnPortableSync(cmd, args, opts = {}) {
   return spawnSync(resolved, args, opts);
 }
 
+// A bounded, synchronous capture of a harness CLI's stdout that a DAEMON
+// cannot hold open (task-spor-deprecate-native-bg-dispatch). Claude Code 2.x
+// leaves a persistent background process behind, and a spawnSync over PIPES
+// waits for every holder of the pipe to close it — not just for the child to
+// exit — so a daemon-spawning `claude plugin list` made `spor status` sit out
+// the full timeout and then read the (successful) call as failed (ETIMEDOUT,
+// status null). Routing stdout to a temp FILE takes the pipe out of it: the
+// call returns the moment the child exits, and the timeout still bounds a child
+// that genuinely hangs. Returns spawnSync's shape with `stdout` read back as
+// utf8 (stderr is discarded — every caller here reads stdout only).
+function spawnCaptureSync(cmd, args, { timeout = 8000, ...opts } = {}) {
+  let dir = null;
+  let fd = null;
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cap-"));
+    const file = path.join(dir, "stdout");
+    fd = fs.openSync(file, "w");
+    const r = spawnPortableSync(cmd, args, { ...opts, stdio: ["ignore", fd, "ignore"], timeout });
+    fs.closeSync(fd);
+    fd = null;
+    let stdout = "";
+    try { stdout = fs.readFileSync(file, "utf8"); } catch { /* nothing written */ }
+    return { ...r, stdout };
+  } catch (e) {
+    return { status: null, stdout: "", error: e };
+  } finally {
+    if (fd != null) try { fs.closeSync(fd); } catch { /* already closed */ }
+    if (dir) try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+}
+
 // The spor plugin Claude Code has LOADED (its own cached copy under
 // ~/.claude/plugins/), parsed from `claude plugin list --json`, or null if the
 // claude CLI is absent / spor isn't installed. Fail-soft and bounded — never
@@ -7843,7 +7513,7 @@ function spawnPortableSync(cmd, args, opts = {}) {
 function claudePluginInfo(cfg = null) {
   const cmd = claudeCmd(cfg);
   if (cmd === "claude" && !hasCmd("claude")) return null;
-  const r = spawnPortableSync(cmd, ["plugin", "list", "--json"], { encoding: "utf8", timeout: 8000 });
+  const r = spawnCaptureSync(cmd, ["plugin", "list", "--json"], { timeout: 8000 });
   if (r.status !== 0 || !r.stdout) return null;
   let arr;
   try {
@@ -7877,7 +7547,7 @@ function sporConnectorBound(cfg = null) {
     if (text == null) {
       const cmd = claudeCmd(cfg);
       if (cmd === "claude" && !hasCmd("claude")) return false;
-      const r = spawnPortableSync(cmd, ["mcp", "list"], { encoding: "utf8", timeout: 8000 });
+      const r = spawnCaptureSync(cmd, ["mcp", "list"], { timeout: 8000 });
       if (r.status !== 0 || !r.stdout) return false;
       text = r.stdout;
     }
@@ -8679,9 +8349,9 @@ async function cmdUpgrade(cfg, { values, positionals: pos }) {
 // (task-spor-cli-dispatch-background-agents) Compile a briefing for a task and
 // launch the harness in the correct repo — by default a SUPERVISED headless
 // run (`claude -p --output-format stream-json` under the shared supervisor,
-// dec-spor-claude-code-supervised-by-default; codex/opencode/copilot likewise);
-// `--bg` / `dispatch.claudeLaunchMode` opts a Claude run into the native
-// `claude --bg` agent instead. The "correct repo" comes
+// dec-spor-claude-code-supervised-by-default; codex/opencode/copilot likewise —
+// the native `claude --bg` launch is retired, task-spor-deprecate-native-bg-
+// dispatch). The "correct repo" comes
 // from a per-machine slug->path map stored in the config cascade under
 // `dispatch.repos` (read via cfg.get; written to $SPOR_HOME/config.json) — the
 // shared graph is path-free by design (repo nodes carry slugs/fingerprints,
@@ -10514,8 +10184,9 @@ async function launchSupervisedHarness(cfg, {
     // the item's current state.
     ...(Array.isArray(itemCommits) && itemCommits.length ? { item_commits: itemCommits } : {}),
     // The profile THIS launch actually resolved to (issue-spor-candidate-
-    // provenance-profile-blind-to-self-routed-items) — see beginNativeRun's
-    // twin field for why it lives on the record and not the work-loop slot.
+    // provenance-profile-blind-to-self-routed-items). It lives on the record,
+    // not the work-loop slot: the slot's shape is what journal/work/*.work.json
+    // publishes, and it carries no profile.
     ...(resolvedProfile ? { resolved_profile: resolvedProfile } : {}),
     log_path: p.log,
     report_path: p.report,
@@ -10686,31 +10357,14 @@ async function launchSupervisedHarness(cfg, {
 
 // --- spor runs (inc-spor-dispatch-session-vanished-2026-07-18) --------------
 // The queryable terminal record for dispatched runs. Reading it RECONCILES
-// first: a dispatched run's ending is invisible to the launcher, so its outcome
-// is derived here — a native-background run from the harness's live-agent list
-// plus its own transcript, a supervised one from its supervisor process plus
-// its own log — and written back, after which the run has a durable terminal
-// state, a classification, a reason, and a diagnostic pointer, whatever
-// happened to it. No LLM: a live-agent listing, a directory read, a pid probe,
-// and a bounded file tail.
-//
-// Only the live-agent listing can fail, and it is only the native path's
-// evidence — hence `enumerated` gating that path alone, and the listing being
-// taken only when a non-terminal native record exists to spend it on
-// (nativeAgentEvidence).
-//
-// It is no longer network-free, and deliberately so
-// (task-spor-dispatch-native-bg-terminal-detection). Reconciling a
-// NATIVE-background run to terminal is now the moment its terminal-state
-// contract can run, and nothing else is going to run it — a `--bg` launch keeps
-// no supervisor. So a native run this call closes (or found already owing the
-// contract) is settled here: the verify re-read, and on a verified not-done the
-// report filing and lease handback §6 prescribes. That is the same work a
-// supervised run's own supervisor does at its exit, moved to the only process
-// that observes a native one ending. Bounded and once-only — the debt is the
-// record's `contract_pending` flag, cleared by the settle — and it is skipped
-// entirely for a record that owes nothing, so a store of supervised runs makes
-// no calls at all.
+// first: a supervised run whose supervisor died has its outcome derived here
+// from its supervisor identity plus its own log, and a legacy native-background
+// record (the retired `claude --bg` launch) is closed from the record alone
+// past its horizon — after which the run has a durable terminal state, a
+// classification, a reason, and a diagnostic pointer, whatever happened to it.
+// No LLM and no harness CLI: a directory read, a pid probe, and a bounded file
+// tail (task-spor-deprecate-native-bg-dispatch retired the `claude agents
+// --json` listing and the transcript scrape this used to take).
 // `spor executions [<exec-id>] [--node <id>] [--stage <s>] [--events] [--json]`
 // (task-spor-client-execution-store-adapter): the read surface over the
 // execution store this box drives — the hosted `/v1/executions` in remote
@@ -10774,41 +10428,22 @@ async function cmdExecutions(cfg, { values, positionals: pos }) {
 
 async function cmdRuns(cfg, { values, positionals: pos }) {
   const home = cfg.userConfigHome();
-  const { agents, enumerated } = nativeAgentEvidence(cfg, dispatchRuns.readRunRecords(home));
-  const closed = dispatchRuns.reconcileRuns(home, { agents, enumerated, stopAgent: makeAgentReaper(cfg) });
-  // …then the second write the store could not make for itself: the terminal-
-  // state contract for any native run it just closed (settleNativeContracts).
-  // `spor runs` is the surface that PRINTS the outcome, so it must be the
-  // settled one, not the provisional beat.
-  // Scoped to what this call ASKED about: settling files nodes and releases
-  // leases, so `spor runs --node x` must not do that on the operator's behalf
-  // for unrelated runs. An unfiltered `spor runs` IS the whole store's
-  // reconciler and settles everything it just closed.
-  const asked = values.node || pos[0]
-    ? new Set(dispatchRuns.listRuns(home, { records: closed, node: values.node || null, runId: pos[0] || null }).map((r) => r.run_id))
-    : null;
-  const records = await settleNativeContracts(cfg, closed, { scope: asked });
+  const records = dispatchRuns.reconcileRuns(home);
   const limit = Math.max(1, parseInt(values.limit, 10) || 20); // a bad --limit falls back to the default, never to 1
   const runs = dispatchRuns.listRuns(home, { records, node: values.node || null, runId: pos[0] || null, limit });
-  // `reconciled` is the honest claim "every run here was resolved against live
-  // evidence" — HERE meaning the runs THIS CALL is actually returning, so a
-  // `--node`/runId-filtered query is judged only by what it shows, not by an
-  // unrelated stale native run elsewhere in the store that isn't even in `runs`.
-  // A failed agent listing only strands NATIVE runs, and only if any non-terminal
-  // one is among the ones shown — supervised runs never needed that listing, so
-  // a Codex-only box reports reconciled even with no `claude` to enumerate.
-  const nativeStale = !enumerated && runs.some(
-    (r) => r.launch_mode === "native-background" && !dispatchRuns.TERMINAL_STATES.has(r.state)
-  );
+  // `reconciled` is the claim "every run here was resolved against its own
+  // evidence". Every run's evidence is now local (a supervisor probe, or a
+  // legacy record's launch stamp), so no reconcile can be left stranded by an
+  // unreadable harness listing and the claim is always true; the key stays for
+  // callers that read it.
   if (values.json) {
-    out(JSON.stringify({ reconciled: !nativeStale, count: runs.length, runs }, null, 2));
+    out(JSON.stringify({ reconciled: true, count: runs.length, runs }, null, 2));
     return 0;
   }
   if (!runs.length) {
     out("no dispatch runs recorded" + (values.node || pos[0] ? " for that filter" : "") + ".");
     return 0;
   }
-  if (nativeStale) err("note: could not list live background agents — native run states may be stale (they were not reconciled).");
   for (const r of runs) {
     const cls = r.termination_class ? ` — ${r.termination_class}${r.termination_signal ? `/${r.termination_signal}` : ""}` : "";
     out(`${r.run_id.slice(0, 8)}  ${r.state}${cls}  ${r.node_id || r.name || "(free-text)"}  ${r.harness}  ${r.created_at || ""}`);
@@ -10819,8 +10454,8 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
     // read like a checked one. `contract_pending` is a THIRD label, distinct
     // from `unenforced`: an unenforced outcome that stays this way is the
     // final, best-effort reading, but a `contract_pending` one is a
-    // provisional beat that a caller with a graph door still owes a verified
-    // verdict for (settleNativeContracts) — an operator staring at "reported
+    // provisional beat that a supervisor still owes a verified verdict for
+    // (closeWithOutcome) — an operator staring at "reported
     // (unenforced)" with no hint that anything is still owed has no way to
     // know the run isn't actually settled yet
     // (issue-spor-native-run-done-state-unreachable-and-contract-pending-invisible).
@@ -10942,6 +10577,15 @@ function harnessReadOnlyPostures() {
 }
 
 async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
+  // The native `claude --bg` launch is retired (task-spor-deprecate-native-bg-
+  // dispatch; see the launch-mode note further down). Refused FIRST, before
+  // anything — repo registration, the capability probe's config write, a claim
+  // — so an operator who passed it gets a clean no, not a half-run.
+  if (values.bg) {
+    err("cannot dispatch: 'spor dispatch --bg' (the native claude --bg launch) is retired — every dispatch now runs supervised, with its outcome read off its own stream.");
+    err("  drop --bg (the run is followed by 'spor runs'); for an attachable interactive session, run 'claude --bg' yourself.");
+    return 1;
+  }
   const dryRun = !!(values.print || values["dry-run"]);
   const full = !!values.full;
   const noBrief = !!values["no-brief"];
@@ -11280,9 +10924,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   });
 
   // Session project (issue-spor-dispatch-propagate-session-project-to-questions).
-  // The launcher env never reaches a native `claude --bg` agent (it self-allocates
-  // a spare worker; dec-spor-session-identity-active-record), and the agent token
-  // carries only {agent, session} — NOT the project. So the one channel the session
+  // The agent token carries only {agent, session} — NOT the project — and a
+  // launcher env is not a channel every harness honors
+  // (dec-spor-session-identity-active-record). So the one channel the session
   // project rides to the agent in every launch mode is the prompt itself: state it, and
   // tell the agent to pass it as ask_question's `project` param when a question
   // has no clear `mentions:`. The server gives that explicit project precedence
@@ -11352,19 +10996,18 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // idempotent renew by design, dec-cc-task-claim-lease). dispatchedAgents() is the
   // same NO-LLM, fail-soft cross-reference `spor next --hide-dispatched` uses; node
   // mode only (mirrors the auto-claim's scope), in BOTH local and remote (it's a
-  // local agent read, independent of the graph backend). claude absent / a stale
-  // exit / unparseable output => empty => no guard (fail-open); --force overrides.
+  // local run-record read, independent of the graph backend). An unreadable
+  // journal => empty => no guard (fail-open); --force overrides.
   const inFlight = nodeId && !backfill ? dispatchedAgents(cfg).get(name) || [] : [];
 
-  // Session identity (dec-spor-dispatch-bg-session-late-bind). No harness lets
-  // us pick the run session up front: the native `claude --bg` variant IGNORES
-  // `--session-id` and self-allocates (verified — it warns and ignores the
-  // flag), and a supervised run (`claude -p` stream-json, codex, …) announces
-  // its session on its own stream. So we do NOT force one; the agent token is
-  // minted session-DEFERRED and the real session is bound AFTER launch — read
-  // off the supervised stream, or captured from `claude agents --json` for a
-  // native run (rebind the token + renew the lease). SPOR_SESSION_ID pins the session for
-  // tests/reproducibility (short-circuits the capture). `mcpKey` names the 0600
+  // Session identity (dec-spor-dispatch-bg-session-late-bind). A supervised run
+  // (`claude -p` stream-json, codex, …) announces its session on its own
+  // stream, so we do NOT force one; the agent token is minted session-DEFERRED
+  // and the supervisor binds the real session the moment the stream names it.
+  // The run's own identity is the `run_id` its record is minted under at
+  // launch — never a name+cwd match against a harness listing (the retired
+  // native launch's heuristic, task-spor-deprecate-native-bg-dispatch).
+  // SPOR_SESSION_ID only labels the --print preview. `mcpKey` names the 0600
   // --mcp-config file — a fresh uuid, since the session id isn't available here.
   const pinnedSession = process.env.SPOR_SESSION_ID || null;
   const mcpKey = crypto.randomUUID();
@@ -11502,41 +11145,30 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // error rather than as "unsupported harness" — the operator wrote something,
   // and needs to know what is wrong with it.
   const harnessResolution = dispatchHarnesses.resolveHarness(harness, { cfg });
-  let harnessAdapter = harnessResolution.adapter;
+  const harnessAdapter = harnessResolution.adapter;
   if (harnessResolution.error && !dryRun) {
     err(`cannot dispatch ${nodeId || name}: this machine's declaration for harness '${harness}' is unusable.`);
     err(`  ${harnessResolution.error}`);
     err(`  fix it in $SPOR_HOME/config.json; the assignment is unchanged.`);
     return 1;
   }
-  // Launch-mode opt-in (task-spor-claude-adapter-headless-supervised): every
-  // built-in launches SUPERVISED by default, Claude Code included; `--bg` (or
-  // a standing `dispatch.claudeLaunchMode: native-background`) swaps in the
-  // adapter's native-background variant — `claude --bg`, the attachable
-  // interactive run. An explicit `--bg` on a harness that has no such mode is
-  // refused (silently ignoring a flag the operator passed is worse); the
-  // standing knob only means anything for the harness that has one, so it is
-  // a no-op elsewhere. A worker-loop dispatch (`spor work`'s implementer runs,
-  // its agent-review gates and fix cycles — everything through
-  // dispatchThroughLocked) passes `ctx.supervisedOnly` and ignores BOTH: the
-  // loop needs the supervised arm's report channel and enforced outcome, and
-  // a box-wide config knob must not silently turn every worker run into an
-  // unenforced, report-less one. The knob is not SILENTLY ignored, though:
-  // cmdWork says so once at worker start (task-spor-work-honor-claude-launch-
-  // mode-and-retire-native-precheck).
+  // One launch mode (task-spor-deprecate-native-bg-dispatch): every harness,
+  // Claude Code included, launches SUPERVISED — a child speaking a JSONL stream
+  // under our own supervisor, whose record, report and terminal state come off
+  // that stream (dec-spor-claude-code-supervised-by-default). The native
+  // `claude --bg` opt-in is RETIRED: its outcome could only be inferred by
+  // scraping `claude agents --json` and the harness's transcript JSONL, both of
+  // which shifted with every Claude Code release. An explicit `--bg` is
+  // refused at the top of this function (silently ignoring a flag the operator
+  // passed is worse than saying no); a standing `dispatch.claudeLaunchMode: native-background` is ignored
+  // with a warning, since failing every dispatch over a stale config key helps
+  // nobody. A worker-loop dispatch (`ctx.supervisedOnly`) never warns here —
+  // cmdWork says it once at worker start.
   const configuredLaunchMode = cfg.get("dispatch.claudeLaunchMode", null) || null;
-  if (configuredLaunchMode && !["supervised", "native-background"].includes(configuredLaunchMode)) {
-    err(`warning: dispatch.claudeLaunchMode '${configuredLaunchMode}' is not recognized (supervised | native-background) — ignoring it.`);
-  }
-  const launchModeRequest = ctx && ctx.supervisedOnly ? null : (values.bg ? "native-background" : configuredLaunchMode);
-  if (harnessAdapter && launchModeRequest) {
-    const variant = dispatchHarnesses.launchVariant(harnessAdapter, launchModeRequest);
-    if (variant) harnessAdapter = variant;
-    else if (values.bg) {
-      err(`cannot use --bg with a ${harnessAdapter.label} dispatch — only Claude Code has a native background (attachable) launch mode.`);
-      err(`  drop --bg to run it under the supervisor, or pick a claude-code profile.`);
-      return 1;
-    }
+  if (configuredLaunchMode && configuredLaunchMode !== "supervised" && !(ctx && ctx.supervisedOnly)) {
+    err(configuredLaunchMode === "native-background"
+      ? "warning: dispatch.claudeLaunchMode 'native-background' is retired (the native claude --bg launch) — ignoring it; this dispatch runs supervised. Remove the key to silence this."
+      : `warning: dispatch.claudeLaunchMode '${configuredLaunchMode}' is not recognized (supervised is the only launch mode) — ignoring it.`);
   }
   const effectiveModel = model || profileRuntime.model || null;
   // Explicit-first launcher resolution (task-spor-dispatch-adapters-opencode-
@@ -12005,7 +11637,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     let agentMcpFile = null;
     if (identityAgent) {
       // Always session-DEFERRED — the run session is bound after launch (below),
-      // even when SPOR_SESSION_ID pins it (the pin feeds the capture, not the mint),
+      // even when SPOR_SESSION_ID pins it (the pin only labels the preview),
       // so the bind path is uniform.
       const mint = await mintAgentToken(cfg, { agent: identityAgent });
       if (mint.ok) {
@@ -12251,168 +11883,12 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       return 0;
     }
 
-    const nativeArgs = harnessAdapter.buildArgs({
-      name,
-      model: effectiveModel,
-      permissionMode: permMode,
-      agent,
-      mcpConfig: agentMcpFile,
-      prompt,
-      readOnly: readOnlyPosture,
-    });
-    // A durable run record for the NATIVE-background launch (the `--bg` opt-in;
-    // the supervised default writes its own record from the supervisor,
-    // inc-spor-dispatch-session-vanished-2026-07-18). `claude --bg` hands the
-    // child to its own daemon and returns, so this launcher never observes the
-    // child's exit, and `claude agents --json` lists only LIVE agents — a run that
-    // finished and a run that died look identical afterwards, which is precisely
-    // how the 2026-07-18 Sonnet dispatches "vanished". Write the record at every
-    // boundary we DO observe (launch, launcher exit, session bind); `spor runs`
-    // classifies the terminal outcome later from the harness's own transcript.
-    dispatchRuns.pruneRuns(cfg.userConfigHome(), { maxAgeMs: cfg.getNum("dispatch.runRetentionMs", 1209600000) });
-    const nativeRun = dispatchRuns.beginNativeRun(cfg.userConfigHome(), {
-      harness: harnessAdapter.id, name, nodeId, cwd: launchDir, model: effectiveModel || null,
-      readOnly: !!readOnlyPosture,
-      // The three facts the terminal-state contract will need when this run is
-      // reconciled, from the launcher that alone knows them — the same three
-      // the supervised launch writes into its job file.
-      releaseNode: claimEstablished ? nodeId : null,
-      project: res.slug || null,
-      localNodesDir: cfg.mode() === "remote" ? null : cfg.nodesDir(),
-      server: cfg.mode() === "remote" ? remote.base(cfg) : null,
-      org: cfg.mode() === "remote" ? (cfg.tenant() || {}).org || null : null,
-      resolvedProfile: profileCheck && profileCheck.id ? profileCheck.id : null,
-    });
-    // The agent's git must follow launchDir (its worktree, or the target checkout),
-    // so hand it an env scrubbed of the git location vars — an ambient GIT_DIR
-    // would otherwise point every commit it makes at the LAUNCHER's repo
-    // (issue-spor-dispatch-worktree-wrong-repo-location). PWD gets the same
-    // treatment as the supervised launch's cwd-agreeing env (opencodePrepareRun):
-    // a spawn's `cwd` moves the child's real working directory but leaves the
-    // INHERITED `PWD` pointing at the launcher's — pin it to launchDir so the two
-    // launch modes agree instead of disagreeing about which env var is authoritative.
-    // Piped rather than inherited, so this launcher can inspect the child's own
-    // output for a recognized launch refusal (below) — e.g. the workspace-trust
-    // one `claude --bg` exits with in a never-opened repo
-    // (issue-spor-dispatch-bg-untrusted-workspace). Forwarded verbatim right
-    // after the (short-lived) launch call returns, so the operator still sees
-    // exactly what an inherited stdio would have shown, just not streamed live.
-    // `maxBuffer` must be raised explicitly: Node's spawnSync default (1MiB)
-    // would otherwise SIGTERM a chattier launch (verbose logging, a noisy MCP
-    // startup banner) that `stdio: "inherit"` had never bounded at all, turning
-    // mere output volume into a false launch failure (and a released claim).
-    const r = spawnPortableSync(harnessBin, nativeArgs, {
-      cwd: launchDir, stdio: ["inherit", "pipe", "pipe"], encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
-      env: dispatchRuns.judgedChildEnv({ ...u.gitEnv(), PWD: launchDir }),
-    });
-    if (r.stdout) process.stdout.write(r.stdout);
-    if (r.stderr) process.stderr.write(r.stderr);
-    if (r.error) {
-      dispatchRuns.updateRun(nativeRun, {
-        state: "failed_launch", termination_class: "launch", termination_signal: "launch-failed",
-        termination_reason: r.error.message, error: r.error.message, finished_at: new Date().toISOString(),
-        // A terminal record must always carry an outcome
-        // (task-spor-dispatch-terminal-states-contract). Nothing here was checked
-        // against the graph — no agent ever ran — so it is unenforced, and the
-        // lease is handed back by releaseClaimOnAbort() below rather than by the
-        // contract.
-        ...dispatchRuns.unenforcedOutcome("failed_launch", "the harness process could not be started, so nothing was verified against the graph"),
-      });
-      err(`could not launch ${harnessBin}: ${r.error.message}`);
-      await abortLaunch();
-      return 1;
-    }
-    const launcherOk = r.status === 0;
-    // A recognized, harness-declared reason the launcher itself refused
-    // (currently: claude-code's workspace-trust refusal) is told apart from an
-    // ordinary bad-args/crash nonzero exit so the run's recorded error names
-    // the actual cause instead of a generic 'launcher-nonzero'.
-    const refusal = !launcherOk && typeof harnessAdapter.launchRefusal === "function"
-      ? harnessAdapter.launchRefusal(`${r.stdout || ""}\n${r.stderr || ""}`)
-      : null;
-    dispatchRuns.updateRun(nativeRun, launcherOk
-      ? { state: "running", launched_at: new Date().toISOString(), launcher_exit: 0 }
-      : {
-          state: "failed_launch", launcher_exit: r.status == null ? null : r.status,
-          termination_class: "launch", termination_signal: refusal ? refusal.signal : "launcher-nonzero",
-          termination_reason: refusal ? refusal.reason : `${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`,
-          ...(refusal ? { error: refusal.reason } : null),
-          finished_at: new Date().toISOString(),
-          ...dispatchRuns.unenforcedOutcome("failed_launch", "the harness left no background agent, so nothing was verified against the graph"),
-        });
-    if (ctx && ctx.onLaunch && launcherOk) {
-      ctx.onLaunch({
-        run_id: nativeRun.runId, harness: harnessAdapter.id, launch_mode: harnessAdapter.launchMode,
-        node_id: nodeId || null, record_path: nativeRun.paths.record,
-      });
-    }
-    // As above: the native record is written and visible to the next dispatch's
-    // occupancy check, so the candidate claim is released.
-    preflight.releaseWorkspace(workspaceLock);
-    out(`run:     ${nativeRun.runId} (${harnessAdapter.label}; 'spor runs' for its outcome)`);
-    if (!launcherOk) {
-      // A non-zero exit here means the harness never left a background agent
-      // behind — the same "no agent will ever attend this node" case the
-      // spawn-error branch above already aborts on, so it needs the same
-      // releaseClaimOnAbort() so the claim doesn't strand the node.
-      if (refusal) {
-        err(`${harnessBin} refused to launch: ${refusal.reason}`);
-        err(`  hint: ${refusal.hint}`);
-      } else {
-        err(`${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`);
-      }
-      await abortLaunch();
-      return r.status == null ? 1 : r.status;
-    }
-
-    // Late session binding for the NATIVE-background `--bg` opt-in
-    // (dec-spor-dispatch-bg-session-late-bind; a supervised run binds its session
-    // from its own stream in the supervisor instead). `claude --bg`
-    // has now self-allocated its run session and registered the agent; read the
-    // REAL session from `claude agents --json` and bind it: (a) rebind the agent
-    // token's session so every subsequent agent write stamps the real run, and
-    // (b) renew the lease to it so lease and token agree (instead of waiting for
-    // the agent's first heartbeat to self-heal). Best-effort throughout — a capture
-    // miss or any bind failure leaves the token session-null (writes carry no
-    // session: honest, never a phantom) and the lease self-healing via heartbeat —
-    // but a bind failure is now reported loudly on stderr rather than skipped in
-    // silence (issue-spor-remote-stale-socket-after-blocking-spawn: a silent skip
-    // here is exactly how a stale pooled socket, closed by the server while this
-    // launch's blocking spawn held the event loop, went unnoticed).
-    // Remote only, and only when there's something to bind (an agent token and/or a
-    // claimed node).
-    //
-    // The capture itself now runs in BOTH modes, because the session id is the
-    // only thing that ties a run to its own transcript: a project dir is one
-    // CHECKOUT, and every `--no-worktree` dispatch into the same repo shares it,
-    // so without this a run can only be identified by co-location — which is how
-    // a live sibling agent held a dead run open and donated it a transcript
-    // (issue-spor-dispatch-run-liveness-same-cwd-misattribution). Only the
-    // remote-side binding below stays remote-only. Best-effort: a capture miss
-    // leaves the record honestly session-less rather than guessing.
-    const realSession = await captureDispatchSession(cfg, name, launchDir, pinnedSession, Date.parse(nativeRun.record.created_at) || 0);
-    // Record the session whether or not the remote bind succeeds: it is the
-    // pointer `spor runs` follows to the harness transcript that holds this
-    // run's terminal reason.
-    if (realSession) dispatchRuns.updateRun(nativeRun, { session_id: realSession, bound_at: new Date().toISOString() });
-    const wantBind = cfg.mode() === "remote" && (agentToken || (nodeId && !backfill && !noClaim));
-    if (wantBind) {
-      if (realSession) {
-        if (agentToken) {
-          const b = await bindAgentSession(cfg, agentToken, realSession);
-          if (b.ok) out(`session: ${realSession} (bound — the agent's writes trace to this run)`);
-          else if (b.conflict) err(`note: the agent token is already bound to another session — leaving it.`);
-          else if (b.absent) err(`warning: could not bind the run session (server has no /v1/agents/session route) — the agent's writes will carry no session stamp; the lease still self-heals via heartbeat.`);
-          else err(`warning: could not bind the run session (${b.error}) — the agent's writes will carry no session stamp; the lease still self-heals via heartbeat.`);
-        } else {
-          out(`session: ${realSession}`);
-        }
-        if (nodeId && !backfill && !noClaim) await renewDispatch(cfg, nodeId, realSession);
-      } else if (agentToken) {
-        err(`note: could not read the run session from 'claude agents' — writes will carry no session stamp (the lease still self-heals).`);
-      }
-    }
-    return r.status == null ? 1 : r.status;
+    // Every adapter launches supervised (the native `claude --bg` launch is
+    // retired, task-spor-deprecate-native-bg-dispatch); an adapter declaring any
+    // other mode is a registry bug, refused rather than guessed at.
+    err(`cannot dispatch ${nodeId || name}: harness '${harnessAdapter.id}' declares launch mode '${harnessAdapter.launchMode}', which spor no longer launches (only supervised-jsonl).`);
+    await abortLaunch();
+    return 1;
   } finally {
     releaseLocalDispatchLock(localDispatchLock);
   }
@@ -12582,31 +12058,17 @@ async function releaseIdleLease(cfg, home, record, { ended = false, outcome = nu
 }
 
 // Which of this worker's runs are over, and what they did to the graph.
-// RECONCILE first, exactly as `spor runs` does. Every run this loop dispatches
-// is SUPERVISED (cmdDispatch's `supervisedOnly`), and a supervised run's
-// supervisor closes its own record, so following them needs no harness
-// listing at all. Only a native-background record — one a RESUMED pipeline
-// adopted from before the supervised default (§10.8), never a run this loop
-// launched — has an ending invisible to its launcher, resolvable only against
-// the harness's live-agent list plus its own transcript; the listing is taken
-// only when such a record is among the runs asked about (nativeAgentEvidence),
-// so a worker following its own runs never boots a harness CLI per poll.
+// RECONCILE first, exactly as `spor runs` does. Every run is SUPERVISED, and a
+// supervised run's supervisor closes its own record, so following them needs
+// no harness listing at all. A legacy native-background record (one a RESUMED
+// pipeline adopted from before the `claude --bg` launch was retired, §10.8) is
+// closed by the reconcile from the record alone once past its horizon
+// (task-spor-deprecate-native-bg-dispatch).
 async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () => {} } = {}) {
   const home = cfg.userConfigHome();
   const wanted = new Set(runIds || []);
   if (!wanted.size) return [];
-  const { agents, enumerated } = nativeAgentEvidence(
-    cfg,
-    dispatchRuns.readRunRecords(home).filter((r) => r && wanted.has(r.run_id))
-  );
-  // Scoped to the runs this worker is following: a manual `spor dispatch --bg`
-  // someone left pending in another repo is not this worker's to file a report
-  // for or hand a lease back on.
-  const records = await settleNativeContracts(
-    cfg,
-    dispatchRuns.reconcileRuns(home, { agents, enumerated, stopAgent: makeAgentReaper(cfg) }),
-    { scope: wanted }
-  );
+  const records = dispatchRuns.reconcileRuns(home);
   const found = new Map();
   for (const r of records) if (r && wanted.has(r.run_id)) found.set(r.run_id, r);
   // Answer for EVERY id asked about, including one the store no longer holds:
@@ -12631,7 +12093,7 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
       maxAgeMs: recMaxAgeMs,
       idleMs: recIdleMs,
       // OBSERVED activity, never the launch fallback: a record with no output
-      // channel this box can read (an unbound native-background run) must fall
+      // channel this box can read (a legacy native-background run) must fall
       // through to the watchdog rather than read as silent since launch.
       activityAt: (r) => dispatchRuns.observedActivityAt(r),
     });
@@ -12662,7 +12124,7 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
       // lease with no record of why.
       const released = await releaseIdleLease(cfg, home, closed, { ended, outcome });
       warn(
-        `work: ${ended ? "stopping" : "giving up following"} run ${String(id).slice(0, 8)} (${record.node_id || record.name || "?"}) — nothing written to its log or transcript for ` +
+        `work: ${ended ? "stopping" : "giving up following"} run ${String(id).slice(0, 8)} (${record.node_id || record.name || "?"}) — nothing written to its log for ` +
           `${Math.max(1, Math.round((verdict.quietMs || 0) / 60000))}m (idle ceiling ${Math.max(1, Math.round(recIdleMs / 60000))}m${budget && recIdleMs !== idleMs ? ", the factory's implementation budget" : ""})` +
           `${ended ? "" : `; ${stopped.alive ? "it did not die on SIGTERM/SIGKILL" : "it had no process of ours to signal"}, so something may still be running in its checkout`}` +
           `${outcome ? ". Its target reads resolved on the graph" : ""}` +
@@ -12711,20 +12173,6 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
         record: { ...record, terminal_note: `this worker stopped following the run after ${Math.round(recMaxAgeMs / 3600000)}h without a terminal state` },
       });
       continue;
-    }
-    if (!enumerated && record && record.launch_mode === "native-background" && !verdict.terminal) {
-      // The same caveat `spor runs` prints, reachable here only for a native
-      // record a resumed pipeline adopted (this loop launches none): a native
-      // run's state can only be resolved against the harness's live-agent
-      // listing, and this call could not read one. The slot is held (correctly
-      // — nothing says the run is over, and the idle ceiling / watchdog bound
-      // the hold), but a worker that quietly stops dispatching must say why.
-      warn(
-        "work: could not list live background agents — a native run's state may be stale, so its slot stays held ('spor runs' reports the same)" +
-          // Only where the run bound a session: the idle ceiling reads a native
-          // run's freshness off its transcript, and an unbound record has none.
-          `${idleMs > 0 && record.session_id ? `; the idle ceiling still frees it after ${Math.max(1, Math.round(idleMs / 60000))}m of silence` : ""}.`
-      );
     }
     out.push({ run_id: id, terminal: verdict.terminal, record });
   }
@@ -12886,9 +12334,9 @@ async function dispatchThroughLocked(cfg, values, positionals = [], opts = {}) {
   ERR_TEE = lines;
   let code;
   try {
-    // supervisedOnly: a worker's runs must be followable and judgeable, so
-    // neither `--bg` nor a standing dispatch.claudeLaunchMode may route them
-    // native-background (see cmdDispatch's launch-mode opt-in).
+    // supervisedOnly: every dispatch is supervised now (the native launch is
+    // retired); the flag only keeps cmdDispatch from repeating, per run, the
+    // retired-dispatch.claudeLaunchMode warning cmdWork already gave once.
     // carryTask: whatever prompt template rides the passthrough (or a personal
     // dispatch.template), the task text — the worker contract, a fix cycle's
     // or a rescue's instructions, the one-turn notice — reaches the agent.
@@ -13339,16 +12787,10 @@ async function awaitGateRun(cfg, runId, { timeoutMs, pollMs = 5000, warn = () =>
 
 // A dispatched run's own final report text — the channel a review gate's
 // structured verdict comes back on. A supervised launch writes it straight to
-// `report_path`; a native-background launch keeps no such file, but writes
-// the same final assistant text to its own session transcript, which
-// `nativeRunReportText` reads by the same "last assistant message wins" rule
-// (dec-spor-native-bg-turn-complete-and-contract) — so a native record with a
-// bound transcript is readable here too, not just a supervised one
-// (task-spor-agent-review-gate-accept-native-bg-reviewer, retiring the
-// supervised-only restriction). A native record with no transcript to read —
-// or any record with neither a report file nor a transcript — still comes
-// back "", which the caller reads as an unreadable verdict: a gate FAILURE,
-// never a pass.
+// `report_path`. A legacy native-background record keeps no such file, and its
+// harness transcript is no longer read (task-spor-deprecate-native-bg-dispatch),
+// so it — like any record with no report file — comes back "", which the
+// caller reads as an unreadable verdict: a gate FAILURE, never a pass.
 function gateRunReportText(record) {
   const file = record && record.report_path;
   if (file) {
@@ -13358,24 +12800,16 @@ function gateRunReportText(record) {
       return "";
     }
   }
-  if (record && record.launch_mode === "native-background") return dispatchRuns.nativeRunReportText(record);
   return "";
 }
 
 // Did this record have a report CHANNEL at all — a place a verdict could have
-// been written, whether or not anything was? The two readable channels are the
-// two `gateRunReportText` reads: a supervised run's `report_path`, and a
-// native-background run's bound session transcript. A record with neither had
-// nowhere to put a verdict; a record with either had somewhere and left it
-// empty, which is a different fact about a different thing.
+// been written, whether or not anything was? The one readable channel is the
+// one `gateRunReportText` reads: a supervised run's `report_path`. A record
+// without it had nowhere to put a verdict; a record with it had somewhere and
+// left it empty, which is a different fact about a different thing.
 function gateRunHadReportChannel(record) {
-  if (!record) return false;
-  if (record.report_path) return true;
-  // Mirrors `nativeRunReportText`'s own rule exactly — the stamped
-  // `transcript_path` first, then the session-bound file it would find — so
-  // "had a channel" can never disagree with what the reader actually reads.
-  if (record.launch_mode !== "native-background") return false;
-  return !!(record.transcript_path || dispatchRuns.findTranscript(record));
+  return !!(record && record.report_path);
 }
 
 // Why a review came back with no verdict to read — the message the fixer is
@@ -13400,7 +12834,7 @@ function gateRunHadReportChannel(record) {
 function reportlessReviewReason(record, classification) {
   if (!gateRunHadReportChannel(record)) {
     return "left no final report to read a verdict from"
-      + " (an agent-review gate must route to a harness whose report is readable — supervised, or native-background with a bound transcript)";
+      + " (an agent-review gate must route to a harness whose report is readable — a supervised launch)";
   }
   const mode = record.launch_mode ? `launched ${record.launch_mode}` : "launched with a report channel";
   const signal = record.termination_signal ? ` (${record.termination_signal})` : "";
@@ -15483,7 +14917,7 @@ function makeGateDeps(
       // other stage reads `producer.resolved_profile` — the profile cmdDispatch
       // ACTUALLY resolved for the producer's own launch (its own
       // `resolveDispatchProfile` verdict, stamped onto that run's record at
-      // launch: see beginNativeRun/launchSupervisedHarness), not the worker's
+      // launch: see launchSupervisedHarness), not the worker's
       // `--profile` passthrough — so an item that routed ITSELF (a `profile:`
       // frontmatter, an `assigned -> agent {profile:}` edge, §2.3 levels 2-3)
       // records the profile it actually ran under instead of null
@@ -20553,19 +19987,18 @@ async function cmdWork(cfg, { values }) {
     for (const e of startupPublish.unavailable) err(`spor work: ${e} — affected items will be skipped before claim and retried (see 'spor work --status').`);
 
   }
-  // A standing `dispatch.claudeLaunchMode: native-background` is honored by an
-  // interactive `spor dispatch` and IGNORED by every dispatch this loop makes
-  // (dispatchThroughLocked passes `supervisedOnly`: a worker's runs must be
-  // followable, judgeable and gateable, which only the supervised arm's report
-  // channel and enforced outcome give). Ignoring a knob the operator set is
-  // fine; ignoring it SILENTLY is not — say so once, here, where an operator
-  // reading the worker's log will see it (task-spor-work-honor-claude-launch-
-  // mode-and-retire-native-precheck). Same wording for --print and a real run.
+  // `dispatch.claudeLaunchMode` names a launch mode that no longer exists
+  // (the native `claude --bg` launch is retired, task-spor-deprecate-native-
+  // bg-dispatch): every run this loop dispatches is SUPERVISED. Ignoring a knob
+  // the operator set is fine; ignoring it SILENTLY is not — say so once, here,
+  // where an operator reading the worker's log will see it (cmdDispatch stays
+  // quiet for `supervisedOnly` dispatches). Same wording for --print and a real
+  // run.
   const configuredLaunchMode = cfg.get("dispatch.claudeLaunchMode", null) || null;
   if (configuredLaunchMode === "native-background") {
-    err("spor work: dispatch.claudeLaunchMode is 'native-background', which this worker ignores — every run it dispatches (implementers, agent-review gates, fix cycles, rescues) is launched SUPERVISED (claude -p under the supervisor) so it can be followed, judged and gated; the setting still applies to an interactive 'spor dispatch'.");
+    err("spor work: dispatch.claudeLaunchMode 'native-background' is retired (the native claude --bg launch), so this worker ignores it — every run it dispatches (implementers, agent-review gates, fix cycles, rescues) is launched SUPERVISED (claude -p under the supervisor) so it can be followed, judged and gated. Remove the key to silence this.");
   } else if (configuredLaunchMode && configuredLaunchMode !== "supervised") {
-    err(`spor work: dispatch.claudeLaunchMode '${configuredLaunchMode}' is not recognized (supervised | native-background) — ignoring it; this worker always launches supervised.`);
+    err(`spor work: dispatch.claudeLaunchMode '${configuredLaunchMode}' is not recognized (supervised is the only launch mode) — ignoring it; this worker always launches supervised.`);
   }
   // The factory's repo scope (issue-spor-work-scope-union-factory-mismatch).
   // Two distinct jobs, and originally only the second was load-bearing:
@@ -22615,7 +22048,7 @@ const COMMANDS = {
   next: {
     group: "Graph", parse: "raw", args: "[--project S | --all-projects] [--type T] [--exclude-type T] [--readiness C] [--limit N]", aliases: ["queue"],
     summary: "the decision queue (local: lib/queue; remote: /v1/queue)",
-    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --name-only, --nodes).\n\nSCOPE. --project accepts a repo slug (-> its home-project grouping union), a\nrepo-<slug> node id (-> that single repo), or a grouping id (-> the grouping\nunion); an unknown token warns and yields an empty queue. Pin a default scope\nfor both modes with the queue.project config key (SPOR_QUEUE_PROJECT or\n.spor.json {\"queue\":{\"project\":\"...\"}}); an explicit --project still wins.\n--all-projects (alias --all) widens to the whole-graph cross-project firehose,\ndropping the cwd/pinned default scope (an explicit --project still wins over it).\n\nPAGE SIZE. --limit N caps the queue at N items (default 20, both modes);\n--limit 0 shows ALL. Remote mode pages the server at 100 items/request, so\n--limit 0 (or any N>100) is assembled by walking offset across pages; the\naggregate counts always describe the full ranked set regardless of the page.\n\nNODE TYPES. --type/--exclude-type whitelist/blacklist node types from the\nranking; both are repeatable and comma-splittable (--type task,issue). Given\nboth, the include set is narrowed and then the excludes are removed (exclude\nwins on overlap). They compose with --project/--all-projects.\n\nAGENT-READINESS. --readiness C narrows to a derived readiness class —\nagent|human|untriaged, comma-separated/repeatable (--readiness agent,untriaged)\n— a hard scope like --type/--exclude-type; an unknown value is rejected (the\nserver's 422 in remote mode, same as local). When the graph carries readiness\nsignal (or a --readiness facet was asked for), the output leads with a\n`readiness: N agent-ready, N need human, N untriaged` line, in both modes.\n\nIN-FLIGHT. --json stamps each item with an `in_flight` flag (and a `dispatched`\nagent summary when true) by cross-referencing live background agents from\n`claude agents --json` — `spor dispatch` names each agent after its node id, so\nan active agent on a queued item is detectable without model guidance.\n--hide-dispatched drops the items that already have an agent in flight. Both are\nclient-side (the server can't see local agents) and fail soft when the claude\nbinary is absent (every item then reads in_flight:false).",
+    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --name-only, --nodes).\n\nSCOPE. --project accepts a repo slug (-> its home-project grouping union), a\nrepo-<slug> node id (-> that single repo), or a grouping id (-> the grouping\nunion); an unknown token warns and yields an empty queue. Pin a default scope\nfor both modes with the queue.project config key (SPOR_QUEUE_PROJECT or\n.spor.json {\"queue\":{\"project\":\"...\"}}); an explicit --project still wins.\n--all-projects (alias --all) widens to the whole-graph cross-project firehose,\ndropping the cwd/pinned default scope (an explicit --project still wins over it).\n\nPAGE SIZE. --limit N caps the queue at N items (default 20, both modes);\n--limit 0 shows ALL. Remote mode pages the server at 100 items/request, so\n--limit 0 (or any N>100) is assembled by walking offset across pages; the\naggregate counts always describe the full ranked set regardless of the page.\n\nNODE TYPES. --type/--exclude-type whitelist/blacklist node types from the\nranking; both are repeatable and comma-splittable (--type task,issue). Given\nboth, the include set is narrowed and then the excludes are removed (exclude\nwins on overlap). They compose with --project/--all-projects.\n\nAGENT-READINESS. --readiness C narrows to a derived readiness class —\nagent|human|untriaged, comma-separated/repeatable (--readiness agent,untriaged)\n— a hard scope like --type/--exclude-type; an unknown value is rejected (the\nserver's 422 in remote mode, same as local). When the graph carries readiness\nsignal (or a --readiness facet was asked for), the output leads with a\n`readiness: N agent-ready, N need human, N untriaged` line, in both modes.\n\nIN-FLIGHT. --json stamps each item with an `in_flight` flag (and a `dispatched`\nrun summary when true) by cross-referencing this machine's live dispatch run\nrecords — `spor dispatch` names each run after its node id, so an active agent\non a queued item is detectable without model guidance. --hide-dispatched drops\nthe items that already have an agent in flight. Both are client-side (the server\ncan't see local runs) and fail soft (an unreadable journal => in_flight:false).",
     options: {
       project: { type: "string", value: "S", desc: "scope to a project slug (default: queue.project config, else inferred)" },
       "all-projects": { type: "boolean", desc: "cross-project firehose — drop the default project scope (alias --all)" },
@@ -23551,7 +22984,7 @@ const COMMANDS = {
       backfill: { type: "boolean", desc: "init + enable + launch /spor:backfill (the primitive behind /spor:onboard)" },
       worktree: { type: "boolean", desc: "run the agent in its own git worktree (overrides dispatch.worktree)" },
       "no-worktree": { type: "boolean", desc: "force-disable worktree isolation for this dispatch" },
-      bg: { type: "boolean", desc: "Claude Code only: launch native-background (claude --bg, attachable with 'claude attach') instead of the supervised headless run — unenforced outcome, no report channel; also dispatch.claudeLaunchMode" },
+      bg: { type: "boolean", desc: "RETIRED — the native claude --bg launch is gone and --bg is refused; every dispatch runs supervised (for an attachable session, run 'claude --bg' yourself)" },
       print: { type: "boolean", desc: "dry run — print the prompt, launch nothing" },
       "dry-run": DRYRUN_OPT,
     },
@@ -23600,12 +23033,9 @@ const COMMANDS = {
       "(SIGINT/SIGTERM, or --once/--max) stops PICKING UP work; runs already in flight\n" +
       "are detached, keep going, and self-report ('spor runs'). There is no --no-claim:\n" +
       "the lease is what keeps two workers off one node, so a loop always takes it.\n\n" +
-      "A native-background harness (claude --bg) is the weak spot: its termination is\n" +
-      "not deterministically observable (dec-spor-dispatch-terminal-states-supervised-\n" +
-      "first), so a slot is freed from the harness's own live-agent listing, and if\n" +
-      "that listing cannot be read the slot stays held and the worker says so. --run-max\n" +
-      "(default 24h) is the backstop that stops following such a run. A supervised\n" +
-      "harness (Codex, OpenCode, Copilot, a declared one) has none of this.\n\n" +
+      "Every run is SUPERVISED (the native claude --bg launch is retired), so a slot\n" +
+      "frees when the run's own supervisor closes its record. --run-max (default 24h)\n" +
+      "is the backstop that stops following a run that never goes terminal.\n\n" +
       "RUN IT AS A SERVICE. 'spor work --status' (add --json) reads back every\n" +
       "worker on this box: state, slots, dispatch count, verified outcomes, what it\n" +
       "is deliberately skipping and why. Records live under the machine-local\n" +
@@ -23649,7 +23079,7 @@ const COMMANDS = {
       "max-interval": { type: "string", value: "S", desc: "backoff ceiling in seconds when idle (default 300)" },
       "retry-after": { type: "string", value: "S", desc: "seconds before retrying a refused item (default 600)" },
       "run-max": { type: "string", value: "H", desc: "hours to follow one run before freeing its slot (default 24)" },
-      "run-idle": { type: "string", value: "M", desc: "minutes of silence (nothing written to a run's log or transcript) before stopping it as wedged (default 45; 0 disables)" },
+      "run-idle": { type: "string", value: "M", desc: "minutes of silence (nothing written to a run's log) before stopping it as wedged (default 45; 0 disables)" },
       regate: { type: "string", value: "run-id", desc: "re-judge one refused run under the factory (after fixing what refused it) and exit" },
       "regate-flakes": { type: "boolean", desc: "sweep this box's refused runs: re-gate every one whose failing tests all belong to a since-fixed flake (covers_tests), retire empty-diff refusals whose work is already on the trusted ref, and exit" },
       max: { type: "string", value: "N", desc: "stop after N dispatches (default: run forever)" },
@@ -23764,37 +23194,24 @@ const COMMANDS = {
       "2026-07-18).\n\n" +
       "A supervised dispatch (the default for every built-in harness, including\n" +
       "Claude Code since it moved to 'claude -p' under the supervisor) has its\n" +
-      "record finalized by the supervisor itself when the child exits. Only an\n" +
-      "explicit 'spor dispatch --bg' still detaches into the Claude harness daemon,\n" +
-      "where the launcher never sees the child exit and 'claude agents' lists only\n" +
-      "what is still running: without this record a finished run and a dead one\n" +
-      "are indistinguishable afterwards. Reading this reconciles those first —\n" +
-      "every native-background run the harness no longer reports live is resolved\n" +
-      "against its own transcript and stamped with a terminal state, a\n" +
-      "classification, a reason, and a transcript pointer:\n\n" +
-      "  done       the session ended its turn cleanly\n" +
+      "record finalized by the supervisor itself when the child exits. Reading this\n" +
+      "reconciles first: a run whose supervisor died is closed from its supervisor\n" +
+      "identity and its own log, and stamped with a terminal state, a\n" +
+      "classification and a reason:\n\n" +
+      "  done       the child exited cleanly\n" +
       "  failed     it ended for a recognized reason (see the class)\n" +
-      "  vanished   it stopped mid-turn with no end-of-turn marker — the reason\n" +
-      "             names the last record and the transcript to read — or it left\n" +
-      "             nothing that can be attributed to it\n" +
+      "  vanished   its supervisor stopped being observed mid-run\n" +
       "  failed_launch  the harness never started\n\n" +
-      "Evidence is only ever this run's own: a transcript is matched by the\n" +
-      "session the run bound, never by the directory it ran in, since several\n" +
-      "dispatches can share one checkout. A run that never bound a session is\n" +
-      "still made terminal, and says that its ending is unknown.\n\n" +
+      "A record from the retired 'spor dispatch --bg' (native claude --bg) launch is\n" +
+      "judged from the record alone — no harness listing or transcript is read: it\n" +
+      "stays in flight for 1h after launch, then closes vanished/native-retired with\n" +
+      "its ending unknown.\n\n" +
       "The classification separates causes that must not be conflated:\n" +
       "environment (provider credit exhaustion, usage limits, rate limits, rejected\n" +
       "auth — re-dispatch with headroom), launch, failed, completed, unknown.\n\n" +
-      "A run still inside its first minute, or one whose harness could not be\n" +
-      "queried at all, is left alone rather than declared dead. Terminal records\n" +
-      "age out after dispatch.runRetentionMs (default 14d).\n\n" +
-      "A finished --bg agent does NOT leave the harness daemon: it sits idle with\n" +
-      "its last turn closed. Such a run is reconciled done anyway, its agent is\n" +
-      "stopped to free the slot, and — since no supervisor exists to do it — its\n" +
-      "terminal-state contract runs here: the target is re-read on the graph, and\n" +
-      "an unresolved run files its final report and hands its lease back\n" +
-      "(WORKERS.md 6). So this reads the graph, and may write to it, for a native\n" +
-      "run it just closed; a store of supervised runs makes no calls at all.",
+      "A run still inside its first minute is left alone rather than declared dead.\n" +
+      "Terminal records age out after dispatch.runRetentionMs (default 14d). No\n" +
+      "graph calls are made: the terminal-state contract is the supervisor's.",
     options: {
       node: { type: "string", value: "id", desc: "only runs dispatched for this node id" },
       limit: { type: "string", value: "N", desc: "how many runs to show (default 20)" },
@@ -24146,7 +23563,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
+module.exports = { spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
 
 if (require.main === module) {
   main()

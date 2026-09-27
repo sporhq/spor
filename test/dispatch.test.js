@@ -31,19 +31,10 @@ const { waitFor, waitForFile, stubExitTail } = require("./helpers/launch.js");
 // hazard) is a pure-ish helper (fs only, no CLI parsing) exported for direct
 // unit testing, same seam spor-cli.test.js uses for nodeFloor/nodeRuntimeCheck.
 const cli = require(CLI);
-// Read back a native-background run's own record for its recorded outcome —
-// the trust-refusal tests below assert on what the run record says, not just
-// on the CLI's own printed hint.
-const dispatchRunner = require(path.join(__dirname, "..", "lib", "shell", "agent-dispatch-runner.js"));
-
 // Env with no SPOR_*/SUBSTRATE_* leakage; force LOCAL mode (no server). Also
 // isolate the config-cascade homes to an empty temp dir so the developer's real
 // ~/.spor/config.json can't leak server+token in and flip a test to remote.
 // `extra` is applied last, so SPOR_HOME / SPOR_CLAUDE_CMD passed by a test win.
-// Default the in-flight agent list to empty (SPOR_FAKE_AGENTS_JSON="[]") so the
-// same-machine dispatch guard (task-spor-dispatch-same-machine-guard) never
-// shells out to a real `claude agents --json` — keeping these tests hermetic and
-// deterministic; a guard test overrides it via `extra`.
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-iso-"));
 function bare(extra = {}) {
   const env = {};
@@ -53,26 +44,19 @@ function bare(extra = {}) {
   }
   env.SPOR_HOME = ISO_HOME;
   env.XDG_CONFIG_HOME = ISO_HOME;
-  env.SPOR_FAKE_AGENTS_JSON = "[]";
-  // The launcher tests here run against the SUPERVISED default (`claude -p
-  // --output-format stream-json` under the shared supervisor,
-  // task-spor-claude-adapter-headless-supervised); the few whose subject is the
-  // native `claude --bg` opt-in merge NATIVE_BG into their env (see below).
+  // The launcher tests here run against the SUPERVISED launch (`claude -p
+  // --output-format stream-json` under the shared supervisor) — the only one
+  // since the native `claude --bg` launch was retired
+  // (task-spor-deprecate-native-bg-dispatch).
   return Object.assign(env, extra);
 }
 function run(args, env, cwd) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(env), cwd });
 }
 
-// The launch-mode pin for the handful of tests whose SUBJECT is the native
-// `claude --bg` launch (its argv, its $PWD pin, its exit-code/lease coupling,
-// its `claude agents --json` session capture): merge into a test's env. Every
-// other launcher test here runs against the SUPERVISED default
-// (`claude -p --output-format stream-json` under the shared supervisor,
-// task-spor-claude-adapter-headless-supervised), whose harness child is a
-// DETACHED grandchild — so a launch is observed by waiting for the stub's
-// marker file rather than reading it the instant the CLI returns.
-const NATIVE_BG = { SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "native-background" };
+// A supervised launcher test's harness child is a DETACHED grandchild, so a
+// launch is observed by waiting for the stub's marker file rather than reading
+// it the instant the CLI returns.
 
 function slashPath(p) {
   return String(p || "").replace(/\\/g, "/").toLowerCase();
@@ -592,8 +576,8 @@ test("dispatch --from-queue: skips an item already in flight here, advances to t
   const { home, repo } = twoTaskFixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   // task-aaa (the top item) already has a background agent in flight on this box.
-  const agents = JSON.stringify([{ id: "g1", name: "task-aaa", kind: "background", status: "busy", state: "working", cwd: "/x" }]);
-  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: agents });
+  const agents = JSON.stringify([{ id: "g1", run_id: "g1", name: "task-aaa", harness: "claude-code", status: "busy", state: "running", cwd: "/x" }]);
+  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home, SPOR_FAKE_DISPATCH_RUNS_JSON: agents });
   assert.strictEqual(r.status, 0, r.stderr);
   // It must land on task-bbb, NOT the in-flight task-aaa.
   assert.match(r.stdout, /--name task-bbb/);
@@ -606,7 +590,7 @@ test("dispatch --from-queue: skips an item already in flight here, advances to t
 test("dispatch --from-queue: nothing in flight picks the top item (unchanged behavior)", () => {
   const { home, repo } = twoTaskFixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: "[]" });
+  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home, SPOR_FAKE_DISPATCH_RUNS_JSON: "[]" });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /--name task-aaa/); // p1 top item
   assert.doesNotMatch(r.stderr, /skipped/); // no skip note when nothing is in flight
@@ -630,7 +614,7 @@ test("dispatch --from-queue: excludes questions (human decisions), picks the tas
   );
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-fq-q-repo-"));
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: "[]" }, fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-")));
+  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home, SPOR_FAKE_DISPATCH_RUNS_JSON: "[]" }, fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-")));
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /--name task-work/);
   assert.doesNotMatch(r.stdout, /question-decide/);
@@ -642,10 +626,10 @@ test("dispatch --from-queue: when EVERY candidate is in flight, falls back to to
   const sentinel = path.join(home, "fq-launched");
   const stub = claudeStub(home, sentinel);
   const agents = JSON.stringify([
-    { id: "g1", name: "task-aaa", kind: "background", status: "busy", state: "working", cwd: "/x" },
-    { id: "g2", name: "task-bbb", kind: "background", status: "busy", state: "working", cwd: "/x" },
+    { id: "g1", run_id: "g1", name: "task-aaa", harness: "claude-code", status: "busy", state: "running", cwd: "/x" },
+    { id: "g2", run_id: "g2", name: "task-bbb", harness: "claude-code", status: "busy", state: "running", cwd: "/x" },
   ]);
-  const r = run(["dispatch", "--from-queue", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents });
+  const r = run(["dispatch", "--from-queue", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_DISPATCH_RUNS_JSON: agents });
   assert.strictEqual(r.status, 1, r.stderr);
   assert.match(r.stderr, /task-aaa already has a background agent in flight on this machine/);
   assert.ok(!fs.existsSync(sentinel), "no agent launched when all candidates are in flight");
@@ -736,46 +720,6 @@ test("dispatch <node> (real): an unmapped cwd-matching slug self-registers the r
   assert.ok(await waitForFile(sentinel), "the agent launched in the cwd-resolved repo");
   const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
   assert.ok(slashPath(cfg.dispatch.repos.demo).endsWith("/demo"), "demo self-registered to the cwd's durable root");
-});
-
-// Real spawn through SPOR_CLAUDE_CMD: the launcher must pass --bg + flags and run
-// in the resolved cwd.
-test("dispatch spawns the claude binary with --bg in the target dir", () => {
-  const { home, repo } = fixture();
-  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const outFile = path.join(home, "spawn.out");
-  // cwd on line 1, then each argv element on its own line (the prompt is last
-  // and may add extra lines — fine, we only assert on the leading flags).
-  const stub = pwdStub(home);
-  const r = run(["dispatch", "dec-x", "--model", "haiku"], { ...NATIVE_BG, SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
-  assert.strictEqual(r.status, 0);
-  const lines = fs.readFileSync(outFile, "utf8").split("\n");
-  const cwd = lines[0];
-  const argv = lines.slice(1);
-  assert.strictEqual(cwd, fs.realpathSync(repo)); // launched in the cross-repo dir
-  assert.strictEqual(argv[0], "--bg");
-  assert.ok(argv.includes("--model") && argv.includes("haiku"));
-  assert.ok(argv.includes("--name") && argv.includes("dec-x"));
-});
-
-// task-spor-dispatch-adapter-follow-up-batch: the native `claude --bg` launch
-// used to hand the child `env: u.gitEnv()` with no PWD override, so the child
-// inherited the LAUNCHER's $PWD instead of the resolved launch dir — the same
-// stale-$PWD trap opencodePrepareRun exists to close for the supervised
-// launch path (a spawn's cwd moves getcwd() but never updates the inherited
-// PWD). Unify: the native launch must pin PWD the same way.
-test("dispatch native launch pins $PWD to the launch dir, not the launcher's inherited PWD", () => {
-  const { home, repo } = fixture();
-  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const outFile = path.join(home, "spawn.out");
-  const stub = pwdEnvStub(home);
-  const r = run(["dispatch", "dec-x", "--no-brief"], { ...NATIVE_BG, SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
-  assert.strictEqual(r.status, 0, r.stderr);
-  const [cwd, pwd] = fs.readFileSync(outFile, "utf8").split("\n");
-  const expected = fs.realpathSync(repo);
-  assert.strictEqual(cwd, expected, "getcwd() follows the launch dir");
-  assert.strictEqual(pwd, expected, "$PWD agrees with getcwd(), not the launcher's own cwd");
-  assert.notStrictEqual(pwd, process.cwd(), "sanity: the launcher's own cwd differs from the launch dir");
 });
 
 // --- worktree isolation (dispatch.worktree) ------------------------------
@@ -2528,16 +2472,12 @@ function remoteEnv(home, server, extra = {}) {
   env.XDG_CONFIG_HOME = home;
   env.SPOR_SERVER = server;
   env.SPOR_TOKEN = "test-token";
-  // Empty agent list by default (see bare()), so the same-machine guard never
-  // shells out to a real `claude agents --json`; a guard test overrides via extra.
-  env.SPOR_FAKE_AGENTS_JSON = "[]";
   // None of these tests configure a dispatch agent — they exercise OTHER guards
   // (claim, readiness, resolution, satisfiability), not identity/mint (that's
   // agent-identity.test.js) — so default the hard-fail's escape hatch on to keep
   // those guards reachable; `extra` can still override it.
   env.SPOR_ALLOW_PERSON_TOKEN = "1";
-  // Supervised default here too, exactly as bare(); a native-subject test
-  // merges NATIVE_BG itself (see the note there).
+  // Supervised, exactly as bare().
   return Object.assign(env, extra);
 }
 
@@ -2618,40 +2558,6 @@ require("node:fs").writeFileSync(${JSON.stringify(sentinel)}, "launched\\n");
 const claimHit = (hits) => hits.find((h) => h.method === "POST" && /\/claim$/.test(h.url));
 const releaseHit = (hits) => hits.find((h) => h.method === "POST" && /\/release$/.test(h.url));
 
-// A claude stub that exits non-zero without ever touching `sentinel` — the
-// harness ran but never left a background agent behind (e.g. bad args, a
-// crash before self-daemonizing).
-function claudeBoomStub(dir) {
-  return writeSpawnableNodeStub(dir, "claude-boom", "process.exit(7);");
-}
-
-// A claude stub reproducing the workspace-trust refusal
-// (issue-spor-dispatch-bg-untrusted-workspace): prints the trust-refusal text
-// to stderr and exits 1 before ever leaving a background agent behind, the
-// same shape a real `claude --bg` takes in a directory whose trust dialog was
-// never accepted.
-function claudeTrustRefusalStub(dir) {
-  return writeSpawnableNodeStub(dir, "claude-untrusted", `
-process.stderr.write("Workspace not trusted\\n");
-process.exit(1);
-`);
-}
-
-// A claude stub that is merely CHATTY (>1MiB combined stdout+stderr — well
-// past Node's spawnSync default maxBuffer) before touching `sentinel` and
-// exiting 0. The native launch pipes this child's output to inspect it for a
-// recognized refusal (claudeWorkspaceTrustRefusal); piping without raising
-// maxBuffer would have Node SIGTERM a child this verbose, misreporting mere
-// output volume as a launch failure and releasing the claim it just
-// established.
-function claudeChattyStub(dir, sentinel) {
-  return writeSpawnableNodeStub(dir, "claude-chatty", `
-const fs = require("node:fs");
-process.stdout.write("x".repeat(2 * 1024 * 1024));
-process.stderr.write("y".repeat(2 * 1024 * 1024));
-fs.writeFileSync(${JSON.stringify(sentinel)}, "launched\\n");
-`);
-}
 
 test("dispatch <node-id> (remote): auto-claims the node, then launches the agent", async () => {
   const { home, repo } = fixture();
@@ -2744,106 +2650,6 @@ test("dispatch --force (remote): a worktree-setup failure does NOT release the p
       !hits.some((h) => h.method === "POST" && /\/release$/.test(h.url)),
       "the --force renewal of a pre-existing lease is never auto-released on a setup failure"
     );
-  } finally {
-    srv.close();
-  }
-});
-
-// issue-spor-dispatch-failed-launch-leaks-claim: `claude --bg` exiting
-// non-zero means it never left a background agent behind — no run will ever
-// attend this node — so the lease this dispatch just established must be
-// released, exactly like the spawn-error and worktree-setup-failure aborts
-// above.
-test("dispatch (remote): a harness that exits non-zero without leaving an agent releases the claim it established", async () => {
-  const { home, repo } = fixture();
-  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
-  const stub = claudeBoomStub(home);
-  try {
-    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub }));
-    assert.notStrictEqual(r.status, 0, "the non-zero launcher exit is surfaced, not swallowed");
-    assert.ok(claimHit(hits), "the claim was established");
-    const release = releaseHit(hits);
-    assert.ok(release, "the freshly-established claim was released");
-    assert.match(release.url, /^\/v1\/nodes\/task-rotate\/release$/);
-    assert.match(r.stdout, /released the claim/);
-  } finally {
-    srv.close();
-  }
-});
-
-// issue-spor-dispatch-bg-untrusted-workspace: a `claude --bg` refusal for an
-// untrusted workspace is a RECOGNIZED launch failure, not a generic
-// 'launcher-nonzero' — the run record must carry the trust-refusal reason and
-// the CLI must print a clear hint, so an operator hitting this on a fresh
-// clone or worktree knows what to do instead of a bare "failed_launch".
-test("dispatch (remote): a claude --bg workspace-trust refusal is recorded and hinted, not a generic launch failure", async () => {
-  const { home, repo } = fixture();
-  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
-  const stub = claudeTrustRefusalStub(home);
-  try {
-    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub }));
-    assert.notStrictEqual(r.status, 0, "the refusal is surfaced, not swallowed");
-    assert.match(r.stderr, /refused to launch/i);
-    assert.match(r.stderr, /workspace.*trust/i);
-    assert.match(r.stderr, /hint:.*claude.*interactively/i, "prints the actionable hint (run claude once, or drop --bg)");
-    assert.ok(claimHit(hits), "the claim was established");
-    assert.ok(releaseHit(hits), "the freshly-established claim is still released on this launch failure");
-    const [record] = dispatchRunner.readRunRecords(home);
-    assert.ok(record, "a run record was written");
-    assert.strictEqual(record.state, "failed_launch");
-    assert.strictEqual(record.termination_signal, "workspace-not-trusted", "told apart from a generic 'launcher-nonzero'");
-    assert.match(record.termination_reason, /workspace.*trust/i);
-    assert.match(record.error, /workspace.*trust/i);
-  } finally {
-    srv.close();
-  }
-});
-
-// The maxBuffer regression this fix's own review caught: piping stdio to
-// inspect it for a refusal must not turn a merely CHATTY (but successful)
-// launch into a false launch failure.
-test("dispatch (remote): a claude --bg launch with >1MiB combined output still succeeds — piping never SIGTERMs a chatty child", async () => {
-  const { home, repo } = fixture();
-  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
-  const sentinel = path.join(home, "launched");
-  const stub = claudeChattyStub(home, sentinel);
-  try {
-    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub }));
-    assert.strictEqual(r.status, 0, r.stderr);
-    assert.ok(fs.existsSync(sentinel), "the chatty bg agent still launched");
-    assert.ok(!releaseHit(hits), "a successful (if chatty) launch never releases its own lease");
-    const [record] = dispatchRunner.readRunRecords(home);
-    assert.strictEqual(record.state, "running", "not misreported as a launch failure from output volume alone");
-  } finally {
-    srv.close();
-  }
-});
-
-test("dispatch (remote): a SUCCESSFUL native launch keeps its lease — no release is sent", async () => {
-  const { home, repo } = fixture();
-  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
-  const sentinel = path.join(home, "launched");
-  const stub = claudeStub(home, sentinel);
-  try {
-    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub }));
-    assert.strictEqual(r.status, 0, r.stderr);
-    assert.ok(claimHit(hits), "the claim was established");
-    assert.ok(fs.existsSync(sentinel), "the bg agent launched");
-    assert.ok(!releaseHit(hits), "a successful launch never releases its own lease — the heartbeat contract owns it from here");
-  } finally {
-    srv.close();
-  }
-});
-
-test("dispatch (remote): a harness release call fails open — the launch failure exit code still surfaces", async () => {
-  const { home, repo } = fixture();
-  const { srv, hits, base } = await claimStub({ claimStatus: 200, releaseStatus: 500 });
-  const stub = claudeBoomStub(home);
-  try {
-    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub }));
-    assert.notStrictEqual(r.status, 0);
-    assert.ok(releaseHit(hits), "the release was still attempted");
-    assert.match(r.stderr, /could not release the claim/);
   } finally {
     srv.close();
   }
@@ -3070,20 +2876,21 @@ test("dispatch <node-id> (local): no lease, no claim line — byte-identical", a
 // agent is already in flight on THIS machine is a duplicate the auto-claim can't
 // catch (a same-person re-claim is an idempotent renew). dispatchedAgents() —
 // the same NO-LLM, fail-soft cross-reference `spor next --hide-dispatched` uses,
-// fed here via SPOR_FAKE_AGENTS_JSON — gates the launch; --force overrides. The
-// guard is node mode only and runs in BOTH local and remote (it's a local read).
+// read off this box's run records and fed here via SPOR_FAKE_DISPATCH_RUNS_JSON —
+// gates the launch; --force overrides. The guard is node mode only and runs in
+// BOTH local and remote (it's a local read).
 const inFlightAgent = (name, extra = {}) =>
-  JSON.stringify([{ id: "g1", name, kind: "background", status: "busy", state: "working", cwd: "/x", ...extra }]);
+  JSON.stringify([{ id: "g1", run_id: "g1", name, harness: "claude-code", status: "busy", state: "running", cwd: "/x", ...extra }]);
 
 test("dispatch <node-id> (local): a same-named agent already in flight refuses, no launch", () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
-  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("dec-x") });
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_DISPATCH_RUNS_JSON: inFlightAgent("dec-x") });
   assert.strictEqual(r.status, 1, r.stderr);
   assert.match(r.stderr, /dec-x already has a background agent in flight on this machine/);
-  assert.match(r.stderr, /g1 \(working\)/); // the live agent is named
+  assert.match(r.stderr, /g1 \(running\)/); // the live run is named
   assert.match(r.stderr, /--force/); // the override is suggested
   assert.ok(!fs.existsSync(sentinel), "no duplicate agent was launched");
 });
@@ -3093,20 +2900,9 @@ test("dispatch <node-id> --force (local): launches despite an agent in flight", 
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
-  const r = run(["dispatch", "dec-x", "--no-brief", "--force"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("dec-x") });
+  const r = run(["dispatch", "dec-x", "--no-brief", "--force"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_DISPATCH_RUNS_JSON: inFlightAgent("dec-x") });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.ok(await waitForFile(sentinel), "the agent launched with --force");
-});
-
-test("dispatch <node-id> (local): a DONE same-named agent is not in flight — dispatch proceeds", async () => {
-  const { home, repo } = fixture();
-  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const sentinel = path.join(home, "g-launched");
-  const stub = claudeStub(home, sentinel);
-  const agents = inFlightAgent("dec-x", { status: "idle", state: "done" });
-  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents });
-  assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(await waitForFile(sentinel), "a finished agent does not block dispatch");
 });
 
 test("dispatch free-text (local): NOT guarded even if an agent shares the derived name (node mode only)", async () => {
@@ -3114,17 +2910,17 @@ test("dispatch free-text (local): NOT guarded even if an agent shares the derive
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
   // free-text name derives from the first words: "alpha beta gamma"
-  const r = run(["dispatch", "alpha beta gamma", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("alpha beta gamma") });
+  const r = run(["dispatch", "alpha beta gamma", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_DISPATCH_RUNS_JSON: inFlightAgent("alpha beta gamma") });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.ok(await waitForFile(sentinel), "free-text dispatch is not guarded — only node dispatch is");
 });
 
-test("dispatch <node-id> (local): fails soft on unparseable agents output (no guard, dispatches)", async () => {
+test("dispatch <node-id> (local): fails soft on unparseable run output (no guard, dispatches)", async () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
-  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: "not json at all" });
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_DISPATCH_RUNS_JSON: "not json at all" });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.ok(await waitForFile(sentinel), "unparseable => empty => no guard => dispatch proceeds");
 });
@@ -3132,15 +2928,15 @@ test("dispatch <node-id> (local): fails soft on unparseable agents output (no gu
 test("dispatch <node-id> --print: previews the in-flight warning; clean when nothing is in flight", () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const r = run(["dispatch", "dec-x", "--no-brief", "--print"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: inFlightAgent("dec-x") });
+  const r = run(["dispatch", "dec-x", "--no-brief", "--print"], { SPOR_HOME: home, SPOR_FAKE_DISPATCH_RUNS_JSON: inFlightAgent("dec-x") });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /in-flight: dec-x already has 1 agent\(s\) in flight here/);
   assert.match(r.stdout, /real dispatch would refuse/);
   // --force flips the preview note
-  const forced = run(["dispatch", "dec-x", "--no-brief", "--print", "--force"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: inFlightAgent("dec-x") });
+  const forced = run(["dispatch", "dec-x", "--no-brief", "--print", "--force"], { SPOR_HOME: home, SPOR_FAKE_DISPATCH_RUNS_JSON: inFlightAgent("dec-x") });
   assert.match(forced.stdout, /--force set, dispatching anyway/);
   // and a clean run (no agents) prints no in-flight line at all
-  const clean = run(["dispatch", "dec-x", "--no-brief", "--print"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: "[]" });
+  const clean = run(["dispatch", "dec-x", "--no-brief", "--print"], { SPOR_HOME: home, SPOR_FAKE_DISPATCH_RUNS_JSON: "[]" });
   assert.doesNotMatch(clean.stdout, /in-flight:/);
 });
 
@@ -3419,7 +3215,7 @@ test("dispatch <node-id> (remote): an in-flight agent refuses BEFORE the claim �
   try {
     const r = await runAsync(
       ["dispatch", "task-rotate", "--dir", repo, "--no-brief"],
-      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("task-rotate") })
+      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_FAKE_DISPATCH_RUNS_JSON: inFlightAgent("task-rotate") })
     );
     assert.strictEqual(r.status, 1, r.stderr);
     assert.match(r.stderr, /already has a background agent in flight/);
@@ -3438,7 +3234,7 @@ test("dispatch <node-id> --force (remote): still auto-claims and launches", asyn
   try {
     const r = await runAsync(
       ["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--force"],
-      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("task-rotate") })
+      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_FAKE_DISPATCH_RUNS_JSON: inFlightAgent("task-rotate") })
     );
     assert.strictEqual(r.status, 0, r.stderr);
     assert.ok(claimHit(hits), "--force still auto-claims the lease");
@@ -4072,7 +3868,7 @@ test("dispatch <node-id> (remote): no readiness signal at all is byte-identical 
 });
 
 
-test("native background judged child never inherits either attestation signing-key alias", () => {
+test("a dispatched (judged) child never inherits either attestation signing-key alias", async () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const outfile = path.join(home, "native-env.json");
@@ -4080,8 +3876,9 @@ test("native background judged child never inherits either attestation signing-k
     key: process.env.SPOR_ATTESTATION_KEY || null, legacy: process.env.SUBSTRATE_ATTESTATION_KEY || null,
     keep: process.env.KEEP_NATIVE_FIXTURE || null
   }));`);
-  const r = run(["dispatch", "dec-x", "--no-brief"], { ...NATIVE_BG, SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outfile,
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outfile,
     SPOR_ATTESTATION_KEY: "judge-secret", SUBSTRATE_ATTESTATION_KEY: "legacy-secret", KEEP_NATIVE_FIXTURE: "ordinary-setting" });
   assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(await waitForFile(outfile), "the supervised child ran");
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(outfile)), { key: null, legacy: null, keep: "ordinary-setting" });
 });

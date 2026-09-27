@@ -1,12 +1,14 @@
 // spor next — the in-flight agent surface (task-spor-cli-in-flight-surface).
 // `spor next --json` stamps each queue item with an `in_flight` flag by
-// cross-referencing live background agents from every dispatch harness
-// (`spor dispatch` names each agent after its node id); --hide-dispatched drops
-// the items that already have one. The cross-reference is CLIENT-SIDE (the
-// server can't see local agents), runs over both render paths (local passthrough
-// + remote /v1/queue), and FAILS SOFT when the claude binary is absent. Tests
-// inject the agent list via SPOR_FAKE_AGENTS_JSON (mirroring SPOR_FAKE_MCP_LIST)
-// and run against throwaway graphs / stub servers — never the live graph.
+// cross-referencing this machine's live dispatch RUN RECORDS (`spor dispatch`
+// names each run after its node id); --hide-dispatched drops the items that
+// already have one. The cross-reference is CLIENT-SIDE (the server can't see
+// local runs), runs over both render paths (local passthrough + remote
+// /v1/queue), and never shells out to a harness CLI — the `claude agents
+// --json` listing is retired with the native launch
+// (task-spor-deprecate-native-bg-dispatch). Tests inject the run list via
+// SPOR_FAKE_DISPATCH_RUNS_JSON (or a real journal) and run against throwaway
+// graphs / stub servers — never the live graph.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert");
@@ -67,38 +69,43 @@ function fixture() {
   return { dir, nodes };
 }
 
-// `claude agents --json` shapes. A background agent's `name` is the node id.
-const AGENTS = (extra = []) =>
-  JSON.stringify([
-    { id: "aa11", name: "task-a", kind: "background", status: "busy", state: "working", cwd: "/x" },
-    ...extra,
-  ]);
+// Active run summaries (dispatchRuns.activeRuns shape). A run's `name` is the node id.
+const RUN_A = { id: "aa11", run_id: "aa11", name: "task-a", node: "task-a", harness: "claude-code", state: "running", status: "busy", cwd: "/x" };
+const RUNS = (extra = []) => JSON.stringify([RUN_A, ...extra]);
 
 // ---------------- local mode (passthrough capture + annotate) ----------------
 
 test("local next --json stamps in_flight + a dispatched summary on the matched item", () => {
   const { nodes } = fixture();
-  const r = run(["next", "--json", "--nodes", nodes], { SPOR_FAKE_AGENTS_JSON: AGENTS() });
+  const r = run(["next", "--json", "--nodes", nodes], { SPOR_FAKE_DISPATCH_RUNS_JSON: RUNS() });
   assert.strictEqual(r.status, 0, r.stderr);
   const q = JSON.parse(r.stdout);
   const byId = Object.fromEntries(q.items.map((it) => [it.id, it]));
   assert.strictEqual(byId["task-a"].in_flight, true);
   assert.strictEqual(byId["task-b"].in_flight, false);
   // the dispatched agent rides along on the in-flight item, not on the idle one
-  assert.deepStrictEqual(byId["task-a"].dispatched, [
-    { id: "aa11", name: "task-a", harness: "claude-code", state: "working", status: "busy", cwd: "/x" },
-  ]);
+  assert.deepStrictEqual(byId["task-a"].dispatched, [RUN_A]);
   assert.ok(!("dispatched" in byId["task-b"]), "no dispatched array on an idle item");
 });
 
-test("local next --json: a DONE background agent does not count as in-flight", () => {
+// A real journal, read through dispatchRuns.activeRuns: a terminal record is not
+// in flight, a young legacy native-background record still is (inside the
+// retirement horizon), and an old one is not.
+test("local next --json: in-flight comes off the real run journal — terminal and aged-out native records do not count", () => {
   const { nodes } = fixture();
-  // task-b has a background agent named after it, but it has finished (state:done)
-  const agents = AGENTS([{ id: "bb22", name: "task-b", kind: "background", status: "idle", state: "done" }]);
-  const q = JSON.parse(run(["next", "--json", "--nodes", nodes], { SPOR_FAKE_AGENTS_JSON: agents }).stdout);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-inflight-home-"));
+  const dir = path.join(home, "journal", "dispatch");
+  fs.mkdirSync(dir, { recursive: true });
+  const rec = (run_id, extra) => fs.writeFileSync(path.join(dir, `${run_id}.run.json`), JSON.stringify({
+    run_id, harness: "claude-code", launch_mode: "native-background", cwd: "/x", ...extra,
+  }));
+  rec("r-young", { name: "task-a", node_id: "task-a", state: "running", created_at: new Date().toISOString() });
+  rec("r-done", { name: "task-b", node_id: "task-b", state: "done", created_at: new Date().toISOString() });
+  rec("r-old", { name: "task-b", node_id: "task-b", state: "running", created_at: new Date(Date.now() - 2 * 3600000).toISOString() });
+  const q = JSON.parse(run(["next", "--json", "--nodes", nodes], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout);
   const byId = Object.fromEntries(q.items.map((it) => [it.id, it]));
-  assert.strictEqual(byId["task-a"].in_flight, true, "working agent counts");
-  assert.strictEqual(byId["task-b"].in_flight, false, "done agent does not");
+  assert.strictEqual(byId["task-a"].in_flight, true, "a young legacy native record is still believed");
+  assert.strictEqual(byId["task-b"].in_flight, false, "a done record and an aged-out native one are not");
 });
 
 test("local next --json unions supervised Codex run records without requiring Claude", () => {
@@ -126,18 +133,20 @@ test("local next --json unions supervised Codex run records without requiring Cl
   assert.deepStrictEqual(item.dispatched, [JSON.parse(codex)[0]]);
 });
 
-test("local next --json: an INTERACTIVE agent named like a node is ignored (background only)", () => {
+test("local next --json never shells out to the claude binary for the in-flight surface", () => {
   const { nodes } = fixture();
-  const agents = JSON.stringify([
-    { name: "task-a", kind: "interactive", status: "busy", state: "working", cwd: "/x" },
-  ]);
-  const q = JSON.parse(run(["next", "--json", "--nodes", nodes], { SPOR_FAKE_AGENTS_JSON: agents }).stdout);
-  assert.strictEqual(q.items.find((it) => it.id === "task-a").in_flight, false);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-inflight-stub-"));
+  const marker = path.join(dir, "called");
+  const stub = path.join(dir, "claude");
+  fs.writeFileSync(stub, `#!/bin/sh\necho "$@" >> "${marker}"\necho '[]'\n`, { mode: 0o755 });
+  const r = run(["next", "--json", "--nodes", nodes], { SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(!fs.existsSync(marker), "the retired `claude agents --json` listing is never taken");
 });
 
 test("local next --json --hide-dispatched drops in-flight items and reports the count", () => {
   const { nodes } = fixture();
-  const r = run(["next", "--json", "--hide-dispatched", "--nodes", nodes], { SPOR_FAKE_AGENTS_JSON: AGENTS() });
+  const r = run(["next", "--json", "--hide-dispatched", "--nodes", nodes], { SPOR_FAKE_DISPATCH_RUNS_JSON: RUNS() });
   const q = JSON.parse(r.stdout);
   assert.deepStrictEqual(q.items.map((it) => it.id), ["task-b"]);
   assert.strictEqual(q.hidden_dispatched, 1);
@@ -146,8 +155,8 @@ test("local next --json --hide-dispatched drops in-flight items and reports the 
 
 test("local next default path is byte-identical passthrough (no agent cross-reference)", () => {
   const { nodes } = fixture();
-  // Even with agents present, the no-flag path must NOT consult them or differ.
-  const viaCli = run(["next", "--nodes", nodes], { SPOR_FAKE_AGENTS_JSON: AGENTS() });
+  // Even with runs present, the no-flag path must NOT consult them or differ.
+  const viaCli = run(["next", "--nodes", nodes], { SPOR_FAKE_DISPATCH_RUNS_JSON: RUNS() });
   const viaLib = runLib("queue.js", ["--nodes", nodes]);
   assert.strictEqual(viaCli.stdout, viaLib.stdout);
 });
@@ -157,7 +166,7 @@ test("local next --hide-dispatched human text == queue.js human render when noth
   // render must match lib/queue.js byte-for-byte; if queue.js's line format moves
   // this fails and both must move together.
   const { nodes } = fixture();
-  const viaCli = run(["next", "--hide-dispatched", "--nodes", nodes], { SPOR_FAKE_AGENTS_JSON: "[]" });
+  const viaCli = run(["next", "--hide-dispatched", "--nodes", nodes], { SPOR_FAKE_DISPATCH_RUNS_JSON: "[]" });
   const viaLib = runLib("queue.js", ["--nodes", nodes]);
   assert.strictEqual(viaCli.stdout, viaLib.stdout);
 });
@@ -183,7 +192,7 @@ function fixtureReadiness() {
 
 test("local next --readiness agent --hide-dispatched human text == queue.js human render byte-for-byte (readiness lead line)", () => {
   const { nodes } = fixtureReadiness();
-  const viaCli = run(["next", "--readiness", "agent", "--hide-dispatched", "--nodes", nodes], { SPOR_FAKE_AGENTS_JSON: "[]" });
+  const viaCli = run(["next", "--readiness", "agent", "--hide-dispatched", "--nodes", nodes], { SPOR_FAKE_DISPATCH_RUNS_JSON: "[]" });
   const viaLib = runLib("queue.js", ["--readiness", "agent", "--nodes", nodes]);
   assert.strictEqual(viaCli.stdout, viaLib.stdout);
   assert.match(viaCli.stdout, /^readiness: \d+ agent-ready, \d+ need human, \d+ untriaged$/m, "readiness lead line present");
@@ -191,7 +200,7 @@ test("local next --readiness agent --hide-dispatched human text == queue.js huma
 
 test("local next --hide-dispatched human text drops the item and notes the hide", () => {
   const { nodes } = fixture();
-  const r = run(["next", "--hide-dispatched", "--nodes", nodes], { SPOR_FAKE_AGENTS_JSON: AGENTS() });
+  const r = run(["next", "--hide-dispatched", "--nodes", nodes], { SPOR_FAKE_DISPATCH_RUNS_JSON: RUNS() });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.doesNotMatch(r.stdout, /task-a/, "in-flight item hidden");
   assert.match(r.stdout, /task-b/, "idle item kept");
@@ -200,7 +209,7 @@ test("local next --hide-dispatched human text drops the item and notes the hide"
 
 test("local next --json fails soft when the claude binary is absent (every item in_flight:false)", () => {
   const { nodes } = fixture();
-  // No SPOR_FAKE_AGENTS_JSON; point claude at a nonexistent binary.
+  // No fake runs; point claude at a nonexistent binary.
   const r = run(["next", "--json", "--nodes", nodes], { SPOR_CLAUDE_CMD: "/nonexistent/claude-xyz" });
   assert.strictEqual(r.status, 0, r.stderr);
   const q = JSON.parse(r.stdout);
@@ -208,9 +217,9 @@ test("local next --json fails soft when the claude binary is absent (every item 
   assert.strictEqual(r.stderr.trim(), "", "no error emitted");
 });
 
-test("local next --json fails soft on unparseable agents output", () => {
+test("local next --json fails soft on unparseable run output", () => {
   const { nodes } = fixture();
-  const r = run(["next", "--json", "--nodes", nodes], { SPOR_FAKE_AGENTS_JSON: "not json at all" });
+  const r = run(["next", "--json", "--nodes", nodes], { SPOR_FAKE_DISPATCH_RUNS_JSON: "not json at all" });
   assert.strictEqual(r.status, 0, r.stderr);
   const q = JSON.parse(r.stdout);
   assert.ok(q.items.every((it) => it.in_flight === false));
@@ -240,14 +249,14 @@ function queueStubServer(items) {
   );
 }
 
-test("remote next --json stamps in_flight by cross-referencing claude agents", async () => {
+test("remote next --json stamps in_flight by cross-referencing the run records", async () => {
   const items = [
     { id: "task-a", score: 1, suggest: "do", why: "queueable" },
     { id: "task-b", score: 0.5, suggest: "do", why: "queueable" },
   ];
   const { srv, base } = await queueStubServer(items);
   try {
-    const r = await runAsync(["next", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: AGENTS() });
+    const r = await runAsync(["next", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_DISPATCH_RUNS_JSON: RUNS() });
     assert.strictEqual(r.status, 0, r.stderr);
     const q = JSON.parse(r.stdout);
     const byId = Object.fromEntries(q.items.map((it) => [it.id, it]));
@@ -266,7 +275,7 @@ test("remote next --json --hide-dispatched drops in-flight items and decrements 
   ];
   const { srv, base } = await queueStubServer(items);
   try {
-    const r = await runAsync(["next", "--json", "--hide-dispatched"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: AGENTS() });
+    const r = await runAsync(["next", "--json", "--hide-dispatched"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_DISPATCH_RUNS_JSON: RUNS() });
     const q = JSON.parse(r.stdout);
     assert.deepStrictEqual(q.items.map((it) => it.id), ["task-b"]);
     assert.strictEqual(q.hidden_dispatched, 1);
@@ -288,7 +297,7 @@ test("remote next --json --hide-dispatched decrements returned_count to match th
   ];
   const { srv, base } = await queueStubServer(items);
   try {
-    const r = await runAsync(["next", "--json", "--hide-dispatched"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: AGENTS() });
+    const r = await runAsync(["next", "--json", "--hide-dispatched"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_DISPATCH_RUNS_JSON: RUNS() });
     const q = JSON.parse(r.stdout);
     assert.strictEqual(q.items.length, 1);
     assert.strictEqual(q.returned_count, 1, "returned_count matches the hidden-adjusted item count");
@@ -304,7 +313,7 @@ test("remote next --hide-dispatched human render notes the hidden count", async 
   ];
   const { srv, base } = await queueStubServer(items);
   try {
-    const r = await runAsync(["next", "--hide-dispatched"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: AGENTS() });
+    const r = await runAsync(["next", "--hide-dispatched"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_DISPATCH_RUNS_JSON: RUNS() });
     assert.strictEqual(r.status, 0, r.stderr);
     assert.doesNotMatch(r.stdout, /task-a/);
     assert.match(r.stdout, /task-b/);

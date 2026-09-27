@@ -873,7 +873,7 @@ function cleanEnv(extra = {}) {
     if (key.startsWith("SPOR_") || key.startsWith("SUBSTRATE_") || key === "XDG_CONFIG_HOME") continue;
     env[key] = value;
   }
-  return { ...env, SPOR_FAKE_AGENTS_JSON: "[]", ...extra };
+  return { ...env, ...extra };
 }
 
 function cli(args, env, cwd) {
@@ -922,12 +922,12 @@ process.stdin.on("end", () => {
 }
 
 // task-spor-work-honor-claude-launch-mode-and-retire-native-precheck: a
-// standing `dispatch.claudeLaunchMode: native-background` is honored by an
-// interactive `spor dispatch` but IGNORED by every dispatch the loop makes (a
-// worker's runs are always supervised, so they can be followed, judged and
-// gated). Ignoring it is right; ignoring it SILENTLY is not — the worker says
-// so once at startup, and says nothing at all under the default.
-test("spor work announces once that it ignores dispatch.claudeLaunchMode: native-background", () => {
+// standing `dispatch.claudeLaunchMode: native-background` names the RETIRED
+// native `claude --bg` launch (task-spor-deprecate-native-bg-dispatch), so every
+// dispatch the loop makes is supervised regardless. Ignoring it is right;
+// ignoring it SILENTLY is not — the worker says so once at startup (and its
+// per-run dispatches stay quiet), and says nothing at all under the default.
+test("spor work announces once that it ignores the retired dispatch.claudeLaunchMode: native-background", () => {
   const { home, outfile } = cliFixture();
   const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() };
   const quiet = cli(["work", "--print"], env);
@@ -942,11 +942,11 @@ test("spor work announces once that it ignores dispatch.claudeLaunchMode: native
     (native.stderr.match(/claudeLaunchMode/g) || []).length, 1,
     `announced exactly once: ${native.stderr}`
   );
-  assert.match(native.stderr, /^spor work: dispatch\.claudeLaunchMode is 'native-background', which this worker ignores — .*launched SUPERVISED .*still applies to an interactive 'spor dispatch'\.$/m);
+  assert.match(native.stderr, /^spor work: dispatch\.claudeLaunchMode 'native-background' is retired \(the native claude --bg launch\), so this worker ignores it — .*launched SUPERVISED .*Remove the key to silence this\.$/m);
   assert.match(native.stdout, /-> task-ready/, "the notice never changes what the worker would do");
   const bogus = cli(["work", "--print"], { ...env, SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "attached" });
   assert.strictEqual(bogus.status, 0, bogus.stderr);
-  assert.match(bogus.stderr, /^spor work: dispatch\.claudeLaunchMode 'attached' is not recognized \(supervised \| native-background\) — ignoring it; this worker always launches supervised\.$/m);
+  assert.match(bogus.stderr, /^spor work: dispatch\.claudeLaunchMode 'attached' is not recognized \(supervised is the only launch mode\) — ignoring it; this worker always launches supervised\.$/m);
 });
 
 test("spor work --print previews scope, pacing and candidates, and launches nothing", () => {
@@ -1999,11 +1999,6 @@ const { spawn } = require("node:child_process");
 // A scratch SPOR_HOME with one task and, optionally, the decision that resolves
 // it — the exact evidence WORKERS.md §6 calls `resolved`.
 function pollFixture({ resolver = false } = {}) {
-  // The live-agent listing is irrelevant to both halves under test (neither
-  // record is native-background) and probing for real would spawn every
-  // installed harness CLI; the canned empty listing is the same seam
-  // `enumerateHarnessAgents` offers everywhere else.
-  process.env.SPOR_FAKE_AGENTS_JSON = "[]";
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-poll-"));
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
@@ -2076,12 +2071,12 @@ test("pollWorkRuns: a run silent past the idle ceiling is STOPPED and classified
     assert.strictEqual(verdict.record.state, "failed");
     assert.strictEqual(verdict.record.termination_class, "idle");
     assert.strictEqual(verdict.record.termination_signal, "idle-timeout");
-    assert.match(verdict.record.termination_reason, /wrote nothing to its log or transcript/);
+    assert.match(verdict.record.termination_reason, /wrote nothing to its log/);
     assert.strictEqual(verdict.record.terminal_state, "failed");
     assert.strictEqual(verdict.record.terminal_enforced, false, "nothing verified it — the graph does not show the target resolved");
     assert.ok(!verdict.cool_ms, "we ENDED the run rather than giving up on it, so the ordinary refusal window applies");
     assert.match(warned.join("\n"), /stopping run run-idle/);
-    assert.match(warned.join("\n"), /nothing written to its log or transcript for 60m \(idle ceiling 1m\)/);
+    assert.match(warned.join("\n"), /nothing written to its log for 60m \(idle ceiling 1m\)/);
 
     // Durable, not just reported: `spor runs` and the resume scan read the file.
     const onDisk = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
@@ -2118,67 +2113,21 @@ test("pollWorkRuns: an idle run whose target reads resolved is classified RESOLV
   }
 });
 
-test("pollWorkRuns: an idle run with no process of ours to signal takes the WATCHDOG's cooldown, not the ordinary one", async () => {
-  // A native-background agent lives in the harness's own daemon, which this
-  // client has no stop verb for. Freeing the slot is still right — 45 minutes
-  // of silence is not a working agent — but we only stopped FOLLOWING it, so
-  // the node must not come straight back round to a worker and put a second
-  // agent into a checkout the first may still hold.
-  const { home, cfg } = pollFixture();
-  const runId = "run-idle-native";
-  const cwd = path.join(home, "checkout");
-  // A native run's observable channel is the harness's own session transcript,
-  // reachable only through a bound session id.
-  const configDir = path.join(home, "cc");
-  const projectDir = path.join(configDir, "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"));
-  fs.mkdirSync(projectDir, { recursive: true });
-  const transcript = path.join(projectDir, "sid-live.jsonl");
-  fs.writeFileSync(transcript, "{}\n");
-  const anHourAgo = (Date.now() - 3600000) / 1000;
-  fs.utimesSync(transcript, anHourAgo, anHourAgo);
-  writeRecord(home, runId, {
-    state: "running",
-    launch_mode: "native-background",
-    session_id: "sid-live",
-    cwd,
-    created_at: new Date(Date.now() - 3600000).toISOString(),
-  });
-  // The harness still lists the agent, so reconciliation leaves the record
-  // open — the exact case the idle ceiling is the only thing that can free.
-  process.env.SPOR_FAKE_AGENTS_JSON = JSON.stringify([{ id: "a1", sessionId: "sid-live", kind: "background", state: "running", cwd }]);
-  const warned = [];
-  let verdict;
-  process.env.CLAUDE_CONFIG_DIR = configDir;
-  try {
-    [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000, warn: (l) => warned.push(l) });
-  } finally {
-    delete process.env.CLAUDE_CONFIG_DIR;
-    process.env.SPOR_FAKE_AGENTS_JSON = "[]";
-  }
-  assert.strictEqual(verdict.terminal, true);
-  assert.strictEqual(verdict.cool_ms, 60000, "cooled for at least as long as the silence we waited out");
-  assert.match(verdict.record.termination_reason, /no process of ours left to signal/);
-  assert.match(warned.join("\n"), /giving up following run run-idle/);
-  assert.match(warned.join("\n"), /something may still be running in its checkout/);
-});
-
 test("pollWorkRuns: a run with NO observable output channel is never judged idle — it falls through to the watchdog", async () => {
-  // A `claude --bg` launch binds its session best-effort and deliberately
-  // leaves the record session-less rather than guessing, so such a record has
-  // no transcript and no log of ours. Reading its LAUNCH as its last activity
-  // would stop a perfectly healthy agent the moment the ceiling passed.
+  // A legacy native-background record (the retired `claude --bg` launch) has
+  // no log of ours and its transcript is no longer read. Reading its LAUNCH as
+  // its last activity would stop a perfectly healthy agent the moment the
+  // ceiling passed; inside its retirement horizon it is simply followed.
   const { home, cfg } = pollFixture();
   const runId = "run-unbound";
   writeRecord(home, runId, {
     state: "running",
     launch_mode: "native-background",
-    created_at: new Date(Date.now() - 3600000).toISOString(),
+    created_at: new Date(Date.now() - 1800000).toISOString(),
   });
-  process.env.SPOR_FAKE_AGENTS_JSON = JSON.stringify([{ id: "a2", name: "task-wedged", kind: "background", state: "running", cwd: home, startedAt: Date.now() - 3600000 }]);
   const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000 });
   assert.strictEqual(verdict.terminal, false, "the slot is held; the 24h watchdog is the honest instrument here");
   assert.strictEqual(verdict.record.state, "running", "and the record is left open, not closed as failed");
-  process.env.SPOR_FAKE_AGENTS_JSON = "[]";
 });
 
 test("pollWorkRuns: a contract-pending record is verified against the graph before it is filed under the provisional verdict", async () => {
@@ -2401,45 +2350,6 @@ test("pollWorkRuns: a release the server refuses leaves the record closed and sa
   }
 });
 
-test("pollWorkRuns: a run this worker only stopped FOLLOWING keeps its lease held — something may still be in its checkout", async () => {
-  // No process of ours to signal: the run did not END, so a held lease is
-  // exactly what keeps a second agent out of that checkout until the TTL.
-  const fake = leaseServer();
-  const base = await fake.listen();
-  const { home, cfg } = remotePollFixture(base);
-  // The same native-background shape as the local-mode cooldown test above:
-  // the harness's daemon still lists the agent, and the only channel we can
-  // read is its bound session transcript.
-  const runId = "run-idle-lease-4";
-  const cwd = path.join(home, "checkout");
-  const configDir = path.join(home, "cc");
-  const projectDir = path.join(configDir, "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"));
-  fs.mkdirSync(projectDir, { recursive: true });
-  const transcript = path.join(projectDir, "sid-held.jsonl");
-  fs.writeFileSync(transcript, "{}\n");
-  const anHourAgo = (Date.now() - 3600000) / 1000;
-  fs.utimesSync(transcript, anHourAgo, anHourAgo);
-  writeRecord(home, runId, {
-    state: "running", launch_mode: "native-background", session_id: "sid-held", cwd,
-    created_at: new Date(Date.now() - 3600000).toISOString(),
-    release_node: "task-wedged", server: base,
-  });
-  process.env.SPOR_FAKE_AGENTS_JSON = JSON.stringify([{ id: "a9", sessionId: "sid-held", kind: "background", state: "running", cwd }]);
-  process.env.CLAUDE_CONFIG_DIR = configDir;
-  try {
-    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000 });
-    assert.strictEqual(verdict.terminal, true);
-    assert.strictEqual(verdict.cool_ms, 60000);
-    assert.strictEqual(verdict.record.lease_released, false);
-    assert.match(verdict.record.terminal_note, /left HELD — something may still be running in its checkout/);
-    assert.ok(!fake.hits.some((h) => h.url.endsWith("/release")), "nothing released");
-  } finally {
-    delete process.env.CLAUDE_CONFIG_DIR;
-    process.env.SPOR_FAKE_AGENTS_JSON = "[]";
-    await fake.close();
-  }
-});
-
 test("pollWorkRuns: a run with no lease of ours (--no-claim, --force) releases nothing, and a lease on ANOTHER graph is left to that tenant's TTL", async () => {
   const fake = leaseServer();
   const base = await fake.listen();
@@ -2567,12 +2477,9 @@ test("pollWorkRuns: in LOCAL mode the idle stop touches no lease — there is no
 
 // ------------------------------------------ pollWorkRuns: native evidence --
 //
-// task-spor-retire-native-bg-enumerated-skip-after-supervised-default: every
-// run this loop dispatches is supervised, so following its own runs must not
-// boot a harness CLI per poll for a live-agent listing only a native-background
-// record could use. The `enumerated === false` skip in reconcileRuns survives
-// as the `--bg` opt-in's rule alone — a native record a resumed pipeline
-// adopted is still held (and said so) when the listing is unreadable.
+// Following runs never boots a harness CLI for a live-agent listing: every run
+// is supervised, and the `claude agents --json` scrape the retired native
+// launch needed is gone (task-spor-deprecate-native-bg-dispatch).
 
 async function withRealAgentListing(stubBody, fn) {
   const saved = { fake: process.env.SPOR_FAKE_AGENTS_JSON, cmd: process.env.SPOR_CLAUDE_CMD };
@@ -2600,19 +2507,17 @@ test("pollWorkRuns: following only supervised runs never asks the harness for a 
   });
 });
 
-test("pollWorkRuns: a native-background record among the followed runs still takes the listing, and an unreadable one still holds the slot (the `--bg` rule)", async () => {
+test("pollWorkRuns: a legacy native-background record is followed and retired from the record alone — no listing is ever taken", async () => {
   const { home, cfg } = pollFixture();
-  await withRealAgentListing('console.log("not json");', async ({ listed }) => {
-    const runId = "native-adopted";
-    // Past the 60s registration grace, well inside the watchdog: the record's
-    // state is decided by the listing alone.
-    writeRecord(home, runId, { harness: "claude-code", launch_mode: "native-background", state: "running", created_at: new Date(Date.now() - 120000).toISOString() });
-    const warned = [];
-    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000, warn: (l) => warned.push(l) });
-    assert.strictEqual(listed(), true, "the live native record is what the listing is for");
-    assert.strictEqual(verdict.terminal, false, "an unreadable listing is not evidence the run ended");
-    assert.strictEqual(verdict.record.state, "running");
-    assert.ok(warned.some((l) => /could not list live background agents/.test(l)), warned.join("\n"));
+  await withRealAgentListing('console.log("[]");', async ({ listed }) => {
+    writeRecord(home, "native-young", { launch_mode: "native-background", state: "running", created_at: new Date(Date.now() - 600000).toISOString() });
+    writeRecord(home, "native-old", { launch_mode: "native-background", state: "running", created_at: new Date(Date.now() - 3 * 3600000).toISOString() });
+    const out = await sporCli.pollWorkRuns(cfg, ["native-young", "native-old"], { maxAgeMs: 86400000 });
+    const byId = Object.fromEntries(out.map((o) => [o.run_id, o]));
+    assert.strictEqual(byId["native-young"].terminal, false, "inside the retirement horizon the slot is held");
+    assert.strictEqual(byId["native-old"].terminal, true);
+    assert.strictEqual(byId["native-old"].record.termination_signal, "native-retired");
+    assert.strictEqual(listed(), false, "the retired `claude agents --json` listing is never taken");
   });
 });
 
@@ -3429,248 +3334,6 @@ async function graphStub(handler) {
   await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
   return { srv, base: `http://127.0.0.1:${srv.address().port}`, seen };
 }
-
-test("settleNativeContracts: a native run whose target reads RESOLVED ends verified, not as a best-effort guess", async () => {
-  const { srv, base, seen } = await graphStub((req, res) => {
-    if (req.method === "GET" && req.url === "/v1/nodes/task-x") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ id: "task-x", type: "task", status: "done", resolution: { by: "dec-y" } }));
-      return;
-    }
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end("{}");
-  });
-  try {
-    const cfg = offsetCfg(base);
-    const home = cfg.userConfigHome();
-    const record = nativeOwing(home);
-    const [settled] = await sporCli.settleNativeContracts(cfg, [record]);
-    assert.strictEqual(settled.terminal_state, "resolved");
-    assert.strictEqual(settled.terminal_enforced, true, "a graph answered the re-read — that is the whole of the claim");
-    assert.strictEqual(settled.contract_pending, false);
-    // Durable, not just in the returned copy — `spor runs` prints what is on disk.
-    const onDisk = dispatchRuns.readJson(path.join(home, "journal", "dispatch", "nb1.run.json"));
-    assert.strictEqual(onDisk.terminal_state, "resolved");
-    // A resolved target is never released: a terminal status already takes it
-    // out of every queue (WORKERS.md §6).
-    assert.ok(!seen.some((r) => r.url.includes("/release")));
-  } finally {
-    srv.close();
-  }
-});
-
-test("settleNativeContracts: an unresolved native run files the agent's own TRANSCRIPT report and releases its lease", async () => {
-  const filed = [];
-  const { srv, base, seen } = await graphStub((req, res, body) => {
-    if (req.method === "GET" && req.url === "/v1/nodes/task-x") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ id: "task-x", type: "task", status: "open" })); // no resolution
-      return;
-    }
-    if (req.method === "POST" && req.url === "/v1/nodes") {
-      filed.push(JSON.parse(body).nodes[0].node);
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ results: [{ ok: true, status: "created" }] }));
-      return;
-    }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end("{}");
-  });
-  try {
-    const cfg = offsetCfg(base);
-    const home = cfg.userConfigHome();
-    const transcript = path.join(home, "t.jsonl");
-    fs.writeFileSync(transcript, [
-      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Got the parser landed; the migration half is still open." }] } }),
-      JSON.stringify({ type: "system", subtype: "turn_duration" }),
-    ].join("\n"));
-    const record = nativeOwing(home, { transcript_path: transcript, release_node: "task-x", project: "spor" });
-    const [settled] = await sporCli.settleNativeContracts(cfg, [record]);
-    assert.strictEqual(settled.terminal_state, "reported");
-    assert.strictEqual(settled.terminal_enforced, true);
-    assert.ok(settled.report_node_id, "`reported` always names the artifact it filed");
-    assert.strictEqual(filed.length, 1);
-    assert.match(filed[0], /the migration half is still open/, "the report is the last assistant text, as for a supervised stream");
-    // ORDERING IS THE CONTRACT: file, then release.
-    const order = seen.filter((r) => r.method === "POST").map((r) => r.url);
-    assert.deepStrictEqual(order, ["/v1/nodes", "/v1/nodes/task-x/release"]);
-    assert.strictEqual(settled.lease_released, true);
-  } finally {
-    srv.close();
-  }
-});
-
-test("settleNativeContracts: a record that owes nothing is passed through without asking the graph anything", async () => {
-  const { srv, base, seen } = await graphStub((req, res) => {
-    res.writeHead(500);
-    res.end("{}");
-  });
-  try {
-    const cfg = offsetCfg(base);
-    const home = cfg.userConfigHome();
-    // A supervised record, and a native one already settled: neither is ours.
-    const supervised = { run_id: "s", launch_mode: "supervised-jsonl", state: "done", contract_pending: true, node_id: "task-x" };
-    const settledAlready = nativeOwing(home, { contract_pending: false, terminal_enforced: true, terminal_state: "resolved" });
-    const out = await sporCli.settleNativeContracts(cfg, [supervised, settledAlready]);
-    assert.deepStrictEqual(out, [supervised, settledAlready]);
-    assert.strictEqual(seen.length, 0);
-  } finally {
-    srv.close();
-  }
-});
-
-test("settleNativeContracts (local mode): the run's OWN graph home answers the re-read", async () => {
-  // task-spor-work-local-mode-resolver-check: local dispatch has no server to
-  // file or release through, but it does have the files the agent wrote its
-  // resolver into — and the launcher's home, not the reconciling cwd's.
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-native-local-"));
-  const nodes = path.join(home, "graph", "nodes");
-  fs.mkdirSync(nodes, { recursive: true });
-  fs.writeFileSync(path.join(nodes, "task-x.md"), "---\nid: task-x\ntype: task\ntitle: A task\nsummary: A task the agent resolved.\nstatus: open\n---\nbody\n");
-  fs.writeFileSync(
-    path.join(nodes, "dec-y.md"),
-    "---\nid: dec-y\ntype: decision\ntitle: Why\nsummary: The decision that resolves it.\nedges:\n  - {type: resolves, to: task-x}\n---\nbody\n"
-  );
-  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
-  const record = nativeOwing(cfg.userConfigHome(), { local_nodes_dir: nodes });
-  const [settled] = await sporCli.settleNativeContracts(cfg, [record]);
-  assert.strictEqual(settled.terminal_state, "resolved");
-  assert.strictEqual(settled.terminal_enforced, true);
-  assert.strictEqual(settled.resolved_by, "dec-y");
-});
-
-test("settleNativeContracts: an UNREACHABLE graph does not spend the run's one contract attempt", async () => {
-  // The debt has no owning process to retire it — a `--bg` launch keeps no
-  // supervisor — so clearing `contract_pending` on a transport failure would
-  // lose the report and the lease handback permanently: nothing would ever look
-  // again. The verdict is still written (it is no worse than the provisional
-  // reading), but the debt survives for the next caller with a reachable graph.
-  const { srv, base } = await graphStub((req, res) => {
-    res.writeHead(503, { "content-type": "application/json" });
-    res.end("{}");
-  });
-  try {
-    const cfg = offsetCfg(base);
-    const home = cfg.userConfigHome();
-    let record = nativeOwing(home, { release_node: "task-x" });
-    for (let i = 1; i <= 2; i++) {
-      [record] = await sporCli.settleNativeContracts(cfg, [record]);
-      assert.strictEqual(record.terminal_enforced, false);
-      assert.strictEqual(record.contract_pending, true, `attempt ${i} keeps the debt`);
-      assert.strictEqual(record.contract_attempts, i);
-    }
-    // …but bounded: "retry until a graph answers" is a pair of timeouts every
-    // poll during an outage nobody asked for.
-    [record] = await sporCli.settleNativeContracts(cfg, [record]);
-    assert.strictEqual(record.contract_attempts, dispatchRuns.NATIVE_CONTRACT_ATTEMPTS);
-    assert.strictEqual(record.contract_pending, false, "three chances, then the honest unenforced reading stands");
-    assert.ok(record.contract_settled_at);
-  } finally {
-    srv.close();
-  }
-});
-
-test("settleNativeContracts: a record launched against ANOTHER graph is skipped, not settled through this one", async () => {
-  // dec-spor-client-cli-mode-tenant-resolution: the ambient tenant belongs to
-  // whoever is running `spor runs`, not to the run. The same node id routinely
-  // exists in two tenants, so settling through the wrong one files a report
-  // into a graph the run never touched and releases someone else's lease.
-  const { srv, base, seen } = await graphStub((req, res) => {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ id: "task-x", type: "task", status: "open" }));
-  });
-  try {
-    const cfg = offsetCfg(base);
-    const home = cfg.userConfigHome();
-    const foreign = nativeOwing(home, { server: "https://api.other-tenant.invalid", release_node: "task-x" });
-    const [out] = await sporCli.settleNativeContracts(cfg, [foreign]);
-    assert.strictEqual(out.contract_pending, true, "the debt stays with the caller that owns it");
-    assert.strictEqual(seen.length, 0, "no call is made against the wrong graph");
-    assert.strictEqual(sporCli.nativeContractDoor(cfg, foreign), null);
-    // A LOCAL-mode launch settled from a remote process is the same mistake.
-    assert.strictEqual(sporCli.nativeContractDoor(cfg, { local_nodes_dir: "/tmp/nodes" }), null);
-    // …and the record that names this very server is ours to answer for.
-    assert.ok(sporCli.nativeContractDoor(cfg, { server: base }));
-    // The SAME front door under a different ORG is a different graph: a hosted
-    // deployment routes every tenant through one host and separates them by the
-    // token's org claim, so a base-URL match alone would settle org A's run
-    // against org B — the exact hazard the stamp exists to stop.
-    assert.strictEqual(sporCli.nativeContractDoor(cfg, { server: base, org: "globex" }), null);
-  } finally {
-    srv.close();
-  }
-});
-
-test("nativeContractDoor: a local-mode launch under an explicit mode:local is still settleable by its own config", () => {
-  // The door must decide localness the way the LAUNCHER did (`cfg.mode()`), not
-  // by whether a credential happens to resolve: a logged-in user with a
-  // deliberately local repo stamps `local_nodes_dir`, and a door that read
-  // "a server resolves, so this is remote" would skip that record forever —
-  // never verifying, never filing, never handing the lease back, and never
-  // even spending an attempt to say so.
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-door-local-"));
-  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ mode: "local" }));
-  const cfg = loadConfig({
-    cwd: home,
-    env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: "http://127.0.0.1:1", SPOR_TOKEN: "t" },
-  });
-  assert.strictEqual(cfg.mode(), "local");
-  const door = sporCli.nativeContractDoor(cfg, { local_nodes_dir: path.join(home, "nodes") });
-  assert.ok(door, "its own config is the door");
-  assert.strictEqual(door.base, null);
-  assert.strictEqual(door.nodesDir, path.join(home, "nodes"));
-});
-
-test("settleNativeContracts: `scope` keeps a filtered read from filing reports for runs it never asked about", async () => {
-  const { srv, base, seen } = await graphStub((req, res) => {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ id: "task-x", type: "task", status: "open" }));
-  });
-  try {
-    const cfg = offsetCfg(base);
-    const home = cfg.userConfigHome();
-    const record = nativeOwing(home);
-    const [out] = await sporCli.settleNativeContracts(cfg, [record], { scope: new Set(["some-other-run"]) });
-    assert.strictEqual(out.contract_pending, true);
-    assert.strictEqual(seen.length, 0);
-  } finally {
-    srv.close();
-  }
-});
-
-test("settleNativeContracts: a lease whose TTL has long since lapsed is not yanked back", async () => {
-  // Nothing reconciles a native record on a timer, so a `--bg` run can sit for
-  // hours — by which time the item may have been re-claimed, quite possibly by
-  // another worker of the same person, whom a 409 does not protect.
-  const { srv, base, seen } = await graphStub((req, res, body) => {
-    if (req.method === "GET") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ id: "task-x", type: "task", status: "open" }));
-      return;
-    }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ results: [{ ok: true, status: "created" }] }));
-  });
-  try {
-    const cfg = offsetCfg(base);
-    const home = cfg.userConfigHome();
-    const stale = nativeOwing(home, {
-      release_node: "task-x",
-      finished_at: new Date(Date.now() - 6 * 3600 * 1000).toISOString(),
-      transcript_path: (() => {
-        const f = path.join(home, "old.jsonl");
-        fs.writeFileSync(f, `${JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "ran out of road" }] } })}\n`);
-        return f;
-      })(),
-    });
-    const [out] = await sporCli.settleNativeContracts(cfg, [stale]);
-    assert.strictEqual(out.terminal_state, "reported", "the report is still filed — it is the item's signal");
-    assert.ok(!seen.some((r) => r.url.includes("/release")), "but the lapsed lease is left alone");
-    assert.ok(!("lease_released" in out), "no lease of ours to hand back is an OMITTED key, never false");
-  } finally {
-    srv.close();
-  }
-});
 
 test("settleNativeOutcome: a verified `resolved` still wins after a weaker verdict already settled", async () => {
   // Two processes can both reconcile a native record (a person's `spor runs`

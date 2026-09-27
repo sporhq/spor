@@ -28,7 +28,6 @@ function baseEnv(extra = {}) {
     if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
     env[k] = v;
   }
-  env.SPOR_FAKE_AGENTS_JSON = "[]";
   env.SPOR_DISTILLING = "1";
   return Object.assign(env, extra);
 }

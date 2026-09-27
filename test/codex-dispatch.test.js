@@ -25,7 +25,7 @@ function cleanEnv(extra = {}) {
     if (key.startsWith("SPOR_") || key.startsWith("SUBSTRATE_") || key === "XDG_CONFIG_HOME") continue;
     env[key] = value;
   }
-  return { ...env, SPOR_FAKE_AGENTS_JSON: "[]", ...extra };
+  return { ...env, ...extra };
 }
 
 function run(args, env, cwd) {
@@ -209,7 +209,7 @@ test("dispatch harness registry exposes one uniform adapter contract", () => {
     assert.strictEqual(typeof adapter.buildArgs, "function", `${adapter.id} builds argv`);
     assert.strictEqual(typeof adapter.validateOptions, "function", `${adapter.id} validates flags`);
     assert.ok(adapter.activeDiscovery && adapter.activeDiscovery.kind, `${adapter.id} declares active-run discovery`);
-    assert.ok(["native-background", "supervised-jsonl"].includes(adapter.launchMode));
+    assert.strictEqual(adapter.launchMode, "supervised-jsonl");
   }
   assert.strictEqual(getHarness("gemini"), null, "unsupported harnesses never silently substitute");
 });

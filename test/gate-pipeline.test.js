@@ -3360,7 +3360,7 @@ function cleanEnv(extra = {}) {
     if (key.startsWith("SPOR_") || key.startsWith("SUBSTRATE_") || key === "XDG_CONFIG_HOME") continue;
     env[key] = value;
   }
-  return { ...env, SPOR_FAKE_AGENTS_JSON: "[]", ...extra };
+  return { ...env, ...extra };
 }
 
 function cli(args, env, cwd) {
@@ -3565,7 +3565,7 @@ test("an agent-review gate routed to a claude-code profile (the supervised defau
     const r = cli(["work", "--print", "--factory", "factory-demo"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode(), SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "native-background" });
     assert.strictEqual(r.status, 0, `${label}: ${r.stderr}`);
     assert.doesNotMatch(r.stderr, /launches native-background and has no report channel/, label);
-    assert.match(r.stderr, /spor work: dispatch\.claudeLaunchMode is 'native-background', which this worker ignores/, label);
+    assert.match(r.stderr, /spor work: dispatch\.claudeLaunchMode 'native-background' is retired/, label);
     assert.match(r.stdout, /gate review {2}agent-review {2}review under profile-native/, label);
   }
 });
@@ -5513,12 +5513,11 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.doesNotMatch(fixLaunch.prompt, /Advisory \(recorded, not enforced/);
 });
 
-// task-spor-agent-review-gate-accept-native-bg-reviewer: a native-background
-// reviewer keeps no report_path, but writes the same final assistant text to
-// its own session transcript — gateRunReportText now falls back to reading
-// that transcript (nativeRunReportText's rule) instead of treating every
-// native-background record as report-less.
-test("a native-background reviewer's verdict is read off its transcript, and a native record with no transcript still fails closed", async () => {
+// A legacy native-background reviewer record keeps no report_path, and its
+// session transcript is no longer read (task-spor-deprecate-native-bg-dispatch,
+// retiring task-spor-agent-review-gate-accept-native-bg-reviewer's fallback):
+// with or without a transcript on disk it is report-less, and fails closed.
+test("a legacy native-background reviewer is report-less — its transcript is never read, and the gate fails closed", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-native-"));
   fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
   fs.writeFileSync(
@@ -5572,14 +5571,14 @@ test("a native-background reviewer's verdict is read off its transcript, and a n
   assert.ok((await deps.changedPaths({ trustedRef: "main" })).ok);
 
   const withTranscript = await deps.review({ gate, cycle: 0, prior: [], fix: null });
-  assert.strictEqual(withTranscript.ok, true, withTranscript.reason);
-  assert.match(withTranscript.text, /"verdict":"pass"/);
+  assert.strictEqual(withTranscript.ok, false, "a PASS verdict sitting in the transcript is not read — fail closed");
+  assert.match(withTranscript.reason, /left no final report to read a verdict from/);
 
   which = "no-transcript";
   const withoutTranscript = await deps.review({ gate, cycle: 0, prior: [], fix: null });
   assert.strictEqual(withoutTranscript.ok, false, "a native record with no transcript still fails closed");
   assert.match(withoutTranscript.reason, /left no final report to read a verdict from/);
-  assert.match(withoutTranscript.reason, /native-background with a bound transcript/);
+  assert.match(withoutTranscript.reason, /a supervised launch/);
 });
 
 // issue-spor-review-gate-reportless-run-blamed-on-routing: the mirror case of
