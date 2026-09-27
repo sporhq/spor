@@ -231,7 +231,7 @@ async function nudge({ input, graph, slug, session, file, remote }) {
     // dedup guard). The `pending` sentinel never counts toward the fired cap
     // (Number("pending") is NaN).
     try {
-      fs.writeFileSync(inFile, JSON.stringify({ ...job, hash }));
+      u.writeSpoolFile(inFile, JSON.stringify({ ...job, hash }));
     } catch {
       return null;
     }
@@ -295,8 +295,8 @@ function classifyForNudge({ prompt, tplSha, session, slug, file, graph, timeoutM
   });
   if (res === null) return null;
 
-  if (res.response.includes("NOTHING")) return { nfacts: 0, facts: "" };
   const facts = parseFactList(res.response);
+  if (u.isNothingVerdict(res.response, facts === "" ? 0 : 1)) return { nfacts: 0, facts: "" };
   const nfacts = facts.split("\n").filter((l) => /^[0-9]/.test(l)).length;
   return { nfacts, facts };
 }

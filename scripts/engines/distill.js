@@ -324,71 +324,14 @@ async function fetchRemoteTitleIndex(graph, rlog) {
 }
 
 // Create `nodePath` with `md` if and only if nothing occupies it yet, and make
-// it appear COMPLETE or not at all. Returns true when this call created it,
-// false when another actor won the race; throws on a real IO failure, so a
-// caller can tell "someone else has it" from "we could not write".
-//
-// hardlink-then-unlink is the primitive that gives both properties at once:
-// the temp file is fully written before it is linked, and link() fails with
-// EEXIST rather than clobbering. Where the filesystem has no usable link()
-// (EPERM/EOPNOTSUPP/ENOSYS on some mounts), the fallback must keep BOTH — an
-// in-place `wx` write keeps exclusivity but gives up atomicity, and a
-// concurrent drain that reads a half-written node parses a matching
-// `capture_key` out of complete frontmatter, calls the finding settled, and
-// consumes the only spool copy of a body that was never written. So the
-// fallback reserves the pathname with the exclusive create and then RENAMES
-// the finished temp file over its own reservation.
+// it appear COMPLETE or not at all: true when this call created it, false when
+// another actor won the race, a throw on a real IO failure. The primitive —
+// hardlink a finished temp file, or reserve with `wx` and rename over the
+// reservation where link() is unusable — is the spool module's
+// createExclusive (lib/shell/spool.js), which documents why an in-place `wx`
+// write is not enough.
 function createNodeExclusive(nodePath, md) {
-  const tmp = `${nodePath}.${process.pid}.tmp`;
-  try {
-    fs.writeFileSync(tmp, md);
-    try {
-      fs.linkSync(tmp, nodePath);
-      return true;
-    } catch (e) {
-      if (e && e.code === "EEXIST") return false;
-      if (e && ["EPERM", "EOPNOTSUPP", "ENOSYS", "EXDEV"].includes(e.code)) {
-        // `wx` is an ATOMIC exclusive create everywhere — it is only the
-        // WRITING that is not atomic — so use it purely as the reservation and
-        // let rename() publish the bytes. Nobody else can hold this
-        // reservation, so the rename replaces a placeholder that is provably
-        // ours and never another actor's node.
-        let fd;
-        try {
-          fd = fs.openSync(nodePath, "wx");
-        } catch (e2) {
-          if (e2 && e2.code === "EEXIST") return false;
-          throw e2;
-        }
-        try {
-          fs.closeSync(fd);
-        } catch {
-          /* best effort */
-        }
-        try {
-          fs.renameSync(tmp, nodePath);
-          return true;
-        } catch (e3) {
-          // Hand the pathname back rather than leaving an empty node squatting
-          // it: the caller keeps the finding spooled and a later sweep retries
-          // the same id instead of minting a longer one.
-          try {
-            fs.rmSync(nodePath, { force: true });
-          } catch {
-            /* best effort */
-          }
-          throw e3;
-        }
-      }
-      throw e;
-    }
-  } finally {
-    try {
-      fs.rmSync(tmp, { force: true });
-    } catch {
-      /* best effort */
-    }
-  }
+  return u.createExclusive(nodePath, md);
 }
 
 // issue-spor-async-nudge-session-final-loss: the SessionEnd half of the async
@@ -629,7 +572,7 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
         let dead = false;
         if (u.ensureDir(path.join(graph, "outbox", "dead"))) {
           try {
-            u.writeFileAtomic(path.join(graph, "outbox", "dead", spoolName), body);
+            u.writeSpoolFile(path.join(graph, "outbox", "dead", spoolName), body);
             dead = true;
           } catch {}
         }
@@ -650,7 +593,7 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
         let spooled = false;
         if (u.ensureDir(path.join(graph, "outbox"))) {
           try {
-            u.writeFileAtomic(path.join(graph, "outbox", spoolName), body);
+            u.writeSpoolFile(path.join(graph, "outbox", spoolName), body);
             spooled = true;
           } catch {}
         }
@@ -852,7 +795,7 @@ function spoolCaptureSlug(ambient, file) {
 // prompt is the better home for the finding (it gets injected in context rather
 // than captured behind someone's back), so collection is strictly the last
 // resort — well inside gc.maxAgeMs, which is what would otherwise delete it.
-const SPOOL_COLLECT_AFTER_MS = 21600000; // 6h
+const SPOOL_COLLECT_AFTER_MS = u.SPOOL_TTL.collectForeign; // 6h
 const SPOOL_COLLECT_MAX = 5; // bounded work per SessionEnd: this runs in a hook
 
 // A DIR is not a unit of work (F22): each of those five can hold any number of
@@ -1094,7 +1037,7 @@ async function distill(input) {
   let usage = null;
   let cost_usd = null;
   let model = null;
-  const recordLlm = (response, error) => {
+  const recordLlm = (response, error, failure) => {
     if (!u.ensureDir(llmDir)) return;
     const rec = {
       id: `llm-${Date.now()}-${u.bashRandom()}`,
@@ -1112,7 +1055,8 @@ async function distill(input) {
       prompt,
       vars: { SLUG: slug, DATE: date, INDEX: index, TOUCHED: touched, CONVO: convo },
       response: error === "" ? response : null,
-      error: error === "" ? null : error,
+      error: error === "" ? null : u.describeBackendFailure(error, failure),
+      ...(failure || {}),
     };
     u.appendLine(path.join(llmDir, `${u.localDate()}.jsonl`), JSON.stringify(rec));
   };
@@ -1124,20 +1068,21 @@ async function distill(input) {
   // CLI should still not hang the SessionEnd hook indefinitely).
   const timeoutMs = u.cfgNum("distill.timeoutMs", "DISTILL_TIMEOUT", 120000);
   const distillCmd = u.cfgStr("distill.cmd", "DISTILL_CMD") || u.hostDefaultBackendCmd("distill");
+  const failure = {};
   if (distillCmd) {
     backend = `cmd:${distillCmd}`;
-    response = u.runBackendCmd(distillCmd, prompt, { timeoutMs });
+    response = u.runBackendCmd(distillCmd, prompt, { timeoutMs, failure });
     if (response === null) {
-      recordLlm("", "distill cmd failed");
-      log("distill cmd failed");
+      recordLlm("", "distill cmd failed", failure);
+      log(u.describeBackendFailure("distill cmd failed", failure));
       return null;
     }
   } else {
     backend = "cli:claude -p --model haiku";
-    const res = u.runClaudeBackend(prompt, { timeoutMs });
+    const res = u.runClaudeBackend(prompt, { timeoutMs, failure });
     if (res === null) {
-      recordLlm("", "claude -p failed");
-      log("claude -p failed");
+      recordLlm("", "claude -p failed", failure);
+      log(u.describeBackendFailure("claude -p failed", failure));
       return null;
     }
     response = res.text;
@@ -1159,7 +1104,8 @@ async function distill(input) {
     }).catch(() => {});
   };
 
-  if (response.includes("NOTHING")) {
+  const blockCount = remote ? parseFactBlocks(response).length : parseNodeBlocks(response).length;
+  if (u.isNothingVerdict(response, blockCount)) {
     await reportSweep(0, 0, 0, 0);
     log("distilled: nothing durable");
     return null;
@@ -1224,7 +1170,7 @@ async function distill(input) {
           `${session}-${Math.floor(Date.now() / 1000)}-${spooled}.capture.json`
         );
         try {
-          fs.writeFileSync(spool, body);
+          u.writeSpoolFile(spool, body);
         } catch {}
         spooled++;
       }

@@ -438,6 +438,20 @@ rather than re-cite. The flip lives in task-spor-flip-nudge-async-default-on.
 The default synchronous path is byte-identical (the drain and its
 syscalls are gated on the flag). See test/nudge-async.test.js and
 test/nudge-sweep.test.js.
+All three hand-off spools — pending-nudges, pending-digests, and the remote
+outbox — go through ONE module, `lib/shell/spool.js`
+(task-spor-client-spool-single-module; re-exported on `u`): `writeSpoolFile`
+(temp + rename, so no reader parses a torn write) and `createExclusive`
+(first-writer-wins, still atomic) for every spool write, the claim-by-rename
+primitives (`claimSpoolResult`, `claimSpoolJob`, and `claimAndReadJson` for the
+digest drain) for every read that consumes, and `SPOOL_TTL`, the one table of
+horizons (claim hold, orphan re-drive, sweep interval, foreign collection, GC)
+that the engines' constants now read from. Add a spool file class there, not in
+the engine that happens to touch it. The outbox drain takes files
+oldest-ATTEMPT first and re-stamps a transiently failed file's mtime, so a
+failing head rotates behind the rest instead of blocking them; session-start's
+detached drain takes up to 10 files in a 20s pass. `node:sqlite` was weighed as
+the store and dismissed while `engines.node` is `>=20` (it needs 22.5+).
 
 The prompt-context engine's digest has the same async pattern as an INTENT GATE
 (issue-spor-user-prompt-submit-digest-noise,

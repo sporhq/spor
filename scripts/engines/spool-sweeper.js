@@ -80,27 +80,28 @@ const SCAN_DIR_MAX = 200;
 // nothing. The stamp is NOT a debt flag: it only ever DELAYS a pass, the
 // `.out.json` is still the whole debt, and a failed stamp write falls through to
 // sweeping — the safe side is doing the work, not skipping it.
-const SWEEP_INTERVAL_MS = 1800000;
+const SWEEP_INTERVAL_MS = u.SPOOL_TTL.sweepInterval;
 const SWEEP_STAMP = "spool-swept";
 
 // --- origin metadata --------------------------------------------------------
 
 // Persist who a spool belongs to, written by post-tool.js when it creates the
-// dir. First write wins (`wx`): the record describes the SESSION's identity —
+// dir. First write wins: the record describes the SESSION's identity —
 // its tenant and its home project — not the individual finding, whose own
 // project is read from the classified file's location at capture time.
 // Best-effort by construction: a spool with no origin is simply not eligible for
 // this sweep, so a failed write can only withhold recovery, never misdirect it.
+// The create is exclusive AND atomic (u.createExclusive): a sweeper reading
+// origin.json while post-tool is still writing it would otherwise parse a torn
+// record, fail, and retain a spool it could have recovered.
 function writeSpoolOrigin(dir, { session, slug, cwd, server, org }) {
   try {
-    fs.writeFileSync(
+    return u.createExclusive(
       path.join(dir, ORIGIN_FILE),
-      JSON.stringify({ session, slug: slug || "", cwd: cwd || "", server: server || "", org: org || "", ts: u.jqNow() }),
-      { flag: "wx" }
+      JSON.stringify({ session, slug: slug || "", cwd: cwd || "", server: server || "", org: org || "", ts: u.jqNow() })
     );
-    return true;
   } catch {
-    return false; // already there (the common case), or unwritable
+    return false; // unwritable
   }
 }
 

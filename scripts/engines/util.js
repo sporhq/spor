@@ -15,6 +15,7 @@ const CODEX_NUDGE_MODEL = "gpt-5.4-mini";
 
 const home = require(path.join(ROOT, "lib", "shell", "home.js"));
 const { writeFileAtomic } = require(path.join(ROOT, "lib", "shell", "atomic-write.js"));
+const spool = require(path.join(ROOT, "lib", "shell", "spool.js"));
 const { gitEnv, gitSpawn, gitToplevelAndCommonDir } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 // The harness vocabulary the capability probe emits — owned by the pure matcher
 // so the probe, the matcher, and the future fleet scheduler agree on one set of
@@ -563,7 +564,7 @@ function gcJournal(graph, opts = {}) {
     if (!enabled) return stat;
     const dir = path.join(graph, "journal");
     const now = opts.now ?? Date.now();
-    const intervalMs = opts.intervalMs ?? cfgNum("gc.intervalMs", "GC_INTERVAL", 86400000); // 1d
+    const intervalMs = opts.intervalMs ?? cfgNum("gc.intervalMs", "GC_INTERVAL", spool.SPOOL_TTL.gcInterval);
     const stamp = path.join(dir, ".gc-stamp");
     if (!opts.force) {
       let last = 0;
@@ -591,7 +592,7 @@ function gcJournal(graph, opts = {}) {
       /* best-effort — an unwritable stamp just means we re-scan next time */
     }
     stat.ran = true;
-    const maxAgeMs = opts.maxAgeMs ?? cfgNum("gc.maxAgeMs", "GC_MAX_AGE", 1209600000); // 14d
+    const maxAgeMs = opts.maxAgeMs ?? cfgNum("gc.maxAgeMs", "GC_MAX_AGE", spool.SPOOL_TTL.gcMaxAge);
     const cutoff = now - maxAgeMs;
     const session = opts.session || null;
     // The live session's own prompt-context digest-dedup cache is named by a hash
@@ -1555,7 +1556,10 @@ function remoteTitleIndex(respBody, maxLines = 150) {
 // backend so the synchronous nudge/distill call can't block the host past its
 // own budget — SIGKILL because the whole point is to survive a wedged child
 // that would ignore SIGTERM (a killed run lands in r.error and fails open).
-function runBackendCmd(cmd, prompt, { timeoutMs } = {}) {
+// `failure`, when given, is filled on a failed run with what the process
+// said about itself (backendFailure) so the caller can record WHY rather than
+// a bare "cmd failed" (issue-spor-nudge-cmd-failed-majority).
+function runBackendCmd(cmd, prompt, { timeoutMs, failure } = {}) {
   const opts = {
     input: prompt,
     encoding: "utf8",
@@ -1566,7 +1570,10 @@ function runBackendCmd(cmd, prompt, { timeoutMs } = {}) {
   const r = process.platform === "win32"
     ? spawnSync(cmd, { ...opts, shell: true })
     : spawnSync("sh", ["-c", cmd], opts);
-  if (r.status !== 0 || r.error) return null;
+  if (r.status !== 0 || r.error) {
+    if (failure) Object.assign(failure, backendFailure(r));
+    return null;
+  }
   // RESPONSE=$(...) — command substitution strips trailing newlines.
   return stripTrailingNewlines(r.stdout);
 }
@@ -1598,12 +1605,49 @@ function parseClaudeResult(stdout) {
   }
 }
 
+// What a failed backend spawn said about itself, for the llm-calls record:
+// the exit code, the killing signal (a SIGKILL is the timeout), a spawn error
+// code (ENOENT: the command does not exist), and the head of stderr. Only the
+// fields that carry something are present.
+function backendFailure(r) {
+  const f = {};
+  if (typeof r.status === "number") f.exit_code = r.status;
+  if (r.signal) f.signal = r.signal;
+  if (r.error && r.error.code) f.spawn_error = r.error.code;
+  const err = stripTrailingNewlines(String(r.stderr || ""));
+  if (err) f.stderr = byteHead(err, 1000);
+  return f;
+}
+
+// "nudge cmd failed" plus the one-line reason a reader of `spor-hook doctor`
+// needs to act on it: "(exit 127: sh: 1: gemini: not found)". The label stays
+// the prefix, so anything grouping failures by label still groups them.
+function describeBackendFailure(label, f) {
+  if (!f) return label;
+  const how =
+    f.spawn_error ? `spawn ${f.spawn_error}` : f.signal ? `signal ${f.signal}` : f.exit_code != null ? `exit ${f.exit_code}` : "";
+  const why = f.stderr ? byteHead(f.stderr.split("\n").find((l) => l.trim()) || "", 200).trim() : "";
+  if (!how && !why) return label;
+  return `${label} (${[how, why].filter(Boolean).join(": ")})`;
+}
+
+// A classifier/distiller response is a NOTHING verdict only when it parsed no
+// fact/node block AND one of its lines is exactly `NOTHING`. A substring test
+// read any fact that merely MENTIONED the word ("returns NOTHING when…") as
+// "no facts" and dropped the whole response (issue-spor-nudge-cmd-failed-majority).
+function isNothingVerdict(response, parsedCount) {
+  if (parsedCount > 0) return false;
+  return String(response)
+    .split("\n")
+    .some((l) => l.trim() === "NOTHING");
+}
+
 // Default backend: headless `claude -p --model haiku --max-turns 1 <prompt>`,
 // JSON output so the call's token usage and cost are recorded. Returns
 // { text, usage, cost_usd, model } or null on process failure. `timeoutMs`
 // (when > 0) SIGKILLs a hung CLI so the call can't block the host past its
 // budget; a killed run lands in r.error and fails open like any other failure.
-function runClaudeBackend(prompt, { timeoutMs } = {}) {
+function runClaudeBackend(prompt, { timeoutMs, failure } = {}) {
   const r = spawnSync(
     "claude",
     ["-p", "--model", "haiku", "--max-turns", "1", "--output-format", "json", prompt],
@@ -1616,7 +1660,10 @@ function runClaudeBackend(prompt, { timeoutMs } = {}) {
       ...(timeoutMs > 0 ? { timeout: timeoutMs, killSignal: "SIGKILL" } : {}),
     }
   );
-  if (r.status !== 0 || r.error) return null;
+  if (r.status !== 0 || r.error) {
+    if (failure) Object.assign(failure, backendFailure(r));
+    return null;
+  }
   return parseClaudeResult(r.stdout);
 }
 
@@ -1637,7 +1684,7 @@ function runClassifierBackend({ prompt, tplSha, session, project, graph, source,
   let usage = null;
   let cost_usd = null;
   let model = null;
-  const recordLlm = (response, error) => {
+  const recordLlm = (response, error, failure) => {
     if (!ensureDir(llmDir)) return;
     const rec = {
       id: `llm-${Date.now()}-${bashRandom()}`,
@@ -1655,24 +1702,26 @@ function runClassifierBackend({ prompt, tplSha, session, project, graph, source,
       prompt,
       vars,
       response: error === "" ? response : null,
-      error: error === "" ? null : error,
+      error: error === "" ? null : describeBackendFailure(error, failure),
+      ...(failure || {}),
     };
     appendLine(path.join(llmDir, `${localDate()}.jsonl`), JSON.stringify(rec));
   };
 
   let response;
+  const failure = {};
   if (cmd) {
     backend = `cmd:${cmd}`;
-    response = runBackendCmd(cmd, prompt, { timeoutMs });
+    response = runBackendCmd(cmd, prompt, { timeoutMs, failure });
     if (response === null) {
-      recordLlm("", `${source} cmd failed`);
+      recordLlm("", `${source} cmd failed`, failure);
       return null;
     }
   } else {
     backend = "cli:claude -p --model haiku";
-    const res = runClaudeBackend(prompt, { timeoutMs });
+    const res = runClaudeBackend(prompt, { timeoutMs, failure });
     if (res === null) {
-      recordLlm("", "claude -p failed");
+      recordLlm("", "claude -p failed", failure);
       return null;
     }
     response = res.text;
@@ -1737,7 +1786,7 @@ function runSpoolWorker(inFile, classify, buildOutput) {
   if (out && job.hash) {
     const outFile = path.join(path.dirname(inFile), `${job.hash}.out.json`);
     try {
-      writeFileAtomic(outFile, JSON.stringify(out));
+      spool.writeSpoolFile(outFile, JSON.stringify(out));
       settled = true;
     } catch {
       /* the result did NOT land — keep the input as the debt to re-run */
@@ -1752,164 +1801,6 @@ function runSpoolWorker(inFile, classify, buildOutput) {
   }
 
   process.exit(0);
-}
-
-// Atomic CLAIM on an async-nudge spool result (dec-spor-nudge-drain-atomic-claim).
-// Both drains read the same `<hash>.out.json` — the prompt-time one injects it,
-// the SessionEnd one captures it — so without a claim an overlapping pair can
-// act on ONE finding twice. The claim is a rename, not a check-then-act: exactly
-// one caller's rename succeeds and every loser gets ENOENT and skips. Two
-// properties make it safe for a drain that must not destroy what it cannot yet
-// place: the claimed name still ends in `.out.json`, so a result the SessionEnd
-// drain deliberately KEEPS (a transient failure) stays visible to every later
-// sweep, and a crash between the claim and the capture strands nothing. Any
-// previous claim segment is stripped first, so re-claiming across sweeps cannot
-// grow the name. Returns the claimed basename, or null when the claim was lost.
-//
-// That same visibility is why a claim is not only taken but HELD: a name ending
-// in `.out.json` can be re-claimed the instant it is written, including while
-// its first owner is still acting on it — the double action the claim exists to
-// stop (the prompt drain injecting a finding the SessionEnd drain is
-// mid-capture, say). So a claim stamped by a pid that is still ALIVE is refused
-// until it goes stale. Liveness, not a bare timeout, is what makes the hold
-// safe for a last-chance drain: a hook process is over in milliseconds, so it
-// hands its claim back by exiting, and only a drain genuinely still running
-// keeps one. The TTL is the backstop for the one case liveness misreads — a
-// recycled pid — and bounds any hold at SPOOL_CLAIM_TTL_MS.
-const SPOOL_CLAIM_RE = /(?:\.claim-\d+-\d+)?\.out\.json$/;
-const SPOOL_CLAIM_STAMP = /\.claim-(\d+)-(\d+)\.out\.json$/;
-const SPOOL_CLAIM_TTL_MS = 300000; // 5min: longer than any drain, short enough to self-heal
-function spoolResultHash(f) {
-  return f.replace(SPOOL_CLAIM_RE, "");
-}
-function claimHeldByLiveOwner(f) {
-  const m = SPOOL_CLAIM_STAMP.exec(f);
-  if (!m) return false;
-  const pid = Number(m[1]);
-  if (pid === process.pid) return false; // our own claim is ours to retake
-  if (Date.now() - Number(m[2]) >= SPOOL_CLAIM_TTL_MS) return false;
-  try {
-    process.kill(pid, 0);
-    return true; // alive: it may still be acting on this finding
-  } catch (e) {
-    // EPERM means the pid exists under another uid — alive. ESRCH means gone.
-    return Boolean(e && e.code === "EPERM");
-  }
-}
-
-// The optional `status` out-param records WHY a claim came back null, because
-// the three reasons are not the same fact and a caller that collapses them
-// destroys work (F16/F17): "held" — a live owner has it and has not yet decided
-// what its bytes even are; "gone" — it was renamed or consumed out from under
-// us, which says who no longer has it, never that a verdict was reached;
-// "failed" — the claim RENAME itself failed (EACCES, EBUSY, EIO, a Windows
-// sharing violation), so nobody owns it, nothing was read, and the result is
-// still sitting there recoverable. None of the three is a read verdict, so none
-// of them is proof that the worker input backing it may be deleted.
-function claimSpoolResult(dir, f, status) {
-  const say = (outcome) => {
-    if (status) status.outcome = outcome;
-  };
-  if (claimHeldByLiveOwner(f)) {
-    say("held");
-    return null;
-  }
-  const claimed = `${spoolResultHash(f)}.claim-${process.pid}-${Date.now()}.out.json`;
-  try {
-    fs.renameSync(path.join(dir, f), path.join(dir, claimed));
-    say("claimed");
-    return claimed;
-  } catch (e) {
-    say(e && e.code === "ENOENT" ? "gone" : "failed");
-    return null;
-  }
-}
-
-// Exclusive lock over ONE spool JOB — the `<hash>.in.json` +
-// `<hash>.redriven.in.json` pair the prompt-time orphan sweep re-drives.
-// COPYFILE_EXCL is the atomic claim for a FIRST re-drive, but it cannot guard
-// the recovery arm, which re-copies over a `.redriven.in.json` that already
-// exists: two overlapping sweeps would both copy (tearing the copy under a
-// worker already reading it) and both spawn. This is that arm's missing claim
-// (F17), and it covers every mutation of the pair — the settled prune
-// included, so a prune can never delete files a sweep is mid-recovery on.
-//
-// The lock is self-healing like the result claim above — a holder that dies
-// must not wedge the job forever — but it reaches that WITHOUT ever deleting
-// another actor's lock (F19). A single well-known lock pathname forced the old
-// shape: see it, judge it stale, unlink it, re-create it. That check-then-unlink
-// is not a claim. Two sweepers could both judge one stale lock, both break it,
-// and both `wx` — worse, the loser's break deletes the WINNER's fresh lock, and
-// the winner's `release()` then deletes its successor's, so a third sweeper
-// walks in on a pair two others are already mutating. That is precisely the
-// concurrent re-copy/re-spawn the lock exists to prevent.
-//
-// So each contender creates ONLY its own uniquely-named lock file
-// (`<hash>.redrive.lock-<pid>-<ts>-<rand>`) and deletes ONLY its own. Everything
-// a racer needs to judge a lock is in its NAME, so there is no create-then-write
-// window to misread and no file to read at all. Ownership is decided by a listing
-// AFTER the create: you hold the job only if no OTHER live contender is present.
-// Two contenders can never both win — each creates before it lists, so if A's
-// listing missed B then B was created after A, and B's own listing must see A.
-// A collision simply means "not ours this pass" for one or both, which is the
-// safe answer: the pair is left exactly as it is for a later sweep.
-//
-// Staleness is per-contender and read-only: a lock whose pid is gone or whose
-// stamp is past SPOOL_CLAIM_TTL_MS is IGNORED by every racer, so a crashed
-// holder costs one horizon, not the job. Such a file is unlinked only when it is
-// provably dead AND expired — and because every racer already ignores it, that
-// unlink can neither grant nor revoke ownership.
-const SPOOL_JOB_LOCK_STAMP = /^(\d+)-(\d+)-[0-9a-f]+$/;
-function spoolJobLockContends(name) {
-  const m = SPOOL_JOB_LOCK_STAMP.exec(name);
-  if (!m) return { contends: false, prunable: false }; // not one of ours: never touch it
-  const pid = Number(m[1]);
-  const expired = Date.now() - Number(m[2]) >= SPOOL_CLAIM_TTL_MS;
-  if (pid === process.pid) return { contends: false, prunable: false }; // ours to ignore, never to reap blindly
-  let alive = false;
-  try {
-    process.kill(pid, 0);
-    alive = true;
-  } catch (e) {
-    alive = Boolean(e && e.code === "EPERM"); // EPERM: alive under another uid
-  }
-  return { contends: alive && !expired, prunable: !alive && expired };
-}
-function claimSpoolJob(dir, hash) {
-  const prefix = `${hash}.redrive.lock-`;
-  const mine = `${prefix}${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-  const p = path.join(dir, mine);
-  try {
-    fs.writeFileSync(p, "", { flag: "wx" });
-  } catch {
-    return null; // cannot lock here at all: do not act
-  }
-  const release = () => {
-    try {
-      fs.unlinkSync(p);
-    } catch {}
-  };
-  let entries;
-  try {
-    entries = fs.readdirSync(dir);
-  } catch {
-    release();
-    return null; // cannot tell who else is here: not ours this pass
-  }
-  for (const f of entries) {
-    if (f === mine || !f.startsWith(prefix)) continue;
-    const { contends, prunable } = spoolJobLockContends(f.slice(prefix.length));
-    if (contends) {
-      release();
-      return null; // a live contender owns the pair this pass
-    }
-    if (prunable) {
-      try {
-        fs.unlinkSync(path.join(dir, f));
-      } catch {}
-    }
-  }
-  return release;
 }
 
 // Detached child that survives the hook process (replaces nohup setsid).
@@ -1997,13 +1888,23 @@ module.exports = {
   localTitleIndex,
   remoteTitleIndex,
   runBackendCmd,
+  backendFailure,
+  describeBackendFailure,
+  isNothingVerdict,
   runClaudeBackend,
   parseClaudeResult,
   runClassifierBackend,
   runSpoolWorker,
-  claimSpoolResult,
-  claimSpoolJob,
-  spoolResultHash,
+  // The spool primitives live in lib/shell/spool.js
+  // (task-spor-client-spool-single-module); re-exported so engines keep
+  // reaching them through `u`.
+  SPOOL_TTL: spool.SPOOL_TTL,
+  writeSpoolFile: spool.writeSpoolFile,
+  createExclusive: spool.createExclusive,
+  claimSpoolResult: spool.claimSpoolResult,
+  claimAndReadJson: spool.claimAndReadJson,
+  claimSpoolJob: spool.claimSpoolJob,
+  spoolResultHash: spool.spoolResultHash,
   spawnDetached,
   bashRandom,
   writeFileAtomic,

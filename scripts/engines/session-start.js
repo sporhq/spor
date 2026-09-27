@@ -387,8 +387,11 @@ async function sessionStart(input) {
     // stacked its 2s onto the briefing's 6s and the queue's 3s, blowing the
     // ~6s session-start budget (§7.1, issue-cc-session-start-serial-timeout-
     // budget). Detaching it (and the commit catch-up) leaves only the two
-    // server reads on the critical path, which now run concurrently.
-    u.spawnDetached([path.join(__dirname, "drain-outbox.js"), "session-start", "2", "1"]);
+    // server reads on the critical path, which now run concurrently. Being
+    // detached, it can afford a BATCH — up to 10 files in a 20s pass — where
+    // one file per session-start left a 41-deep post-outage backlog needing 41
+    // sessions to clear (issue-spor-outbox-drain-file-cap-hol-block).
+    u.spawnDetached([path.join(__dirname, "drain-outbox.js"), "session-start", "2", "10", "20"]);
 
     // Commit-link catch-up (task-cc-commit-linking): detached, costs nothing.
     if (cwd && fs.existsSync(cwd)) {

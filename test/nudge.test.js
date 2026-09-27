@@ -333,3 +333,31 @@ test('fail-open: a dying classifier exits 0, no output, error journaled', () => 
   assert.strictEqual(again.trim(), '');
   assert.strictEqual(llmCalls(home).length, 1);
 });
+
+// issue-spor-nudge-cmd-failed-majority: NOTHING is a verdict only as an exact
+// line with no FACT block, and a failed backend records why it failed.
+test('a FACT whose text mentions NOTHING still fires the nudge', () => {
+  const { root, home, cwd } = scratch();
+  const stub = backend(root, 'fact-with-nothing.js', `
+process.stdin.resume();
+process.stdin.on("end", () => process.stdout.write(${JSON.stringify(
+    '===FACT===\nThe classifier returns NOTHING for a changelog, so changelogs are never captured.\n===END===\n'
+  )}));
+`);
+  const out = postTool(home, cwd, stub, { file: path.join(cwd, 'notes.md'), content: PROSE });
+  assert.match(JSON.parse(out).hookSpecificOutput.additionalContext, /changelogs are never captured/);
+  assert.strictEqual(journal(home).filter((e) => e.tool === 'nudge').length, 1);
+});
+
+test('a failed backend records its exit code and stderr head in llm-calls', () => {
+  const { root, home, cwd } = scratch();
+  const stub = backend(root, 'loud-failing-backend.js', `
+process.stdin.resume();
+process.stdin.on("end", () => { process.stderr.write("quota exceeded: try again later\\n"); process.exit(3); });
+`);
+  postTool(home, cwd, stub, { file: path.join(cwd, 'doc.md'), content: PROSE });
+  const [call] = llmCalls(home);
+  assert.strictEqual(call.exit_code, 3);
+  assert.match(call.stderr, /quota exceeded/);
+  assert.match(call.error, /^nudge cmd failed \(exit 3: quota exceeded: try again later\)$/);
+});

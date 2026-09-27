@@ -12,8 +12,19 @@ const u = require("./util");
 
 // Returns a { attempted, drained, deadLettered, failed } tally so a caller (the
 // `spor drain` verb) can report the outcome; the detached/session-start callers
-// ignore it. Observable behavior (file moves, journal lines) is unchanged.
-async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) {
+// ignore it.
+//
+// No file may block the ones behind it (issue-spor-outbox-drain-file-cap-hol-block):
+// files are taken OLDEST-ATTEMPT first — a file's last failed attempt, else its
+// spool time (mtime) — and a transient failure stamps the attempt, rotating
+// that file behind everything not yet tried, so a capped drain that keeps
+// failing on one file still reaches every other file on later passes. The
+// attempt stamp is a sidecar (`outbox/.attempts/<name>`, its mtime) rather than
+// the file's own mtime, which stays the SPOOL time: `spor-hook doctor` reports
+// the outbox's oldest mtime as how long captures have been stuck, and an
+// outage must not read as minutes old because every drain re-stamped it. `maxWallSec` (0 = none) bounds
+// the whole pass besides the per-file `maxTimeSec` and the `maxFiles` cap.
+async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0, maxWallSec = 0) {
   const summary = { attempted: 0, drained: 0, deadLettered: 0, failed: 0 };
   if (!u.serverBase()) return summary;
   const outbox = path.join(graph, "outbox");
@@ -26,16 +37,49 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
   // (session-start) skip them so one slow file can't eat the hook budget.
   const retry = maxTimeSec <= 5 ? 0 : 2;
 
+  const attempts = path.join(outbox, ".attempts");
+  const stampOf = (name) => path.join(attempts, name);
+  const clearStamp = (name) => {
+    try {
+      fs.rmSync(stampOf(name), { force: true });
+    } catch {}
+  };
   let files;
   try {
-    files = fs.readdirSync(outbox).filter((f) => f.endsWith(".json")).sort();
+    files = fs
+      .readdirSync(outbox)
+      .filter((f) => f.endsWith(".json"))
+      .map((name) => {
+        let m = 0;
+        try {
+          m = fs.statSync(stampOf(name)).mtimeMs;
+        } catch {
+          try {
+            m = fs.statSync(path.join(outbox, name)).mtimeMs;
+          } catch {}
+        }
+        return { name, m };
+      })
+      .sort((a, b) => a.m - b.m || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+      .map((e) => e.name);
   } catch {
     return summary;
   }
+  // A stamp whose file is gone (drained or dead-lettered by another drain) is
+  // litter; prune it so the sidecar dir stays bounded by the outbox itself.
+  try {
+    const live = new Set(files);
+    for (const s of fs.readdirSync(attempts)) if (!live.has(s)) clearStamp(s);
+  } catch {}
 
+  const deadline = maxWallSec > 0 ? Date.now() + maxWallSec * 1000 : 0;
   for (const name of files) {
     if (maxFiles > 0 && summary.attempted >= maxFiles) {
       rlog(`file cap (${maxFiles}) reached; deferring the rest to the next drain`);
+      break;
+    }
+    if (deadline && Date.now() >= deadline) {
+      rlog(`time budget (${maxWallSec}s) spent; deferring the rest to the next drain`);
       break;
     }
     const file = path.join(outbox, name);
@@ -58,6 +102,7 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
       try {
         fs.unlinkSync(file);
       } catch {}
+      clearStamp(name);
       summary.drained++;
       rlog(`drained ${name} (http=${http})`);
     } else if (http === "401" || http === "403" || http === "400" || http === "413" || http === "422") {
@@ -74,6 +119,7 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
           fs.unlinkSync(file);
         } catch {}
       }
+      clearStamp(name);
       summary.deadLettered++;
       if (http === "401") {
         rlog(
@@ -85,6 +131,14 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
       }
     } else {
       summary.failed++;
+      // Re-stamp the attempt so this file rotates behind every file not yet
+      // tried: a head that keeps failing no longer starves the queue.
+      try {
+        u.ensureDir(attempts);
+        fs.writeFileSync(stampOf(name), "");
+        const now = new Date();
+        fs.utimesSync(stampOf(name), now, now);
+      } catch {}
       rlog(`drain failed for ${name} (http=${http}); leaving spooled`);
     }
   }
@@ -95,13 +149,14 @@ module.exports = { drainOutbox };
 
 // CLI entry so session-start can fire the drain DETACHED (off the response
 // critical path) the same way it fires link-commits.js — argv: tag, perFileSec,
-// maxFiles. The graph home is re-derived from the environment, identical to the
-// in-process call. Fail-open, always exits 0.
+// maxFiles, maxWallSec. The graph home is re-derived from the environment,
+// identical to the in-process call. Fail-open, always exits 0.
 if (require.main === module) {
   const tag = process.argv[2] || "drain";
   const maxTimeSec = Number(process.argv[3]) || 30;
   const maxFiles = Number(process.argv[4]) || 0;
-  drainOutbox(u.graphHome(), tag, maxTimeSec, maxFiles)
+  const maxWallSec = Number(process.argv[5]) || 0;
+  drainOutbox(u.graphHome(), tag, maxTimeSec, maxFiles, maxWallSec)
     .catch(() => {})
     .finally(() => process.exit(0));
 }

@@ -194,7 +194,7 @@ async function main() {
     // live claim on a false positive would silently strand active work.
     payload.spor_debounced = true;
     try {
-      fs.writeFileSync(pendingFile, JSON.stringify(payload));
+      u.writeSpoolFile(pendingFile, JSON.stringify(payload));
     } catch {
       return;
     }

@@ -193,3 +193,60 @@ test('u.curl with retry=0 does not retry a 429 (session-start fast path)', async
     globalThis.fetch = realFetch;
   }
 });
+
+// issue-spor-outbox-drain-file-cap-hol-block: one failing file must not block
+// the ones behind it.
+test('drain: a transiently failing head does not block the files behind it', async () => {
+  const graph = scratchGraph();
+  for (const n of ['a.json', 'b.json', 'c.json', 'd.json', 'e.json']) spool(graph, n);
+  // Oldest first by mtime: make a.json the unambiguous head.
+  const old = new Date(Date.now() - 60000);
+  fs.utimesSync(path.join(graph, 'outbox', 'a.json'), old, old);
+  let calls = 0;
+  const s = await withServer(async () => (calls++ === 0 ? fakeResponse(503) : fakeResponse(200)), () =>
+    drainOutbox(graph, 'test', 2, 10, 20)
+  );
+  assert.deepStrictEqual({ drained: s.drained, failed: s.failed }, { drained: 4, failed: 1 });
+  assert.ok(live(graph, 'a.json'), 'the failing file stays spooled');
+  // The rotation stamp is a sidecar: the file's own mtime stays its SPOOL time,
+  // which is what `spor-hook doctor` reports as how long captures are stuck.
+  assert.strictEqual(Math.round(fs.statSync(path.join(graph, 'outbox', 'a.json')).mtimeMs / 1000), Math.round(old.getTime() / 1000));
+  assert.deepStrictEqual(fs.readdirSync(path.join(graph, 'outbox', '.attempts')), ['a.json']);
+  for (const n of ['b.json', 'c.json', 'd.json', 'e.json']) assert.ok(!live(graph, n), `${n} drained`);
+});
+
+test('drain: a failed file rotates behind the untried ones under a file cap of 1', async () => {
+  const graph = scratchGraph();
+  const old = new Date(Date.now() - 60000);
+  const seen = [];
+  const responder = async (url, init) => {
+    seen.push(String(init.body));
+    return fakeResponse(seen.length === 1 ? 503 : 200);
+  };
+  fs.writeFileSync(path.join(graph, 'outbox', 'a.json'), JSON.stringify({ id: 'n-a' }));
+  fs.utimesSync(path.join(graph, 'outbox', 'a.json'), old, old);
+  fs.writeFileSync(path.join(graph, 'outbox', 'b.json'), JSON.stringify({ id: 'n-b' }));
+  await withServer(responder, () => drainOutbox(graph, 'test', 2, 1));
+  await withServer(responder, () => drainOutbox(graph, 'test', 2, 1));
+  assert.match(seen[0], /n-a/);
+  assert.match(seen[1], /n-b/, 'the second pass takes the untried file, not the failed head again');
+  assert.ok(!live(graph, 'b.json'));
+  assert.ok(live(graph, 'a.json'));
+  // A later success clears the stamp.
+  await withServer(async () => fakeResponse(200), () => drainOutbox(graph, 'test', 2, 0));
+  assert.deepStrictEqual(fs.readdirSync(path.join(graph, 'outbox', '.attempts')), []);
+});
+
+test('drain: the wall-clock budget stops a pass and leaves the rest spooled', async () => {
+  const graph = scratchGraph();
+  spool(graph, 'a.json');
+  spool(graph, 'b.json');
+  const s = await withServer(
+    async () => {
+      await new Promise((r) => setTimeout(r, 1100));
+      return fakeResponse(200);
+    },
+    () => drainOutbox(graph, 'test', 2, 0, 1)
+  );
+  assert.strictEqual(s.attempted, 1);
+});

@@ -73,6 +73,7 @@ const remote = require(path.join(ROOT, "lib", "remote.js"));
 const auth = require(path.join(ROOT, "lib", "auth.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const { gitSpawn } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
+const { writeSpoolFile } = require(path.join(ROOT, "lib", "shell", "spool.js"));
 const dispatchRuns = lazyModule(path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js"));
 const dispatchTerminal = lazyModule(path.join(ROOT, "lib", "shell", "dispatch-terminal.js"));
 const dispatchHarnesses = lazyModule(path.join(ROOT, "lib", "shell", "dispatch-harnesses.js"));
@@ -3910,7 +3911,9 @@ function spoolCapture(cfg, body) {
     const dir = path.join(cfg.graphHome(), "outbox");
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, `cli-${Date.now()}-${crypto.randomUUID()}.capture.json`);
-    fs.writeFileSync(file, JSON.stringify(body));
+    // Atomic: a concurrent drain lists `*.json` and must never POST (and then
+    // dead-letter on the 400) a half-written body — the temp name ends `.tmp`.
+    writeSpoolFile(file, JSON.stringify(body));
     return file;
   } catch {
     return null;

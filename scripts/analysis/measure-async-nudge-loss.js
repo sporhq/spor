@@ -142,6 +142,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { parseFactList } = require("../engines/post-tool.js");
+const { isNothingVerdict } = require("../engines/util.js");
 
 // Hand adjudication of every lost fact against its session's distiller output,
 // keyed by sha256(session|fact) so it survives re-runs and re-orderings. The
@@ -191,8 +192,8 @@ const DRAIN_OBSERVABLE_LAG_MS = 120000;
 function verdictFacts(rec) {
   if (rec.error) return null; // backend failed: no result written, nothing to lose
   const response = String(rec.response ?? "");
-  if (response.includes("NOTHING")) return { nfacts: 0, facts: "" };
   const facts = parseFactList(response);
+  if (isNothingVerdict(response, facts === "" ? 0 : 1)) return { nfacts: 0, facts: "" };
   const nfacts = facts.split("\n").filter((l) => /^[0-9]/.test(l)).length;
   return { nfacts, facts };
 }
@@ -1090,7 +1091,15 @@ function main(argv) {
     if (!ds.length) continue;
     backstopRanFindings++;
     const productive = ds.some(
-      (d) => !d.error && !String(d.response ?? "").includes("NOTHING") && String(d.response ?? "").trim()
+      (d) => {
+        // The engine's rule (u.isNothingVerdict over the engine's own block
+        // parsers): NOTHING only as an exact line with no completed fact/node
+        // block beside it. Either mode's parser may apply to a record.
+        const r = String(d.response ?? "");
+        const { parseFactBlocks, parseNodeBlocks } = require("../engines/distill.js");
+        const blocks = Math.max(parseFactBlocks(r).length, parseNodeBlocks(r).length);
+        return !d.error && !isNothingVerdict(r, blocks) && r.trim();
+      }
     );
     if (!productive) continue;
     backstopProductiveFindings++;

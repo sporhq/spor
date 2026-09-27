@@ -230,7 +230,7 @@ function recordDigestShown(graph, input, digest) {
   const sig = digestSignature(digest);
   try {
     u.ensureDir(path.dirname(p));
-    fs.writeFileSync(p, JSON.stringify({ sig, at: new Date().toISOString() }) + "\n");
+    u.writeSpoolFile(p, JSON.stringify({ sig, at: new Date().toISOString() }) + "\n");
   } catch {}
 }
 
@@ -256,7 +256,7 @@ function stripSystemReminders(prompt) {
 // (journal/<session>.nudged-injected), matching the synchronous nudge's cap;
 // results beyond the cap are consumed and dropped (parity with sync, which
 // stops firing after 3). Fail-open: any error injects nothing.
-const PENDING_ORPHAN_MS = 3600000; // prune an un-consumed `.in.json` after 1h
+const PENDING_ORPHAN_MS = u.SPOOL_TTL.orphanInput; // prune an un-consumed `.in.json` after 1h
 function drainPendingNudges(graph, input, slug) {
   // Resolve the session EXACTLY as post-tool does (input.session_id ?? "unknown")
   // — the dispatcher already folds cursor/copilot's conversation_id/sessionId
@@ -652,7 +652,7 @@ function spoolDigestIntent(graph, input, slug, prompt, digest) {
   const hash = `${Date.now()}-${u.bashRandom()}`;
   const inFile = path.join(spoolDir, `${hash}.in.json`);
   try {
-    fs.writeFileSync(inFile, JSON.stringify({ ...job, hash }));
+    u.writeSpoolFile(inFile, JSON.stringify({ ...job, hash }));
   } catch {
     return digest;
   }
@@ -685,16 +685,13 @@ function drainPendingDigests(graph, input, slug, { suppress = false } = {}) {
     return ""; // no spool dir for this session
   }
 
+  // Each result is TAKEN by rename before it is read (u.claimAndReadJson), so
+  // two overlapping prompts in one session can never both inject one snapshot
+  // — the loser's rename finds nothing. The claimed name keeps the hash prefix,
+  // so the ascending sort still orders by spool time.
   let result = null;
   for (const f of all.filter((n) => n.endsWith(".out.json")).sort()) {
-    const fp = path.join(dir, f);
-    let r = null;
-    try {
-      r = JSON.parse(fs.readFileSync(fp, "utf8"));
-    } catch {}
-    try {
-      fs.unlinkSync(fp);
-    } catch {}
+    const r = u.claimAndReadJson(dir, f);
     if (r && r.digest) result = r; // sorted ascending — the last valid one is newest
   }
 
