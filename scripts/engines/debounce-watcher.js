@@ -52,7 +52,10 @@ async function runDistill() {
   // default home and bypass the shared graph. Fail-open: a config error leaves
   // the prior env/default resolution.
   try {
-    require(path.join(__dirname, "util")).useConfig({ cwd: payload.cwd || process.cwd() });
+    const cfg = require(path.join(__dirname, "util")).useConfig({ cwd: payload.cwd || process.cwd() });
+    // The bound org lost its credential since the hook spooled this: distill
+    // into NEITHER graph (issue-spor-ambient-org-selector-silent-fallback).
+    if (cfg.tenantError()) return;
   } catch {
     /* fall back to env/default home */
   }

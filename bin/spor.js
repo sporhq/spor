@@ -300,6 +300,62 @@ function localMuteNoOp(nodesDir) {
   }
 }
 
+// `spor config [explain] [<key>]` — every declared client config key
+// (lib/config-keys.js) with its resolved value and the layer that WON it, plus
+// the tenant the org selectors resolved (or refused) and any config warnings
+// (task-spor-client-config-typed-key-table-and-explain). Read-only, and exempt
+// from the org refusal in main(): it is where you go to see WHY a tenant was
+// refused. Secret keys are always redacted.
+function cmdConfig(cfg, p) {
+  const pos = p.positionals.slice();
+  if (pos[0] === "explain") pos.shift();
+  else if (pos.length && pos[0] !== undefined && !pos[0].includes(".") && !cfg.explain(pos[0]).length) {
+    err(`spor config: unknown subcommand or key '${pos[0]}'. Try 'spor config explain [<key>]'.`);
+    return 1;
+  }
+  // A child of an open map (dispatch.capabilities.probed) explains its map.
+  const declared = pos[0] ? require("../lib/config-keys.js").lookup(pos[0]) : null;
+  const only = declared && declared.type === "map" ? declared.key : pos[0] || null;
+  let rows = cfg.explain(only);
+  if (only && !rows.length) {
+    err(`spor config: '${only}' is not a declared config key (see 'spor config explain').`);
+    return 1;
+  }
+  if (p.values.set) rows = rows.filter((r) => r.source !== "unset" && r.source !== "default");
+  const shown = (r) => (r.secret && r.value != null && r.value !== "" ? "<redacted>" : r.value);
+  const te = cfg.tenantError();
+  const t = te ? null : cfg.tenant();
+  const tenant = te
+    ? { refused: te.kind, org: te.org, source: te.source, origin: te.origin, stored_orgs: te.orgs }
+    : t ? { server: t.server, org: t.org || null, source: t.source } : null;
+  if (p.values.json) {
+    out(JSON.stringify({
+      mode: cfg.mode(), tenant, warnings: cfg.warnings,
+      keys: rows.map((r) => ({ ...r, value: shown(r), default: r.default === undefined ? null : r.default })),
+    }, null, 2));
+    return 0;
+  }
+  const fmt = (v) => (v === undefined ? "(unset)" : JSON.stringify(v));
+  const w = Math.max(...rows.map((r) => r.key.length), 3);
+  for (const r of rows) {
+    const where = r.source === "unset" ? "unset" : r.source === "default" ? "default" : `${r.source}  ${r.origin}`;
+    let line = `${r.key.padEnd(w)}  ${fmt(shown(r))}  <- ${where}`;
+    if (r.shadowed.length) line += `  (also: ${r.shadowed.map((s) => `${s.source} ${s.origin}`).join(", ")})`;
+    out(line);
+  }
+  out("");
+  out(`mode:     ${cfg.mode()}`);
+  if (tenant && tenant.refused) {
+    out(`tenant:   REFUSED — org '${tenant.org}' (from ${tenant.origin}) has no stored credential; stored: ${tenant.stored_orgs.join(", ") || "(none)"}`);
+  } else if (tenant) {
+    out(`tenant:   ${tenant.server}${tenant.org ? ` (org ${tenant.org})` : ""}  <- ${tenant.source}`);
+  } else {
+    out("tenant:   none (local)");
+  }
+  for (const m of cfg.warnings) err(`config:   ${m}`);
+  return 0;
+}
+
 async function cmdStatus(cfg, { values }) {
   const quiet = !!(values && values.quiet);
   const mode = cfg.mode();
@@ -5923,7 +5979,10 @@ async function cmdAuthList(cfg) {
 
 // `spor auth switch <org>` — set the active (default) tenant.
 function cmdAuthSwitch(cfg, args) {
-  const sel = args.find((a) => !a.startsWith("-"));
+  // The global --org is lifted out of argv before we see it, so `spor auth
+  // switch --org acme` arrives with no positional: honor it as the selector
+  // (issue-spor-cli-auth-known-org-ignored).
+  const sel = args.find((a) => !a.startsWith("-")) || cfg.flagOrg();
   if (!sel) {
     err("usage: spor auth switch <org>");
     return 1;
@@ -5970,7 +6029,18 @@ function cmdAuthLogout(cfg, args) {
     out(`cleared ${n} tenant${n === 1 ? "" : "s"}.`);
     return 0;
   }
-  const sel = args.find((a) => !a.startsWith("-"));
+  let sel = args.find((a) => !a.startsWith("-"));
+  // `spor auth logout --org acme` names the tenant to clear; main() already
+  // refused an unstored one, so the resolved tenant IS acme's credential. Clear
+  // that key — never the active default (issue-spor-cli-auth-known-org-ignored).
+  if (!sel && cfg.flagOrg()) {
+    const t = cfg.tenant();
+    if (t && t.key) {
+      const r = auth.removeTenant(cfg.userConfigHome(), t.key);
+      out(r.ok ? `logged out of ${r.key}` : `no stored tenant for '${cfg.flagOrg()}'`);
+      return r.ok ? 0 : 1;
+    }
+  }
   if (!sel) {
     const store = auth.readStore(cfg.userConfigHome());
     if (!store.default) {
@@ -8278,7 +8348,7 @@ async function cmdUpgrade(cfg, { values, positionals: pos }) {
 // `dispatch.repos` (read via cfg.get; written to $SPOR_HOME/config.json) — the
 // shared graph is path-free by design (repo nodes carry slugs/fingerprints,
 // never a local path; teammates clone to different paths), so the map MUST be
-// local. It self-learns from session-start and from `--dir`/`spor repos`.
+// local. It is written by `spor enable`, `spor repos add` and each real dispatch (never by a hook).
 
 // Whether a node is CONFIRMED absent from the graph — as opposed to merely
 // unreadable right now. resolveNode folds both into `null` (a 404, a 5xx, a
@@ -20903,7 +20973,7 @@ async function cmdRepos(cfg, args) {
     const map = cfg.get("dispatch.repos", {}) || {};
     const keys = Object.keys(map).sort();
     if (!keys.length) {
-      out("no repos mapped yet — they self-register as you open sessions, or: spor repos add <slug> <path>");
+      out("no repos mapped yet — 'spor enable' or a 'spor dispatch' from inside a repo registers it, or: spor repos add <slug> <path>");
       return 0;
     }
     for (const k of keys) out(`${k}\t${map[k]}`);
@@ -21693,6 +21763,25 @@ const COMMANDS = {
     help: "Print the resolved mode (local/remote), graph home, project slug, identity,\nand a health probe. In local mode it also warns of a split-brain claude.ai\nSpor MCP connector; it always surfaces the Node prerequisite line.\n\n--quiet skips the remote health probe and identity lookup (each a network\nround-trip, the health probe up to 6s) — use it when a caller only needs the\nlocally-resolved mode/project/graph fields, e.g. a skill reading back the\nproject slug.",
     examples: ["spor status", "spor status --quiet"],
     run: (cfg, p) => cmdStatus(cfg, p),
+  },
+  config: {
+    group: "Getting started", parse: "strict", args: "[explain] [<key>]",
+    options: {
+      set: { type: "boolean", desc: "only keys some config layer actually set" },
+      json: { type: "boolean", desc: "machine-readable output" },
+    },
+    summary: "every config key, its value, and the layer that set it",
+    help:
+      "Explain the client config cascade: for every declared key (or one key /\n" +
+      "namespace), the resolved value and the WINNING layer — cli flag, env var,\n" +
+      "repo .spor.json, user $SPOR_HOME/config.json, global\n" +
+      "$XDG_CONFIG_HOME/spor/config.json, built-in default, or unset — plus any\n" +
+      "lower layers it shadows. Also prints the resolved mode, the tenant the org\n" +
+      "selectors chose (or REFUSED: an org with no stored credential fails\n" +
+      "closed), and every config warning (unknown keys, mistyped values).\n" +
+      "Secret values (token, attestation.signingKey) are always redacted.",
+    examples: ["spor config", "spor config explain nudge", "spor config explain --set", "spor config explain dispatch.agent --json"],
+    run: (cfg, p) => cmdConfig(cfg, p),
   },
   join: {
     group: "Getting started", parse: "strict", args: "[url] <token>",
@@ -22733,9 +22822,14 @@ const COMMANDS = {
     group: "Repo scoping", parse: "strict", args: "",
     options: { "no-agents": { type: "boolean", desc: "skip writing the AGENTS.md capture-discipline directive" } },
     summary: "opt this repo in (.spor.json + AGENTS.md directive)",
-    help: "Set { enabled: true } in this repo's committable .spor.json. Spor is opt-in\nper repo — a repo with no .spor/.spor.json marker is a no-op — so this is how\nyou turn it on (and how you undo a prior 'spor disable'). Also writes the\nAGENTS.md capture-discipline directive (see 'spor help agents-md'; skip with\n--no-agents). Commit the files to share the setting.",
+    help: "Set { enabled: true } in this repo's committable .spor.json. Spor is opt-in\nper repo — a repo with no .spor/.spor.json marker is a no-op — so this is how\nyou turn it on (and how you undo a prior 'spor disable'). Also registers the\ncheckout in this machine's dispatch.repos map (see 'spor repos') and writes the\nAGENTS.md capture-discipline directive (see 'spor help agents-md'; skip with\n--no-agents). Commit the files to share the setting.",
     run: async (cfg, p) => {
       const rc = cmdScope(true);
+      // Enabling is also where this checkout is REGISTERED in the machine-local
+      // dispatch.repos map — an explicit verb, never the session-start hook's
+      // passive side effect (task-spor-client-config-typed-key-table-and-explain).
+      // dispatchRoot() is the durable main checkout even from a linked worktree.
+      if (rc === 0 && u.registerRepo(cfg.userConfigHome(), safeSlug(), dispatchRoot())) out(`  registered ${safeSlug()} -> ${dispatchRoot()} for spor dispatch`);
       // Enabling is the moment this repo's work was decided to belong in the
       // graph — the standing directive rides along by default.
       if (rc === 0 && !p.values["no-agents"]) await cmdAgentsMd(cfg, { values: {} });
@@ -23174,8 +23268,9 @@ const COMMANDS = {
     summary: "the local dispatch slug->dir map, plus repo-identity tags in the graph",
     help:
       "Two repo registers in one place.\n\n" +
-      "The machine-local slug->repo-dir map dispatch uses to find a repo (self-\n" +
-      "registers as you open sessions, lives in your user config.json):\n" +
+      "The machine-local slug->repo-dir map dispatch uses to find a repo (written\n" +
+      "by 'spor enable', by every dispatch for the dir it resolved, and by 'repos\n" +
+      "add' — never by a hook; lives in your user config.json):\n" +
       "  spor repos                 list the map\n" +
       "  spor repos add <slug> <p>  map a slug to a path (refuses a path inside a\n" +
       "                             linked git worktree; --force overrides)\n" +
@@ -23446,6 +23541,9 @@ function isCredentialAcquisition(canon, args) {
 function refuseUnknownOrg(cfg, canon, args = []) {
   const te = cfg.tenantError();
   if (!te) return false;
+  // `spor config explain` is the diagnostic that SHOWS the refusal; it reads no
+  // graph, so blocking it would hide the one explanation available.
+  if (canon === "config") return false;
   if (te.kind === "empty-org") {
     err(`spor: --org was given an empty value — refusing to fall back to whichever tenant is active.`);
     err(`  an empty selector is malformed input (typically an unset shell variable), not "use the default".`);
@@ -23453,9 +23551,18 @@ function refuseUnknownOrg(cfg, canon, args = []) {
     return true;
   }
   if (te.kind !== "unknown-org" || isCredentialAcquisition(canon, args)) return false;
-  err(`spor: no credential stored for org '${te.org}' — refusing to run against a different tenant.`);
+  // An AMBIENT refusal is not something this command line asserted, so the
+  // verbs that only inspect or repair local state still run: listing the stored
+  // credentials (what the refusal tells you to check) and turning Spor off for
+  // the repo. Neither reads or writes a graph.
+  if (te.source !== "cli-org" && ((canon === "auth" && (args[0] === undefined || args[0] === "list")) || canon === "disable")) return false;
+  // An AMBIENT selector (SPOR_ORG, a repo `.spor` org: marker) refuses exactly
+  // like --org (issue-spor-ambient-org-selector-silent-fallback); name it, since
+  // the operator did not type it on this command line.
+  const from = te.source === "env-org" ? ` (from ${te.origin})` : te.source === "repo-marker" ? ` (bound by ${te.origin})` : "";
+  err(`spor: no credential stored for org '${te.org}'${from} — refusing to run against a different tenant.`);
   err(te.orgs.length ? `  stored orgs: ${te.orgs.join(", ")}` : "  the credential store is empty");
-  err(`  run 'spor auth login --org ${te.org}' to add one, or 'spor auth list' to see them.`);
+  err(`  run 'spor auth login --org ${te.org}' to add one, or 'spor auth list' to see them${from ? ` ('spor config explain' shows which selector chose it)` : ""}.`);
   return true;
 }
 

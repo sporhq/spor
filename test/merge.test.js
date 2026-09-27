@@ -11,6 +11,7 @@
 // trust_attached_code, force) + the rendered report + the fail-soft exits —
 // server responses are scripted, never a live graph.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
+const { hermeticEnv } = require("./helpers/env.js");
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -24,14 +25,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-merge-iso-"));
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  env.SPOR_HOME = ISO_HOME;
-  env.XDG_CONFIG_HOME = ISO_HOME;
-  return Object.assign(env, extra);
+  return hermeticEnv({ SPOR_HOME: ISO_HOME, XDG_CONFIG_HOME: ISO_HOME, ...extra });
 }
 // Local-mode-only: no network involved, safe to block synchronously.
 function run(args, env) {

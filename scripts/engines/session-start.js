@@ -322,33 +322,20 @@ async function sessionStart(input) {
     /* best effort — a sweep that never starts leaves the spool exactly as it was */
   }
 
-  // Learn where this slug lives on THIS machine (slug -> checkout path), so
-  // `spor dispatch` can later launch `claude --bg` in the right repo without a
-  // path map in the shared graph (paths differ per teammate; repo nodes carry
-  // slugs/fingerprints, never a local path). inferenceRoot() is the same repo
-  // root projectSlug() derives the slug from, so path and slug stay consistent
-  // and a linked worktree resolves to its main checkout. Pure side effect: never
-  // alters this run's output; fail-open (registerRepo no-ops on a non-canonical
-  // slug or unchanged value). (task-spor-cli-dispatch-background-agents)
-  // The slug->path map is machine-local — written to the PERSONAL user config
-  // home, never the (possibly marker-shared) graph home, so it can't desync
-  // from where the cascade reads it back (issue-spor-config-desync-shared-graph-home).
-  // `verify`: this is the PASSIVE re-probe, so it must not clobber a correct
-  // existing mapping with the wrong checkout when run from a cross-repo worktree
-  // cwd (issue-spor-dispatch-repos-corruption-worktree-session-start) — it only
-  // fills an unmapped slug or self-heals when this dir genuinely is slug's repo.
-  try {
-    if (cwd && fs.existsSync(cwd)) {
-      u.registerRepo(u.userConfigHome(), slug, u.inferenceRoot(cwd) || cwd, { verify: true });
-    }
-  } catch {
-    /* best effort */
-  }
+  // Session-start does NOT learn the slug -> checkout-path map
+  // (`dispatch.repos`) any more (task-spor-client-config-typed-key-table-and-
+  // explain): a hook writing machine-local config as a passive side effect is
+  // how a dispatched agent's worktree cwd kept rewriting a correct mapping to
+  // the wrong checkout (issue-spor-dispatch-repos-corruption-worktree-session-
+  // start, recurred twice after the verify guard). Registration is explicit:
+  // `spor enable` / `spor repos add`, and every real `spor dispatch`
+  // self-registers the dir it resolved (plus its cwd-self fallback when you are
+  // standing in the target repo).
 
   // Refresh this machine's dispatch CAPABILITIES (harnesses on PATH, installed
   // plugins/skills) into the same machine-local config.json — the other half of
   // profile satisfiability (dec-spor-machine-profile-satisfiability,
-  // task-spor-dispatch-capabilities-satisfiability). Like registerRepo: a pure,
+  // task-spor-dispatch-capabilities-satisfiability). A pure,
   // fail-open side effect that never alters this run's output, cheap and no-spawn
   // (PATH stat + a JSON read), so it stays off the latency budget. It writes only
   // `dispatch.capabilities.probed`; user declarations under `.declared` survive.
@@ -566,7 +553,7 @@ ${body}${pathScopedBriefsBlock(cwd, nodes)}`;
   // appeared dead for `claude --bg` (it fires; source=startup). Emit the parity
   // line so onboarding is visibly underway and points at the bootstrap path
   // (issue-cc-local-mode-session-start-empty-graph-fallback). Side effects above
-  // (registerRepo, plugin-root) already ran; the repo-identity write below is
+  // (the capabilities probe, plugin-root) already ran; the repo-identity write below is
   // gated on projCount>0, so nothing else is skipped by returning early here.
   if (count === 0) {
     return envelope(

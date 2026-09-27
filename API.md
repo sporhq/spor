@@ -1101,9 +1101,16 @@ machine-local — never committed, always in the shared-graph `.gitignore`):
   refuse like any other verb, since acting on the active tenant is exactly the
   hazard. An `--org` given an **empty** value (an unset shell variable, in
   either the `--org ""` or the dangling `--org` spelling) refuses everywhere,
-  acquisition included: it is malformed input, not "use the default". The
-  ambient selectors (`SPOR_ORG`, the repo `org:` marker) still fall
-  through — they also ride the fail-open hook engines.
+  acquisition included: it is malformed input, not "use the default".
+- **Unknown ambient org refuses too.** `SPOR_ORG` and a repo `.spor` `org:`
+  marker naming an org with no stored credential refuse exactly like `--org`
+  (issue-spor-ambient-org-selector-silent-fallback): the CLI exits 1 naming the
+  selector and the stored orgs (acquisition invocations exempt), and the hook
+  engines inject nothing and write nothing to EITHER graph — no remote call and
+  no fall-through to the local graph home — journaling a warning to
+  `journal/remote.log`. Under an explicit `mode: local`/`off` no tenant is
+  consulted, so a stray ambient org is moot there. `spor config explain` shows
+  which selector chose (or refused) the tenant.
 - **Refresh.** A 401/403 on a tenant carrying a `refresh_token` transparently
   refreshes against its issuer (`grant_type=refresh_token`) and retries once.
 - **Byte-identical.** With no credential store and only a flat

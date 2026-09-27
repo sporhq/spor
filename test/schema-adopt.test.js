@@ -7,6 +7,7 @@
 // pristine older copy upgrades in place, a diverged or unstamped resident
 // refuses without --force.
 require("./helpers/tmp-cleanup");
+const { hermeticEnv } = require("./helpers/env.js");
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -28,14 +29,7 @@ const MOP = CANDS.find((c) => c.id === "schema-edge-member-of-program");
 
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-schema-adopt-iso-"));
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  env.SPOR_HOME = ISO_HOME;
-  env.XDG_CONFIG_HOME = ISO_HOME;
-  return Object.assign(env, extra);
+  return hermeticEnv({ SPOR_HOME: ISO_HOME, XDG_CONFIG_HOME: ISO_HOME, ...extra });
 }
 function run(args, extra) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(extra) });

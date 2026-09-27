@@ -22,6 +22,7 @@
 // Everything runs against a throwaway graph home with SPOR_*/SUBSTRATE_*
 // routing cleared (norm-cc-scratch-home-for-tests).
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
+const { hermeticEnv } = require("./helpers/env.js");
 const test = require("node:test");
 const assert = require("node:assert");
 const { spawnSync, spawn } = require("node:child_process");
@@ -410,13 +411,7 @@ test("describeTenant reports the selector that chose the tenant, and never the c
 // -------------------------------------------------------------- CLI layer --
 
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  env.PATH = pathWithOnlyGitAndNode();
-  return Object.assign(env, extra);
+  return hermeticEnv({ PATH: pathWithOnlyGitAndNode(), ...extra });
 }
 function cli(args, env, cwd) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(env), cwd });

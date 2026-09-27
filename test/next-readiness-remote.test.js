@@ -7,6 +7,7 @@
 // rather than being swallowed. Runs against an in-process fake server only —
 // never the live graph.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
+const { hermeticEnv } = require("./helpers/env.js");
 const test = require("node:test");
 const assert = require("node:assert");
 const { spawn, spawnSync } = require("node:child_process");
@@ -21,14 +22,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 // ~/.spor/config.json can't leak a server+token in and flip a local test remote.
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-readiness-remote-iso-"));
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  env.SPOR_HOME = ISO_HOME;
-  env.XDG_CONFIG_HOME = ISO_HOME;
-  return Object.assign(env, extra);
+  return hermeticEnv({ SPOR_HOME: ISO_HOME, XDG_CONFIG_HOME: ISO_HOME, ...extra });
 }
 // Async spawn: the stub server runs IN-PROCESS, so a blocking spawnSync would
 // freeze the test event loop (mirrors next-limit.test.js / in-flight.test.js).

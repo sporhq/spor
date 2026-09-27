@@ -8,6 +8,7 @@
 // Oracle = the on-disk frontmatter in local mode, and the REQUEST BODY the CLI
 // PUTs in remote mode (never the server's framing — we script the responses).
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
+const { hermeticEnv } = require("./helpers/env.js");
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -23,12 +24,7 @@ const tar = require("../lib/tar.js");
 // Env with no SPOR_*/SUBSTRATE_*/XDG leakage so a configured dev box can't flip a
 // local-mode test to remote or leak a token.
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  return Object.assign(env, extra);
+  return hermeticEnv({ ...extra });
 }
 function run(args, extra) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(extra) });

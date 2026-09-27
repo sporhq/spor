@@ -958,8 +958,8 @@ function ensureGraphGitignore(graphHomeDir) {
 // override layers and is READ via Config.get('dispatch.repos'). Writes target
 // the USER config ($SPOR_HOME/config.json) — the same machine-local,
 // never-committed file that holds server/token — so they never land in a
-// committable repo .spor.json. Learned passively by session-start and written
-// explicitly by `spor repos`/`spor dispatch`; fail-open throughout.
+// committable repo .spor.json. Written only by explicit verbs — `spor enable`,
+// `spor repos`, `spor dispatch` — never by a hook; fail-open throughout.
 function userConfigPath(graphHomeDir) {
   return path.join(graphHomeDir, "config.json");
 }

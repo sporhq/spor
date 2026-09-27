@@ -389,7 +389,7 @@ async function main() {
     // did for the session that spawned us. Re-check the gates too — the spawn
     // decision and the work are minutes apart in the worst case.
     const cfg = u.useConfig({ cwd });
-    if (!cfg.enabled()) return;
+    if (!cfg.enabled() || cfg.tenantError()) return; // a refused tenant writes to no graph
     if (!u.cfgBool("nudge.async", "NUDGE_ASYNC", false)) return;
     if (!u.cfgBool("nudge.enabled", "NUDGE", true)) return;
     const graph = u.graphHome();

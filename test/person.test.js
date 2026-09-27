@@ -8,6 +8,7 @@
 // viewerFor binding it must resolve back to. Everything runs against throwaway
 // git-init'd graph homes — never the live graph.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
+const { hermeticEnv } = require("./helpers/env.js");
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -22,12 +23,7 @@ const queueLib = require("../lib/queue.js");
 // Env with no SPOR_*/SUBSTRATE_*/XDG leakage so a configured dev box can't flip a
 // local-mode test to remote or leak a token (mirrors repos-tag.test.js).
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  return Object.assign(env, extra);
+  return hermeticEnv({ ...extra });
 }
 function run(args, extra) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(extra) });

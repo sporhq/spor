@@ -9,6 +9,7 @@
 //     subtree, a sibling subtree, and the repo root, plus the byte-identical
 //     no-briefs case (norm-cc-byte-identical-refactor).
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
+const { hermeticEnv } = require("./helpers/env.js");
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -89,12 +90,9 @@ test("matchBriefs: a non-object map fails open to no match", () => {
 // ---------------------------------------------------------------------------
 
 function bareEnv(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  return Object.assign(env, extra);
+  // Library-level cascade tests resolve mode from the configs they write, so
+  // opt out of the helper's local-mode pin.
+  return hermeticEnv({ SPOR_MODE: "auto", ...extra });
 }
 function tmp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "spor-briefs-"));

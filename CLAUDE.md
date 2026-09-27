@@ -717,7 +717,8 @@ personas: backend personas are not user prompts), so this recipe exercises
 the session-start briefing only — test the digest via the `bin/spor-hook
 prompt-context` payload above.
 
-When testing against a scratch graph, set `SPOR_HOME=/tmp/whatever` — never
+When testing against a scratch graph, set `SPOR_HOME=/tmp/whatever` AND
+`SPOR_MODE=local` (a scratch home alone can still resolve remote) — never
 test write-paths against your live graph home. The live graph (the one the
 Spor server and distiller auto-commit into) and the client-side cache/outbox
 home in remote mode (`~/.spor`, or a legacy `~/.substrate`) are off-limits to
@@ -807,7 +808,22 @@ default-on — every OTHER resolved value stays byte-identical. Engines read it
 through the active config the dispatcher sets per run
 (`u.useConfig`/`u.config()`/`u.cfgStr`); when none is active, every read falls
 back to the exact `envDual` it replaced, so standalone calls and unit tests
-stay byte-identical. `.spor.json` is config, held SEPARATE from the `.spor`
+stay byte-identical. **Every key is declared ONCE in `lib/config-keys.js`**
+(task-spor-client-config-typed-key-table-and-explain): type, default, env
+spelling, repo-layer ban (`noRepo`), secret redaction. `ENV_MAP`,
+`KNOWN_KEYS`, `REPO_FORBIDDEN_*` and the applied `DEFAULTS` are DERIVED from it
+— never hand-extend them — file layers are checked against it (a nested typo or
+mistyped value warns), and `test/config-keys.test.js` lints every literal
+config read in the tree against it (undeclared key, fallback literal ≠ table
+default, or env name ≠ table env fails the suite). Adding a knob = one table row.
+`spor config explain [<key>] [--set] [--json]` prints each key's value and the
+WINNING layer (+ what it shadows), the tenant the org selectors chose or
+refused, and every config warning. `SPOR_MODE` (`mode`) is an env key: a
+scratch `SPOR_HOME` alone does NOT force local mode (the cascade still reads
+env/global remote config, issue-spor-scratch-home-does-not-force-local-mode) —
+pin `SPOR_MODE=local`; `test/helpers/env.js` `hermeticEnv()` does so by default
+for a spawned CLI/hook unless the caller passes remote intent (`SPOR_SERVER`/
+`SPOR_ORG`/its own `SPOR_MODE`). `.spor.json` is config, held SEPARATE from the `.spor`
 identity marker (which stays flat `key: value`). **Per-repo graph home
 (local-mode git sharing, dec-spor-local-mode-sharing-boundary):** a `graph:
 <path>` key in the flat `.spor` marker binds the repo to a shared graph home
@@ -863,8 +879,12 @@ discovery line — dec-spor-monorepo-path-scoped-briefs; a covered subtree is an
 "area" label on a brief, never a node type, and distilled nodes still stamp
 `project: <repo>`), and the `spor dispatch`
 slug→local-path map (`dispatch.repos`, a per-machine `{slug: path}` table the
-shared graph can't hold; written to the USER `$SPOR_HOME/config.json` by
-`spor repos`/`session-start`, read via the cascade — never a committable
+shared graph can't hold; written to the USER `$SPOR_HOME/config.json` only by
+explicit verbs — `spor enable`, `spor repos add`, and every real `spor dispatch`
+for the dir it resolved — never by a hook (session-start used to learn it
+passively and kept rewriting correct entries from worktree cwds,
+issue-spor-dispatch-repos-corruption-worktree-session-start); read via the
+cascade — never a committable
 `.spor.json`, since paths are machine-specific), and its sibling
 `dispatch.capabilities` — the machine-local profile-satisfiability map
 (harnesses/reachable-MCP/skills/plugins + a `deny` policy list) probe-populated
@@ -1626,11 +1646,17 @@ EMPTY value is a SECOND refusal kind (`empty-org`) and is exempt from nothing,
 acquisition included — no org was named at all, so there is nothing to acquire
 or read; both spellings a shell's unset `$ORG` produces are caught (quoted, it
 arrives as `--org ""`; unquoted, the word vanishes and the dangling `--org` is
-read as empty rather than dropped). The AMBIENT org selectors (`SPOR_ORG`, the repo `org:` marker)
-deliberately still fall through: they also ride the fail-open hook engines, so
-hardening them is its own change (issue-spor-ambient-org-selector-silent-fallback).
-Because only a caller that passes `--org` can ever see the refusal, the engines
-stay byte-identical. The org for a freshly-minted token is the
+read as empty rather than dropped). The AMBIENT org selectors (`SPOR_ORG`, the
+repo `org:` marker) now refuse the same way
+(issue-spor-ambient-org-selector-silent-fallback, decided 2026-09-26): the CLI
+exits 1 naming the selector (`refuseUnknownOrg`), and because they also ride the
+fail-open hook engines, the dispatcher (`tenantRefused` in bin/spor-hook.js) and
+the detached workers that re-resolve the cascade (debounce-watcher,
+spool-sweeper) turn the refusal into "inject nothing, write nothing to EITHER
+graph" plus a `journal/remote.log` line — never the local-graph fallthrough the
+null tenant would otherwise resolve to. It is moot (not reported) under an
+explicit `mode: local`/`off`. `spor config explain` is exempt from the CLI
+refusal: it is where you go to see it. The org for a freshly-minted token is the
 JWT `org` claim (opaque-token deployments need `--org`, or the future `/v1/me`
 org echo).
 

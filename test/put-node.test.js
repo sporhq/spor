@@ -2,6 +2,7 @@
 // Remote mode is the shell twin of MCP put_node / REST POST /v1/nodes. Local
 // mode writes nodes/<id>.md only after validation and revision/collision checks.
 require("./helpers/tmp-cleanup");
+const { hermeticEnv } = require("./helpers/env.js");
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -15,14 +16,7 @@ const { gitBlobSha } = require("../bin/spor.js");
 
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-put-node-iso-"));
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  env.SPOR_HOME = ISO_HOME;
-  env.XDG_CONFIG_HOME = ISO_HOME;
-  return Object.assign(env, extra);
+  return hermeticEnv({ SPOR_HOME: ISO_HOME, XDG_CONFIG_HOME: ISO_HOME, ...extra });
 }
 function run(args, extra) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(extra) });

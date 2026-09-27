@@ -7,6 +7,7 @@
 //
 // Scratch git repos + scratch graph homes only — never the live graph.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
+const { hermeticEnv } = require("./helpers/env.js");
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -22,12 +23,7 @@ const resolution = require("../lib/kernel/resolution.js");
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  return Object.assign(env, extra);
+  return hermeticEnv({ ...extra });
 }
 function run(home, args, extra = {}) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare({ SPOR_HOME: home, XDG_CONFIG_HOME: home, ...extra }) });

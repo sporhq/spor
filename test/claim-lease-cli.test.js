@@ -9,6 +9,7 @@
 // REQUEST the CLI POSTs (path + body) in remote mode — never the server's
 // framing, which we script — plus the remote-only degradation in local mode.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
+const { hermeticEnv } = require("./helpers/env.js");
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -23,14 +24,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 // real ~/.spor/config.json can't flip a local-mode test to remote.
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-lease-iso-"));
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  env.SPOR_HOME = ISO_HOME;
-  env.XDG_CONFIG_HOME = ISO_HOME;
-  return Object.assign(env, extra);
+  return hermeticEnv({ SPOR_HOME: ISO_HOME, XDG_CONFIG_HOME: ISO_HOME, ...extra });
 }
 // Sync runner for the local-mode + usage paths (no server, so no event-loop deadlock).
 function run(args, extra) {

@@ -77,6 +77,33 @@ function normalize(payload, host) {
   return payload;
 }
 
+// True (after journaling a warning to remote.log) when the cascade REFUSED to
+// resolve a tenant — see Config.tenantError(). Every hook then no-ops.
+function tenantRefused(cfg) {
+  const te = cfg.tenantError();
+  if (!te) return false;
+  try {
+    // Throttled to one line an hour: a refused repo refuses EVERY hook call
+    // (each tool call fires post-tool), and one line says it all.
+    const journal = path.join(u.graphHome(), "journal");
+    u.ensureDir(journal);
+    const stamp = path.join(journal, "tenant-refused.stamp");
+    let last = 0;
+    try {
+      last = fs.statSync(stamp).mtimeMs;
+    } catch {
+      /* first refusal */
+    }
+    if (Date.now() - last < 3600000) return true;
+    fs.writeFileSync(stamp, "");
+    const log = u.makeLogger(path.join(journal, "remote.log"), "config: ");
+    log(`org '${te.org}' (from ${te.origin}) has no stored credential — hook skipped; run 'spor auth login --org ${te.org}' or fix the selector`);
+  } catch {
+    /* logging must never break fail-open */
+  }
+  return true;
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const event = argv.shift() ?? "";
@@ -112,7 +139,8 @@ async function main() {
     const ci = args.indexOf("--cwd");
     if (ci >= 0 && args[ci + 1]) amdCwd = args[ci + 1];
     else if (payload && payload.cwd) amdCwd = payload.cwd;
-    if (!u.useConfig({ cwd: amdCwd }).enabled()) return;
+    const amdCfg = u.useConfig({ cwd: amdCwd });
+    if (!amdCfg.enabled() || tenantRefused(amdCfg)) return;
     await agentsMd(payload, args);
     return;
   }
@@ -176,6 +204,13 @@ async function main() {
     }
     return;
   }
+
+  // A bound org this box holds no credential for (SPOR_ORG, a repo `.spor`
+  // org: marker) is a REFUSAL, not a hint (issue-spor-ambient-org-selector-
+  // silent-fallback): inject nothing and write nothing to EITHER graph — the
+  // null tenant would otherwise resolve LOCAL mode and quietly distill into the
+  // personal graph home. Journaled, since a hook can only fail silently.
+  if (tenantRefused(cfg)) return;
 
   // Debounced distill: spool the payload and hand off to a per-session
   // watcher (one at a time — the lock holds the watcher's pid; stale locks

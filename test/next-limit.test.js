@@ -7,6 +7,7 @@
 // aggregates (count, counts_by_*) are taken from the first page. These tests run
 // against throwaway graphs / an in-process paging stub — never the live graph.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
+const { hermeticEnv } = require("./helpers/env.js");
 const test = require("node:test");
 const assert = require("node:assert");
 const { spawnSync } = require("node:child_process");
@@ -21,14 +22,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 // ~/.spor/config.json can't leak a server+token in and flip a local test remote.
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-limit-iso-"));
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  env.SPOR_HOME = ISO_HOME;
-  env.XDG_CONFIG_HOME = ISO_HOME;
-  return Object.assign(env, extra);
+  return hermeticEnv({ SPOR_HOME: ISO_HOME, XDG_CONFIG_HOME: ISO_HOME, ...extra });
 }
 function run(args, env) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(env) });

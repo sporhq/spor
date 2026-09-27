@@ -6,6 +6,7 @@
 // the --ids/--summary/--json projections, and the empty-result case.
 
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
+const { hermeticEnv } = require("./helpers/env.js");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
@@ -187,13 +188,8 @@ test("query: edges empty result is an empty edge list", () => {
 const { spawnSync } = require("node:child_process");
 const QUERY = path.join(__dirname, "..", "lib", "query.js");
 
-function bareEnv(extra) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
-  return Object.assign(env, extra);
+function bareEnv(extra = {}) {
+  return hermeticEnv({ ...extra });
 }
 function cli(nodesDir, args) {
   return spawnSync(process.execPath, [QUERY, "--nodes", nodesDir, ...args], {
