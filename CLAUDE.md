@@ -1298,7 +1298,14 @@ pinned `trusted_sha`, never the moving ref; and every whole-record run-record
 writer takes the record lock (`writeRecordCarryingGate`) with NO unlocked
 fallback — the bounded wait outlasts the stale window, stale locks are broken
 by rename (one breaker wins, a live lock taken by mistake is handed back) and
-release is token-checked. In `propose` mode the same attestation rides in the PR body — a body that cannot be built is a FAILED proposal, never a generic PR —
+release is token-checked. Under that lock there is ONE versioned put of an
+existing record (`putRecord`, stamping a monotonic `rev`; the namespace
+stampers take `expectedRev` and refuse a moved record as `stale`), records are
+minted once (`createRecord`), and `test/record-write-lint.test.js` fails any
+other write path — a raw `atomicJson`, an `fs` write on a record path, a
+`gate_progress:` key built outside the writer, a settled-record door from an
+unlisted function (task-spor-gate-progress-versioned-put-and-write-lint;
+WORKERS.md §10.10 "One versioned put"). In `propose` mode the same attestation rides in the PR body — a body that cannot be built is a FAILED proposal, never a generic PR —
 between `<!-- spor-attestation:begin/end -->` markers, refreshed with the final
 graph-bound copy after settlement (a failed `gh pr edit` is a failed proposal
 on reuse, and a stamped-stale record post-settle, never a silent success), so

@@ -10246,7 +10246,7 @@ async function launchSupervisedHarness(cfg, {
     release_node: releaseNode || null,
     project: project || null,
   }, null, 2) + "\n");
-  dispatchRuns.atomicJson(p.record, record);
+  dispatchRuns.createRecord(p.record, record);
 
   const runnerEnv = u.gitEnv();
   for (const key of [
@@ -12980,10 +12980,20 @@ function gateNodeShape(markdown) {
   const body = text.slice(end + 4).replace(/^\n+/, "").trim();
   return { fm, body };
 }
-function gateNodeEquivalent(a, b) {
-  const x = gateNodeShape(a);
-  const y = gateNodeShape(b);
-  return x.body === y.body && x.fm.length === y.fm.length && x.fm.every((l, i) => l === y.fm[i]);
+// One tolerance, one way: an occupant with NO `gate_head:` line at all is
+// equivalent to a candidate that carries one (the approval item grew the
+// field in task-spor-gate-progress-versioned-put-and-write-lint, and a
+// resumed pipeline re-files the SAME deterministic id — the id already folds
+// the head in — over an item a person may be mid-answering; refusing it would
+// fail the longest-lived gate on an upgrade). An occupant carrying a
+// DIFFERENT `gate_head:` is a different node and still refuses.
+function gateNodeEquivalent(occupant, candidate) {
+  const x = gateNodeShape(occupant);
+  const y = gateNodeShape(candidate);
+  if (x.body !== y.body) return false;
+  const isHead = (l) => /^gate_head:/.test(l);
+  const ys = y.fm.length === x.fm.length + 1 && !x.fm.some(isHead) ? y.fm.filter((l) => !isHead(l)) : y.fm;
+  return ys.length === x.fm.length && ys.every((l, i) => l === x.fm[i]);
 }
 
 // Write a gate's node — a fact, an escalation, an approval — through the same
@@ -13027,7 +13037,13 @@ async function writeGateNode(cfg, id, markdown) {
       // record — edges and all — and the caller needs no read to know it.
       // The remote door cannot say that (`if_exists: skip` compares nothing),
       // so it omits the flag and the caller reconciles by reading.
-      return same ? { ok: true, id, existing: true, identical: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
+      if (same) return { ok: true, id, existing: true, identical: true };
+      // The remote door's shape compare, for the one tolerance it carries (an
+      // occupant that predates `gate_head:`) — without `identical`, since this
+      // did NOT compare bytes; the caller reconciles by reading, as it does
+      // for a remote `existing`.
+      if (gateNodeEquivalent(fs.readFileSync(file, "utf8"), markdown)) return { ok: true, id, existing: true };
+      return { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
     }
     // The same validation the local `put-node` door runs: a malformed gate node
     // written straight to disk would break loadGraph for everything downstream.
@@ -13140,7 +13156,7 @@ function nodeBodyCapBytes() {
 // (work.accept ready, dec-spor-work-accept-policy-configurable) would leave it
 // unworked forever. The consent the stamp records is real, just upstream: the
 // operator declared the lane's profile in the factory definition.
-function buildGateWorkNode({ id, type = "task", title, summary, body, project, date, edges = [], requiresHuman = false, profile = null, lists = {} }) {
+function buildGateWorkNode({ id, type = "task", title, summary, body, project, date, edges = [], requiresHuman = false, profile = null, lists = {}, fields = {} }) {
   // The frontmatter parser is line-based: a title or summary carrying a newline
   // (a git message, a suite's first failing line) would truncate the node. Flatten
   // and cap both, the same discipline the dispatch report artifact keeps.
@@ -13158,6 +13174,13 @@ function buildGateWorkNode({ id, type = "task", title, summary, body, project, d
     `date: ${date}`,
     ...(requiresHuman ? ["requires: [human]"] : ["readiness: agent"]),
     ...(profile ? [`profile: ${profile}`] : []),
+    // Flat scalar fields a reader binds on (`gate_head` on an approval item —
+    // the judged commit the approval is FOR, task-spor-gate-progress-
+    // versioned-put-and-write-lint). Values are kept to one token so a value
+    // carrying a newline or a colon cannot open a second frontmatter key.
+    ...Object.entries(fields || {})
+      .filter(([k, v]) => /^[a-z][a-z0-9_]*$/.test(k) && v != null && /^[A-Za-z0-9._@:/-]+$/.test(String(v)))
+      .map(([k, v]) => `${k}: ${v}`),
     // Structured list fields (parseFrontmatter's LIST_FIELDS allowlist):
     // `failing_tests` on an escalation, `covers_tests` on a flake issue
     // (task-spor-gate-escalation-auto-regate-on-flake-fix). Entries are paths
@@ -13187,13 +13210,24 @@ function buildGateWorkNode({ id, type = "task", title, summary, body, project, d
 // work" and exactly wrong here, where it would turn a dismissal into an
 // approval. So: a live inbound RESOLVING edge approves; any other terminal
 // status is a refusal; anything else is still pending.
-async function gateApprovalState(cfg, id) {
+//
+// `head` binds the answer to the judged commit: the approval item's own
+// `gate_head:` frontmatter must name the commit this pipeline is asking about.
+// The id already folds the head in, so a mismatch is a node that was edited or
+// minted by hand under this id — and an approval of some OTHER commit is not an
+// approval of this one. It reads `mismatch`, which the gate treats as a
+// refusal, never as pending (a poll would wait a day on it) and never as
+// approved. An item with no `gate_head:` at all (filed before the field
+// existed) is read as before.
+async function gateApprovalState(cfg, id, { head = null } = {}) {
   const node = await resolveNode(cfg, id);
   // A failed read is neither an approval nor a rejection — same as a
   // confirmed-absent node, this reads "pending" so the poll above keeps
   // waiting and tries again next interval rather than concluding anything off
   // a body that never actually loaded.
   if (!node || nodeUnreadable(node)) return { state: "pending" };
+  const bound = node.frontmatter && node.frontmatter.gate_head ? String(node.frontmatter.gate_head).trim().toLowerCase() : null;
+  if (bound && head && bound !== String(head).toLowerCase()) return { state: "mismatch", head: bound };
   const status = (node.status || "").toLowerCase();
   if (node.resolution && node.resolution.by) return { state: "approved", by: node.resolution.by };
   if (cfg.mode() !== "remote") {
@@ -15577,6 +15611,10 @@ function makeGateDeps(
           project: slug,
           date: date(),
           requiresHuman: true,
+          // The judged commit rides the frontmatter as well as the body and the
+          // id hash, so the READ side can bind the answer to the commit it was
+          // asked about rather than trusting the id alone.
+          fields: { gate_head: head.toLowerCase() },
           // `blocks`: an unanswered approval is not an approval, so the gated
           // item is not done — and that must be true on the graph, not only in
           // this worker's cooldown map.
@@ -15584,7 +15622,7 @@ function makeGateDeps(
         })
       );
     },
-    checkApproval: ({ id }) => gateApprovalState(cfg, id),
+    checkApproval: ({ id, head }) => gateApprovalState(cfg, id, { head }),
     demote: ({ blockerId }) => gateDemoteItem(cfg, entry.node_id, { blockerId }),
     escalate: async ({ gate, attempts, detail, evidence, findings, ledger, rescue = 0, rescues = [], outage = null, failingTests = null }) => {
       const k = keysFor(rescue);
@@ -15799,8 +15837,21 @@ async function retryOneEscalation(
       `work: gate escalation retry for ${record.node_id} (run ${String(record.run_id).slice(0, 8)}) gave up after ${nextAttempt} attempt(s) — ` +
         `${reason}; re-run by hand with 'spor work --regate ${record.run_id}'`
     );
-    dispatchRuns.stampGateState(home, record.run_id, { gate_escalation_retry_count: nextAttempt, gate_escalation_retry_exhausted: true }, { allowSettledPatch: true });
+    stampRetry({ gate_escalation_retry_count: nextAttempt, gate_escalation_retry_exhausted: true });
   };
+  // Every retry stamp is a compare-and-swap on the attempt it was planned from
+  // (issue-spor-gate-progress-snapshots-can-overwrite-concurrent-debt): the
+  // patch lands only while the record still carries the pending payload at
+  // the retry count this pass read. Two workers replaying the same pending
+  // escalation off the same read then land ONE bookkeeping write, not a
+  // stale second one over the first's — and a payload another pass already
+  // cleared (its escalation landed) is never re-stamped as pending.
+  const stampRetry = (patch) => dispatchRuns.stampGateState(
+    home,
+    record.run_id,
+    (fresh) => (fresh.gate_escalation_pending && (Number(fresh.gate_escalation_retry_count) || 0) === attempts ? patch : {}),
+    { allowSettledPatch: true }
+  );
   // The gate this refusal named, looked up fresh in the CURRENT factory
   // (never persisted whole in the payload — see gate-runner.js): a factory
   // edited since the refusal (the gate renamed or removed) can't be replayed,
@@ -15910,12 +15961,7 @@ async function retryOneEscalation(
       return;
     }
     const delay = workLoop.nextEscalationRetryDelay(nextAttempt, backoffMs, maxBackoffMs);
-    dispatchRuns.stampGateState(
-      home,
-      record.run_id,
-      { gate_escalation_retry_count: nextAttempt, gate_escalation_retry_at: new Date(Date.now() + delay).toISOString() },
-      { allowSettledPatch: true }
-    );
+    stampRetry({ gate_escalation_retry_count: nextAttempt, gate_escalation_retry_at: new Date(Date.now() + delay).toISOString() });
     log(`work: gate escalation retry ${nextAttempt}/${maxAttempts} for ${record.node_id} could not be filed (${reason}) — trying again in ${Math.round(delay / 1000)}s`);
     return;
   }
@@ -15923,19 +15969,14 @@ async function retryOneEscalation(
   // escalation demotes the item (dec-spor-gate-refusal-atomic-escalate-then-
   // demote) — a retry earns no exception to that rule.
   const demoted = await deps.demote({ blockerId: esc.id });
-  dispatchRuns.stampGateState(
-    home,
-    record.run_id,
-    {
-      gate_escalated_to: esc.id,
-      gate_escalation_ids: [esc.id],
-      gate_demoted: !!demoted.demoted,
-      gate_escalation_failed: false,
-      gate_escalation_pending: null,
-      gate_escalation_retry_count: nextAttempt,
-    },
-    { allowSettledPatch: true }
-  );
+  stampRetry({
+    gate_escalated_to: esc.id,
+    gate_escalation_ids: [esc.id],
+    gate_demoted: !!demoted.demoted,
+    gate_escalation_failed: false,
+    gate_escalation_pending: null,
+    gate_escalation_retry_count: nextAttempt,
+  });
   // The refusal's own fact (`art-gate-*`/`art-merge-*`, `payload.factId`)
   // still reads "no escalation could be filed … status left as the run left
   // it" — true when written, false now. A fact is never rewritten, so the
@@ -19537,7 +19578,10 @@ async function writeSweepNote(cfg, { kind, record, factoryId, escalations, relat
 
 // CAS write of a flake-sweep reservation: the patch lands only if
 // `gate_flake_regate` on disk still equals `prior` exactly, as it stood when
-// the caller planned this reservation. Without this, two concurrent sweeps
+// the caller planned this reservation — and the SAME door writes the
+// reservation's hand-back and its settled state afterwards, keyed on the
+// reservation this call took (its `at`), so a sweep that lost the race can
+// neither hand back nor settle another sweep's reservation. Without this, two concurrent sweeps
 // (or a sweep racing a stale re-run of itself) that both read the SAME prior
 // state can both pass the naive "did my write land" check and both proceed to
 // `cmdWorkRegate` the same run — the duplicate-run hazard
@@ -19604,7 +19648,9 @@ async function cmdWorkRegateFlakes(cfg, values, ctx) {
         ].join("\n"),
       });
       if (note.ok) {
-        dispatchRuns.stampGateState(home, record.run_id, { gate_retired: { at: new Date().toISOString(), by: note.id, why: step.why } }, { allowSettledPatch: true });
+        // CAS on the retirement itself: a second sweep that planned the same
+        // retirement off the same read must not overwrite the first's stamp.
+        dispatchRuns.stampGateState(home, record.run_id, (fresh) => (fresh.gate_retired ? {} : { gate_retired: { at: new Date().toISOString(), by: note.id, why: step.why } }), { allowSettledPatch: true });
         out(`work: retired ${escalations.join(", ")} (run ${short}, ${record.node_id}) with ${note.id} — ${step.why}`);
         acted += 1;
       } else {
@@ -19636,11 +19682,11 @@ async function cmdWorkRegateFlakes(cfg, values, ctx) {
     if (!report.claimed) {
       // Refused before judging (a live gate on it, say): nothing was tried, so
       // the reservation is handed back and the next sweep may try again.
-      dispatchRuns.stampGateState(home, record.run_id, { gate_flake_regate: prior }, { allowSettledPatch: true });
+      casFlakeRegateReservation(home, record.run_id, reservation, prior);
       failed += 1;
       continue;
     }
-    dispatchRuns.stampGateState(home, record.run_id, { gate_flake_regate: { ...reservation, state: after.gate_state || null } }, { allowSettledPatch: true });
+    casFlakeRegateReservation(home, record.run_id, reservation, { ...reservation, state: after.gate_state || null });
     if (code === 0) {
       acted += 1;
       continue;

@@ -4487,6 +4487,33 @@ graph selection. A parked proposal retains its debt until its PR body is
 refreshed successfully. Pending debt prevents run retention from pruning the
 record. Gate, implementation, completion, native/contract settlement and final
 run bookkeeping all share the same record lock, including their read/merge.
+
+**One versioned put.** Under that lock there is exactly ONE write of an
+existing run record — `putRecord` in `lib/shell/agent-dispatch-runner.js` —
+and every locked writer above goes through it. It stamps a monotonic `rev`
+(read from the disk copy at the moment of the write, never from the caller's
+merge) and `rev_at`. The namespace stampers (`stampGateState`,
+`stampImplState`, `stampCompletionState`, `stampRun`, `updateGateProgress`)
+take an `expectedRev`: a caller that read the record (`readRecord`), decided
+a patch off that read, and hands the rev back has its write REFUSED
+(`stale: true`, the disk record returned, nothing written) when anything
+landed in between. The rev is the record's, not a namespace's, so an
+`expectedRev` caller yields to ANY concurrent write — the conservative
+direction for a premise read off the whole record; the merging stampers,
+which only ever touch their own fields under the lock, pass none. A record is
+created once (`createRecord`, `wx`; a second launcher minting the same run id
+reads the winner back). The bin/spor.js callers that used to hand-carry a
+premise through an unconditional stamp compare-and-swap on it instead: the
+flake-sweep reservation's take, hand-back and settle all go through
+`casFlakeRegateReservation` keyed on the exact reservation each call took,
+and the escalation retry's bookkeeping lands only while the record still
+carries the pending payload at the retry count the pass read.
+`test/record-write-lint.test.js` is what keeps it that way: a source scan
+that fails the suite on any other `atomicJson` call, any raw `fs` write onto
+a record path, a `gate_progress:` key built outside the writer, a
+settled-record door (`allowSettledPatch`, `force: true`) used from an
+unlisted function, or a record lock primitive referenced outside the runner.
+Growing an allowlist there is a deliberate, reviewable edit.
 The launcher also merges its post-spawn PID stamp through this lock: a paused
 launcher cannot restore its original record over a completed supervisor or
 subsequent re-gate.
@@ -4499,6 +4526,12 @@ final bookkeeping and recovery mutations retain the same ownership nonce; a
 losing re-gate cannot overwrite the successor. Human approval requests name
 and key their identity on the exact judged commit, so a fix that changes the
 candidate requires a fresh approval even when its risk paths stay unchanged.
+The binding is read back, not only minted: the approval item carries the
+judged commit as `gate_head:` frontmatter, the poll hands the head it is
+judging to `checkApproval`, and an item whose `gate_head` names another
+commit reads `mismatch` — a FINAL refusal naming the item, never `approved`
+and never `pending` (a poll would wait a day on an answer that cannot bind).
+An item with no `gate_head` (filed before the field existed) reads as before.
 
 A stale breaker lock is deliberately fail-closed: age alone cannot authorize
 unlinking its pathname because that pathname may already name a live successor.
