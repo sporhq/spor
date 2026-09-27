@@ -69,7 +69,11 @@ Body about the demo decision.
 }
 
 // Records every request; POST /v1/questions echoes an ask_question result.
-function askStub({ status = 201, routed_to = "person-steward", via = "mentions", routed_by = null, warnings = [], unrouted = false, errCode = "invalid_node", message = "x", details = [] } = {}) {
+// `explicitTo: true` makes GET /v1/status advertise
+// capabilities.ask_question_explicit_to, the door cmdAsk probes (via the
+// shared remoteCapabilities cache) before deciding whether --to travels as a
+// real `to` field or the pre-capability leading mention.
+function askStub({ status = 201, routed_to = "person-steward", via = "mentions", routed_by = null, warnings = [], unrouted = false, errCode = "invalid_node", message = "x", details = [], explicitTo = false } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -77,6 +81,9 @@ function askStub({ status = 201, routed_to = "person-steward", via = "mentions",
     req.on("end", () => {
       hits.push({ method: req.method, url: req.url, body });
       const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+      if (req.url === "/v1/status" && req.method === "GET") {
+        return j(200, { node_count: 0, projects: {}, head: "abc", uptime: 1, capabilities: explicitTo ? { ask_question_explicit_to: true } : {} });
+      }
       if (req.url === "/v1/questions" && req.method === "POST") {
         if (status >= 400) return j(status, { error: { code: errCode, message, details } });
         return j(status, {
@@ -284,8 +291,10 @@ test("ask (remote) fails open against an unreachable server (no stack trace)", a
 });
 
 // task-spor-ask-to-flag-and-routing-warnings: --to sends an explicit routing
-// target (no such field exists server-side, so it rides as a leading mention —
-// see 626f2c8 in spor-server), and the response's routed_by/warnings surface.
+// target. Against a server that predates capabilities.ask_question_explicit_to
+// (task-spor-ask-to-use-explicit-field / 0df2c55 in spor-server) it rides as a
+// leading mention, and the response's routed_by/warnings surface either way.
+// askStub's default (explicitTo: false) is exactly that older-server shape.
 
 test("ask (remote) --to is sent as a leading mention, ahead of --mention", async () => {
   const { srv, hits, base } = await askStub();
@@ -295,7 +304,7 @@ test("ask (remote) --to is sent as a leading mention, ahead of --mention", async
     const post = hits.find((h) => h.method === "POST" && h.url === "/v1/questions");
     const body = JSON.parse(post.body);
     assert.deepStrictEqual(body.mentions, ["person-ada", "dec-x"]);
-    assert.ok(!("to" in body), "--to has no server-side field of its own — it only ever travels as a mention");
+    assert.ok(!("to" in body), "no explicit-`to` capability advertised — --to still travels only as a mention");
   } finally {
     srv.close();
   }
@@ -307,6 +316,88 @@ test("ask (remote) --to deduplicates against an identical --mention", async () =
     await runAsync(["ask", "q", "--to", "person-ada", "--mention", "person-ada"], remoteEnv(base));
     const post = hits.find((h) => h.method === "POST" && h.url === "/v1/questions");
     assert.deepStrictEqual(JSON.parse(post.body).mentions, ["person-ada"]);
+  } finally {
+    srv.close();
+  }
+});
+
+// ---------------- --to explicit field (task-spor-ask-to-use-explicit-field) ----------------
+// When the server advertises capabilities.ask_question_explicit_to (GET
+// /v1/status), --to sends the server's real `to` routing field instead of
+// riding as a leading mention.
+
+test("ask (remote) sends --to as the explicit `to` field when the server advertises the capability, no mention added", async () => {
+  const { srv, hits, base } = await askStub({ explicitTo: true, routed_to: "person-ada", via: null, routed_by: "explicit" });
+  try {
+    const r = await runAsync(["ask", "Is this still on for Friday?", "--to", "person-ada"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const post = hits.find((h) => h.method === "POST" && h.url === "/v1/questions");
+    const body = JSON.parse(post.body);
+    assert.strictEqual(body.to, "person-ada");
+    assert.ok(!("mentions" in body), "--to no longer doubles as a mention once the explicit field is available");
+  } finally {
+    srv.close();
+  }
+});
+
+test("ask (remote) keeps --mention separate from an explicit --to", async () => {
+  const { srv, hits, base } = await askStub({ explicitTo: true });
+  try {
+    await runAsync(["ask", "q", "--to", "person-ada", "--mention", "dec-x"], remoteEnv(base));
+    const post = hits.find((h) => h.method === "POST" && h.url === "/v1/questions");
+    const body = JSON.parse(post.body);
+    assert.strictEqual(body.to, "person-ada");
+    assert.deepStrictEqual(body.mentions, ["dec-x"], "--to itself is not folded into mentions");
+  } finally {
+    srv.close();
+  }
+});
+
+test("ask (remote) without the capability still falls back to the leading-mention shape", async () => {
+  const { srv, hits, base } = await askStub({ explicitTo: false });
+  try {
+    const r = await runAsync(["ask", "Is this still on for Friday?", "--to", "person-ada", "--mention", "dec-x"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const post = hits.find((h) => h.method === "POST" && h.url === "/v1/questions");
+    const body = JSON.parse(post.body);
+    assert.ok(!("to" in body), "no explicit `to` field against an older server");
+    assert.deepStrictEqual(body.mentions, ["person-ada", "dec-x"]);
+  } finally {
+    srv.close();
+  }
+});
+
+test("ask (remote) prints routed_by: explicit like the other routes", async () => {
+  const { srv, base } = await askStub({ explicitTo: true, routed_to: "person-ada", via: null, routed_by: "explicit" });
+  try {
+    const r = await runAsync(["ask", "q", "--to", "person-ada"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /routed to person-ada \(by explicit\)/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("ask (remote) a 400 on an unknown person prints a clean error", async () => {
+  const { srv, base } = await askStub({ explicitTo: true, status: 400, errCode: "bad_request", message: "'to' must name an existing person node; 'person-ghost' is not one" });
+  try {
+    const r = await runAsync(["ask", "q", "--to", "person-ghost"], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /ask error 400: 'to' must name an existing person node; 'person-ghost' is not one/);
+    assert.doesNotMatch(r.stderr, /at Object|Error:/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("ask (remote) with no --to sends no `to` field even when the capability is advertised", async () => {
+  const { srv, hits, base } = await askStub({ explicitTo: true });
+  try {
+    await runAsync(["ask", "a mention-less question"], remoteEnv(base));
+    const post = hits.find((h) => h.method === "POST" && h.url === "/v1/questions");
+    const body = JSON.parse(post.body);
+    assert.ok(!("to" in body));
+    assert.ok(!("mentions" in body));
   } finally {
     srv.close();
   }

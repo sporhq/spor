@@ -4418,18 +4418,19 @@ async function cmdAsk(cfg, { values, positionals }) {
     return 1;
   }
   const toList = (v) => (v == null ? [] : Array.isArray(v) ? v : [v]);
-  // --to is a best-effort routing nudge, not a real override: askQuestion (spor-
-  // server server/questions.js) takes no explicit routing-target field, only
-  // {text, title, mentions, project} — routing is derived entirely from the
-  // question's relevance neighborhood (mention -> live claim/assigned/author/
-  // steward -> one-hop neighbors -> owner fallback). So --to is sent as a
-  // leading mention: it wins only when the person themselves is stewarded by
-  // someone, or the routing walk otherwise lands on them; it does not force the
-  // route the way a real target field would. Listed first so it gets first look
-  // in the neighborhood walk.
+  // --to: when the server advertises capabilities.ask_question_explicit_to
+  // (task-spor-server-ask-question-explicit-to), it names a real routing-target
+  // field (`to`) that wins over every inferred signal — sent alone, not folded
+  // into mentions. Against an older server (capability absent) it falls back to
+  // the original best-effort shape: askQuestion (spor-server server/questions.js)
+  // then took no explicit routing-target field, only {text, title, mentions,
+  // project}, so --to rode along as a leading mention — it won only when the
+  // person themselves was stewarded by someone, or the routing walk otherwise
+  // landed on them, never a guaranteed override. That fallback is preserved
+  // below (dec-spor-ask-to-best-effort-mention, for a server that predates the
+  // capability).
   const toTargets = toList(values.to);
   const mentionIds = toList(values.mention);
-  const mentions = [...new Set([...toTargets, ...mentionIds])];
   const title = values.title || null;
   // --project is OPTIONAL on purpose: remote routing derives the project from the
   // question's relevance neighborhood (then the asker's home project), so only an
@@ -4439,9 +4440,16 @@ async function cmdAsk(cfg, { values, positionals }) {
   const project = values.project || null;
 
   if (cfg.mode() === "remote") {
+    const caps = await remoteCapabilities(cfg);
+    const explicitTo = caps.ask_question_explicit_to && toTargets.length ? toTargets[0] : null;
+    // With the explicit field available, --to is sent on its own (`to`) and
+    // never doubles as a mention; without it, --to still rides the leading
+    // mention alongside --mention exactly as before.
+    const mentions = explicitTo ? [...new Set(mentionIds)] : [...new Set([...toTargets, ...mentionIds])];
     const body = { text };
     if (title) body.title = title;
     if (mentions.length) body.mentions = mentions;
+    if (explicitTo) body.to = explicitTo;
     if (project) body.project = project;
     // Question routing is deterministic server-side (no LLM, unlike capture
     // ingestion), so the default 8s budget is plenty — match correct/priority,
@@ -4530,7 +4538,10 @@ async function cmdAsk(cfg, { values, positionals }) {
 
   // --mention -> a mentions edge (the weakest association, the same edge the
   // server routes off), so the local node carries the same lineage as remote.
-  const edgeLines = mentions.map((m) => `  - {type: mentions, to: ${m}}`);
+  // Local mode has no router (and no capability to probe), so --to still
+  // folds in as a mention here regardless of what a remote call would do.
+  const localMentions = [...new Set([...toTargets, ...mentionIds])];
+  const edgeLines = localMentions.map((m) => `  - {type: mentions, to: ${m}}`);
   const edgesBlock = edgeLines.length ? `edges:\n${edgeLines.join("\n")}\n` : "";
   const md = `---\nid: ${id}\ntype: question\nrepo: ${slug}\ntitle: ${titleText.replace(/\n/g, " ")}\nsummary: ${summary.replace(/\n/g, " ")}\nstatus: open\n${edgesBlock}date: ${today()}\n---\n\n${text}\n`;
   let node;
@@ -22076,19 +22087,20 @@ const COMMANDS = {
       "still surfaces in 'spor next'.\n\n" +
       "--mention names a node the question is about (repeatable); routing considers\n" +
       "mentions first, and locally each becomes a mentions edge. --to names a person\n" +
-      "you want this routed to; the server has no explicit routing-target field, so\n" +
-      "it's sent as a leading mention — a nudge, not a guaranteed override, since the\n" +
-      "actual route still follows the person's live claim/assigned/author/steward\n" +
-      "signals over the question's neighborhood. --project overrides the derived\n" +
-      "project — pass it for a mention-less question whose neighborhood is empty.\n" +
-      "--title/--id apply to the local node. The response's routing line shows who it\n" +
-      "reached and, when the server reports it, routed_by (steward|claim|assigned|\n" +
-      "author|owner); any routing warnings print to stderr.\n\n" +
+      "you want this routed to; on a server that advertises explicit `to` routing it\n" +
+      "wins over every inferred signal, else it falls back to being sent as a leading\n" +
+      "mention — a nudge, not a guaranteed override, since the actual route then\n" +
+      "still follows the person's live claim/assigned/author/steward signals over the\n" +
+      "question's neighborhood. --project overrides the derived project — pass it for\n" +
+      "a mention-less question whose neighborhood is empty. --title/--id apply to the\n" +
+      "local node. The response's routing line shows who it reached and, when the\n" +
+      "server reports it, routed_by (explicit|steward|claim|assigned|author|owner);\n" +
+      "any routing warnings print to stderr.\n\n" +
       "Answer a question by writing a node with an answers edge to it, then\n" +
       "'spor set-status <id> answered'.",
     options: {
       title: { type: "string", value: "...", desc: "short question title (default: first 10 words)" },
-      to: { type: "string", value: "id", desc: "person to route this to (best-effort — sent as a leading mention; not a guaranteed override)" },
+      to: { type: "string", value: "id", desc: "person to route this to — an explicit override on a server that supports it, else a best-effort leading mention" },
       mention: { type: "string", value: "id", desc: "a node the question is about (repeatable; routing weighs these first)", multiple: true },
       project: { type: "string", value: "S", desc: "override the derived project (for a mention-less question)" },
       id: { type: "string", value: "id", desc: "explicit node id (local only)" },
