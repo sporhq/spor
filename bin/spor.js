@@ -19487,8 +19487,12 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   const owesEvidence = Object.values((record.gate_progress && record.gate_progress.gates) || {}).some((p) => p && (p.filingIntent || (p.evidence && p.evidence.complete !== true)));
   const resume = record.gate_state === "interrupted" || (owesEvidence && !gatesKernel.SETTLED_GATE_STATES.has(record.gate_state));
   // Attempt 1 was the pipeline that refused; each re-gate counts up from
-  // there. A resume keeps the attempt it continues.
-  const attempt = (Number(record.gate_regate_count) || 0) + (resume ? 1 : 2);
+  // there. A resume keeps the attempt it continues — and a pipeline no
+  // --regate ever re-opened (count 0: a work loop's own) ran with NO attempt,
+  // so it resumes as 0, never 1: the gate keys read the two alike, but the
+  // implementation stage's ledger segment and its run names do not.
+  const regateCount = Number(record.gate_regate_count) || 0;
+  const attempt = resume ? (regateCount ? regateCount + 1 : 0) : regateCount + 2;
   // The item's OWN repo stamp, exactly as the loop's slot would carry it --
   // which means AS CLAIMED, not as it reads now. The record carries it since
   // task-spor-factory-no-code-outcome-convention; for a record predating that,
@@ -19530,7 +19534,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // Every escalation this run has accumulated across attempts — a passing
   // re-gate answers all of them, not only the latest.
   const escalatedBefore = [...new Set([...(Array.isArray(record.gate_escalation_ids) ? record.gate_escalation_ids : []), record.gate_escalated_to].filter(Boolean))];
-  out(`work: ${resume ? "resuming the interrupted re-gate of" : "re-gating"} ${record.node_id} — run ${shortId}, attempt ${attempt}, under ${factoryId} (previously ${previous})`);
+  out(`work: ${resume ? "resuming the interrupted re-gate of" : "re-gating"} ${record.node_id} — run ${shortId}, attempt ${Math.max(1, attempt)}, under ${factoryId} (previously ${previous})`);
   // A re-gate re-opens a controller record's completion: a refusal's
   // `consumed` stamp (reconcileCompletions) must not hide a completion this
   // attempt may now write and then owe.
@@ -19566,13 +19570,15 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   if (!owns() || res?.superseded || res?.not_run) { err("spor work --regate: ownership changed; no final mutation is applied"); return 1; }
   const state = (res && res.state) || "failed";
   const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
-  // Interrupted AGAIN: nothing settled, so nothing but the state is stamped —
-  // the loop's own markGate shape — leaving the attempt's evidence, escalation
-  // bookkeeping and failing-test list exactly as the attempt holds them, for
-  // the next --regate to resume.
+  // Interrupted: nothing settled, so nothing is stamped but the state — the
+  // loop's own markGate shape — leaving the attempt's evidence and escalation
+  // bookkeeping as the attempt holds them, for the next --regate to resume.
+  // The one exception is the failing-test list: it names a SETTLED attempt's
+  // failure, and this attempt judged nothing, so it must not stand as though
+  // this attempt failed on those tests (--regate-flakes reads it).
   if (state === "interrupted") {
-    stamp({ gate_state: state, gate_reason: reason });
-    out(`work: re-gate of ${record.node_id} interrupted${reason ? ` — ${reason}` : ""} — nothing settled; resume attempt ${attempt} with 'spor work --regate ${record.run_id}'`);
+    stamp({ gate_state: state, gate_reason: reason, gate_failing_tests: null });
+    out(`work: re-gate of ${record.node_id} interrupted${reason ? ` — ${reason}` : ""} — nothing settled; resume attempt ${Math.max(1, attempt)} with 'spor work --regate ${record.run_id}'`);
     return 1;
   }
   stamp({
@@ -20039,6 +20045,14 @@ async function cmdWorkRegateFlakes(cfg, values, ctx) {
       continue;
     }
     failed += 1;
+    // Interrupted is not a refusal: the re-gate judged nothing yet, so the
+    // "the flake fix did not clear the refusal" note would be false. The
+    // attempt is resumable ('spor work --regate'), and the sweep never re-plans
+    // an unsettled record, so it is left to that door.
+    if (after.gate_state === "interrupted") {
+      out(`work: the automatic re-gate of run ${short} on ${record.node_id} was interrupted before a verdict${after.gate_reason ? ` (${String(after.gate_reason).slice(0, 200)})` : ""} — resume it with 'spor work --regate ${record.run_id}'`);
+      continue;
+    }
     const note = await writeSweepNote(cfg, {
       kind: "flake-regate", record, factoryId, escalations, related: [...step.issues, after.gate_escalated_to !== record.gate_escalated_to ? after.gate_escalated_to : null],
       title: `Automatic re-gate after a flake fix still refused ${record.node_id}`,

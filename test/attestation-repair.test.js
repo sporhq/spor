@@ -261,7 +261,7 @@ test("an interrupted --regate on pending flake evidence is resumed by the next -
   const f = fixture();
   const gate = { id: "acceptance", kind: "command", command: "true", timeoutMs: 60000, cycles: 0, source: "inline", risk: [] };
   const factory = { ...f.factory, gates: [gate] };
-  runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "failed", gate_worker: "old", gate_regate_count: 0 });
+  runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "failed", gate_worker: "old", gate_regate_count: 0, gate_failing_tests: ["test/old.test.js"] });
   const owed = () => Object.values((runner.readJson(f.file).gate_progress || {}).gates || {}).some((p) => p && (p.filingIntent || (p.evidence && p.evidence.complete !== true)));
   const regate = () => cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory, factoryId: factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home });
   const evidence = (complete) => ({ complete, gate, origin: cli.attestationGraphOrigin(f.cfg), outcome: { state: "passed", flake: { issues: ["issue-flake-one"] } } });
@@ -296,6 +296,7 @@ test("an interrupted --regate on pending flake evidence is resumed by the next -
     assert.equal(rec.gate_regate_count, 1);
     assert.ok(owed(), "the interrupted attempt owes its evidence");
     assert.ok(!rec.gate_attestation && !rec.gate_attestation_pending, "an interruption attests nothing");
+    assert.equal(rec.gate_failing_tests, null, "the refused attempt's failing tests do not stand for an attempt that judged nothing");
     // The trap: opening a NEW attempt over the owed evidence is refused, and
     // the --regate left no gating slot for a worker to resume from.
     const reopen = { settleId: rec.gate_settle_id, regateCount: 1, state: "interrupted" };
@@ -325,11 +326,49 @@ test("a --regate does not resume an interrupted pipeline a live worker has parke
   const loop = require("../lib/shell/work-loop.js");
   const workerId = "parking-worker";
   loop.writeWorkerStatus(f.home, { worker_id: workerId, pid: process.pid, started_ticks: runner.processStartTicks(process.pid), started_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-  runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "interrupted", gate_worker: workerId });
+  runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "interrupted", gate_settle_id: "parked", gate_worker: workerId });
   const before = fs.readFileSync(f.file, "utf8");
   const code = await cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory: f.factory, factoryId: f.factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home });
   assert.equal(code, 1);
   assert.equal(fs.readFileSync(f.file, "utf8"), before, "the parked record is untouched");
+  // ...and the claim itself refuses a resume past a live owner, not only the pre-check.
+  const ownerLive = (id) => loop.readWorkerStatuses(f.home, { alive: cli.workerAlive }).some((w) => w.live && w.worker_id === id);
+  const claim = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "resumer", ownerLive, reopen: { settleId: "parked", regateCount: 0, state: "interrupted", resume: true } });
+  assert.match(claim.refused, /being gated right now by worker parking-worker/);
+  assert.equal(fs.readFileSync(f.file, "utf8"), before);
+});
+
+// Review finding: a pipeline no --regate ever re-opened (a work loop's own,
+// gate_regate_count 0) ran with NO attempt, so a --regate resumes it as
+// attempt 0 — the gate keys read 0 and 1 alike, but the implementation
+// stage's ledger segment and run names do not.
+test("a --regate resumes a work loop's interrupted pipeline under the loop's own attempt, seeing the evidence the loop journaled", async () => {
+  const gatesLib = require("../lib/shell/gate-runner.js");
+  const f = fixture();
+  const gate = { id: "acceptance", kind: "command", command: "true", timeoutMs: 60000, cycles: 0, source: "inline", risk: [] };
+  const factory = { ...f.factory, gates: [gate] };
+  runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "running", gate_settle_id: "loop-claim", gate_worker: "dead-loop-worker" });
+  const evidence = (complete) => ({ complete, gate, origin: cli.attestationGraphOrigin(f.cfg), outcome: { state: "passed", flake: { issues: ["issue-flake-one"] } } });
+  // The loop's pass journals evidence (under ITS attempt: none), then the loop stamps it interrupted.
+  const loopDeps = cli.makeGateDeps(f.cfg, { record: runner.readJson(f.file), entry: { run_id: f.item.run_id, node_id: f.item.node_id }, factory, slug: null, passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home: f.home, gateOwner: "loop-claim" });
+  await loopDeps.saveGateProgress({ gate, progress: { evidence: evidence(false) } });
+  runner.stampGateState(f.home, f.item.run_id, { gate_state: "interrupted", gate_reason: "flake occurrence evidence is pending graph publication" }, { own: "loop-claim" });
+  const seen = [];
+  const original = gatesLib.runGatePipeline;
+  gatesLib.runGatePipeline = async ({ item, deps }) => {
+    const pre = await deps.checkEvidenceOrigins();
+    seen.push({ attempt: item.attempt, pending: (pre.pending || []).length });
+    await deps.saveGateProgress({ gate, item, progress: { evidence: evidence(true) } });
+    return f.gateResult;
+  };
+  try {
+    assert.equal(await cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory, factoryId: factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home }), 0);
+  } finally { gatesLib.runGatePipeline = original; }
+  assert.deepEqual(seen, [{ attempt: 0, pending: 1 }]);
+  const rec = runner.readJson(f.file);
+  assert.equal(rec.gate_state, "passed");
+  assert.equal(rec.gate_regate_count || 0, 0, "no new attempt was opened");
+  assert.equal(Object.values(rec.gate_progress.gates).some((p) => p.evidence && !p.evidence.complete), false, "nothing is left owed");
 });
 
 test("proposal push and trusted-ref merge never execute repository hooks with judge credentials", () => {
