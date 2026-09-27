@@ -19730,7 +19730,7 @@ function flakeSweepPlan(records, graph, { trustedRef, scope = null, isController
       skip(`${cov.why}, but this factory's integration stage would land the branch on a pass — re-gate it by hand ('spor work --regate ${record.run_id}')`);
       continue;
     }
-    plan.push({ record, action: "regate", issues: cov.issues, why: cov.why });
+    plan.push({ record, action: "regate", issues: cov.issues, why: cov.why, failingTests });
   }
 
   // GRAPH-ONLY: an open escalation carrying structured `failing_tests` that no
@@ -19851,7 +19851,7 @@ async function cmdWorkRegateFlakes(cfg, values, ctx) {
     // that did not land means no re-gate at all (never an untracked one).
     const prior = record.gate_flake_regate || null;
     const tried = [...new Set([...((prior && prior.issues) || []), ...step.issues])].sort();
-    const reservation = { issues: tried, tests: record.gate_failing_tests, at: new Date().toISOString(), state: "running" };
+    const reservation = { issues: tried, tests: step.failingTests || record.gate_failing_tests, at: new Date().toISOString(), state: "running" };
     const reserved = dispatchRuns.stampGateState(home, record.run_id, { gate_flake_regate: reservation }, { allowSettledPatch: true });
     if (!reserved || !reserved.gate_flake_regate || reserved.gate_flake_regate.at !== reservation.at) {
       out(`work: could not record the unattended re-gate of run ${short} on its record — not re-gating it`);
