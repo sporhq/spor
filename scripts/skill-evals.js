@@ -56,9 +56,11 @@ function skillFrontmatterName(skillDir) {
   } catch {
     return null;
   }
-  const match = raw.match(/^---\n([\s\S]*?)\n---/);
+  // A skill manifest, not a graph node: only the fence is shared with the
+  // node grammar (kernel/frontmatter.js splitDocument).
+  const match = require("../lib/kernel/frontmatter.js").splitDocument(raw);
   if (!match) return null;
-  const nameLine = match[1].split("\n").find((l) => /^name:\s*/.test(l));
+  const nameLine = match.frontmatter.split("\n").find((l) => /^name:\s*/.test(l));
   return nameLine ? nameLine.replace(/^name:\s*/, "").trim() : null;
 }
 

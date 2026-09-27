@@ -1,0 +1,8 @@
+{
+  "id": "grammar-frontmatter",
+  "kind": "frontmatter",
+  "corpus": "grammar",
+  "input": {},
+  "expected": "grammar-frontmatter.json",
+  "covers": "the whole node-file grammar in one read (task-spor-client-single-frontmatter-parser): flow edges with attrs and the target: alias, block-form edges opened by any key with comments/blank lines/flush-left items, alias and inverse spellings kept verbatim, a flow edge outside the edges block, inline/indented/flush-left/empty block lists, a stray line inside a block list, a list key holding a scalar, quoted scalars, folded continuations, duplicate keys, repo: beating project:, a CRLF file, no fence, and the two deliberate edge faults (strict throws the first, lenient records both and keeps the valid edge) — plus the lex ranges the editors splice by, and the serialize/parse round-trip law"
+}

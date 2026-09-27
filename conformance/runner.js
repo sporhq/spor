@@ -29,6 +29,7 @@ const fs = require("fs");
 const path = require("path");
 
 const kgraph = require("../lib/kernel/graph.js");
+const kfm = require("../lib/kernel/frontmatter.js");
 const kqueue = require("../lib/kernel/queue.js");
 const { sandboxFor } = require("../lib/sandbox.js");
 
@@ -135,6 +136,67 @@ const KINDS = {
       now: ms(c.input.now),
       sandboxFor,
     }));
+  },
+
+  // the node-file grammar (task-spor-client-single-frontmatter-parser) — one
+  // JSON record per corpus file: the strict read (node or its fault), the
+  // lenient lex the lint and the editors consume (line-ranged entries, edge
+  // entries, recorded faults), the canonical serialization, and whether the
+  // serialization folds back to the same node (the round-trip law). Files are
+  // presented as raw bytes — a CRLF fixture is part of the contract.
+  frontmatter(c) {
+    const files = readFilesSorted(path.join(CORPORA_DIR, c.corpus, "nodes"));
+    const out = {};
+    for (const [f, raw] of Object.entries(files)) {
+      const rec = {};
+      try {
+        rec.node = kfm.parseFrontmatter(raw, f);
+      } catch (e) {
+        rec.fault = e.message;
+      }
+      const doc = kfm.splitDocument(raw);
+      rec.crlf = doc ? doc.crlf : null;
+      if (doc) {
+        const lex = kfm.lexFrontmatter(doc.frontmatter, f, { lenient: true });
+        rec.lex = { entries: lex.entries, edges: lex.edges, faults: lex.faults };
+        rec.lenient = kfm.readNode(raw, f).node;
+      }
+      if (rec.node) {
+        rec.serialized = kfm.serializeNode(rec.node);
+        const back = kfm.parseFrontmatter(rec.serialized, f);
+        // Identity, not key order: a block-form edge opened by `to:` folds to
+        // {to, type} and serializes as {type, to} — the same edge.
+        const canon = (v) => Array.isArray(v) ? v.map(canon)
+          : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v;
+        const strip = (n) => { const { file, ...rest } = n; return canon(rest); };
+        rec.roundtrip = JSON.stringify(strip(back)) === JSON.stringify(strip(rec.node));
+      }
+      out[f] = rec;
+    }
+    return json(out);
+  },
+
+  // structure-aware edits over a corpus file — the editors every local
+  // rewrite goes through (edge add/remove, stamp, key set). Each op pins its
+  // arguments; the output is the rewritten raw (null = nothing to do), so a
+  // port must splice by the same entry ranges to the byte.
+  "frontmatter-edit"(c) {
+    const files = readFilesSorted(path.join(CORPORA_DIR, c.corpus, "nodes"));
+    const out = [];
+    for (const op of c.input.ops) {
+      const raw = files[op.file];
+      let result;
+      switch (op.op) {
+        case "withEdge": result = kfm.withEdge(raw, op.type, op.to, op.attrs ?? null); break;
+        case "withoutEdge": result = kfm.withoutEdge(raw, { type: op.type, to: op.to }, op.renames ?? null); break;
+        case "withStamp": result = kfm.withStamp(raw, op.keys, op.lines); break;
+        case "withKey": result = kfm.withKey(raw, op.key, op.value ?? null); break;
+        case "withKeyAfter": result = kfm.withKeyAfter(raw, op.key, op.line ?? null, op.anchors ?? []); break;
+        default: throw new Error(`${c.id}: unknown op '${op.op}'`);
+      }
+      out.push({ op, result });
+    }
+    return json(out);
   },
 
   // validator diagnostics — JSON of the reportable surface (the parsed nodes

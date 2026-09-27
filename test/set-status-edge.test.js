@@ -941,3 +941,117 @@ test("edge --help prints the command page with its alias", () => {
   assert.match(r.stdout, /^spor edge <id> <type> <to>/m);
   assert.match(r.stdout, /add-edge/); // alias listed
 });
+
+// --- edges by PARSED identity (task-spor-client-single-frontmatter-parser) ---
+// The local edge verbs go through the kernel grammar (lib/kernel/frontmatter.js),
+// so a removal matches an entry however the file spells it — YAML block form,
+// an alias, an inverse spelling on the OTHER node — instead of the one
+// regex-shaped line the old removeEdgeLine knew.
+
+function writeBlockEdgeTask(nodes) {
+  fs.writeFileSync(path.join(nodes, "task-x.md"), `---
+id: task-x
+type: task
+project: demo
+title: A demo task
+summary: A demo task carrying a block-form edge the way MCP put_node writes them.
+date: 2026-06-01
+edges:
+  - type: blocks
+    to: dec-y
+---
+Body about the demo task.
+`);
+}
+
+test("edge --remove (local) withdraws a block-form YAML edge in full (issue-spor-edge-remove-misses-block-style-yaml-edges)", () => {
+  const { home, nodes } = fixtureGraph();
+  writeBlockEdgeTask(nodes);
+  const r = run(["edge", "task-x", "blocks", "dec-y", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge removed: task-x -\[blocks\]-> dec-y/);
+  const after = readNode(nodes, "task-x");
+  assert.doesNotMatch(after, /blocks/);
+  assert.doesNotMatch(after, /to: dec-y/, "both lines of the block entry are gone");
+  assert.match(after, /edges:\n---/, "the now-empty edges: key is left as-is");
+  const v = validateGraph(nodes);
+  assert.strictEqual(v.status, 0, v.stdout);
+});
+
+test("edge --remove (local) that matches nothing reports 'already absent' and writes nothing", () => {
+  const { home, nodes } = fixtureGraph();
+  writeBlockEdgeTask(nodes);
+  const before = readNode(nodes, "task-x");
+  const r = run(["edge", "task-x", "blocks", "task-x", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge already absent/);
+  assert.strictEqual(readNode(nodes, "task-x"), before);
+});
+
+test("edge (local) sees a block-form edge as already present rather than appending a duplicate", () => {
+  const { home, nodes } = fixtureGraph();
+  writeBlockEdgeTask(nodes);
+  const before = readNode(nodes, "task-x");
+  const r = run(["edge", "task-x", "blocks", "dec-y"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge already present: task-x -\[blocks\]-> dec-y/);
+  assert.strictEqual(readNode(nodes, "task-x"), before);
+});
+
+function writeInverseSpelling(nodes) {
+  // task-a carries `blocked-by -> task-b`: the SAME edge as `task-b blocks task-a`.
+  fs.writeFileSync(path.join(nodes, "task-a.md"), `---
+id: task-a
+type: task
+project: demo
+title: Task a
+summary: A task carrying an inverse-spelled edge authored by hand.
+date: 2026-06-01
+edges:
+  - {type: blocked-by, to: task-b}
+---
+Body a.
+`);
+  fs.writeFileSync(path.join(nodes, "task-b.md"), `---
+id: task-b
+type: task
+project: demo
+title: Task b
+summary: The blocker task, carrying no edge of its own.
+date: 2026-06-01
+---
+Body b.
+`);
+}
+
+test("edge --remove (local) withdraws an INVERSE spelling from the target node (issue-spor-cmd-edge-inverse-spelling-invisible)", () => {
+  const { home, nodes } = fixtureGraph();
+  writeInverseSpelling(nodes);
+  const r = run(["edge", "task-b", "blocks", "task-a", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge removed: task-b -\[blocks\]-> task-a \(removed on task-a\)/);
+  assert.doesNotMatch(readNode(nodes, "task-a"), /blocked-by/, "the inverse line is deleted from task-a.md");
+  assert.doesNotMatch(readNode(nodes, "task-b"), /edges:/);
+});
+
+test("edge (local) reports an INVERSE spelling on the target as already present rather than appending a duplicate", () => {
+  const { home, nodes } = fixtureGraph();
+  writeInverseSpelling(nodes);
+  const before = readNode(nodes, "task-b");
+  const r = run(["edge", "task-b", "blocks", "task-a"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge already present: task-b -\[blocks\]-> task-a/);
+  assert.strictEqual(readNode(nodes, "task-b"), before, "nothing appended to task-b");
+  assert.match(readNode(nodes, "task-a"), /blocked-by/, "task-a untouched");
+});
+
+test("edge (local) on a CRLF node file appends and keeps the file CRLF", () => {
+  const { home, nodes } = fixtureGraph();
+  const file = path.join(nodes, "dec-y.md");
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(/\n/g, "\r\n"));
+  const r = run(["edge", "dec-y", "resolves", "task-x"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const after = readNode(nodes, "dec-y");
+  assert.match(after, /edges:\r\n  - \{type: resolves, to: task-x\}\r\n---\r\n/);
+  assert.doesNotMatch(after, /[^\r]\n/, "no bare LF introduced");
+});

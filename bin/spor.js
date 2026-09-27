@@ -103,6 +103,11 @@ const attestation = lazyModule(path.join(ROOT, "lib", "shell", "attestation.js")
 // queue ranker and read surfaces use. The dispatch guard reads it so it never
 // launches an agent at already-finished work (issue-spor-dispatch-resolved-task-no-guard).
 const resolution = require(path.join(ROOT, "lib", "kernel", "resolution.js"));
+// THE node-file grammar (task-spor-client-single-frontmatter-parser): every
+// local read of a node file's structure and every in-place rewrite — stamp
+// fields, status, tags, edge add/remove — goes through kernel/frontmatter.js,
+// never a regex over the raw text (test/frontmatter-lint.test.js enforces it).
+const frontmatter = require(path.join(ROOT, "lib", "kernel", "frontmatter.js"));
 const { isTerminalStatus, resolutionOf, openFindingsFor } = resolution;
 // Agent-readiness (dec-spor-agent-readiness-derived-classification): the same
 // derivation rankQueue uses per queue item, reused here for ONE node so the
@@ -4480,20 +4485,10 @@ function gitIdentity(repoDir) {
 // (task-spor-priority-readiness-stamp-helper-dedup) — the only per-field
 // pieces are the field name itself, the allowed-value vocabulary (each
 // verb's own normalize*), and the provenance key prefix this derives from it.
-// A CRLF node file is otherwise valid (parseFrontmatter accepts `\r?\n`), so
-// the fence match here does too, and the file's line-ending style is
-// preserved on write rather than silently flattened to LF
-// (issue-spor-rewrite-stamp-crlf-frontmatter).
+// The rewrite is the kernel's structure-aware withStamp: the old entries are
+// located by PARSED key (continuations included), and a CRLF file is written
+// back CRLF (issue-spor-rewrite-stamp-crlf-frontmatter).
 function rewriteStamp(field, raw, value, identity, via) {
-  const crlf = /\r\n/.test(raw);
-  const norm = crlf ? raw.replace(/\r\n/g, "\n") : raw;
-  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(norm);
-  if (!m) return null;
-  let fm = m[1];
-  const body = m[2];
-  const stripFmLine = (s, key) => s.replace(new RegExp(`(^|\\n)${key}:[^\\n]*`, "g"), "");
-  for (const k of [field, `${field}_by`, `${field}_at`, `${field}_via`]) fm = stripFmLine(fm, k);
-  fm = fm.replace(/\n+$/, "").replace(/^\n+/, "");
   const stamps = [];
   if (value) {
     stamps.push(`${field}: ${value}`);
@@ -4501,9 +4496,7 @@ function rewriteStamp(field, raw, value, identity, via) {
     stamps.push(`${field}_at: ${u.isoMs()}`);
     stamps.push(`${field}_via: ${via}`);
   }
-  const fmOut = stamps.length ? `${fm}\n${stamps.join("\n")}` : fm;
-  const rebuilt = `---\n${fmOut}\n---\n${body}`;
-  return crlf ? rebuilt.replace(/\n/g, "\r\n") : rebuilt;
+  return frontmatter.withStamp(raw, [field, `${field}_by`, `${field}_at`, `${field}_via`], stamps);
 }
 
 // The set-a-stamp-field verb core: validate/normalize is caller-specific
@@ -4687,16 +4680,11 @@ function badNodeIdReason(id) {
 const MAX_ID_LENGTH = 200;
 
 // Rewrite a node's raw markdown to carry `value` as its status, mirroring the
-// server's forceStatus (store.js): strip any existing status line, then append
+// server's forceStatus (store.js): strip any existing status entry, then append
 // `status: <value>` at the end of the frontmatter block. Returns the new raw, or
 // null when the frontmatter can't be located.
 function rewriteStatus(raw, value) {
-  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
-  if (!m) return null;
-  let fm = m[1];
-  const body = m[2];
-  fm = fm.replace(/(^|\n)status:[^\n]*/g, "").replace(/\n+$/, "").replace(/^\n+/, "");
-  return `---\n${fm}\nstatus: ${value}\n---\n${body}`;
+  return frontmatter.withStamp(raw, ["status"], [`status: ${value}`]);
 }
 
 // --- resolve-time ancestry warning (task-spor-client-resolve-time-ancestry-
@@ -4974,140 +4962,49 @@ function parseEdgeAttrs(rawList) {
   return { attrs: Object.keys(out).length ? out : null };
 }
 
-// Render an attribute map to the `, k: v` tail insertEdgeLine appends, byte-
-// matching the server's renderEdgeAttrs (sorted keys, blanks dropped).
-function renderEdgeAttrsTail(attrs) {
-  if (!attrs) return "";
-  return Object.keys(attrs)
-    .filter((k) => attrs[k] != null && attrs[k] !== "")
-    .sort()
-    .map((k) => `, ${k}: ${attrs[k]}`)
-    .join("");
-}
-
 // Append a `  - {type: T, to: TO[, k: v]}` line to a node's frontmatter, mirroring
 // the server's insertEdgeLine: insert after the last existing edge (or after the
 // `edges:` key), creating the block at the end of the frontmatter when absent.
+// Attrs render sorted with blanks dropped (the server's renderEdgeAttrs).
 // Returns the new raw, or null when the frontmatter can't be located.
-function appendEdgeLine(raw, type, to, attrs) {
-  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
-  if (!m) return null;
-  const body = m[2];
-  const line = `  - {type: ${type}, to: ${to}${renderEdgeAttrsTail(attrs)}}`;
-  const lines = m[1].split("\n");
-  const EDGE_LINE = /^\s*-\s*\{type:/;
-  let edgesKey = -1, lastEdge = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^edges:\s*$/.test(lines[i])) edgesKey = i;
-    if (EDGE_LINE.test(lines[i])) lastEdge = i;
-  }
-  if (edgesKey === -1) lines.push("edges:", line);
-  else lines.splice((lastEdge > edgesKey ? lastEdge : edgesKey) + 1, 0, line);
-  return `---\n${lines.join("\n")}\n---\n${body}`;
-}
+const appendEdgeLine = (raw, type, to, attrs) => frontmatter.withEdge(raw, type, to, attrs);
 
-// An edge type as the registry's canonical spelling. parseFrontmatter never
-// canonicalizes, so a node authored by hand — or distilled before a rename
-// landed — carries its legacy ALIAS verbatim (`related-to`, `supercedes`,
-// `derives-from`), while every write path here has already run the REQUESTED
-// type through edgeRenames(). Comparing the two raw spellings therefore
-// double-added the canonical form onto a node that already carried the alias,
-// and reported "already absent" when asked to remove the alias
-// (issue-spor-cmd-edge-alias-spelling-not-canonicalized). Both sides go
-// through this before any equality test. It is a COMPARISON-time normalization
-// only: the file's own spelling is never rewritten, so an add still appends
-// the canonical form and a remove withdraws whichever spelling is present.
-function canonEdgeType(type, renames) {
-  return (renames && renames[type]) || type;
-}
+// An edge type as the registry's canonical spelling — comparison-time only,
+// the file's own spelling is never rewritten (issue-spor-cmd-edge-alias-
+// spelling-not-canonicalized). `renames` is `reg.edgeRenames()`.
+const { canonEdgeType } = frontmatter;
 
-// Remove an edge entry matching (type, to) exactly — the withdrawal twin of
-// appendEdgeLine (local `spor edge --remove`, the remove_edge micro-mutation,
-// API.md §1/§3, and the controller-completion retract of a premature
-// `resolves` edge, lib/shell/completion.js retractPremature). `type` and `to`
-// are pre-validated [\w-]+ tokens (NODE_ID_RE / reg.isKnownEdge), so no
-// regex-escaping is needed.
-//
-// Matches BOTH edge spellings parseFrontmatter accepts (issue-spor-remove-
-// edge-line-flow-form-only-retract-never-converges): the flow form
-// `- {type: T, to: TO[, k: v]}` every machine writer (including
-// appendEdgeLine) produces, and the YAML block form `- type: T` / indented
-// `to: TO` a hand-authored node may carry — a premature `resolves` edge is
-// exactly the kind of edge a human or an LLM distiller might author by hand,
-// so retract must be able to withdraw either spelling or it fails and
-// re-logs on every completion pass without ever converging. The scan mirrors
-// parseFrontmatter's own edge recognition (flow-form single line; block-form
-// entries opened by `- key: value` and folded onto by subsequent indented
-// `key: value` lines, `target:` accepted as an alias for `to:`, closed by the
-// next top-level key or EOF) closely enough to track each entry's exact line
-// RANGE, so a matched block-form entry is removed in full — every one of its
-// indented lines, not just the one that happens to carry `to:`. The lookahead
-// after `to` in the flow-form match requires the token to END there (a comma
-// or the closing brace) so removing `agent-x` can never eat a longer
-// `agent-x-2`; the block-form match compares the fully-folded entry, so no
-// such lookahead is needed there.
-//
-// Returns the new raw, or null when no matching entry exists (the caller
-// reports an idempotent skip, mirroring the server's remove_edge contract) or
-// the frontmatter can't be located.
-//
-// `renames` is the registry's `edgeRenames()` map, so an entry written with a
-// legacy ALIAS spelling matches the canonical `type` the caller asks for —
-// see canonEdgeType above. Omitting it degrades to a raw spelling match.
-function removeEdgeLine(raw, type, to, renames) {
-  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
-  if (!m) return null;
-  const body = m[2];
-  const lines = m[1].split("\n");
-  const FLOW_EDGE_RE = /-\s*\{type:\s*([\w-]+)\s*,\s*(?:to|target):\s*([\w-]+)(?=[,}])/;
+// Remove the edge entry matching `pred` (a predicate over the PARSED edge) —
+// the withdrawal twin of appendEdgeLine (local `spor edge --remove`, the
+// remove_edge micro-mutation, API.md §1/§3, and the controller-completion
+// retract of a premature `resolves` edge, lib/shell/completion.js
+// retractPremature). Matching is by parsed identity, so the flow form every
+// machine writer produces and the YAML block form a hand-authored or MCP-
+// written node carries are withdrawn alike, every line of a block entry
+// (issue-spor-edge-remove-misses-block-style-yaml-edges, issue-spor-remove-
+// edge-line-flow-form-only-retract-never-converges). Returns the new raw, or
+// null when no entry matches (the caller reports the idempotent skip) or the
+// frontmatter can't be located.
+const removeEdgeLine = (raw, pred) => frontmatter.withoutEdge(raw, pred);
 
-  let inEdgesBlock = false;
-  let edgeBuf = null;
-  let edgeStart = -1;
-  let match = null; // {start, end} once the target entry is located
-
-  const flushEdgeBuf = (end) => {
-    if (edgeBuf && !match && canonEdgeType(edgeBuf.type, renames) === type && edgeBuf.to === to) match = { start: edgeStart, end };
-    edgeBuf = null;
-    edgeStart = -1;
-  };
-
-  for (let i = 0; i < lines.length && !match; i++) {
-    const line = lines[i];
-    const kv = line.match(/^(\w[\w-]*):\s*(.*)$/);
-    if (kv) {
-      flushEdgeBuf(i);
-      inEdgesBlock = kv[1] === "edges";
-      continue;
-    }
-    const flow = line.match(FLOW_EDGE_RE);
-    if (flow) {
-      flushEdgeBuf(i);
-      if (!match && canonEdgeType(flow[1], renames) === type && flow[2] === to) match = { start: i, end: i + 1 };
-      continue;
-    }
-    if (inEdgesBlock) {
-      const open = line.match(/^\s*-\s+(\w[\w-]*):\s*(.*)$/);
-      if (open) {
-        flushEdgeBuf(i);
-        edgeStart = i;
-        edgeBuf = {};
-        edgeBuf[open[1] === "target" ? "to" : open[1]] = open[2].trim().replace(/^["']|["']$/g, "");
-        continue;
-      }
-      const cont = edgeBuf && line.match(/^\s+(\w[\w-]*):\s*(.*)$/);
-      if (cont) {
-        edgeBuf[cont[1] === "target" ? "to" : cont[1]] = cont[2].trim().replace(/^["']|["']$/g, "");
-        continue;
-      }
-      if (line.trim() === "" || line.trim().startsWith("#")) continue;
-      flushEdgeBuf(i);
-    }
-  }
-  if (!match) flushEdgeBuf(lines.length);
-  if (!match) return null;
-  lines.splice(match.start, match.end - match.start);
-  return `---\n${lines.join("\n")}\n---\n${body}`;
+// Where a local edge `srcId -[edgeType]-> target` is actually WRITTEN, by
+// parsed identity: on srcId in the canonical or an alias spelling, or on
+// target in an INVERSE spelling — `- {type: blocked-by, to: srcId}` on target
+// IS `srcId blocks target` (issue-spor-cmd-edge-inverse-spelling-invisible;
+// settled scope: the local presence check and --remove also scan the target
+// through reg.edgeInverses(), for parity with the server's remove_edge, and
+// unknown inverse types stay a validate WARNING). Returns {holder, pred} —
+// the node file holding the entry and the predicate that selects it — or
+// null when the edge is absent from both.
+function localEdgeSite(g, reg, srcId, edgeType, target) {
+  const renames = reg.edgeRenames();
+  const inverses = reg.edgeInverses();
+  const edgesOf = (id) => (g.nodes[id] && g.nodes[id].edges) || [];
+  const onSrc = (e) => frontmatter.sameEdge(e, { type: edgeType, to: target }, renames);
+  if (edgesOf(srcId).some(onSrc)) return { holder: srcId, pred: onSrc };
+  const onTarget = (e) => e.to === srcId && inverses[canonEdgeType(e.type, renames)] === edgeType;
+  if (edgesOf(target).some(onTarget)) return { holder: target, pred: onTarget };
+  return null;
 }
 
 async function cmdEdge(cfg, { values, positionals }) {
@@ -5223,16 +5120,28 @@ async function cmdEdge(cfg, { values, positionals }) {
     err(`no such node: ${srcId}`);
     return 1;
   }
-  const existing = (g.nodes[srcId] && g.nodes[srcId].edges) || [];
+  // Presence is judged by PARSED identity on both ends: the canonical or an
+  // alias spelling on srcId, or an inverse spelling on target.
+  const site = localEdgeSite(g, reg, srcId, edgeType, target);
   if (remove) {
     // Unlike add, a removal target need not still exist (removing a stale
     // edge onto a since-deleted node is exactly the cleanup this is for).
-    if (!existing.some((e) => canonEdgeType(e.type, renames) === edgeType && e.to === target)) {
+    if (!site) {
       out(`edge already absent: ${id} -[${type}]-> ${to}`);
       out(writeTargetLine(cfg));
       return 0;
     }
-    const newRaw = removeEdgeLine(raw, edgeType, target, renames);
+    const holderFile = path.join(nodesDir, `${site.holder}.md`);
+    let holderRaw = raw;
+    if (site.holder !== srcId) {
+      try {
+        holderRaw = fs.readFileSync(holderFile, "utf8");
+      } catch {
+        err(`no such node: ${site.holder}`);
+        return 1;
+      }
+    }
+    const newRaw = removeEdgeLine(holderRaw, site.pred);
     if (newRaw == null) {
       err(`could not remove ${srcId} -[${edgeType}]-> ${target}: no matching edge entry found in the frontmatter`);
       err(`  (the edge is present per the parsed graph but its line(s) could not be located — rewrite the node with 'spor put-node' instead)`);
@@ -5240,7 +5149,7 @@ async function cmdEdge(cfg, { values, positionals }) {
     }
     let node;
     try {
-      node = graphLib.parseFrontmatter(newRaw, `${srcId}.md`);
+      node = graphLib.parseFrontmatter(newRaw, `${site.holder}.md`);
     } catch (e) {
       err(`invalid node after edge remove: ${e.message}`);
       return 1;
@@ -5250,8 +5159,8 @@ async function cmdEdge(cfg, { values, positionals }) {
       err(`invalid node after edge remove:\n  ${v.errors.join("\n  ")}`);
       return 1;
     }
-    fs.writeFileSync(file, newRaw);
-    out(`edge removed: ${id} -[${type}]-> ${to}${srcId !== id ? ` (removed on ${srcId})` : ""}`);
+    fs.writeFileSync(holderFile, newRaw);
+    out(`edge removed: ${id} -[${type}]-> ${to}${site.holder !== id ? ` (removed on ${site.holder})` : ""}`);
     out(writeTargetLine(cfg));
     return 0;
   }
@@ -5259,7 +5168,7 @@ async function cmdEdge(cfg, { values, positionals }) {
     err(`edge target '${target}' does not exist — create it first (add_edge never creates dangling edges)`);
     return 1;
   }
-  if (existing.some((e) => canonEdgeType(e.type, renames) === edgeType && e.to === target) && !attrs) {
+  if (site && !attrs) {
     out(`edge already present: ${id} -[${type}]-> ${to}`);
     out(writeTargetLine(cfg));
     return 0;
@@ -7683,12 +7592,15 @@ function renderManifest(srcSegs) {
 
 function readMarkdownAgent(srcSegs) {
   const raw = fs.readFileSync(path.join(ROOT, ...srcSegs), "utf8").replace(/\r\n/g, "\n");
-  const m = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  // An agent manifest, not a graph node: only the fence is shared with the
+  // node grammar (kernel/frontmatter.js splitDocument); its keys are read
+  // verbatim (no quote stripping, no lists).
+  const m = frontmatter.splitDocument(raw);
   const meta = {};
   let body = raw;
   if (m) {
-    body = m[2];
-    for (const line of m[1].split("\n")) {
+    body = m.body;
+    for (const line of m.frontmatter.split("\n")) {
       const mm = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
       if (mm) meta[mm[1]] = mm[2].trim();
     }
@@ -17007,18 +16919,28 @@ async function graphEdgeMutation(cfg, from, type, to, { remove = false } = {}) {
   } else if (renames[edgeType]) edgeType = renames[edgeType];
   if (!NODE_ID_RE.test(srcId) || !NODE_ID_RE.test(target)) return { ok: false, reason: `bad node id ('${srcId}' / '${target}')` };
   if (!reg.isKnownEdge(edgeType)) return { ok: false, reason: `unknown edge type '${type}'` };
-  const file = path.join(nodesDir, `${srcId}.md`);
+  let file = path.join(nodesDir, `${srcId}.md`);
   let raw;
   try {
     raw = fs.readFileSync(file, "utf8");
   } catch {
     return { ok: false, reason: `no such node: ${srcId}` };
   }
-  const existing = (g.nodes[srcId] && g.nodes[srcId].edges) || [];
-  const present = existing.some((e) => canonEdgeType(e.type, renames) === edgeType && e.to === target);
-  if (remove && !present) return { ok: true, skipped: true };
-  if (!remove && present) return { ok: true, skipped: true };
-  const newRaw = remove ? removeEdgeLine(raw, edgeType, target, renames) : appendEdgeLine(raw, edgeType, target, null);
+  const site = localEdgeSite(g, reg, srcId, edgeType, target);
+  if (remove && !site) return { ok: true, skipped: true };
+  if (!remove && site) return { ok: true, skipped: true };
+  // A removal withdraws the entry wherever it is written — an inverse
+  // spelling lives on the target node (localEdgeSite).
+  if (remove && site.holder !== srcId) {
+    srcId = site.holder;
+    file = path.join(nodesDir, `${srcId}.md`);
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      return { ok: false, reason: `no such node: ${srcId}` };
+    }
+  }
+  const newRaw = remove ? removeEdgeLine(raw, site.pred) : appendEdgeLine(raw, edgeType, target, null);
   if (newRaw == null) return { ok: false, reason: `could not ${remove ? "remove" : "add"} ${srcId} -[${edgeType}]-> ${target}: the frontmatter${remove ? " line" : ""} could not be located` };
   let node;
   try {
@@ -20732,13 +20654,12 @@ function normalizeTags(rawTags) {
   return { tags };
 }
 
-// Read the inline `tags:` list off a repo node's raw markdown (frontmatter
-// only), mirroring the kernel's inline-list parse. [] when absent.
+// Read the `tags:` list off a repo node's raw markdown through the kernel
+// grammar (inline or block form, exactly what the compiler reads). [] when
+// absent, scalar, or the file has no frontmatter.
 function tagsFromRaw(raw) {
-  const m = /^---\n([\s\S]*?)\n---/.exec(raw);
-  const fm = m ? m[1] : ""; // no frontmatter fence -> no tags (never scan the body)
-  const t = /^tags:\s*\[([^\]]*)\]/m.exec(fm);
-  return t ? t[1].split(",").map((s) => s.trim()).filter(Boolean) : [];
+  const r = frontmatter.readNode(raw, "repo.md");
+  return r && Array.isArray(r.node.tags) ? r.node.tags : [];
 }
 
 // Rewrite a repo node's raw markdown to carry `tags` as its inline `tags:` list,
@@ -20747,18 +20668,7 @@ function tagsFromRaw(raw) {
 // when present, else appended to the frontmatter. Returns the new raw, or null
 // when the frontmatter can't be located.
 function rewriteTags(raw, tags) {
-  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
-  if (!m) return null;
-  const body = m[2];
-  const lines = m[1].split("\n").filter((l) => !/^tags:\s*/.test(l));
-  if (tags.length) {
-    const line = `tags: [${tags.join(", ")}]`;
-    let anchor = -1;
-    for (let i = 0; i < lines.length; i++) if (/^(fingerprints|slugs):\s*/.test(lines[i])) anchor = i;
-    if (anchor === -1) lines.push(line);
-    else lines.splice(anchor + 1, 0, line);
-  }
-  return `---\n${lines.join("\n")}\n---\n${body}`;
+  return frontmatter.withKeyAfter(raw, "tags", tags.length ? `tags: [${tags.join(", ")}]` : null, ["fingerprints", "slugs"]);
 }
 
 // Order-insensitive set equality, so a no-op tag edit skips the write (and, in

@@ -1,0 +1,874 @@
+{
+  "art-crlf.md": {
+    "node": {
+      "edges": [
+        {
+          "type": "relates-to",
+          "to": "dec-flow-edges"
+        },
+        {
+          "type": "mentions",
+          "to": "corr-lists"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "CRLF body.",
+      "file": "art-crlf.md",
+      "id": "art-crlf",
+      "type": "artifact",
+      "repo": "grammar",
+      "title": "A CRLF node file",
+      "summary": "Written with Windows line endings, folded across a continuation.",
+      "date": "2026-09-27",
+      "project": "grammar"
+    },
+    "crlf": true,
+    "lex": {
+      "entries": [
+        {
+          "kind": "scalar",
+          "key": "id",
+          "start": 0,
+          "end": 1
+        },
+        {
+          "kind": "scalar",
+          "key": "type",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "kind": "scalar",
+          "key": "repo",
+          "start": 2,
+          "end": 3
+        },
+        {
+          "kind": "scalar",
+          "key": "title",
+          "start": 3,
+          "end": 4
+        },
+        {
+          "kind": "scalar",
+          "key": "summary",
+          "start": 4,
+          "end": 6
+        },
+        {
+          "kind": "edges",
+          "key": "edges",
+          "start": 6,
+          "end": 10
+        },
+        {
+          "kind": "scalar",
+          "key": "date",
+          "start": 10,
+          "end": 11
+        }
+      ],
+      "edges": [
+        {
+          "edge": {
+            "type": "relates-to",
+            "to": "dec-flow-edges"
+          },
+          "form": "flow",
+          "start": 7,
+          "end": 8
+        },
+        {
+          "edge": {
+            "type": "mentions",
+            "to": "corr-lists"
+          },
+          "form": "block",
+          "start": 8,
+          "end": 10
+        }
+      ],
+      "faults": []
+    },
+    "lenient": {
+      "edges": [
+        {
+          "type": "relates-to",
+          "to": "dec-flow-edges"
+        },
+        {
+          "type": "mentions",
+          "to": "corr-lists"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "CRLF body.",
+      "file": "art-crlf.md",
+      "id": "art-crlf",
+      "type": "artifact",
+      "repo": "grammar",
+      "title": "A CRLF node file",
+      "summary": "Written with Windows line endings, folded across a continuation.",
+      "date": "2026-09-27",
+      "project": "grammar"
+    },
+    "serialized": "---\nid: art-crlf\ntype: artifact\nrepo: grammar\ntitle: A CRLF node file\nsummary: Written with Windows line endings, folded across a continuation.\ndate: 2026-09-27\nproject: grammar\nedges:\n  - {type: relates-to, to: dec-flow-edges}\n  - {type: mentions, to: corr-lists}\n---\n\nCRLF body.\n",
+    "roundtrip": true
+  },
+  "bad-edge-entry.md": {
+    "fault": "unparseable edge entry \"garbage line inside the edges block\" in bad-edge-entry.md",
+    "crlf": false,
+    "lex": {
+      "entries": [
+        {
+          "kind": "scalar",
+          "key": "id",
+          "start": 0,
+          "end": 1
+        },
+        {
+          "kind": "scalar",
+          "key": "type",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "kind": "scalar",
+          "key": "repo",
+          "start": 2,
+          "end": 3
+        },
+        {
+          "kind": "scalar",
+          "key": "title",
+          "start": 3,
+          "end": 4
+        },
+        {
+          "kind": "scalar",
+          "key": "summary",
+          "start": 4,
+          "end": 5
+        },
+        {
+          "kind": "edges",
+          "key": "edges",
+          "start": 5,
+          "end": 9
+        },
+        {
+          "kind": "scalar",
+          "key": "date",
+          "start": 9,
+          "end": 10
+        }
+      ],
+      "edges": [
+        {
+          "edge": {
+            "type": "blocks",
+            "to": "corr-lists"
+          },
+          "form": "flow",
+          "start": 8,
+          "end": 9
+        }
+      ],
+      "faults": [
+        {
+          "line": 7,
+          "message": "unparseable edge entry \"garbage line inside the edges block\""
+        },
+        {
+          "line": 6,
+          "message": "unparseable edge entry {\"type\":\"relates-to\"}"
+        }
+      ]
+    },
+    "lenient": {
+      "edges": [
+        {
+          "type": "blocks",
+          "to": "corr-lists"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "Body.",
+      "file": "bad-edge-entry.md",
+      "id": "bad-edge-entry",
+      "type": "task",
+      "repo": "grammar",
+      "title": "Faulting edge entries",
+      "summary": "A block entry with no target, a garbage line, then a valid edge the lenient read still keeps.",
+      "date": "2026-09-27",
+      "project": "grammar"
+    }
+  },
+  "bad-no-fence.md": {
+    "fault": "no frontmatter in bad-no-fence.md",
+    "crlf": null
+  },
+  "corr-lists.md": {
+    "node": {
+      "edges": [],
+      "pin": [
+        "dec-flow-edges",
+        "task-block-edges"
+      ],
+      "exclude": [],
+      "body": "Body with a list-looking line:\n- not frontmatter",
+      "file": "corr-lists.md",
+      "id": "corr-lists",
+      "type": "correction",
+      "target": "dec-flow-edges",
+      "title": "Every list shape",
+      "summary": "Inline lists, indented and flush-left block lists, an empty block list, a stray line, a list key with a scalar.",
+      "commits": [
+        "grammar@1a2b3c4d",
+        "grammar@5e6f7a8b"
+      ],
+      "slugs": [
+        "grammar",
+        "grammar-alias"
+      ],
+      "fingerprints": [
+        "abc123",
+        "def456"
+      ],
+      "tags": [],
+      "applies_to_tags": "not-a-list",
+      "queue_mute": [
+        "a",
+        "b"
+      ],
+      "date": "2026-09-27"
+    },
+    "crlf": false,
+    "lex": {
+      "entries": [
+        {
+          "kind": "scalar",
+          "key": "id",
+          "start": 0,
+          "end": 1
+        },
+        {
+          "kind": "scalar",
+          "key": "type",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "kind": "scalar",
+          "key": "target",
+          "start": 2,
+          "end": 3
+        },
+        {
+          "kind": "scalar",
+          "key": "title",
+          "start": 3,
+          "end": 4
+        },
+        {
+          "kind": "scalar",
+          "key": "summary",
+          "start": 4,
+          "end": 5
+        },
+        {
+          "kind": "list",
+          "key": "pin",
+          "form": "inline",
+          "start": 5,
+          "end": 6
+        },
+        {
+          "kind": "list",
+          "key": "exclude",
+          "form": "inline",
+          "start": 6,
+          "end": 7
+        },
+        {
+          "kind": "list",
+          "key": "commits",
+          "form": "block",
+          "start": 7,
+          "end": 10
+        },
+        {
+          "kind": "list",
+          "key": "slugs",
+          "form": "block",
+          "start": 10,
+          "end": 13
+        },
+        {
+          "kind": "list",
+          "key": "fingerprints",
+          "form": "block",
+          "start": 13,
+          "end": 17
+        },
+        {
+          "kind": "list",
+          "key": "tags",
+          "form": "block",
+          "start": 17,
+          "end": 18
+        },
+        {
+          "kind": "scalar",
+          "key": "applies_to_tags",
+          "start": 18,
+          "end": 19
+        },
+        {
+          "kind": "list",
+          "key": "queue_mute",
+          "form": "inline",
+          "start": 19,
+          "end": 20
+        },
+        {
+          "kind": "scalar",
+          "key": "date",
+          "start": 20,
+          "end": 21
+        }
+      ],
+      "edges": [],
+      "faults": []
+    },
+    "lenient": {
+      "edges": [],
+      "pin": [
+        "dec-flow-edges",
+        "task-block-edges"
+      ],
+      "exclude": [],
+      "body": "Body with a list-looking line:\n- not frontmatter",
+      "file": "corr-lists.md",
+      "id": "corr-lists",
+      "type": "correction",
+      "target": "dec-flow-edges",
+      "title": "Every list shape",
+      "summary": "Inline lists, indented and flush-left block lists, an empty block list, a stray line, a list key with a scalar.",
+      "commits": [
+        "grammar@1a2b3c4d",
+        "grammar@5e6f7a8b"
+      ],
+      "slugs": [
+        "grammar",
+        "grammar-alias"
+      ],
+      "fingerprints": [
+        "abc123",
+        "def456"
+      ],
+      "tags": [],
+      "applies_to_tags": "not-a-list",
+      "queue_mute": [
+        "a",
+        "b"
+      ],
+      "date": "2026-09-27"
+    },
+    "serialized": "---\nid: corr-lists\ntype: correction\npin: [dec-flow-edges, task-block-edges]\ntarget: dec-flow-edges\ntitle: Every list shape\nsummary: Inline lists, indented and flush-left block lists, an empty block list, a stray line, a list key with a scalar.\ncommits: [grammar@1a2b3c4d, grammar@5e6f7a8b]\nslugs: [grammar, grammar-alias]\nfingerprints: [abc123, def456]\ntags: []\napplies_to_tags: not-a-list\nqueue_mute: [a, b]\ndate: 2026-09-27\n---\n\nBody with a list-looking line:\n- not frontmatter\n",
+    "roundtrip": true
+  },
+  "dec-flow-edges.md": {
+    "node": {
+      "edges": [
+        {
+          "type": "resolves",
+          "to": "task-block-edges"
+        },
+        {
+          "type": "assigned",
+          "to": "agent-x",
+          "profile": "profile-y",
+          "priority": "p1"
+        },
+        {
+          "type": "relates-to",
+          "to": "corr-lists"
+        },
+        {
+          "type": "mentions",
+          "to": "agent-x-2"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "Body of the flow-form decision.",
+      "file": "dec-flow-edges.md",
+      "id": "dec-flow-edges",
+      "type": "decision",
+      "repo": "grammar",
+      "title": "Flow-form edges, quoted scalars, folded summary",
+      "summary": "A decision whose summary folds across two indented continuation lines, joined with single spaces.",
+      "status": "active",
+      "date": "2026-09-27",
+      "custom_key": "verbatim scalar with [brackets] and, commas",
+      "project": "grammar"
+    },
+    "crlf": false,
+    "lex": {
+      "entries": [
+        {
+          "kind": "scalar",
+          "key": "id",
+          "start": 0,
+          "end": 1
+        },
+        {
+          "kind": "scalar",
+          "key": "type",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "kind": "scalar",
+          "key": "repo",
+          "start": 2,
+          "end": 3
+        },
+        {
+          "kind": "scalar",
+          "key": "title",
+          "start": 3,
+          "end": 4
+        },
+        {
+          "kind": "scalar",
+          "key": "summary",
+          "start": 4,
+          "end": 7
+        },
+        {
+          "kind": "scalar",
+          "key": "status",
+          "start": 7,
+          "end": 8
+        },
+        {
+          "kind": "scalar",
+          "key": "date",
+          "start": 8,
+          "end": 9
+        },
+        {
+          "kind": "edges",
+          "key": "edges",
+          "start": 9,
+          "end": 14
+        },
+        {
+          "kind": "scalar",
+          "key": "custom_key",
+          "start": 14,
+          "end": 15
+        }
+      ],
+      "edges": [
+        {
+          "edge": {
+            "type": "resolves",
+            "to": "task-block-edges"
+          },
+          "form": "flow",
+          "start": 10,
+          "end": 11
+        },
+        {
+          "edge": {
+            "type": "assigned",
+            "to": "agent-x",
+            "profile": "profile-y",
+            "priority": "p1"
+          },
+          "form": "flow",
+          "start": 11,
+          "end": 12
+        },
+        {
+          "edge": {
+            "type": "relates-to",
+            "to": "corr-lists"
+          },
+          "form": "flow",
+          "start": 12,
+          "end": 13
+        },
+        {
+          "edge": {
+            "type": "mentions",
+            "to": "agent-x-2"
+          },
+          "form": "flow",
+          "start": 13,
+          "end": 14
+        }
+      ],
+      "faults": []
+    },
+    "lenient": {
+      "edges": [
+        {
+          "type": "resolves",
+          "to": "task-block-edges"
+        },
+        {
+          "type": "assigned",
+          "to": "agent-x",
+          "profile": "profile-y",
+          "priority": "p1"
+        },
+        {
+          "type": "relates-to",
+          "to": "corr-lists"
+        },
+        {
+          "type": "mentions",
+          "to": "agent-x-2"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "Body of the flow-form decision.",
+      "file": "dec-flow-edges.md",
+      "id": "dec-flow-edges",
+      "type": "decision",
+      "repo": "grammar",
+      "title": "Flow-form edges, quoted scalars, folded summary",
+      "summary": "A decision whose summary folds across two indented continuation lines, joined with single spaces.",
+      "status": "active",
+      "date": "2026-09-27",
+      "custom_key": "verbatim scalar with [brackets] and, commas",
+      "project": "grammar"
+    },
+    "serialized": "---\nid: dec-flow-edges\ntype: decision\nrepo: grammar\ntitle: Flow-form edges, quoted scalars, folded summary\nsummary: A decision whose summary folds across two indented continuation lines, joined with single spaces.\nstatus: active\ndate: 2026-09-27\ncustom_key: verbatim scalar with [brackets] and, commas\nproject: grammar\nedges:\n  - {type: resolves, to: task-block-edges}\n  - {type: assigned, to: agent-x, profile: profile-y, priority: p1}\n  - {type: relates-to, to: corr-lists}\n  - {type: mentions, to: agent-x-2}\n---\n\nBody of the flow-form decision.\n",
+    "roundtrip": true
+  },
+  "norm-inverse-alias.md": {
+    "node": {
+      "edges": [
+        {
+          "type": "related-to",
+          "to": "dec-flow-edges"
+        },
+        {
+          "type": "blocked-by",
+          "to": "task-block-edges"
+        },
+        {
+          "type": "mentions",
+          "to": "corr-lists"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "Body without a blank line after the fence.",
+      "file": "norm-inverse-alias.md",
+      "id": "norm-inverse-alias",
+      "type": "norm",
+      "project": "grammar",
+      "repo": "grammar",
+      "title": "The second title wins",
+      "summary": "Edge spellings the parser keeps verbatim, a flow edge outside the edges block, a duplicate key.",
+      "status": "active",
+      "date": "2026-09-27"
+    },
+    "crlf": false,
+    "lex": {
+      "entries": [
+        {
+          "kind": "edges",
+          "key": "edges",
+          "start": 0,
+          "end": 3
+        },
+        {
+          "kind": "scalar",
+          "key": "id",
+          "start": 3,
+          "end": 4
+        },
+        {
+          "kind": "scalar",
+          "key": "type",
+          "start": 4,
+          "end": 5
+        },
+        {
+          "kind": "scalar",
+          "key": "project",
+          "start": 5,
+          "end": 6
+        },
+        {
+          "kind": "scalar",
+          "key": "repo",
+          "start": 6,
+          "end": 7
+        },
+        {
+          "kind": "scalar",
+          "key": "title",
+          "start": 7,
+          "end": 8
+        },
+        {
+          "kind": "scalar",
+          "key": "summary",
+          "start": 8,
+          "end": 9
+        },
+        {
+          "kind": "scalar",
+          "key": "title",
+          "start": 9,
+          "end": 10
+        },
+        {
+          "kind": "scalar",
+          "key": "status",
+          "start": 10,
+          "end": 11
+        },
+        {
+          "kind": "scalar",
+          "key": "date",
+          "start": 12,
+          "end": 13
+        }
+      ],
+      "edges": [
+        {
+          "edge": {
+            "type": "related-to",
+            "to": "dec-flow-edges"
+          },
+          "form": "flow",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "edge": {
+            "type": "blocked-by",
+            "to": "task-block-edges"
+          },
+          "form": "flow",
+          "start": 2,
+          "end": 3
+        },
+        {
+          "edge": {
+            "type": "mentions",
+            "to": "corr-lists"
+          },
+          "form": "flow",
+          "start": 11,
+          "end": 12
+        }
+      ],
+      "faults": []
+    },
+    "lenient": {
+      "edges": [
+        {
+          "type": "related-to",
+          "to": "dec-flow-edges"
+        },
+        {
+          "type": "blocked-by",
+          "to": "task-block-edges"
+        },
+        {
+          "type": "mentions",
+          "to": "corr-lists"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "Body without a blank line after the fence.",
+      "file": "norm-inverse-alias.md",
+      "id": "norm-inverse-alias",
+      "type": "norm",
+      "project": "grammar",
+      "repo": "grammar",
+      "title": "The second title wins",
+      "summary": "Edge spellings the parser keeps verbatim, a flow edge outside the edges block, a duplicate key.",
+      "status": "active",
+      "date": "2026-09-27"
+    },
+    "serialized": "---\nid: norm-inverse-alias\ntype: norm\nproject: grammar\nrepo: grammar\ntitle: The second title wins\nsummary: Edge spellings the parser keeps verbatim, a flow edge outside the edges block, a duplicate key.\nstatus: active\ndate: 2026-09-27\nedges:\n  - {type: related-to, to: dec-flow-edges}\n  - {type: blocked-by, to: task-block-edges}\n  - {type: mentions, to: corr-lists}\n---\n\nBody without a blank line after the fence.\n",
+    "roundtrip": true
+  },
+  "task-block-edges.md": {
+    "node": {
+      "edges": [
+        {
+          "type": "blocks",
+          "to": "dec-flow-edges"
+        },
+        {
+          "to": "corr-lists",
+          "type": "relates-to"
+        },
+        {
+          "type": "assigned",
+          "to": "agent-x",
+          "profile": "profile-y"
+        },
+        {
+          "type": "mentions",
+          "to": "norm-inverse-alias"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "Body of the block-form task.",
+      "file": "task-block-edges.md",
+      "id": "task-block-edges",
+      "type": "task",
+      "project": "grammar",
+      "title": "Block-form edges with comments and blank lines",
+      "summary": "Edges in YAML block form, opened by any key, target alias, extra attributes.",
+      "status": "open",
+      "date": "2026-09-27"
+    },
+    "crlf": false,
+    "lex": {
+      "entries": [
+        {
+          "kind": "scalar",
+          "key": "id",
+          "start": 0,
+          "end": 1
+        },
+        {
+          "kind": "scalar",
+          "key": "type",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "kind": "scalar",
+          "key": "project",
+          "start": 2,
+          "end": 3
+        },
+        {
+          "kind": "scalar",
+          "key": "title",
+          "start": 3,
+          "end": 4
+        },
+        {
+          "kind": "scalar",
+          "key": "summary",
+          "start": 4,
+          "end": 5
+        },
+        {
+          "kind": "scalar",
+          "key": "status",
+          "start": 5,
+          "end": 6
+        },
+        {
+          "kind": "edges",
+          "key": "edges",
+          "start": 6,
+          "end": 18
+        },
+        {
+          "kind": "scalar",
+          "key": "date",
+          "start": 18,
+          "end": 19
+        }
+      ],
+      "edges": [
+        {
+          "edge": {
+            "type": "blocks",
+            "to": "dec-flow-edges"
+          },
+          "form": "block",
+          "start": 9,
+          "end": 11
+        },
+        {
+          "edge": {
+            "to": "corr-lists",
+            "type": "relates-to"
+          },
+          "form": "block",
+          "start": 11,
+          "end": 13
+        },
+        {
+          "edge": {
+            "type": "assigned",
+            "to": "agent-x",
+            "profile": "profile-y"
+          },
+          "form": "block",
+          "start": 13,
+          "end": 16
+        },
+        {
+          "edge": {
+            "type": "mentions",
+            "to": "norm-inverse-alias"
+          },
+          "form": "block",
+          "start": 16,
+          "end": 18
+        }
+      ],
+      "faults": []
+    },
+    "lenient": {
+      "edges": [
+        {
+          "type": "blocks",
+          "to": "dec-flow-edges"
+        },
+        {
+          "to": "corr-lists",
+          "type": "relates-to"
+        },
+        {
+          "type": "assigned",
+          "to": "agent-x",
+          "profile": "profile-y"
+        },
+        {
+          "type": "mentions",
+          "to": "norm-inverse-alias"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "Body of the block-form task.",
+      "file": "task-block-edges.md",
+      "id": "task-block-edges",
+      "type": "task",
+      "project": "grammar",
+      "title": "Block-form edges with comments and blank lines",
+      "summary": "Edges in YAML block form, opened by any key, target alias, extra attributes.",
+      "status": "open",
+      "date": "2026-09-27"
+    },
+    "serialized": "---\nid: task-block-edges\ntype: task\nproject: grammar\ntitle: Block-form edges with comments and blank lines\nsummary: Edges in YAML block form, opened by any key, target alias, extra attributes.\nstatus: open\ndate: 2026-09-27\nedges:\n  - {type: blocks, to: dec-flow-edges}\n  - {type: relates-to, to: corr-lists}\n  - {type: assigned, to: agent-x, profile: profile-y}\n  - {type: mentions, to: norm-inverse-alias}\n---\n\nBody of the block-form task.\n",
+    "roundtrip": true
+  }
+}

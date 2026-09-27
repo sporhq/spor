@@ -96,20 +96,21 @@ for (const f of fs.readdirSync(OUT_DIR)) fs.unlinkSync(path.join(OUT_DIR, f));
 
 let written = 0;
 for (const [f, raw] of Object.entries(files)) {
-  const m = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
-  if (!m) continue;
-  const n = kernel.parseFrontmatter(raw, f);
+  let n;
+  try {
+    n = kernel.parseFrontmatter(raw, f);
+  } catch {
+    continue; // no frontmatter / unreadable entry: not a node the loader keeps
+  }
   if (!n.id) continue;
   const newId = mapId(n.id);
   const isSchema = n.type === "schema";
 
   const fm = [`id: ${newId}`];
   const seen = new Set(["id", "edges", "body", "file"]);
-  const fmKeys = []; // preserve original key order from the frontmatter text
-  for (const line of m[1].split("\n")) {
-    const kv = line.match(/^(\w[\w-]*):/);
-    if (kv && !fmKeys.includes(kv[1])) fmKeys.push(kv[1]);
-  }
+  // The parsed node carries the frontmatter's own key order (kernel/
+  // frontmatter.js foldNode), after the edges/pin/exclude/body/file slots.
+  const fmKeys = Object.keys(n).filter((k) => !seen.has(k) || k === "id");
   for (const k of fmKeys) {
     if (seen.has(k) || n[k] === undefined) continue;
     seen.add(k);

@@ -1,0 +1,182 @@
+{
+  "id": "grammar-edits",
+  "kind": "frontmatter-edit",
+  "corpus": "grammar",
+  "input": {
+    "ops": [
+      {
+        "file": "task-block-edges.md",
+        "op": "withoutEdge",
+        "type": "blocks",
+        "to": "dec-flow-edges"
+      },
+      {
+        "file": "task-block-edges.md",
+        "op": "withoutEdge",
+        "type": "assigned",
+        "to": "agent-x"
+      },
+      {
+        "file": "task-block-edges.md",
+        "op": "withoutEdge",
+        "type": "mentions",
+        "to": "norm-inverse-alias"
+      },
+      {
+        "file": "task-block-edges.md",
+        "op": "withoutEdge",
+        "type": "blocks",
+        "to": "nobody"
+      },
+      {
+        "file": "task-block-edges.md",
+        "op": "withEdge",
+        "type": "resolves",
+        "to": "corr-lists",
+        "attrs": {
+          "profile": "p",
+          "empty": ""
+        }
+      },
+      {
+        "file": "dec-flow-edges.md",
+        "op": "withoutEdge",
+        "type": "mentions",
+        "to": "agent-x"
+      },
+      {
+        "file": "dec-flow-edges.md",
+        "op": "withoutEdge",
+        "type": "mentions",
+        "to": "agent-x-2"
+      },
+      {
+        "file": "dec-flow-edges.md",
+        "op": "withEdge",
+        "type": "supersedes",
+        "to": "corr-lists"
+      },
+      {
+        "file": "norm-inverse-alias.md",
+        "op": "withoutEdge",
+        "type": "relates-to",
+        "to": "dec-flow-edges",
+        "renames": {
+          "related-to": "relates-to"
+        }
+      },
+      {
+        "file": "norm-inverse-alias.md",
+        "op": "withoutEdge",
+        "type": "relates-to",
+        "to": "dec-flow-edges"
+      },
+      {
+        "file": "norm-inverse-alias.md",
+        "op": "withoutEdge",
+        "type": "mentions",
+        "to": "corr-lists"
+      },
+      {
+        "file": "corr-lists.md",
+        "op": "withEdge",
+        "type": "relates-to",
+        "to": "dec-flow-edges"
+      },
+      {
+        "file": "art-crlf.md",
+        "op": "withStamp",
+        "keys": [
+          "priority",
+          "priority_by",
+          "priority_at",
+          "priority_via"
+        ],
+        "lines": [
+          "priority: p1",
+          "priority_at: 2026-09-27T00:00:00.000Z",
+          "priority_via: cli"
+        ]
+      },
+      {
+        "file": "art-crlf.md",
+        "op": "withoutEdge",
+        "type": "mentions",
+        "to": "corr-lists"
+      },
+      {
+        "file": "dec-flow-edges.md",
+        "op": "withStamp",
+        "keys": [
+          "status"
+        ],
+        "lines": [
+          "status: superseded"
+        ]
+      },
+      {
+        "file": "dec-flow-edges.md",
+        "op": "withStamp",
+        "keys": [
+          "summary"
+        ],
+        "lines": []
+      },
+      {
+        "file": "task-block-edges.md",
+        "op": "withKey",
+        "key": "status",
+        "value": "done"
+      },
+      {
+        "file": "task-block-edges.md",
+        "op": "withKey",
+        "key": "execution",
+        "value": "exec-1"
+      },
+      {
+        "file": "task-block-edges.md",
+        "op": "withKey",
+        "key": "status",
+        "value": null
+      },
+      {
+        "file": "corr-lists.md",
+        "op": "withKeyAfter",
+        "key": "tags",
+        "line": "tags: [a, b]",
+        "anchors": [
+          "fingerprints",
+          "slugs"
+        ]
+      },
+      {
+        "file": "corr-lists.md",
+        "op": "withKeyAfter",
+        "key": "tags",
+        "line": null,
+        "anchors": [
+          "fingerprints",
+          "slugs"
+        ]
+      },
+      {
+        "file": "corr-lists.md",
+        "op": "withKeyAfter",
+        "key": "commits",
+        "line": "commits: [grammar@deadbeef]",
+        "anchors": [
+          "nothing"
+        ]
+      },
+      {
+        "file": "bad-no-fence.md",
+        "op": "withEdge",
+        "type": "relates-to",
+        "to": "dec-flow-edges"
+      }
+    ]
+  },
+  "expected": "grammar-edits.json",
+  "covers": "the structure-aware editors: a block-form edge removed in full (every line, including one opened by to: and one flush-left), a flow edge removed without eating a longer id, a no-match null, an append landing after the last edge of either form with sorted attrs and blanks dropped, alias-spelling removal through renames (and its raw-match miss without them), a flow edge outside the edges block removed, a stamp rewrite and an edge removal on a CRLF file written back CRLF, a folded scalar stripped with its continuations, in-place / before-edges / removal key sets, a register placed after a block-form anchor's LAST line, and every editor returning null on a fenceless file"
+}

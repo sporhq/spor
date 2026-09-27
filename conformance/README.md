@@ -28,6 +28,18 @@ artifact (REFACTOR.md §2).
     score identical (0 weight).
   - `diagnostics` — deliberately broken corpus covering every validator
     error and warning class.
+  - `grammar` — the node-file grammar itself (lib/kernel/frontmatter.js,
+    task-spor-client-single-frontmatter-parser): every edge shape (flow with
+    attributes and the `target:` alias, block form opened by any key,
+    comments/blank lines, alias and inverse spellings, a flow edge outside the
+    block), every list shape (inline, indented/flush-left/empty block, a stray
+    line, a list key holding a scalar), quoted and folded scalars, duplicate
+    keys, `repo:` beating `project:`, a CRLF file (`.gitattributes` pins
+    its bytes), a fenceless file and the two deliberate edge faults. The
+    `grammar-frontmatter` case pins the strict read, the lenient lex (line
+    ranges, recorded faults), the canonical serialization and the round-trip
+    law; `grammar-edits` pins the structure-aware editors (edge add/remove,
+    stamp, key set) to the byte.
   - `meridian` — the self-contained example org from wf/lenses/examples
     (dec-demo-vocab-in-fixtures): graph-resident schema vocabulary, lenses,
     workspaces.
@@ -36,7 +48,8 @@ artifact (REFACTOR.md §2).
     `tools/scrub-live-graph.js` (review output before committing — shapes,
     not content).
 - `cases/<id>.json` — one pinned invocation each: `kind`
-  (compile | skeleton | queue | validate | viewtree | queue-viewtree | runs),
+  (compile | skeleton | queue | validate | frontmatter | frontmatter-edit |
+  viewtree | queue-viewtree | runs),
   `corpus`, `input`, `expected`, and a `covers` note.
 - `expected/` — the goldens. Treat diffs here like source diffs in review.
 - `runner.js` — runner one: the JS kernel. `--update` regenerates goldens,

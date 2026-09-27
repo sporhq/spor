@@ -50,11 +50,23 @@ client-facing contract is this repo's API.md.
 - **Refactors prove themselves byte-identical** against the live graph
   (norm-cc-byte-identical-refactor), standing-armed by the `conformance/`
   golden suite.
-- The frontmatter parser is regex-based, not a YAML library. It supports
-  simple `key: value`, YAML folded multi-line values (indented
+- The frontmatter parser is regex-based, not a YAML library, and the whole
+  node-file grammar is spelled in ONE module, `lib/kernel/frontmatter.js`
+  (task-spor-client-single-frontmatter-parser): the loader's
+  `parseFrontmatter`, the lint's lenient `readNode`, the canonical
+  `serializeNode`, and the structure-aware editors every local rewrite goes
+  through (`withEdge`/`withoutEdge`/`withStamp`/`withKey`/`withKeyAfter`
+  — edge add/remove, the priority/readiness/status stamps, tags, the
+  completion hold key, candidate adoption) all consume the same line-ranged
+  lexer, so an edge is matched by PARSED identity regardless of YAML style and
+  a rewrite touches no other byte. `test/frontmatter-lint.test.js` bans the
+  fence/key/edge regexes outside that file — never re-derive them; reach for
+  `splitDocument`/`readNode`/the editors. The conformance `grammar` corpus
+  (`grammar-frontmatter`, `grammar-edits`) pins the grammar byte-for-byte.
+  It supports simple `key: value`, YAML folded multi-line values (indented
   continuations), a fixed allowlist of keys
-  (`pin`/`exclude`/`slugs`/`tags`/`skills`/`requires`/… — see the
-  `parseFrontmatter` `LIST_FIELDS` allowlist) as either an inline list
+  (`pin`/`exclude`/`slugs`/`tags`/`skills`/`requires`/… — the
+  `LIST_FIELDS` allowlist in `lib/kernel/frontmatter.js`) as either an inline list
   (`commits: [wf@1a2b3c4d]`) or a YAML block list (`commits:` alone on its
   line followed by indented `- wf@1a2b3c4d` lines — both parse to the same
   array; only these allowlisted keys get block-list support, everything else

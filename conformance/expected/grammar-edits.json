@@ -1,0 +1,242 @@
+[
+  {
+    "op": {
+      "file": "task-block-edges.md",
+      "op": "withoutEdge",
+      "type": "blocks",
+      "to": "dec-flow-edges"
+    },
+    "result": "---\nid: task-block-edges\ntype: task\nproject: grammar\ntitle: Block-form edges with comments and blank lines\nsummary: Edges in YAML block form, opened by any key, target alias, extra attributes.\nstatus: open\nedges:\n  # a comment inside the block\n\n  - to: corr-lists\n    type: \"relates-to\"\n  - type: assigned\n    target: agent-x\n    profile: profile-y\n- type: mentions\n  to: norm-inverse-alias\ndate: 2026-09-27\n---\n\nBody of the block-form task.\n"
+  },
+  {
+    "op": {
+      "file": "task-block-edges.md",
+      "op": "withoutEdge",
+      "type": "assigned",
+      "to": "agent-x"
+    },
+    "result": "---\nid: task-block-edges\ntype: task\nproject: grammar\ntitle: Block-form edges with comments and blank lines\nsummary: Edges in YAML block form, opened by any key, target alias, extra attributes.\nstatus: open\nedges:\n  # a comment inside the block\n\n  - type: blocks\n    to: dec-flow-edges\n  - to: corr-lists\n    type: \"relates-to\"\n- type: mentions\n  to: norm-inverse-alias\ndate: 2026-09-27\n---\n\nBody of the block-form task.\n"
+  },
+  {
+    "op": {
+      "file": "task-block-edges.md",
+      "op": "withoutEdge",
+      "type": "mentions",
+      "to": "norm-inverse-alias"
+    },
+    "result": "---\nid: task-block-edges\ntype: task\nproject: grammar\ntitle: Block-form edges with comments and blank lines\nsummary: Edges in YAML block form, opened by any key, target alias, extra attributes.\nstatus: open\nedges:\n  # a comment inside the block\n\n  - type: blocks\n    to: dec-flow-edges\n  - to: corr-lists\n    type: \"relates-to\"\n  - type: assigned\n    target: agent-x\n    profile: profile-y\ndate: 2026-09-27\n---\n\nBody of the block-form task.\n"
+  },
+  {
+    "op": {
+      "file": "task-block-edges.md",
+      "op": "withoutEdge",
+      "type": "blocks",
+      "to": "nobody"
+    },
+    "result": null
+  },
+  {
+    "op": {
+      "file": "task-block-edges.md",
+      "op": "withEdge",
+      "type": "resolves",
+      "to": "corr-lists",
+      "attrs": {
+        "profile": "p",
+        "empty": ""
+      }
+    },
+    "result": "---\nid: task-block-edges\ntype: task\nproject: grammar\ntitle: Block-form edges with comments and blank lines\nsummary: Edges in YAML block form, opened by any key, target alias, extra attributes.\nstatus: open\nedges:\n  # a comment inside the block\n\n  - type: blocks\n    to: dec-flow-edges\n  - to: corr-lists\n    type: \"relates-to\"\n  - type: assigned\n    target: agent-x\n    profile: profile-y\n- type: mentions\n  to: norm-inverse-alias\n  - {type: resolves, to: corr-lists, profile: p}\ndate: 2026-09-27\n---\n\nBody of the block-form task.\n"
+  },
+  {
+    "op": {
+      "file": "dec-flow-edges.md",
+      "op": "withoutEdge",
+      "type": "mentions",
+      "to": "agent-x"
+    },
+    "result": null
+  },
+  {
+    "op": {
+      "file": "dec-flow-edges.md",
+      "op": "withoutEdge",
+      "type": "mentions",
+      "to": "agent-x-2"
+    },
+    "result": "---\nid: dec-flow-edges\ntype: decision\nrepo: grammar\ntitle: \"Flow-form edges, quoted scalars, folded summary\"\nsummary: A decision whose summary folds\n  across two indented continuation\n  lines, joined with single spaces.\nstatus: 'active'\ndate: 2026-09-27\nedges:\n  - {type: resolves, to: task-block-edges}\n  - {type: assigned, to: agent-x, profile: profile-y, priority: p1}\n  - {type: relates-to, target: corr-lists}\ncustom_key: verbatim scalar with [brackets] and, commas\n---\n\nBody of the flow-form decision.\n"
+  },
+  {
+    "op": {
+      "file": "dec-flow-edges.md",
+      "op": "withEdge",
+      "type": "supersedes",
+      "to": "corr-lists"
+    },
+    "result": "---\nid: dec-flow-edges\ntype: decision\nrepo: grammar\ntitle: \"Flow-form edges, quoted scalars, folded summary\"\nsummary: A decision whose summary folds\n  across two indented continuation\n  lines, joined with single spaces.\nstatus: 'active'\ndate: 2026-09-27\nedges:\n  - {type: resolves, to: task-block-edges}\n  - {type: assigned, to: agent-x, profile: profile-y, priority: p1}\n  - {type: relates-to, target: corr-lists}\n  - {type: mentions, to: agent-x-2}\n  - {type: supersedes, to: corr-lists}\ncustom_key: verbatim scalar with [brackets] and, commas\n---\n\nBody of the flow-form decision.\n"
+  },
+  {
+    "op": {
+      "file": "norm-inverse-alias.md",
+      "op": "withoutEdge",
+      "type": "relates-to",
+      "to": "dec-flow-edges",
+      "renames": {
+        "related-to": "relates-to"
+      }
+    },
+    "result": "---\nedges:\n  - {type: blocked-by, to: task-block-edges}\nid: norm-inverse-alias\ntype: norm\nproject: legacy-project\nrepo: grammar\ntitle: Alias and inverse spellings, edges first, repo beats project\nsummary: Edge spellings the parser keeps verbatim, a flow edge outside the edges block, a duplicate key.\ntitle: The second title wins\nstatus: active\n  - {type: mentions, to: corr-lists}\ndate: 2026-09-27\n---\nBody without a blank line after the fence.\n"
+  },
+  {
+    "op": {
+      "file": "norm-inverse-alias.md",
+      "op": "withoutEdge",
+      "type": "relates-to",
+      "to": "dec-flow-edges"
+    },
+    "result": null
+  },
+  {
+    "op": {
+      "file": "norm-inverse-alias.md",
+      "op": "withoutEdge",
+      "type": "mentions",
+      "to": "corr-lists"
+    },
+    "result": "---\nedges:\n  - {type: related-to, to: dec-flow-edges}\n  - {type: blocked-by, to: task-block-edges}\nid: norm-inverse-alias\ntype: norm\nproject: legacy-project\nrepo: grammar\ntitle: Alias and inverse spellings, edges first, repo beats project\nsummary: Edge spellings the parser keeps verbatim, a flow edge outside the edges block, a duplicate key.\ntitle: The second title wins\nstatus: active\ndate: 2026-09-27\n---\nBody without a blank line after the fence.\n"
+  },
+  {
+    "op": {
+      "file": "corr-lists.md",
+      "op": "withEdge",
+      "type": "relates-to",
+      "to": "dec-flow-edges"
+    },
+    "result": "---\nid: corr-lists\ntype: correction\ntarget: dec-flow-edges\ntitle: Every list shape\nsummary: Inline lists, indented and flush-left block lists, an empty block list, a stray line, a list key with a scalar.\npin: [dec-flow-edges, task-block-edges]\nexclude: []\ncommits:\n  - grammar@1a2b3c4d\n  - \"grammar@5e6f7a8b\"\nslugs:\n- grammar\n- grammar-alias\nfingerprints:\n  - abc123\n  this line is stray and must not fold into the array\n  - def456\ntags:\napplies_to_tags: not-a-list\nqueue_mute: [a, , b]\ndate: 2026-09-27\nedges:\n  - {type: relates-to, to: dec-flow-edges}\n---\n\nBody with a list-looking line:\n- not frontmatter\n"
+  },
+  {
+    "op": {
+      "file": "art-crlf.md",
+      "op": "withStamp",
+      "keys": [
+        "priority",
+        "priority_by",
+        "priority_at",
+        "priority_via"
+      ],
+      "lines": [
+        "priority: p1",
+        "priority_at: 2026-09-27T00:00:00.000Z",
+        "priority_via: cli"
+      ]
+    },
+    "result": "---\r\nid: art-crlf\r\ntype: artifact\r\nrepo: grammar\r\ntitle: A CRLF node file\r\nsummary: Written with Windows line endings, folded\r\n  across a continuation.\r\nedges:\r\n  - {type: relates-to, to: dec-flow-edges}\r\n  - type: mentions\r\n    to: corr-lists\r\ndate: 2026-09-27\r\npriority: p1\r\npriority_at: 2026-09-27T00:00:00.000Z\r\npriority_via: cli\r\n---\r\n\r\nCRLF body.\r\n"
+  },
+  {
+    "op": {
+      "file": "art-crlf.md",
+      "op": "withoutEdge",
+      "type": "mentions",
+      "to": "corr-lists"
+    },
+    "result": "---\r\nid: art-crlf\r\ntype: artifact\r\nrepo: grammar\r\ntitle: A CRLF node file\r\nsummary: Written with Windows line endings, folded\r\n  across a continuation.\r\nedges:\r\n  - {type: relates-to, to: dec-flow-edges}\r\ndate: 2026-09-27\r\n---\r\n\r\nCRLF body.\r\n"
+  },
+  {
+    "op": {
+      "file": "dec-flow-edges.md",
+      "op": "withStamp",
+      "keys": [
+        "status"
+      ],
+      "lines": [
+        "status: superseded"
+      ]
+    },
+    "result": "---\nid: dec-flow-edges\ntype: decision\nrepo: grammar\ntitle: \"Flow-form edges, quoted scalars, folded summary\"\nsummary: A decision whose summary folds\n  across two indented continuation\n  lines, joined with single spaces.\ndate: 2026-09-27\nedges:\n  - {type: resolves, to: task-block-edges}\n  - {type: assigned, to: agent-x, profile: profile-y, priority: p1}\n  - {type: relates-to, target: corr-lists}\n  - {type: mentions, to: agent-x-2}\ncustom_key: verbatim scalar with [brackets] and, commas\nstatus: superseded\n---\n\nBody of the flow-form decision.\n"
+  },
+  {
+    "op": {
+      "file": "dec-flow-edges.md",
+      "op": "withStamp",
+      "keys": [
+        "summary"
+      ],
+      "lines": []
+    },
+    "result": "---\nid: dec-flow-edges\ntype: decision\nrepo: grammar\ntitle: \"Flow-form edges, quoted scalars, folded summary\"\nstatus: 'active'\ndate: 2026-09-27\nedges:\n  - {type: resolves, to: task-block-edges}\n  - {type: assigned, to: agent-x, profile: profile-y, priority: p1}\n  - {type: relates-to, target: corr-lists}\n  - {type: mentions, to: agent-x-2}\ncustom_key: verbatim scalar with [brackets] and, commas\n---\n\nBody of the flow-form decision.\n"
+  },
+  {
+    "op": {
+      "file": "task-block-edges.md",
+      "op": "withKey",
+      "key": "status",
+      "value": "done"
+    },
+    "result": "---\nid: task-block-edges\ntype: task\nproject: grammar\ntitle: Block-form edges with comments and blank lines\nsummary: Edges in YAML block form, opened by any key, target alias, extra attributes.\nstatus: done\nedges:\n  # a comment inside the block\n\n  - type: blocks\n    to: dec-flow-edges\n  - to: corr-lists\n    type: \"relates-to\"\n  - type: assigned\n    target: agent-x\n    profile: profile-y\n- type: mentions\n  to: norm-inverse-alias\ndate: 2026-09-27\n---\n\nBody of the block-form task.\n"
+  },
+  {
+    "op": {
+      "file": "task-block-edges.md",
+      "op": "withKey",
+      "key": "execution",
+      "value": "exec-1"
+    },
+    "result": "---\nid: task-block-edges\ntype: task\nproject: grammar\ntitle: Block-form edges with comments and blank lines\nsummary: Edges in YAML block form, opened by any key, target alias, extra attributes.\nstatus: open\nexecution: exec-1\nedges:\n  # a comment inside the block\n\n  - type: blocks\n    to: dec-flow-edges\n  - to: corr-lists\n    type: \"relates-to\"\n  - type: assigned\n    target: agent-x\n    profile: profile-y\n- type: mentions\n  to: norm-inverse-alias\ndate: 2026-09-27\n---\n\nBody of the block-form task.\n"
+  },
+  {
+    "op": {
+      "file": "task-block-edges.md",
+      "op": "withKey",
+      "key": "status",
+      "value": null
+    },
+    "result": "---\nid: task-block-edges\ntype: task\nproject: grammar\ntitle: Block-form edges with comments and blank lines\nsummary: Edges in YAML block form, opened by any key, target alias, extra attributes.\nedges:\n  # a comment inside the block\n\n  - type: blocks\n    to: dec-flow-edges\n  - to: corr-lists\n    type: \"relates-to\"\n  - type: assigned\n    target: agent-x\n    profile: profile-y\n- type: mentions\n  to: norm-inverse-alias\ndate: 2026-09-27\n---\n\nBody of the block-form task.\n"
+  },
+  {
+    "op": {
+      "file": "corr-lists.md",
+      "op": "withKeyAfter",
+      "key": "tags",
+      "line": "tags: [a, b]",
+      "anchors": [
+        "fingerprints",
+        "slugs"
+      ]
+    },
+    "result": "---\nid: corr-lists\ntype: correction\ntarget: dec-flow-edges\ntitle: Every list shape\nsummary: Inline lists, indented and flush-left block lists, an empty block list, a stray line, a list key with a scalar.\npin: [dec-flow-edges, task-block-edges]\nexclude: []\ncommits:\n  - grammar@1a2b3c4d\n  - \"grammar@5e6f7a8b\"\nslugs:\n- grammar\n- grammar-alias\nfingerprints:\n  - abc123\n  this line is stray and must not fold into the array\n  - def456\ntags: [a, b]\napplies_to_tags: not-a-list\nqueue_mute: [a, , b]\ndate: 2026-09-27\n---\n\nBody with a list-looking line:\n- not frontmatter\n"
+  },
+  {
+    "op": {
+      "file": "corr-lists.md",
+      "op": "withKeyAfter",
+      "key": "tags",
+      "line": null,
+      "anchors": [
+        "fingerprints",
+        "slugs"
+      ]
+    },
+    "result": "---\nid: corr-lists\ntype: correction\ntarget: dec-flow-edges\ntitle: Every list shape\nsummary: Inline lists, indented and flush-left block lists, an empty block list, a stray line, a list key with a scalar.\npin: [dec-flow-edges, task-block-edges]\nexclude: []\ncommits:\n  - grammar@1a2b3c4d\n  - \"grammar@5e6f7a8b\"\nslugs:\n- grammar\n- grammar-alias\nfingerprints:\n  - abc123\n  this line is stray and must not fold into the array\n  - def456\napplies_to_tags: not-a-list\nqueue_mute: [a, , b]\ndate: 2026-09-27\n---\n\nBody with a list-looking line:\n- not frontmatter\n"
+  },
+  {
+    "op": {
+      "file": "corr-lists.md",
+      "op": "withKeyAfter",
+      "key": "commits",
+      "line": "commits: [grammar@deadbeef]",
+      "anchors": [
+        "nothing"
+      ]
+    },
+    "result": "---\nid: corr-lists\ntype: correction\ntarget: dec-flow-edges\ntitle: Every list shape\nsummary: Inline lists, indented and flush-left block lists, an empty block list, a stray line, a list key with a scalar.\npin: [dec-flow-edges, task-block-edges]\nexclude: []\nslugs:\n- grammar\n- grammar-alias\nfingerprints:\n  - abc123\n  this line is stray and must not fold into the array\n  - def456\ntags:\napplies_to_tags: not-a-list\nqueue_mute: [a, , b]\ndate: 2026-09-27\ncommits: [grammar@deadbeef]\n---\n\nBody with a list-looking line:\n- not frontmatter\n"
+  },
+  {
+    "op": {
+      "file": "bad-no-fence.md",
+      "op": "withEdge",
+      "type": "relates-to",
+      "to": "dec-flow-edges"
+    },
+    "result": null
+  }
+]

@@ -391,9 +391,11 @@ above, **declaring it gates nothing** — it tells a reader what the hooks
 already do.
 
 Otherwise there is **no declarative field list and no status enum.** Custom fields are free-form: any flat frontmatter key the
-regex parser accepts (simple `key: value` scalars, YAML-folded multi-line
-values, `pin:`/`exclude:` inline lists, `- {type: X, to: Y}` edges — and nothing
-fancier) is carried verbatim on the node. What a field MUST contain, and which
+regex parser (`lib/kernel/frontmatter.js`, the one node-file grammar) accepts
+(simple `key: value` scalars, YAML-folded multi-line values, the allowlisted
+list keys as `[a, b]` inline or block lists, `- {type: X, to: Y}` flow-form or
+`- type: X` / `to: Y` block-form edges — and nothing fancier) is carried
+verbatim on the node. What a field MUST contain, and which
 status changes are legal, are enforced **in attached code** — two pure functions
 the server runs on the write path:
 
