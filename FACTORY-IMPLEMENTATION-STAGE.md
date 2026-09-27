@@ -662,6 +662,15 @@ Each is the canonical reading.
   pass for this slot, so the stage stops `escalated` rather than act on a
   charge nobody recorded. The gate runner applies the same rule to a pool
   charge that could not land.
+- **An empty segment with no stop requested escalates too**
+  (task-spor-work-loop-parked-reoffer-cap, landed after this reconciliation's
+  ad94f9d baseline — §11.5). I12's `interrupted` is reserved for a STOP; a
+  segment with no attempt at all and no stop asked for no longer resumes as a
+  re-offerable `interrupted` (re-offering the pipeline would find the same
+  empty ledger every time). The stage settles `escalated` through the same
+  `stop()` door, riding the reason on the record itself
+  (`impl_stop_reason`) since there is no entry to carry it, so a resumed
+  settled stage re-files the byte-identical escalation.
 - **Retry order.** On the retry pool the order is: charge the pool, then
   RESERVE the next attempt, then wait out `retry.backoff_ms`. A worker stopped
   during the wait therefore leaves a pending reservation that the resume
@@ -1866,7 +1875,7 @@ canonical. In every row the shipped side is canonical.
 | D6 | classifier vocabulary and pools | §5.3: one table from run observation to attempt outcome | two layers: dispatch (`completed/failed/infrastructure/cancelled/declined/unroutable`), then product (`judgeProduct`), plus a separate publish classification. The retry pool is `gate_progress.pools.retry`, per pipeline attempt. Both caps are 0 when no stage is declared. |
 | D7 | the tip rule and the dispatch bound | preamble fact 2, §3.3, G9-G11, §5.4: fix cycles re-run only the failed gate, and a separate G9 re-judge step runs at acceptance | commit-bound attestation: a head move restarts from gate 0, passes at the current head stand, and caps are cumulative, so the bound is the sum of the caps. `rejudge_on_repin: false` retains a verified-ancestor pass. |
 | D8 | where `mismatch` lives | M1 settles `impl_state: mismatch` at any stage | the stage's `mismatch` comes from its own decision. An integration mismatch is `integration_state: mismatch`. |
-| D9 | runner refinements | I2, I10, §6.5 (a) | a refused re-dispatch withdraws its reservation. An unfollowable attempt is `cancelled`, then escalated. A stamp that does not land escalates on a live worker. The retry order is charge, reserve, wait. `--regate` opens a new ledger segment. |
+| D9 | runner refinements | I2, I10, I12, §6.5 (a) | a refused re-dispatch withdraws its reservation. An unfollowable attempt is `cancelled`, then escalated. A stamp that does not land escalates on a live worker. The retry order is charge, reserve, wait. `--regate` opens a new ledger segment. `interrupted` (I12) is reserved for a STOP; an empty segment with none requested escalates instead of resuming as a re-offerable park (task-spor-work-loop-parked-reoffer-cap, landed after this reconciliation's baseline — see §11.5). |
 | D10 | ownership at completion | §4.3, §6.5 (c): the CAS plus the hold | also the execution store's fenced `confirm` (flush the outbox, renew) before step 1. `impl_claim` gains the store fields. |
 | D11 | the hosted contract | §7.1-§7.5 | EXECUTION-STATE.md / lib/kernel/execution.js: the coarse stage enum, the pools `implementation/retry/cycle/rescue`, twelve event types (no retraction or withdrawal events), gate keys without `candidate_id`, NUL-joined execution ids, and `409 execution_boundary`. |
 
@@ -1900,3 +1909,13 @@ vocabularies and key formats, each runner refinement in D9, and the
 that is left uncovered by a D-note. It raised one should-fix: the D11 key
 format for `candidate.published` was stated imprecisely. That is corrected
 above. No blocking findings.
+
+Landing this text on `main` (this reconciliation's own merge) found one more:
+`main` had advanced past ad94f9d to include
+task-spor-work-loop-parked-reoffer-cap, which narrows I12's `interrupted` to a
+STOP and settles an empty ledger segment `escalated` instead — a small,
+mechanical gap the fresh-context review above did not see because it ran
+before that commit landed. Folded into D9 and the Reconciled-rows list above
+rather than re-running the review, since the fix is additive (a missed
+refinement, not a wrong one) and re-verified directly against
+`lib/shell/implementation-stage.js` on the code this lands beside.
