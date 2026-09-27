@@ -98,6 +98,20 @@ function llmCalls(home) {
   );
 }
 
+// The detached worker's own recordLlm() APPENDS to this same file with a plain
+// fs.appendFileSync (util.js's appendLine) — not the atomic temp-file+rename
+// runSpoolWorker uses for its `.out.json` result — so a poll landing mid-write
+// can hit a torn/partial line and JSON.parse throws. Retry like `awaitJson`
+// (test/helpers/launch.js, commit 74aa2e8) rather than letting that exception
+// escape the poll (issue-spor-nudge-async-test-torn-json-read).
+function tryLlmCalls(home) {
+  try {
+    return llmCalls(home);
+  } catch {
+    return null;
+  }
+}
+
 function journal(home, session = "s1") {
   const p = path.join(home, "journal", `${session}.jsonl`);
   if (!fs.existsSync(p)) return [];
@@ -193,8 +207,10 @@ test("async NOTHING verdict: worker drops no result, prompt injects nothing, fil
     ({ root, home, cwd } = scratch());
     file = path.join(cwd, "notes.md");
     postTool(home, cwd, nothingStub(root), { file, content: PROSE });
-    // Wait for the worker to record its (NOTHING) llm call.
-    assert.ok(await waitFor(() => llmCalls(home).length === 1), "worker never ran");
+    // Wait for the worker to record its (NOTHING) llm call. Poll with the
+    // torn-read-tolerant reader: the worker is still appending to this same
+    // file out of band with this loop.
+    assert.ok(await waitFor(() => tryLlmCalls(home)?.length === 1), "worker never ran");
     call = llmCalls(home)[0];
     if (call.error == null || attempt >= 2) break;
   }
