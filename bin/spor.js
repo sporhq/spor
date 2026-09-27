@@ -1713,7 +1713,7 @@ function splitNodeDocuments(raw) {
   if (starts.length === 1) return [raw];
   return starts.map((s, n) => {
     if (n === starts.length - 1) return lines.slice(s).join("\n");
-    return lines.slice(s, starts[n + 1]).join("\n").replace(/\n*$/, "\n");
+    return lines.slice(s, starts[n + 1]).join("\n") + "\n";
   });
 }
 

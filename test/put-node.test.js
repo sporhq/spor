@@ -386,10 +386,21 @@ test("splitNodeDocuments: concatenated nodes split at each frontmatter fence", (
   const a = taskMd("task-a", "", "A body.\n\n---\n\nstill A");
   const b = nodeMd("dec-b");
   const c = taskMd("task-c", "status: open\n");
-  const docs = splitNodeDocuments(a + "\n" + b + c);
+  const docs = splitNodeDocuments(a + b + c);
   assert.deepStrictEqual(docs, [a, b, c]);
   // CRLF input splits the same way
   assert.strictEqual(splitNodeDocuments((a + b).replace(/\n/g, "\r\n")).length, 2);
+});
+
+// issue-spor-batch-put-node-trailing-newline-loss: a non-final document's own
+// trailing blank lines are part of its body, not normalization noise to strip.
+test("splitNodeDocuments: a document's trailing blank lines round-trip byte for byte", () => {
+  const a = taskMd("task-blank", "", "Body line one.\n\nBody line three.\n\n\n");
+  const b = taskMd("task-after");
+  const combined = a + b;
+  const docs = splitNodeDocuments(combined);
+  assert.deepStrictEqual(docs, [a, b]);
+  assert.strictEqual(docs.join(""), combined);
 });
 
 test("resolverFirstOrder: moves a resolver ahead of the node it resolves, otherwise stable", () => {
@@ -454,6 +465,16 @@ test("put-node (local) multi-document stdin stamps priority at create like `spor
   assert.match(raw, /\npriority: p1\npriority_by: Batch Tester <batch@example.com>\npriority_at: \S+\npriority_via: cli\n---\n/);
   assert.strictEqual(readNode(nodes, "task-plain"), taskMd("task-plain"));
   assert.strictEqual(validateGraph(nodes).status, 0);
+});
+
+test("put-node (local) multi-document stdin preserves a document's trailing blank lines on write", () => {
+  const { home, nodes } = fixtureGraph();
+  const a = taskMd("task-blank-write", "", "Body line one.\n\nBody line three.\n\n\n");
+  const b = taskMd("task-after-write");
+  const r = runStdin(["put-node", "-"], a + b, { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(readNode(nodes, "task-blank-write"), a);
+  assert.strictEqual(readNode(nodes, "task-after-write"), b);
 });
 
 test("put-node (local) batch refuses the whole input on one bad entry", () => {
