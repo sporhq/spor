@@ -2235,6 +2235,115 @@ test("a stop that lands while a pipeline is PARKED leaves its slot standing and 
   assert.strictEqual(logs.filter((l) => /abandoned by the stop/.test(l) && /task-a gate pipeline/.test(l)).length, 0);
 });
 
+// task-spor-work-loop-parked-reoffer-cap: a parked pipeline is re-offered every
+// retryAfterMs, and one whose interruption cannot clear on its own would be
+// re-run for the worker's whole lifetime. The record counts CONSECUTIVE
+// identical interruptions; at `parkedReofferMax` the loop escalates instead.
+const reofferRun = ({ max = 3, gate, escalateParked, ticks = 200 }) => {
+  const marks = [];
+  const logs = [];
+  const escalations = [];
+  const calls = [];
+  const state = { clock: 1_700_000_000_000, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  const deps = evidenceLoopDeps({ state, control, marks, logs, gate: async (entry, record) => (calls.push({ entry, record }), gate(calls.length, control, record)) });
+  // Carry every stamp forward, as the real journal does.
+  let stored = { run_id: "run-1", node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true };
+  deps.markGate = (runId, patch) => {
+    marks.push({ run_id: runId, ...patch });
+    stored = { ...stored, ...patch };
+    return { ...stored };
+  };
+  deps.sleep = async (ms) => {
+    state.clock += ms;
+    await new Promise((r) => setImmediate(r));
+    if ((state.ticks += 1) >= ticks) control.stopping = true;
+  };
+  if (escalateParked) deps.escalateParked = async (args) => (escalations.push(args), escalateParked(args, escalations.length));
+  const run = workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 1000, parkedReofferMax: max }, deps, control });
+  return { run, marks, logs, escalations, calls, control, stored: () => stored };
+};
+
+test("re-offer cap: after N IDENTICAL interruptions the loop stops re-offering, files a requires:human escalation naming the reason, and settles the run blocked", async () => {
+  const t = reofferRun({ max: 3, gate: () => EVIDENCE_PENDING, escalateParked: () => ({ ok: true, id: "task-gate-parked-a-run1-deadbeef", demoted: true }), ticks: 60 });
+  const status = await t.run;
+  assert.strictEqual(t.calls.length, 3, "run once, re-offered twice — then the third identical interruption escalates instead of parking");
+  assert.deepStrictEqual(t.marks.filter((m) => m.gate_state === "interrupted").map((m) => m.gate_interrupt_count), [1, 2, 3], "counted on the run record");
+  assert.strictEqual(t.escalations.length, 1);
+  assert.strictEqual(t.escalations[0].reason, EVIDENCE_PENDING.reason, "the escalation names the reason");
+  assert.strictEqual(t.escalations[0].count, 3);
+  assert.strictEqual(t.escalations[0].node_id, "task-a");
+  const settled = t.marks[t.marks.length - 1];
+  assert.strictEqual(settled.gate_state, "blocked", "settled — the resume scan never re-offers it again");
+  assert.strictEqual(settled.gate_escalated_to, "task-gate-parked-a-run1-deadbeef");
+  assert.strictEqual(settled.gate_demoted, true);
+  assert.match(settled.gate_reason, /re-offered 3 time\(s\)/);
+  assert.strictEqual(status.gates.blocked, 1);
+  assert.deepStrictEqual(status.gating, [], "the slot is freed");
+  assert.ok(status.skipped.some((s) => s.id === "task-a"), "and the node cools off like any refused pipeline");
+  assert.ok(t.logs.some((l) => /interrupted 3 time\(s\) in a row/.test(l) && /escalating to a person/.test(l)), t.logs.join("\n"));
+  assert.deepStrictEqual(workLoop.orphanedGateRuns([{ worker_id: "w", live: false, gating: [{ run_id: "run-1", node_id: "task-a" }] }], { records: new Map([["run-1", t.stored()]]) }), [], "a blocked record is never adopted as an orphan");
+});
+
+test("re-offer cap: a CHANGING reason resets the count — only consecutive identical interruptions escalate", async () => {
+  const reasons = ["reason A", "reason A", "reason B", "reason B", "reason A", "reason A", "reason A"];
+  const t = reofferRun({
+    max: 3,
+    gate: (n) => ({ state: "interrupted", gates: [], facts: [], reason: reasons[n - 1] }),
+    escalateParked: () => ({ ok: true, id: "task-gate-parked-x" }),
+    ticks: 80,
+  });
+  await t.run;
+  assert.deepStrictEqual(
+    t.marks.filter((m) => m.gate_state === "interrupted").map((m) => `${m.gate_interrupt_reason}:${m.gate_interrupt_count}`),
+    ["reason A:1", "reason A:2", "reason B:1", "reason B:2", "reason A:1", "reason A:2", "reason A:3"]
+  );
+  assert.strictEqual(t.escalations.length, 1, "escalated only once three IDENTICAL reasons ran consecutively");
+  assert.strictEqual(t.escalations[0].reason, "reason A");
+  assert.strictEqual(t.calls.length, 7);
+});
+
+test("re-offer cap: a --regate's new pipeline attempt starts a fresh count, and 0 disables the cap", async () => {
+  // Same reason, but the record's pipeline attempt moved on (a person re-gated).
+  const t = reofferRun({
+    max: 2,
+    gate: (n, control, record) => {
+      // A re-gate opened attempt 1: stamped on the journal AND on the record this pass was handed.
+      if (n === 2) record.gate_regate_count = t.stored().gate_regate_count = 1;
+      return EVIDENCE_PENDING;
+    },
+    escalateParked: () => ({ ok: true, id: "task-gate-parked-y" }),
+    ticks: 40,
+  });
+  await t.run;
+  const counts = t.marks.filter((m) => m.gate_state === "interrupted").map((m) => `${m.gate_interrupt_attempt}:${m.gate_interrupt_count}`);
+  assert.deepStrictEqual(counts, ["0:1", "1:1", "1:2"], "the same reason under a new attempt starts again at 1");
+  assert.strictEqual(t.escalations.length, 1);
+  assert.strictEqual(t.calls.length, 3);
+
+  const off = reofferRun({ max: 0, gate: () => EVIDENCE_PENDING, escalateParked: () => ({ ok: true, id: "never" }), ticks: 40 });
+  await off.run;
+  assert.strictEqual(off.escalations.length, 0, "0 re-offers without bound, as before the cap");
+  assert.ok(off.calls.length > 5);
+});
+
+test("re-offer cap: an escalation that could not be filed re-parks the run unsettled (not counted twice) and tries again on the next identical interruption", async () => {
+  const t = reofferRun({
+    max: 2,
+    gate: (n, control) => (n >= 4 ? ((control.stopping = true), EVIDENCE_PENDING) : EVIDENCE_PENDING),
+    escalateParked: (args, n) => (n === 1 ? { ok: false, reason: "offline — graph unreachable" } : { ok: true, id: "task-gate-parked-z" }),
+    ticks: 60,
+  });
+  const status = await t.run;
+  assert.strictEqual(t.escalations.length, 2, "retried after the failed filing");
+  assert.deepStrictEqual(t.escalations.map((e) => e.count), [2, 3]);
+  assert.ok(t.logs.some((l) => /escalation could not be filed \(offline — graph unreachable\)/.test(l)), t.logs.join("\n"));
+  const interrupted = t.marks.filter((m) => m.gate_state === "interrupted");
+  assert.deepStrictEqual(interrupted.map((m) => m.gate_interrupt_count), [1, 2, undefined, 3], "the failed escalation's re-park stamps no count");
+  assert.strictEqual(status.gates.blocked, 1);
+  assert.strictEqual(t.marks[t.marks.length - 1].gate_state, "blocked");
+});
+
 test("the resume scan reads back what the run journal and the worker status files actually store", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-resume-"));
   const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
@@ -2683,6 +2792,31 @@ test("runGatePipeline's escalation actually lands on disk with the right shape �
   assert.strictEqual(res2.escalated_to, res.escalated_to, "the same refusal re-escalates to the SAME node, never a second one");
   const escalationFiles = fs.readdirSync(nodes).filter((f) => f.startsWith("task-gate-acceptance-"));
   assert.strictEqual(escalationFiles.length, 1, "idempotent — no second escalation node for the identical refusal");
+});
+
+test("escalateParkedPipeline (the re-offer cap's real door): files a requires:human item that blocks the work item and names the reason, demotes the item, and is idempotent per (run, attempt, reason)", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-parked-cap-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  fs.writeFileSync(path.join(nodes, "task-stuck.md"), "---\nid: task-stuck\ntype: task\ntitle: Stuck\nsummary: A work item whose gate pipeline keeps interrupting on the same reason.\nstatus: done\ndate: 2026-09-27\n---\n\nBody.\n");
+  const args = { run_id: "run-abcdef123456", node_id: "task-stuck", project: "spor", reason: "flake occurrence evidence is pending graph publication", count: 10, record: { run_id: "run-abcdef123456", node_id: "task-stuck" } };
+  const res = await sporCli.escalateParkedPipeline(cfg, args);
+  assert.strictEqual(res.ok, true, JSON.stringify(res));
+  assert.match(res.id, /^task-gate-parked-stuck-/);
+  assert.strictEqual(res.demoted, true);
+  const md = fs.readFileSync(path.join(nodes, `${res.id}.md`), "utf8");
+  assert.match(md, /requires: \[human\]/);
+  assert.match(md, /\{type: blocks, to: task-stuck\}/);
+  assert.match(md, /flake occurrence evidence is pending graph publication/);
+  assert.match(md, /spor work --regate run-abcdef123456/);
+  assert.match(fs.readFileSync(path.join(nodes, "task-stuck.md"), "utf8"), /^status: open$/m, "the completion was rolled back");
+  const again = await sporCli.escalateParkedPipeline(cfg, args);
+  assert.deepStrictEqual([again.ok, again.id], [true, res.id], "the same stuck reason re-files the same node");
+  const retried = await sporCli.escalateParkedPipeline(cfg, { ...args, count: 11 });
+  assert.deepStrictEqual([retried.ok, retried.id], [true, res.id], "a retry at a higher count is the SAME node, not a refused collision (the count is not in the content)");
+  const other = await sporCli.escalateParkedPipeline(cfg, { ...args, reason: "a different stuck reason" });
+  assert.notStrictEqual(other.id, res.id, "a different reason is a different escalation");
 });
 
 // gatePromoteItem is gateDemoteItem's mirror (task-spor-integration-propose-
@@ -7903,6 +8037,35 @@ test("I9 -> I3: a failed harness exit spends the code pool, the re-dispatch prod
   assert.strictEqual(f.seen.reads, 1, "the failed run's tree is never read — the classifier settled it; only the clean re-dispatch is judged on its product");
   assert.strictEqual(f.seen.implements.length, 1);
   assert.strictEqual(f.seen.escalations.length, 0);
+});
+
+test("an EMPTY implementation ledger with no stop requested settles as a refusal (escalated), not a re-offerable `interrupted` — and a resume re-files the byte-identical escalation (task-spor-work-loop-parked-reoffer-cap)", async () => {
+  // The segment reservation is the only way an entry lands; stub it out so the
+  // loop finds the ledger empty, which is exactly the anomaly this settles.
+  const reserve = gates.reserveImplAttempt;
+  gates.reserveImplAttempt = (list) => (Array.isArray(list) ? list.map((e) => ({ ...e })) : []);
+  const f = stageFakes();
+  let res;
+  try {
+    res = await runStage(stageFactory({ budget: { attempts: 2 } }), f);
+  } finally {
+    gates.reserveImplAttempt = reserve;
+  }
+  assert.strictEqual(res.state, "escalated", "a settled refusal, never `interrupted` — nothing a resume could pick up");
+  assert.match(res.reason, /ledger holds no attempt/);
+  assert.strictEqual(res.escalated_to, "task-impl-escalated-demo");
+  assert.strictEqual(f.seen.implements.length, 0, "nothing is dispatched on an empty ledger");
+  assert.strictEqual(f.seen.escalations.length, 1);
+  const stamped = f.seen.patches.find((p) => p.impl_state === "escalated");
+  assert.ok(stamped, "the refusal is stamped as the settled stage");
+  assert.strictEqual(stamped.impl_stop_reason, res.reason, "with no entry to carry it, the reason rides the record");
+
+  // A resume reads the settled stage back and re-files the SAME body.
+  const g = stageFakes({ implState: "escalated", record: implRecord("completed", { run_id: ITEM.run_id, impl_stop_reason: res.reason }) });
+  const again = await runStage(stageFactory({ budget: { attempts: 2 } }), g);
+  assert.strictEqual(again.state, "escalated");
+  assert.strictEqual(again.resumed, true);
+  assert.strictEqual(g.seen.escalations[0].reason, f.seen.escalations[0].reason, "the re-file carries the byte-identical reason");
 });
 
 test("I4: a dirty tree under `require_clean` is a code outcome — the re-dispatch is told to commit-or-discard, and the clean tree it leaves is the candidate; with `require_clean: false` the pipeline's own round-trip judges it instead", async () => {

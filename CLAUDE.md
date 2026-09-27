@@ -1022,7 +1022,9 @@ exception), and a worker never claims a `readiness: human` item even though
 one-shot dispatch only warns on the non-`requires:human` half (WORKERS.md §3).
 Knobs: `work.concurrency` (1), `work.intervalMs` (30s), `work.maxIntervalMs`
 (the idle backoff ceiling, 5min), `work.retryAfterMs` (10min),
-`work.runMaxMs` (24h), `work.runIdleMs` (45min), `work.restartOnLand`
+`work.runMaxMs` (24h), `work.runIdleMs` (45min), `work.parkedReofferMax`
+(10 identical `interrupted` re-offers of a parked gate pipeline before it is
+escalated to a person; 0 = unbounded), `work.restartOnLand`
 (`--restart-on-land`, off — a self-hosting factory's worker drains and exits
 for a supervisor restart once the watched ref — the factory's integration
 target when it resolves in the code checkout, else the loaded branch — moves to

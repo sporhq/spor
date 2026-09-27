@@ -2517,6 +2517,24 @@ out of selection; nor does it hold a winding-down worker (`--max`, `--once`,
 `--restart-on-land`) open, and the exit never re-offers it: that exit leaves it
 standing for the next worker, exactly as a stop does.
 
+**Re-offers are bounded** (task-spor-work-loop-parked-reoffer-cap). An
+interruption that cannot clear on its own — evidence owed to a gate the factory
+no longer declares, a graph this box cannot read, a stored outcome it cannot
+recover — would otherwise be re-offered every `work.retryAfterMs` for the
+worker's whole lifetime. Each park stamps the run record with
+`gate_interrupt_reason`, `gate_interrupt_attempt` (the pipeline attempt, i.e.
+`gate_regate_count`) and `gate_interrupt_count`, the number of CONSECUTIVE
+interruptions with that same reason under that same attempt; a different reason,
+or a `--regate` that opens a new attempt, starts the count again at 1, and a
+stop's hand-off to the next worker is not counted. When the count reaches
+`work.parkedReofferMax` (config-only, default 10; 0 re-offers without bound) the
+worker stops re-offering and files a deterministic `task-gate-parked-…`
+`requires: [human]` item that names the reason and `blocks` the work item, then
+applies the §10.7 demotion; the run settles `blocked` (so the resume join never
+adopts it again, the node cools, and `spor work --regate` is the door back). An
+escalation that could not be filed leaves the run parked and unsettled, and the
+next identical interruption tries it again.
+
 Which slots count is a question of **provenance**, and the two lists differ. A
 `gating` slot only ever exists on a gate-armed worker, so it is owed a verdict
 by construction. An `active` slot exists on **every** worker, bare ones

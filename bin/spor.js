@@ -16166,6 +16166,73 @@ function makeGateDeps(
   };
 }
 
+// task-spor-work-loop-parked-reoffer-cap: the work loop's re-offer cap. A gate
+// pipeline that keeps coming back `interrupted` for the SAME reason is not
+// going to clear by being re-run (evidence owed to a gate the factory no
+// longer declares, a graph this box cannot read, a stored outcome it cannot
+// recover), so after `work.parkedReofferMax` identical interruptions the loop
+// stops re-offering it and files this item instead — `requires: [human]`,
+// `blocks` the work item, then the §10.7 demotion, in that order
+// (dec-spor-gate-refusal-atomic-escalate-then-demote). The id is keyed on the
+// run, its pipeline attempt and the reason, so a re-file is the same node and
+// a DIFFERENT stuck reason (after a person's --regate) is a new one. The
+// count is deliberately NOT in the content: it rises on every re-offer, so a
+// retried filing (a write that landed but timed out, a worker stopped
+// mid-escalation) would otherwise collide with its own earlier node forever.
+async function escalateParkedPipeline(cfg, { run_id: runId, node_id: nodeId, project = null, reason = "", record = null }, { slug = null } = {}) {
+  const rec = record || {};
+  const attemptKey = Number(rec.gate_regate_count) || 0;
+  const short = gateRunner.shortRunAttempt(runId);
+  const id = `task-gate-parked-${gateStem(nodeId)}-${short}-${gateIdSuffix("parked", nodeId, runId, `${attemptKey}\n${reason}`)}`.toLowerCase();
+  const body = [
+    `The gate pipeline for ${nodeId} was re-offered repeatedly by its worker and came back \`interrupted\` for the`,
+    "same reason every time, so the worker has stopped re-offering it. An interruption settles nothing — no gate",
+    "judged the change — and one that recurs unchanged is not going to clear by being re-run:",
+    "",
+    "```",
+    fenceSafe(String(reason || "(no reason was recorded)").slice(0, 1000)),
+    "```",
+    "",
+    `This item \`blocks\` ${nodeId} on the graph, and if that item had already been flipped to a completion status the`,
+    "worker rolled it back. Clear the cause, then re-judge the run with",
+    `'spor work --regate ${runId}' — a re-gate starts a fresh count. The run's own record is \`${runId}\` ('spor runs ${runId}').`,
+    ...(completionKernel.isControllerRecord(rec)
+      ? [
+          "",
+          `${nodeId} is HELD by execution \`${rec.impl_claim.execution_id}\`: no resolving edge and no terminal status retires it while the hold stands.`,
+          `'spor release ${nodeId} --execution ${rec.impl_claim.execution_id}' ends the execution instead.`,
+        ]
+      : []),
+  ].join("\n");
+  const written = await writeGateNode(
+    cfg,
+    id,
+    buildGateWorkNode({
+      id,
+      title: `Gate pipeline stuck — ${nodeId} interrupted repeatedly for the same reason`,
+      summary: `The gate pipeline for ${nodeId} kept coming back interrupted (${String(reason || "no reason recorded").slice(0, 200)}); the worker stopped re-offering it. Needs a person, then 'spor work --regate ${runId}'.`,
+      body,
+      project: rec.item_repo || project || slug,
+      date: new Date().toISOString().slice(0, 10),
+      requiresHuman: true,
+      edges: [{ type: "blocks", to: nodeId }],
+    })
+  );
+  if (!written || !written.ok) return { ok: false, reason: (written && written.reason) || "the escalation could not be written" };
+  let demote = null;
+  try {
+    demote = await gateDemoteItem(cfg, nodeId, { blockerId: id });
+  } catch (e) {
+    demote = { ok: false, reason: (e && e.message) || String(e) };
+  }
+  return {
+    ok: true,
+    id,
+    demoted: !!(demote && demote.ok && demote.demoted),
+    ...(demote && !demote.ok ? { demote_reason: demote.reason || "the demotion did not land" } : {}),
+  };
+}
+
 // task-spor-gate-escalation-bounded-auto-retry, dec-spor-gate-refusal-atomic-
 // escalate-then-demote. Retry ONLY the escalate+demote pair for one settled-
 // but-unescalated refusal, using the exact args the original attempt captured
@@ -20282,6 +20349,10 @@ async function cmdWork(cfg, { values }) {
   const escalationRetryMaxAttempts = Math.max(0, cfg.getNum("work.escalationRetryMaxAttempts", workLoop.WORK_DEFAULTS.escalationRetryMaxAttempts));
   const escalationRetryBackoffMs = Math.max(0, cfg.getNum("work.escalationRetryBackoffMs", workLoop.WORK_DEFAULTS.escalationRetryBackoffMs));
   const escalationRetryMaxBackoffMs = Math.max(escalationRetryBackoffMs, cfg.getNum("work.escalationRetryMaxBackoffMs", workLoop.WORK_DEFAULTS.escalationRetryMaxBackoffMs));
+  // task-spor-work-loop-parked-reoffer-cap: config-only for the same reason —
+  // how many identical `interrupted` results a parked gate pipeline may report
+  // before the loop escalates it to a person (0 = re-offer without bound).
+  const parkedReofferMax = Math.max(0, Math.floor(cfg.getNum("work.parkedReofferMax", workLoop.WORK_DEFAULTS.parkedReofferMax)));
   // `--restart-on-land` (work.restartOnLand): exit cleanly, once the in-flight
   // work settles, when the checkout this worker loaded its code from moves past
   // that code — for a self-hosting factory whose worker sits on the checkout
@@ -20774,7 +20845,7 @@ async function cmdWork(cfg, { values }) {
   if (restartOnLand && !loadedCode) out(`work: --restart-on-land has nothing to watch — ${ROOT} is not a source checkout; the worker runs until stopped`);
   const final = await workLoop.runWorkLoop({
     opts: {
-      workerId, project: slug, accept, repos: factoryRepos, graph: localFactoryGraph, selfAgent, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId, factoryRevision: factory && factory.revision, restartOnLand,
+      workerId, project: slug, accept, repos: factoryRepos, graph: localFactoryGraph, selfAgent, concurrency, intervalMs, maxIntervalMs, retryAfterMs, parkedReofferMax, max, once: !!values.once, factory: factoryId, factoryRevision: factory && factory.revision, restartOnLand,
       // The pid-reuse guard for this record: a SIGKILLed worker leaves no
       // stopped_at, and a bare pid probe would read its recycled pid as this
       // worker still running (the same identity check the run store makes).
@@ -20955,6 +21026,9 @@ async function cmdWork(cfg, { values }) {
                 }
               };
             })(),
+            // task-spor-work-loop-parked-reoffer-cap: the loop's escalation
+            // door for a pipeline interrupted identically too many times.
+            escalateParked: (args) => escalateParkedPipeline(cfg, args, { slug }),
             // task-spor-integration-propose-mode: present whenever a factory
             // is armed, but a no-op unless the CURRENT (possibly reloaded)
             // definition's integration mode is 'propose' — read live, at call
@@ -23972,7 +24046,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
+module.exports = { forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
 
 if (require.main === module) {
   main()
