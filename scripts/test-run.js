@@ -20,15 +20,30 @@
 //   - The preloads ride every run: tmp-cleanup, the outer-timeout notice, and
 //     the compile cache (test/helpers/compile-cache.js).
 //
-// The runner parent is a plain pass-through: stdio is inherited, a signal we
+// The runner parent is a pass-through: stdio is inherited, a signal we
 // receive is forwarded to the `node --test` child (so an outer timeout still
 // reaches the runner that reports cancelled files), and we exit with its code.
+// Two things it adds on the way (task-spor-acceptance-suites-on-isolated-ci-runners):
+//   - A SCRUBBED environment. git's repo-local variables (GIT_DIR,
+//     GIT_WORK_TREE, GIT_INDEX_FILE, … — the `git rev-parse --local-env-vars`
+//     set) are removed before `node --test` starts, so no test process and no
+//     CLI or git it spawns can inherit them. A suite launched from a git hook
+//     or a `git bisect run` otherwise hands its scratch-repo fixtures the HOST
+//     repo's location: they commit onto the host and rewrite its config
+//     (issue-spor-server-tests-inherit-git-env-corrupt-host-repo). Scrubbing
+//     once at the root makes that class impossible for every fixture, however
+//     it builds its own env.
+//   - A LOUD verdict. The last line on stderr always names the outcome — exit
+//     code or signal, wall time, shard — and under GitHub Actions a failure is
+//     also an `::error` annotation, so a red run can never be silent
+//     (issue-spor-server-ci-run-tiers-silent-failure).
 
 "use strict";
 
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const { envWithoutRepoLocalVars } = require("./heal-stale-root.js");
 
 const ROOT = path.join(__dirname, "..");
 const PRELOADS = [
@@ -123,9 +138,36 @@ function buildArgs(argv) {
   return args;
 }
 
+// The environment every test process runs under: the caller's, minus git's
+// repo-local variables (see the header).
+function suiteEnv(env = process.env) {
+  return envWithoutRepoLocalVars(env);
+}
+
+// The one-line verdict printed after `node --test` exits.
+function verdictLine({ code, signal, ms, shard }) {
+  const where = shard ? ` (shard ${shard})` : "";
+  const secs = Math.round(ms / 1000);
+  if (signal) return `test-run: FAILED${where} — node --test was killed by ${signal} after ${secs}s`;
+  if (code === 0) return `test-run: passed${where} in ${secs}s`;
+  return `test-run: FAILED${where} — node --test exited ${code == null ? "without a code" : code} after ${secs}s; the failing tests are listed above`;
+}
+
+function report(result, env = process.env) {
+  const line = verdictLine(result);
+  process.stderr.write(`\n${line}\n`);
+  if (env.GITHUB_ACTIONS === "true" && (result.signal || result.code !== 0)) {
+    process.stderr.write(`::error title=test suite failed::${line.replace(/^test-run: /, "")}\n`);
+  }
+}
+
 function main() {
-  const args = buildArgs(process.argv.slice(2));
-  const child = spawn(process.execPath, args, { cwd: ROOT, stdio: "inherit" });
+  const argv = process.argv.slice(2);
+  const args = buildArgs(argv);
+  const shardArg = args.find((a) => a.startsWith("--test-shard="));
+  const shard = shardArg ? shardArg.slice("--test-shard=".length) : null;
+  const started = Date.now();
+  const child = spawn(process.execPath, args, { cwd: ROOT, stdio: "inherit", env: suiteEnv() });
   const forward = (sig) => { try { child.kill(sig); } catch { /* already gone */ } };
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => forward(sig));
   child.on("error", (err) => {
@@ -133,6 +175,7 @@ function main() {
     process.exit(1);
   });
   child.on("exit", (code, signal) => {
+    report({ code, signal, ms: Date.now() - started, shard });
     if (signal) {
       process.removeAllListeners(signal);
       process.kill(process.pid, signal);
@@ -144,4 +187,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { buildArgs, parseShard };
+module.exports = { buildArgs, parseShard, suiteEnv, verdictLine };

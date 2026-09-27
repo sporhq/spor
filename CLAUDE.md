@@ -82,6 +82,15 @@ once, and preloads `test/helpers/compile-cache.js`, which points every spawned
 CLI at a shared V8 compile cache (task-spor-test-suite-runtime-budget). On a
 loaded box the suite's wall time is CPU starvation, not sleeps — a ~0.1
 CPU-second CLI spawn takes ~2s at load 30 — so per-spawn CPU is the lever.
+The runner also hands `node --test` an environment with git's repo-local
+variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, … — the pinned
+`GIT_LOCAL_ENV_VARS` in scripts/heal-stale-root.js) removed, so a suite
+launched from a git hook or `git bisect run` cannot point a scratch fixture at
+the host repo; `test/helpers/git.js` `gitEnv()` is the same scrub for a
+directly-run file and the one place to build a fixture's git env. And it always
+ends on a verdict line on stderr (`test-run: passed …` / `test-run: FAILED …`,
+plus an `::error` annotation under GitHub Actions), so a red run is never silent
+(task-spor-acceptance-suites-on-isolated-ci-runners).
 
 A full run under fleet load can outlast a caller's timeout (the Bash tool
 caps at 600s). A SIGTERM to the runner cancels every unfinished file, so the

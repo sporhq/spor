@@ -11,6 +11,10 @@ jobs:
   test:
     name: Node ${{ matrix.node }} on ${{ matrix.os }} (shard ${{ matrix.shard }}/4)
     runs-on: ${{ matrix.os }}
+    # A wedged shard fails at this ceiling with the runner's own verdict
+    # instead of sitting out GitHub's 6h default with no output
+    # (task-spor-acceptance-suites-on-isolated-ci-runners).
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +36,7 @@ jobs:
   conformance:
     name: Conformance (Node ${{ matrix.node }} on ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
