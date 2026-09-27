@@ -48,6 +48,57 @@ test("resolutionOf mirrors the map entry", () => {
   assert.equal(resolutionOf(g, "no-such-node"), null);
 });
 
+// ---------- FALLBACK_NON_RESOLVING (issue-spor-fallback-non-resolving-
+// missing-in-review) ----------
+//
+// A graph with NO registry (a hand-built fixture, or a graph-less caller)
+// falls back to FALLBACK_NON_RESOLVING, which must match the seed registry's
+// non-resolving partition: an in-review or approved artifact is a resolver
+// still in flight and must not retire its target, exactly as a registry-
+// backed reader (rankQueue against a real graph) already treats it.
+
+test("resolutionMap: a registry-less in-review artifact resolver does not retire its target", () => {
+  const g = fixture();
+  g.nodes["art-pr"] = {
+    id: "art-pr", type: "artifact", status: "in-review", date: "2026-09-27",
+    title: "Draft fix", summary: "Still in review.",
+    edges: [{ type: "resolves", to: "task-y" }],
+  };
+  // task-y already has a live resolver (dec-fix) in fixture(); drop it so the
+  // in-review artifact is the ONLY inbound resolver and the assertion is
+  // unambiguous.
+  g.nodes["dec-fix"].status = "superseded";
+  g.supersededBy["dec-fix"] = "art-pr"; // any truthy value marks it superseded
+  const m = resolutionMap(g);
+  assert.equal(m["task-y"], undefined, "an in-review resolver must not retire its target");
+});
+
+test("resolutionMap: a registry-less approved artifact resolver does not retire its target", () => {
+  const g = fixture();
+  g.nodes["art-pr"] = {
+    id: "art-pr", type: "artifact", status: "approved", date: "2026-09-27",
+    title: "Approved fix", summary: "Approved, not yet merged.",
+    edges: [{ type: "resolves", to: "task-y" }],
+  };
+  g.nodes["dec-fix"].status = "superseded";
+  g.supersededBy["dec-fix"] = "art-pr";
+  const m = resolutionMap(g);
+  assert.equal(m["task-y"], undefined, "an approved resolver must not retire its target");
+});
+
+test("resolutionMap: a registry-less merged artifact resolver still retires its target", () => {
+  const g = fixture();
+  g.nodes["art-pr"] = {
+    id: "art-pr", type: "artifact", status: "merged", date: "2026-09-27",
+    title: "Merged fix", summary: "Shipped.",
+    edges: [{ type: "resolves", to: "task-y" }],
+  };
+  g.nodes["dec-fix"].status = "superseded";
+  g.supersededBy["dec-fix"] = "art-pr";
+  const m = resolutionMap(g);
+  assert.equal(m["task-y"].by, "art-pr", "a merged resolver still retires its target (unaffected by the fix)");
+});
+
 test("a resolver missing summary/title yields null, not undefined", () => {
   const g = fixture();
   delete g.nodes["dec-ans"].summary;

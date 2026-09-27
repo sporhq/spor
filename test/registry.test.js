@@ -564,6 +564,21 @@ test("seed pack: the terminal-status register reproduces resolution.js's fallbac
   assert.equal(classes.includes("released"), false, "released is artifact-scoped, not type-blind");
 });
 
+test("seed pack: the type-blind non-resolving union reproduces resolution.js's FALLBACK_NON_RESOLVING byte-identically", () => {
+  // The mirror pin of the terminal-status test above, for the sibling
+  // partition (issue-spor-fallback-non-resolving-missing-in-review): a
+  // registry-less reader (a hand-built test graph, coupling.js's graph-less
+  // scan) falls back to resolution.js's FALLBACK_NON_RESOLVING, which must
+  // equal the seed's type-blind nonResolvingStatuses() union — otherwise the
+  // two readers disagree about whether an in-review/approved artifact
+  // resolver retires its target.
+  const resolution = require(path.join(__dirname, "..", "lib", "kernel", "resolution.js"));
+  const reg = graph.seedRegistry();
+  const union = [...reg.nonResolvingStatuses()].sort();
+  assert.deepEqual(union, [...resolution.nonResolvingStatuses],
+    "seed nonResolvingStatuses() union == FALLBACK_NON_RESOLVING (sorted)");
+});
+
 test("parseSchemaNode: rejects a malformed completion policy", () => {
   // task-spor-registry-declarative-terminal-status-policy: the declaration is
   // only useful to a reader if it cannot be self-contradictory — a completion
