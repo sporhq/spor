@@ -183,6 +183,12 @@ right failure but a rude way to discover a typo:
 - every agent-review gate has a `profile` (the runner checks the field is
   present, not that a matching profile node exists — a typo there is not
   caught until dispatch, so double-check it yourself, e.g. `spor get <profile>`);
+- if a review gate declares a `fallback_profile` (the lane a reviewer outage
+  routes to): refuse to write one whose `model_family` is missing or EQUAL to
+  the implementer lane's — the runner refuses it at dispatch anyway, so it
+  would only ever look like protection. Tell the operator that both fallback
+  and the reset-aware pause spend the factory's `implementation.retry.attempts`
+  pool, so a factory that declares none gets neither;
 - `protected_paths` is declared **only** with a `test_lane_profile` to route to;
 - every risk class a gate names is declared in `risk_classes` (any kind that
   arms: command, agent-review, human);

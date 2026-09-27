@@ -2196,6 +2196,56 @@ takes the retry already paid for rather than a fresh, uncharged one. A pool
 already spent, or a charge that will not land, still refuses as above — a stop
 does not turn an exhausted budget into a pause.
 
+#### A reviewer outage that names its end: pause, cooldown, fallback
+
+A usage-limit outage usually says when it ends — Codex's `turn.failed` reads
+"…try again at Sep 7th, 2026 6:27 AM", other harnesses "try again in 3 hours",
+an HTTP 429 `Retry-After: <s>` — and a fixed backoff that ignores it re-asks a
+backend a day from returning, spends the pool, and pages a person for something
+that heals itself at a stated instant
+(task-spor-review-gate-quota-outage-reset-aware-pause-and-fallback-reviewer,
+dec-spor-reviewer-reset-pause-budget-and-provenance). So:
+
+- **The reading.** The supervisor lifts the phrase off the environment
+  signature's whole line and stamps it on the run record
+  (`termination_reset_hint`) beside the host's UTC offset at that instant
+  (`termination_utc_offset_min`); `classifyExecutionOutcome` turns the pair into
+  `reset_at`. A zone-less absolute time is read ONLY in that captured offset —
+  a record without one is the unknown-reset reading, and the declared backoff
+  applies exactly as before. A hint outside [end − 10min, end + 30d] is ignored.
+- **The pause.** A review outage carrying `reset_at` PARKS the pipeline: it
+  returns `interrupted` with `paused_until`, settles nothing (no fact, no
+  escalation, no demotion, no attestation), charges no fix cycle and never
+  enters the rescue lane, and the loop frees the slot — the item stays out of
+  selection — until that instant, then re-offers it (a wake under 5 minutes is
+  simply waited out). The pause itself is free; the review AFTER it is charged
+  to `implementation.retry` now, owe-before-clear, so a pool of zero refuses
+  (naming the reset) rather than pausing for a review it may not make. A reset
+  further out than the gate's `pause_max_ms` (default 48h) refuses too. The wake
+  rides `gate_progress.pools.retry.paused_until` and `gate_paused_until` on the
+  run record: a resumed worker honors a pause it did not create (parks it again
+  at once, dispatching nothing), the resume scan ages a paused run from its
+  wake rather than its end, and `spor work --status` / `spor runs` show it.
+- **The cooldown.** The same outage stamps the review LANE (profile) cooling
+  until its reset in machine-local `journal/reviewer-cooldowns.json`. Any other
+  item this box judges under that lane then pauses without dispatching (free —
+  no review was made, so what follows is still the gate's first) instead of
+  filing one outage per item. The stamp is a durable flag read against settled
+  state every time: a passed reset blocks nothing, a review under the lane that
+  ANSWERED strictly after the outage clears it, and an older success does not.
+- **The fallback.** An agent-review gate may declare `fallback_profile` (and
+  `fallback_after`, default 1): after that many no-verdict readings under
+  `profile` the runner routes the review there — charged to the same pool
+  (unless the primary was never dispatched because it was cooling) — and only
+  when the fallback's declared `model_family` differs from the implementer
+  profile's (`resolved_profile`); an unknown or equal family refuses the
+  fallback and the gate pauses or refuses as above. The route is per gate and
+  durable (`gate_progress.pools.routes`), so later fix-cycle reviews, and a
+  resume, keep judging with the reviewer it selected — and judge that lane's
+  cooldown, not the primary's. Every outcome under it names the reviewer: the
+  gate result's `reviewer`, a `Reviewer:` line on the `art-gate-*` fact, and the
+  attested step's `reviewer` (inside the digest).
+
 A FIXER's own dispatch is read through the same classifier, and what its class
 means depends on what it left behind: a fix whose harness died on the
 environment and left HEAD exactly where it was produced nothing to judge, so the

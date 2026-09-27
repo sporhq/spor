@@ -10850,6 +10850,7 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
     // 'spor runs <that id>' is how a human (or a restarted 'spor work') finds
     // out whether it is still going.
     if (r.gate_state) out(`  gate:       ${r.gate_state}${r.gate_reason ? ` — ${r.gate_reason}` : ""}`);
+    if (r.gate_paused_until && r.gate_state === "interrupted") out(`  paused:     until ${r.gate_paused_until}${r.gate_paused_profile ? ` (review lane ${r.gate_paused_profile})` : ""}`);
     if (r.gate_head) out(`  gated head: ${r.gate_head}${r.gate_landed_sha ? ` (landed ${String(r.gate_landed_sha).slice(0, 12)})` : ""}`);
     if (r.gate_attestation) out(`  attested:   ${r.gate_attestation}`);
     // A run that PROMISED an attestation and has none says so here, never
@@ -13050,7 +13051,7 @@ function cmdWorkStatus(cfg, { json }) {
     }
     for (const a of w.active || []) out(`  active:   ${a.node_id || "(free-text)"}  run ${String(a.run_id).slice(0, 8)}  ${a.harness || ""}  since ${a.started_at}`);
     for (const g of w.gating || []) {
-      out(`  gating:   ${g.node_id}  run ${String(g.run_id).slice(0, 8)}  since ${g.started_at}`);
+      out(`  gating:   ${g.node_id}  run ${String(g.run_id).slice(0, 8)}  since ${g.started_at}${g.paused_until ? `  (paused until ${g.paused_until})` : ""}`);
       // The execution hold this pipeline claimed before it ever dispatched
       // (task-spor-work-status-show-execution-hold-and-stale-reading) — the
       // holder, the completion boundary it is pinned to, and the same
@@ -13093,6 +13094,8 @@ function cmdWorkStatus(cfg, { json }) {
           `${r.gate ? `  gates ${r.gate}` : ""}${r.superseded ? " (superseded)" : ""}`
       );
       if (r.gate && r.gate !== "passed" && r.gate_reason) out(`            ${r.gate_reason}`);
+      // A pipeline PAUSED on a review lane's stated reset: when it wakes.
+      if (r.paused_until) out(`            paused until ${r.paused_until} — slot freed; re-offered then`);
       // A verdict this worker's pipeline did NOT produce (cross-model review,
       // minor finding 5): the `gates` state above is the record's — the one
       // that won the settle race — and this worker's own verdict lost and was
@@ -14260,6 +14263,88 @@ function refuseDirtyCandidate(factory, cwd) {
   return null;
 }
 
+// --- the per-lane reviewer cooldown (task-spor-review-gate-quota-outage-
+// reset-aware-pause-and-fallback-reviewer) ---
+//
+// One machine-local file, `journal/reviewer-cooldowns.json`: per review
+// PROFILE, the latest outage that named its own end (`until`, `at` — the
+// outage run's finish — `reason`, `run_id`) and the finish time of the latest
+// review under it that ANSWERED (`success_at`). It is a durable flag, so it is
+// never trusted as written: gates.reviewerCooldownActive reads it against the
+// clock (a passed reset blocks nothing) and against a strictly NEWER success
+// (a stale success never clears a newer outage), every time. Writes are
+// best-effort and whole-file atomic (temp + rename); two workers racing one
+// write can lose a stamp, which costs one more dispatch into the dead lane,
+// never a verdict.
+function reviewerCooldownFile(home) {
+  return path.join(home, "journal", "reviewer-cooldowns.json");
+}
+function readReviewerCooldowns(home) {
+  try {
+    const j = JSON.parse(fs.readFileSync(reviewerCooldownFile(home), "utf8"));
+    return j && typeof j === "object" && j.profiles && typeof j.profiles === "object" ? j : { profiles: {} };
+  } catch {
+    return { profiles: {} };
+  }
+}
+function writeReviewerCooldowns(home, data) {
+  const file = reviewerCooldownFile(home);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
+  fs.renameSync(tmp, file);
+}
+function readReviewerCooldown(home, profile, now = Date.now()) {
+  if (!profile) return null;
+  const entry = readReviewerCooldowns(home).profiles[profile];
+  if (!entry || !entry.until) return null;
+  return gatesKernel.reviewerCooldownActive(entry, { now, successAt: Number(entry.success_at) || 0 });
+}
+function stampReviewerCooldown(home, { profile, until, at, reason = "", run_id = null }) {
+  if (!profile || !(Number(until) > 0)) return;
+  const data = readReviewerCooldowns(home);
+  const prev = data.profiles[profile] || null;
+  const stamp = { until: Number(until), at: Number(at) || Date.now(), reason: String(reason || "").slice(0, 300), run_id: run_id || null };
+  const merged = gatesKernel.mergeReviewerCooldown(prev && prev.until ? prev : null, stamp);
+  data.profiles[profile] = { ...merged, ...(prev && prev.success_at ? { success_at: prev.success_at } : {}) };
+  writeReviewerCooldowns(home, data);
+}
+function noteReviewerSuccess(home, profile, at) {
+  if (!profile || !(Number(at) > 0)) return;
+  const data = readReviewerCooldowns(home);
+  const prev = data.profiles[profile] || {};
+  // Recorded even with no stamp yet: an OLDER outage read late must not
+  // re-cool a lane that has since answered.
+  if (Number(prev.success_at) >= Number(at)) return;
+  data.profiles[profile] = { ...prev, success_at: Number(at) };
+  writeReviewerCooldowns(home, data);
+}
+
+// Is `fallback` an INDEPENDENT reviewer of work the `implementer` profile
+// produced (dec-spor-reviewer-reset-pause-budget-and-provenance)? Independence
+// is the declared, canonical MODEL FAMILY on each profile (`model_family:`),
+// never the provider or the harness — two harnesses can front one model, and
+// one harness many. An unknown family on either side, or an equal one,
+// refuses the fallback: a review the implementer's own model family writes is
+// not the cross-model review the gate exists for, and a family nobody
+// declared cannot be shown to differ.
+async function reviewerIndependence(cfg, { fallback, implementer }) {
+  const family = async (id) => {
+    if (!id) return null;
+    const n = await resolveNode(cfg, id);
+    if (!n || !n.raw) return null;
+    const fm = require(path.join(ROOT, "lib", "graph.js")).parseFrontmatter(n.raw, `${id}.md`);
+    return gatesKernel.canonicalModelFamily(fm.model_family);
+  };
+  const theirs = await family(fallback);
+  if (!theirs) return { ok: false, reason: `the fallback profile ${fallback} declares no model_family, so its independence from the implementer cannot be shown` };
+  if (!implementer) return { ok: false, reason: "the run records no resolved implementer profile to compare the fallback's model family against" };
+  const ours = await family(implementer);
+  if (!ours) return { ok: false, reason: `the implementer's profile ${implementer} declares no model_family, so the fallback cannot be shown to differ from it` };
+  if (ours === theirs) return { ok: false, reason: `the fallback ${fallback} is the same model family (${theirs}) as the implementer's profile ${implementer} — that is not an independent review` };
+  return { ok: true, family: theirs };
+}
+
 function makeGateDeps(
   cfg,
   { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, gateOwner = undefined, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, runIdleMs = workLoop.WORK_DEFAULTS.runIdleMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
@@ -14624,7 +14709,7 @@ function makeGateDeps(
     // for the harness's own reason.
     const classification = gatesKernel.classifyExecutionOutcome(done.record);
     if (classification.outcome === "infrastructure") {
-      return { ok: false, reason: `the review run under ${gate.profile} ${classification.reason}`, classification, runId: launched.run.run_id };
+      return { ok: false, reason: `the review run under ${gate.profile} ${classification.reason}`, classification, runId: launched.run.run_id, finishedAt: (done.record && done.record.finished_at) || null };
     }
     const text = gateRunReportText(done.record);
     if (!text.trim()) {
@@ -14640,7 +14725,7 @@ function makeGateDeps(
         runId: launched.run.run_id,
       };
     }
-    return { ok: true, text, runId: launched.run.run_id };
+    return { ok: true, text, runId: launched.run.run_id, startedAt: (done.record && done.record.created_at) || null, finishedAt: (done.record && done.record.finished_at) || null };
   };
 
   const fix = async ({ gate, cycle, findings, detail, evidence, ledger, onLaunch = null, rescue = 0, base = 0 }) => {
@@ -15326,6 +15411,13 @@ function makeGateDeps(
     saveRescueState,
     loadGatePools,
     saveGatePools,
+    // The per-lane reviewer COOLDOWN and the fallback's independence check
+    // (task-spor-review-gate-quota-outage-reset-aware-pause-and-fallback-
+    // reviewer) — machine-local, like every other gate deps' state.
+    reviewerCooldown: async ({ profile, now }) => readReviewerCooldown(home, profile, now),
+    stampReviewerCooldown: async (stamp) => stampReviewerCooldown(home, stamp),
+    noteReviewerSuccess: async ({ profile, at }) => noteReviewerSuccess(home, profile, at),
+    reviewerIndependence: async ({ profile }) => reviewerIndependence(cfg, { fallback: profile, implementer: record && record.resolved_profile }),
     updateGateProgress,
     rescue,
     implement,
@@ -18624,7 +18716,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // stamped, settled or attested, and the resume re-runs the pipeline.
   if (intResult.state === "interrupted") {
     if (reporter) reporter.leave();
-    return { state: "interrupted", ...(intResult.outage_interrupted ? { outage_interrupted: true } : {}), gates: gateResult.gates || [], facts: [...gateFacts, ...(intResult.facts || [])], reason: intResult.reason };
+    return { state: "interrupted", ...(intResult.outage_interrupted ? { outage_interrupted: true } : {}), ...(intResult.paused_until ? { paused_until: intResult.paused_until, paused_profile: intResult.paused_profile || null } : {}), ...(intResult.fallback_route ? { fallback_route: true } : {}), gates: gateResult.gates || [], facts: [...gateFacts, ...(intResult.facts || [])], reason: intResult.reason };
   }
   const intState = completionKernel.INTEGRATION_STATES.includes(intResult.state) ? intResult.state : intResult.state === "passed" ? "landed" : "failed";
   const allFacts = [...gateFacts, ...(intResult.facts || [])];

@@ -1195,7 +1195,21 @@ identity, the review dispatch drops the worker's harness flags
 is refused by the reviewer's adapter), and a fix cycle already launched under
 its unique run name is ADOPTED on resume, never dispatched twice
 (`gate_fix_gate`/`gate_fix_cycle` ride the stamp so `loadGateProgress` reads
-the launch back). `cycles` counts FIX dispatches (`cycles: 3` = initial review + 3 fixes). **human** arms on
+the launch back). `cycles` counts FIX dispatches (`cycles: 3` = initial review + 3 fixes). A review
+that produced NO verdict because its backend was out (§5.3's `infrastructure`)
+and whose harness STATED its end ("try again at <date>", `Retry-After`) is
+PAUSED, not retried on the fixed backoff
+(task-spor-review-gate-quota-outage-reset-aware-pause-and-fallback-reviewer,
+WORKERS.md §10.4): the supervisor stamps the hint + the host's UTC offset
+(`termination_reset_hint`/`termination_utc_offset_min`; a zone-less time is
+never read without the offset), the pipeline returns `interrupted` with
+`paused_until` and the loop frees the slot until then, bounded by the gate's
+`pause_max_ms` (48h); the lane is stamped cooling in
+`journal/reviewer-cooldowns.json` so other items pause without dispatching; and
+a gate's declared `fallback_profile` is routed to after `fallback_after`
+no-verdicts when its `model_family` differs from the implementer's. Pause is
+free; the review after it, and a fallback dispatch, spend
+`implementation.retry` (zero authorizes none). **human** arms on
 declared risk classes, files an approval item and BLOCKS the resolve until a
 live RESOLVING EDGE (approved — a bare status flip is not an approval) or any
 other terminal status (refused) answers it, reporting `blocked` at `approval_timeout_ms` rather than deciding for the
