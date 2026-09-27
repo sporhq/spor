@@ -2396,6 +2396,53 @@ async function reconcileAfterLand(cfg, { dir, ref, targetSha, landedSha, itemId 
   }
 }
 
+// checkProposals' twin of reconcileAfterLand (task-spor-propose-mode-post-
+// land-reconcile): a proposal's PR merges on GitHub itself, out of band from
+// this box, so unlike a direct land there is no fresh local tip to reconcile
+// from — the target ref has to be fetched first. `r` is the run record;
+// `gate_proposal_repo_dir`/`gate_proposal_target_sha` are what parkForReview
+// stamped onto it before the implementer's worktree was removed (the one
+// window those facts were ever available). Fetches the REMOTE-TRACKING ref,
+// never the local branch of the same name — the main checkout this reads may
+// have that branch checked out, and force-moving a checked-out ref without
+// syncing the working tree is exactly the hazard reconcileCheckedOutTarget
+// (lib/shell/integration-runner.js) exists to avoid for a direct land; a
+// remote-tracking ref carries no such risk. Fail-open throughout: the PR is
+// already confirmed merged by the caller, and this is bookkeeping on top of
+// that fact, never a reason to treat the merge itself as unsettled.
+async function reconcileAfterProposalLanded(cfg, r, { log }) {
+  const dir = r.gate_proposal_repo_dir;
+  const targetRef = r.gate_proposal_target_ref;
+  if (!dir || !targetRef) {
+    log(`work: reconcile-landed after ${r.node_id}'s proposal landed could not run (no recorded checkout/target ref for this run — it predates this stamp, or the tracking-node write never landed)`);
+    return null;
+  }
+  const { remote, branch } = integrationRunner.splitRemoteRef(targetRef);
+  const fetched = git(dir, ["fetch", "--quiet", remote, `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`]);
+  if (fetched.status !== 0) {
+    log(`work: reconcile-landed after ${r.node_id}'s proposal landed could not fetch ${remote}/${branch} in ${dir} (${(fetched.stderr || "").trim().split("\n").filter(Boolean).pop() || "git fetch failed"})`);
+    return null;
+  }
+  try {
+    const res = await reconcileLanded(cfg, {
+      dir, ref: targetRef, tip: `${remote}/${branch}`, since: r.gate_proposal_target_sha || null,
+      exclude: [r.node_id],
+      exportOpts: { timeoutMs: 30000, report: (m) => log(`work: reconcile-landed: ${m}`) },
+    });
+    if (res.error) {
+      log(`work: reconcile-landed after ${r.node_id}'s proposal landed on ${targetRef} could not run (${res.error})`);
+      return null;
+    }
+    const created = res.hits.filter((h) => h.finding && h.finding.status === "created");
+    if (created.length) log(`work: reconcile-landed filed ${created.length} confirm-close finding(s) for open items the merged commits name: ${created.map((h) => h.findingId).join(", ")}`);
+    for (const h of res.hits) for (const x of [h.draft, h.finding]) if (x && x.ok === false) log(`work: reconcile-landed could not write ${x.id} (${x.message})`);
+    return res;
+  } catch (e) {
+    log(`work: reconcile-landed after ${r.node_id}'s proposal landed on ${targetRef} threw (${e.message})`);
+    return null;
+  }
+}
+
 // --- spor history: per-node git-log lineage --------------------------------
 // (task-spor-history-cli-verb) The shell front-door for a single node's commit
 // history — every revision's actor, time, and what changed — as a `git log`
@@ -17031,7 +17078,12 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
         return { ok: false, reason };
       }
       if (!body) return { ok: false, reason: "the attestation for the pull request body was not built — a proposal must carry its attestation, so no PR was opened" };
-      return proposePR({ top, head, targetRef, body });
+      // `chain.targetSha` is target_ref's tip AT PROPOSE TIME (the candidate
+      // build resolved it fresh, before this PR ever opened) — carried on the
+      // returned proposal so parkForReview can stamp it durably, since it is
+      // the one fact reconcileAfterProposalLanded needs later and has no other
+      // way to recover once this run's implementer worktree is gone.
+      return { ...proposePR({ top, head, targetRef, body }), targetSha: (chain && chain.targetSha) || null };
     },
     parkForReview: async ({ proposal }) => {
       const id = proposalTrackingId(entry.node_id, entry.run_id);
@@ -17055,12 +17107,22 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       // write above hit a transient failure. `id` is deterministic
       // (proposalTrackingId), so checkProposals can always find/recompute it
       // and heal a tracking item that never actually landed on the graph.
+      //
+      // `gate_proposal_repo_dir` and `gate_proposal_target_sha` are what
+      // task-spor-propose-mode-post-land-reconcile's checkProposals pass needs
+      // once the PR merges: the run's own implementer worktree (record.cwd) is
+      // removed by cleanupImplementer right after this park() returns, so the
+      // durable main checkout it belongs to (mainCheckoutOf) — and target_ref's
+      // pre-propose tip, before any of this PR's own commits landed on it —
+      // must be captured in this same window or never at all.
       dispatchRuns.stampGateState(home, entry.run_id, {
         gate_proposal_number: proposal.number || null,
         gate_proposal_repo: proposal.repo || null,
         gate_proposal_url: proposal.url || null,
         gate_proposal_branch: proposal.branch || null,
         gate_proposal_target_ref: integration.targetRef,
+        gate_proposal_target_sha: proposal.targetSha || null,
+        gate_proposal_repo_dir: (record && record.cwd && mainCheckoutOf(record.cwd)) || null,
         gate_proposal_strategy: integration.strategy,
         gate_proposal_blocker: id,
         gate_proposal_project: slug || null,
@@ -19212,8 +19274,9 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
       blockerId: healed.id,
       factory: r.gate_proposal_factory,
     };
+    let checked = null;
     try {
-      await integrationRunner.checkProposal(proposal, {
+      checked = await integrationRunner.checkProposal(proposal, {
         deps: {
           prStatus: (p) => ghPrStatus(p),
           recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
@@ -19223,6 +19286,18 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
       });
     } catch (e) {
       log(`work: checking the proposal for ${r.node_id} failed (${(e && e.message) || e})`);
+    }
+    // task-spor-propose-mode-post-land-reconcile: a direct `spor work` land
+    // runs the shipped-on-main detection right after landing (line ~18413);
+    // a proposal that merged through a PR was landing this whole time without
+    // it, so the merged range's own `Spor:` trailers/`commits:` stamps never
+    // drafted a resolver or filed a confirm-close finding for whatever ELSE
+    // they name. `checked.state === "landed"` alone (not `settled`) — the
+    // merge is a GitHub-side fact independent of whether this pass's own
+    // fact-write/restore settled; gated the same as the direct-land call so
+    // one config knob covers both paths.
+    if (checked && checked.state === "landed" && cfg.getBool("work.reconcileLanded", true)) {
+      await reconcileAfterProposalLanded(cfg, r, { log });
     }
   }
 }

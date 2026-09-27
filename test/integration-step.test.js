@@ -1106,6 +1106,111 @@ test("issue-spor-integration-park-orphan: a failed tracking-node write still sta
   assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-merge-")).length, 1, "no duplicate fact from the second pass");
 });
 
+// --------------------------- task-spor-propose-mode-post-land-reconcile -----
+//
+// spor e93d748 runs the shipped-on-main detection (lib/kernel/landed.js +
+// lib/shell/landed.js) right after a DIRECT `spor work` land, but a proposal
+// that merges through a pull request lands out of band, on GitHub itself —
+// checkProposals used to skip the same detection entirely, so a `Spor:`
+// trailer on the merged range naming some OTHER open item never drafted its
+// resolver or filed a confirm-close finding. This drives checkProposals
+// against a REAL git remote (a bare "origin.git" the fake gh's reported merge
+// actually landed on) — the merge happens through a SEPARATE clone, exactly
+// as a real GitHub merge would, so the run's own recorded checkout only sees
+// it once checkProposals fetches.
+test("task-spor-propose-mode-post-land-reconcile: checkProposals reconciles the merged range once the PR is confirmed merged, drafting a resolver for another open item its trailer names", async (t) => {
+  if (process.platform === "win32") return; // the fake gh is a sh script
+
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  // The remote (bare) and the run's OWN recorded checkout — a clone taken
+  // BEFORE the PR merges, exactly like a dispatch box's main checkout would
+  // be by the time checkProposals gets around to checking a parked proposal.
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-reconcile-"));
+  const bare = path.join(parent, "origin.git");
+  execFileSync("git", ["init", "-q", "--bare", "-b", "main", bare], { stdio: "ignore" });
+  const seed = path.join(parent, "seed");
+  execFileSync("git", ["init", "-q", "-b", "main", seed], { stdio: "ignore" });
+  git(seed, "config", "user.email", "t@t");
+  git(seed, "config", "user.name", "Test");
+  fs.writeFileSync(path.join(seed, "a.txt"), "a\n");
+  git(seed, "add", "-A");
+  git(seed, "commit", "-q", "-m", "initial");
+  git(seed, "remote", "add", "origin", bare);
+  git(seed, "push", "-q", "origin", "main");
+  const mainCheckout = path.join(parent, "main-checkout");
+  execFileSync("git", ["clone", "-q", bare, mainCheckout], { stdio: "ignore" });
+  const targetSha = git(mainCheckout, "rev-parse", "main").trim();
+
+  // The merge itself: a SEPARATE push, naming another open item in a `Spor:`
+  // trailer — `mainCheckout`'s own `origin/main` stays stale until fetched.
+  fs.writeFileSync(path.join(seed, "b.txt"), "b\n");
+  git(seed, "add", "-A");
+  git(seed, "commit", "-q", "-m", "Merge PR: add bounded retry", "-m", "Spor: task-drive-by-other");
+  git(seed, "push", "-q", "origin", "main");
+  const landedSha = git(seed, "rev-parse", "main").trim();
+  assert.strictEqual(git(mainCheckout, "rev-parse", "origin/main").trim(), targetSha, "precondition: the run's own checkout has not seen the merge yet");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-reconcile-home-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, front) => fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-09-27\n---\n\nBody.\n`);
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+
+  write("task-proposed", "type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\n");
+  write("task-drive-by-other", "type: task\ntitle: A drive-by fix\nsummary: Another open item the merged commit's trailer also names.\nstatus: open\n");
+
+  const entry = { node_id: "task-proposed", run_id: "22222222-3333-4444-5555-000000000002" };
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "done", gate_state: "parked",
+    gate_proposal_number: 9,
+    gate_proposal_repo: "demo/repo",
+    gate_proposal_url: "https://github.com/demo/repo/pull/9",
+    gate_proposal_branch: entry.node_id,
+    gate_proposal_target_ref: "main",
+    gate_proposal_target_sha: targetSha,
+    gate_proposal_repo_dir: mainCheckout,
+    gate_proposal_strategy: "merge",
+    gate_proposal_project: "demo",
+    gate_proposal_factory: "factory-demo",
+  });
+
+  const ghDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fake-gh-propose-reconcile-"));
+  const stateFile = path.join(ghDir, "state.json");
+  fs.writeFileSync(stateFile, JSON.stringify({ state: "MERGED", mergedAt: "2026-09-27T00:00:00Z", mergeCommit: { oid: landedSha }, mergedBy: { login: "reviewer" }, baseRefName: "main" }));
+  writeFakePathBin(ghDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\ncat "${stateFile}"\n`);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${ghDir}${path.delimiter}${originalPath}`;
+  t.after(() => { process.env.PATH = originalPath; });
+
+  const first = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => first.push(l) });
+
+  assert.strictEqual(git(mainCheckout, "rev-parse", "origin/main").trim(), landedSha, "checkProposals fetched the merged range before reconciling it");
+  assert.ok(first.some((l) => /reconcile-landed filed 1 confirm-close finding\(s\).*find-shipped-on-main-task-drive-by-other/.test(l)), first.join("\n"));
+  const finding = fs.readFileSync(path.join(nodes, "find-shipped-on-main-task-drive-by-other.md"), "utf8");
+  assert.ok(finding.includes(landedSha.slice(0, 12)), "the finding names the merged commit");
+  const draft = fs.readFileSync(path.join(nodes, "art-shipped-task-drive-by-other.md"), "utf8");
+  assert.match(draft, /^status: in-review$/m);
+  assert.doesNotMatch(draft, /type: resolves/, "a draft resolver, never an automatic close");
+  assert.match(fs.readFileSync(path.join(nodes, "task-drive-by-other.md"), "utf8"), /^status: open$/m, "never closed automatically");
+  // The run's OWN item is excluded — its completion is this pass's `restore`,
+  // not a confirm-close candidate for a scan it triggered.
+  assert.strictEqual(fs.existsSync(path.join(nodes, "find-shipped-on-main-task-proposed.md")), false);
+  assert.strictEqual(statusOf("task-proposed"), "done", "the proposal's own lifecycle still completes in the same pass");
+
+  // Re-run: the tracking item is now closed, so this pass is a pure no-op —
+  // no duplicate draft/finding, no error logged.
+  const second = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => second.push(l) });
+  assert.ok(!second.some((l) => /could not/.test(l)), second.join("\n"));
+  assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("find-shipped-on-main-")).length, 1, "no duplicate finding from the second pass");
+  assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-shipped-")).length, 1, "no duplicate draft from the second pass");
+});
+
 // The other half of park()'s withheld demotion: the heal pass that re-creates
 // the missing tracking item is the first moment a blocker exists, so it is
 // where the rollback finally runs — against the REAL gateDemoteItem and a real
