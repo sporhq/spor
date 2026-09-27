@@ -3958,6 +3958,81 @@ test("flakeCoverage: ALL failing tests covered by a FIXED flake, never twice for
   assert.match(again.why, /already re-gated once/);
 });
 
+// task-spor-regate-flakes-read-graph-failing-tests: flakeSweepPlan must not
+// depend solely on a LOCAL run record for the refusal's failing-test list —
+// the escalation node itself carries `failing_tests:` (buildGateWorkNode), and
+// that survives both a run record that never had the field and one that has
+// since been pruned from this box's journal entirely.
+function flakeGraphFixture({ escalationFailingTests = ["test/flaky.test.js"], flakeStatus = "resolved", covers = ["test/flaky.test.js"], escalationProject = null } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-graph-"));
+  fs.writeFileSync(
+    path.join(dir, "issue-flake-known.md"),
+    `---\nid: issue-flake-known\ntype: issue\ntitle: A known flake\nsummary: test/flaky.test.js flakes under load.\nstatus: ${flakeStatus}\ncovers_tests: [${covers.join(", ")}]\ndate: 2026-08-26\n---\nFlaky.\n`
+  );
+  fs.writeFileSync(path.join(dir, "task-ready.md"), "---\nid: task-ready\ntype: task\ntitle: Ready\nsummary: The gated work item.\nstatus: open\ndate: 2026-08-26\n---\nWork.\n");
+  fs.writeFileSync(
+    path.join(dir, "task-gate-acceptance-ready-x.md"),
+    [
+      "---",
+      "id: task-gate-acceptance-ready-x",
+      "type: task",
+      ...(escalationProject ? [`project: ${escalationProject}`] : []),
+      "title: Gate escalation — gate-acceptance refused task-ready",
+      "summary: The gate-acceptance gate refused task-ready.",
+      "status: open",
+      "requires: [human]",
+      `failing_tests: [${escalationFailingTests.join(", ")}]`,
+      "date: 2026-08-26",
+      "edges:",
+      "  - {type: blocks, to: task-ready}",
+      "---",
+      "",
+      "Refused.",
+      "",
+    ].join("\n")
+  );
+  const graphLib = require("../lib/graph.js");
+  return { dir, graph: graphLib.loadGraph(dir) };
+}
+
+test("flakeSweepPlan: a graph-only escalation (no local run record at all) covered by a fixed flake plans a REPORT, never a regate", () => {
+  const { graph } = flakeGraphFixture({ escalationFailingTests: ["test/flaky.test.js"] });
+  const sporCli = require("../bin/spor.js");
+  const plan = sporCli.flakeSweepPlan([], graph, { trustedRef: "main" });
+  assert.strictEqual(plan.length, 1);
+  assert.strictEqual(plan[0].action, "report");
+  assert.strictEqual(plan[0].escalation, "task-gate-acceptance-ready-x");
+  assert.strictEqual(plan[0].itemId, "task-ready");
+  assert.deepStrictEqual(plan[0].issues, ["issue-flake-known"]);
+  assert.strictEqual(plan[0].record, undefined, "there is no runnable candidate to re-gate from");
+});
+
+test("flakeSweepPlan: a local run record with no gate_failing_tests falls back to the escalation node's and still regates", () => {
+  const { graph } = flakeGraphFixture({ escalationFailingTests: ["test/flaky.test.js"] });
+  const sporCli = require("../bin/spor.js");
+  const record = { run_id: "11111111-2222-3333-4444-555555555555", node_id: "task-ready", gate_state: "failed", gate_escalated_to: "task-gate-acceptance-ready-x" };
+  const plan = sporCli.flakeSweepPlan([record], graph, { trustedRef: "main" });
+  assert.strictEqual(plan.length, 1, "the escalation is handled once via the record, never duplicated by the graph-only pass");
+  assert.strictEqual(plan[0].action, "regate");
+  assert.strictEqual(plan[0].record, record);
+  assert.deepStrictEqual(plan[0].issues, ["issue-flake-known"]);
+});
+
+test("flakeSweepPlan: an uncovered failing test takes no action, whether read from the record or the graph fallback", () => {
+  const { graph } = flakeGraphFixture({ escalationFailingTests: ["test/real.test.js"], covers: ["test/flaky.test.js"] });
+  const sporCli = require("../bin/spor.js");
+  const graphOnlyPlan = sporCli.flakeSweepPlan([], graph, { trustedRef: "main" });
+  assert.strictEqual(graphOnlyPlan.length, 1);
+  assert.strictEqual(graphOnlyPlan[0].action, "skip");
+  assert.match(graphOnlyPlan[0].why, /no known flake/);
+
+  const record = { run_id: "11111111-2222-3333-4444-555555555556", node_id: "task-ready", gate_state: "failed", gate_escalated_to: "task-gate-acceptance-ready-x" };
+  const recordPlan = sporCli.flakeSweepPlan([record], graph, { trustedRef: "main" });
+  assert.strictEqual(recordPlan.length, 1);
+  assert.strictEqual(recordPlan[0].action, "skip");
+  assert.match(recordPlan[0].why, /no known flake/);
+});
+
 // A demo repo whose trusted suite fails naming `failing` test files until
 // lib/fixed.js exists on main — the shape of a flake that a later fix clears.
 function flakeSweepFixture({ failing, flakeStatus = "resolved", covers = ["test/flaky.test.js"] }) {

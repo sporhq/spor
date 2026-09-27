@@ -19679,8 +19679,13 @@ function escalationsOf(record) {
 function flakeSweepPlan(records, graph, { trustedRef, scope = null, isController = () => false, hasIntegration = false } = {}) {
   const covering = coveringFlakeNodes(graph);
   const plan = [];
+  // Every escalation a LOCAL run record already speaks for — whether or not
+  // it ends up actionable — so the graph-only pass below never double-reports
+  // one this box can actually re-gate.
+  const handled = new Set();
   for (const record of records) {
     if (!record || !record.run_id || !record.node_id) continue;
+    for (const esc of escalationsOf(record)) handled.add(esc);
     if (!gatesKernel.SETTLED_GATE_STATES.has(record.gate_state) || !gatesKernel.canRegateState(record.gate_state)) continue;
     if (!record.gate_escalated_to || !graphNodeOpen(graph, record.gate_escalated_to)) continue;
     const skip = (why) => plan.push({ record, action: "skip", why });
@@ -19692,9 +19697,24 @@ function flakeSweepPlan(records, graph, { trustedRef, scope = null, isController
       else skip(`empty diff, but ${main.why}`);
       continue;
     }
-    if (!Array.isArray(record.gate_failing_tests) || !record.gate_failing_tests.length) continue;
+    // The refusal's own run record is the primary source — it is what this
+    // box actually judged — but a record that predates the field, or one
+    // whose `gate_failing_tests` a caller cleared, still has its failing
+    // tests on the escalation NODE itself (`buildGateWorkNode`'s
+    // `failing_tests:`), which is graph-resident and survives even after the
+    // local run record that filed it is pruned. Fall back to it rather than
+    // silently dropping the record from consideration
+    // (task-spor-regate-flakes-read-graph-failing-tests).
+    const escNode = graph.nodes && graph.nodes[record.gate_escalated_to];
+    const failingTests =
+      Array.isArray(record.gate_failing_tests) && record.gate_failing_tests.length
+        ? record.gate_failing_tests
+        : escNode && Array.isArray(escNode.failing_tests) && escNode.failing_tests.length
+          ? escNode.failing_tests
+          : null;
+    if (!failingTests) continue;
     const attempted = (record.gate_flake_regate && record.gate_flake_regate.issues) || [];
-    const cov = gatesKernel.flakeCoverage(record.gate_failing_tests, covering, { attempted });
+    const cov = gatesKernel.flakeCoverage(failingTests, covering, { attempted });
     if (!cov.covered) {
       skip(cov.why);
       continue;
@@ -19711,6 +19731,27 @@ function flakeSweepPlan(records, graph, { trustedRef, scope = null, isController
       continue;
     }
     plan.push({ record, action: "regate", issues: cov.issues, why: cov.why });
+  }
+
+  // GRAPH-ONLY: an open escalation carrying structured `failing_tests` that no
+  // local run record speaks for at all — filed from another machine, or one
+  // whose own run record already aged out of this box's journal (escalations
+  // it exists to unblock routinely outlive the 14-day run-record retention).
+  // There is no runnable candidate here to re-gate, so even a fully-covered
+  // one can only be reported for a person, never re-gated unattended.
+  for (const n of Object.values(graph.nodes || {})) {
+    if (!n || handled.has(n.id)) continue;
+    if (!Array.isArray(n.failing_tests) || !n.failing_tests.length) continue;
+    if (!graphNodeOpen(graph, n.id)) continue;
+    if (scope && scope.size && !gatesKernel.inRepoScope(n.project, scope, graph)) continue;
+    const blocksEdge = (n.edges || []).find((e) => e && String(e.type).toLowerCase() === "blocks");
+    const itemId = blocksEdge ? blocksEdge.to : null;
+    const cov = gatesKernel.flakeCoverage(n.failing_tests, covering, {});
+    if (!cov.covered) {
+      plan.push({ escalation: n.id, itemId, action: "skip", why: cov.why });
+      continue;
+    }
+    plan.push({ escalation: n.id, itemId, action: "report", issues: cov.issues, why: cov.why });
   }
   return plan;
 }
@@ -19761,6 +19802,17 @@ async function cmdWorkRegateFlakes(cfg, values, ctx) {
   let failed = 0;
   for (const step of plan) {
     const { record } = step;
+    // GRAPH-ONLY: no local run record backs this escalation at all, so there
+    // is nothing here to re-gate — only report or leave alone.
+    if (!record) {
+      const target = `${step.escalation}${step.itemId ? ` (blocks ${step.itemId})` : ""}`;
+      if (step.action === "report") {
+        out(`work: ${target} is covered by a fixed flake (${step.issues.join(", ")}), but this box has no local run record to re-gate it from — re-gate it by hand from wherever it ran, or resolve the escalation directly`);
+      } else {
+        out(`work: left ${target} — ${step.why}`);
+      }
+      continue;
+    }
     const short = String(record.run_id).slice(0, 8);
     if (step.action === "skip") {
       out(`work: left ${record.gate_escalated_to} (run ${short}, ${record.node_id}) — ${step.why}`);
@@ -19841,7 +19893,7 @@ async function cmdWorkRegateFlakes(cfg, values, ctx) {
     });
     if (!note.ok) out(`work: the re-gate annotation for run ${short} could not be written (${note.reason || "no response"})`);
   }
-  out(`work: flake sweep — ${acted} escalation(s) retired, ${failed} attempt(s) did not clear, ${plan.filter((p) => p.action === "skip").length} left for a person`);
+  out(`work: flake sweep — ${acted} escalation(s) retired, ${failed} attempt(s) did not clear, ${plan.filter((p) => p.action === "skip" || p.action === "report").length} left for a person`);
   return failed ? 1 : 0;
 }
 
