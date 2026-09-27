@@ -153,6 +153,10 @@ spor check [--staged|--range <a..b>|--files <f...>] [--strict]   # coupling-drif
                                #   disagreement. Advisory; --strict exits 1 (CI/pre-commit). The diff is
                                #   always local git; norms are mode-aware (local nodes dir / GET /v1/export)
 spor export [--gzip] [--history|--auth] [--out <file>]   # nodes/ ustar tarball (--history: git-bundle data-exit; --auth: admin-gated restore w/ auth files — both remote-only); local build / GET /v1/export
+spor reconcile-landed [--since <ref>|--last N]   # open tasks/issues a commit REACHABLE FROM main names
+                               #   (Spor: trailer or commits: stamp) get an unlinked draft resolver +
+                               #   a confirm-close finding; never flips status. --confirm <find-…> closes
+                               #   a batch (draft merged + resolves + completion status)
 spor validate [--summary|--json]   # whole-graph lint (local nodes dir / GET /v1/export then lint locally);
                                #   --summary tallies warnings by kind (dangling edges, …) + orphans —
                                #   the post-backfill sanity read. Never triggers a gardener sweep

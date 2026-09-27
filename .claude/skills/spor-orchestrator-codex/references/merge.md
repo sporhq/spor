@@ -75,6 +75,13 @@ resume waiting for that command's result. A helper must not select more work.
    and perform a reviewed revert within existing authorization, preserving
    commits that landed later. Do not force-push, blindly move main backwards,
    or claim successful completion. Keep the task unresolved pending recovery.
+   Once green, reconcile the landed range so other open items its `Spor:`
+   trailers name get a drafted resolver and a confirm-close finding
+   (task-spor-landing-detect-shipped-resolver-draft):
+   `spor reconcile-landed --dir <merged tree> --ref main --since "$BASE"`. It
+   never flips a status; report any `filed:` finding ids for the supervisor to
+   batch-confirm (`spor reconcile-landed --confirm <ids…>`) or dismiss. A
+   failure here is not a merge failure.
 7. Verify main contains the landed SHA. Remove only this attempt's exact clean
    worktree; never `--force` past uncommitted changes or clean other agents'
    worktrees. Delete its branch only after confirming it is fully merged.

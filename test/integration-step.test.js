@@ -3190,7 +3190,7 @@ function cli(args, env) {
 // a factory definition. Mirrors gate-pipeline.test.js's cliFixture, scoped
 // down to what the integration end-to-end tests need: one command gate, and
 // (when `integration` is passed) an integration block riding beside it.
-function integrationCliFixture({ integration = null, implementation = null, completion = null } = {}) {
+function integrationCliFixture({ integration = null, implementation = null, completion = null, trailer = null } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-home-"));
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
@@ -3236,7 +3236,7 @@ process.stdin.on("end", () => {
   // must not re-add a file that's already there.
   if (!prompt.includes("refused to land") && !fs.existsSync(cwd + "/lib/sub.js")) {
     fs.writeFileSync(cwd + "/lib/sub.js", "module.exports = (a, b) => a - b;\\n");
-    cp.execSync('git add -A && git -c user.email=t@t -c user.name=Test commit -qm "add subtract"', { cwd });
+    cp.execSync('git add -A && git -c user.email=t@t -c user.name=Test commit -qm "add subtract"${trailer ? ` -m "Spor: ${trailer}"` : ""}', { cwd });
   }
   fs.appendFileSync(process.env.OUTFILE, JSON.stringify({ cwd, prompt }) + "\\n");
   process.stdout.write(JSON.stringify({ kind: "message", message: { text: "fake worker report" } }) + "\\n");
@@ -3259,6 +3259,35 @@ process.stdin.on("end", () => {
   );
   return { home, repo, nodes, outfile };
 }
+
+// task-spor-landing-detect-shipped-resolver-draft: the merge path reconciles
+// the landed range — an OTHER open item a landed commit's `Spor:` trailer
+// names gets a draft resolver + a confirm-close finding right after the land,
+// and nothing is closed automatically.
+test("end to end, local mode: a landed commit's trailer naming another open item drafts its resolver and files a confirm-close finding", () => {
+  const { home, repo, nodes, outfile } = integrationCliFixture({ integration: { mode: "local", command: `"${process.execPath}" test/acceptance.js`, strategy: "merge" }, trailer: "task-drive-by" });
+  fs.writeFileSync(path.join(nodes, "task-drive-by.md"), "---\nid: task-drive-by\ntype: task\nrepo: demo\ntitle: A drive-by fix\nsummary: Another open item the implementer's commit also fixes.\nstatus: open\ndate: 2026-08-26\n---\n\nBody.\n");
+  const r = cli(["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--worktree", "--factory", "factory-demo"], {
+    SPOR_HOME: home,
+    XDG_CONFIG_HOME: home,
+    OUTFILE: outfile,
+    PATH: pathWithOnlyGitAndNode(),
+  });
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, /integration landed on main/);
+  assert.match(r.stdout, /reconcile-landed filed 1 confirm-close finding\(s\).*find-shipped-on-main-task-drive-by/);
+  const md = fs.readFileSync(path.join(nodes, "find-shipped-on-main-task-drive-by.md"), "utf8");
+  const landed = git(repo, "rev-parse", "main").trim();
+  const trailered = git(repo, "log", "--format=%H", "--grep=Spor: task-drive-by", "main").trim();
+  assert.match(trailered, /^[0-9a-f]{40}$/);
+  assert.ok(md.includes(`demo@${trailered}`), "the finding names the landed commit, repo-qualified");
+  assert.ok(md.includes(`\`git merge-base --is-ancestor <sha> main\` passed`), "and the reachability check");
+  assert.ok(md.includes(landed.slice(0, 12)), "and the tip it was checked against");
+  const draft = fs.readFileSync(path.join(nodes, "art-shipped-task-drive-by.md"), "utf8");
+  assert.match(draft, /^status: in-review$/m);
+  assert.doesNotMatch(draft, /type: resolves/);
+  assert.match(fs.readFileSync(path.join(nodes, "task-drive-by.md"), "utf8"), /^status: open$/m, "never closed automatically");
+});
 
 test("end to end, local mode: after its gate passes, the integration stage lands the candidate on local main, and cleans up", () => {
   const { home, repo, nodes, outfile } = integrationCliFixture({ integration: { mode: "local", command: `"${process.execPath}" test/acceptance.js`, strategy: "merge" } });

@@ -2041,6 +2041,314 @@ async function cmdBlame(cfg, { positionals, values }) {
   return 0;
 }
 
+// --- spor reconcile-landed: detect landed work, draft its resolver ----------
+// (task-spor-landing-detect-shipped-resolver-draft) An open task/issue named
+// by a commit that is REACHABLE FROM the trunk ref — through a `Spor:` trailer
+// or a `commits:` stamp — gets an UNLINKED draft resolver (`art-shipped-*`,
+// status in-review, no resolves edge) and a `find-shipped-on-main-*` finding
+// asking a person to confirm the close. Terminal status is never flipped here
+// (dec-spor-gardener-reversible-auto-write-class); `--confirm <finding…>` is
+// the explicit, batch door that does it. The pure half is lib/kernel/landed.js,
+// the git half lib/shell/landed.js; this is the graph load + the writes, shared
+// by the verb and by the integration stage's post-land hook
+// (reconcileAfterLand). Writes are `if_exists: skip` on deterministic ids, so a
+// re-run over the same range files nothing new.
+const landedKernel = require(path.join(ROOT, "lib", "kernel", "landed.js"));
+const landedShell = require(path.join(ROOT, "lib", "shell", "landed.js"));
+const landedHash = (s) => crypto.createHash("sha1").update(String(s)).digest("hex");
+
+// The graph to judge liveness against: the local nodes dir, or the team graph
+// via GET /v1/export (the documented graph-wide sweep, as `spor query` does).
+// -> {graph, cleanup} | {error}
+async function loadLandedGraph(cfg, exportOpts = {}) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  if (cfg.mode() === "remote") {
+    const fetched = await fetchRemoteExportNodes(cfg, "reconcile-landed", exportOpts);
+    if (fetched.error) return { error: "could not fetch the team graph" };
+    try {
+      return { graph: graphLib.loadGraph(fetched.nodesDir), cleanup: fetched.cleanup };
+    } catch (e) {
+      fetched.cleanup();
+      return { error: `could not load the team graph: ${e.message}` };
+    }
+  }
+  const nodesDir = cfg.nodesDir();
+  if (!fs.existsSync(nodesDir)) return { error: `no Spor graph at ${nodesDir} — run 'spor init', or set SPOR_SERVER for a team graph.` };
+  try {
+    return { graph: graphLib.loadGraph(nodesDir), cleanup: () => {} };
+  } catch (e) {
+    return { error: `could not load the graph: ${e.message}` };
+  }
+}
+
+// Write complete node markdown with `if_exists: skip`, through the same
+// validated doors `spor put-node` uses. -> [{id, ok, status, message?}]
+async function putNodesSkip(cfg, raws) {
+  const nodes = [];
+  for (const raw of raws) {
+    const parsed = parsePutNode(raw, "reconcile-landed.md");
+    if (parsed.error) throw new Error(`reconcile-landed rendered an invalid node: ${parsed.error}`);
+    nodes.push({ raw, node: parsed.node });
+  }
+  if (!nodes.length) return [];
+  if (cfg.mode() === "remote") {
+    const results = [];
+    for (const chunk of chunkPutEntries(nodes.map((n) => ({ node: n.raw, if_exists: "skip" })))) {
+      const batch = nodes.slice(results.length, results.length + chunk.length);
+      const r = await remote.post(cfg, "/v1/nodes", { nodes: chunk }, { timeoutMs: Math.min(120000, 15000 + 1000 * chunk.length) });
+      const rs = r.json && Array.isArray(r.json.results) ? r.json.results : null;
+      batch.forEach((n, i) => {
+        const res = rs && rs[i];
+        if (res && res.ok) results.push({ id: n.node.id, ok: true, status: res.status || "ok" });
+        else results.push({ id: n.node.id, ok: false, status: "error", message: r.transport ? `offline (${r.error})` : `${r.status}${res ? `: ${putNodeEntryDetail(res)}` : ""}` });
+      });
+    }
+    return results;
+  }
+  const nodesDir = cfg.nodesDir();
+  let identity;
+  const stampIdentity = () => (identity ??= gitIdentity(path.dirname(nodesDir)));
+  const prepared = nodes.map((n) => ({ n, p: preparePutNodeLocal(nodesDir, n.raw, n.node, "skip", null, stampIdentity) }));
+  const writes = prepared.filter(({ p }) => p.ok && !p.skip).map(({ p }) => p);
+  const v = writes.length ? validatePutNodeBatchLocal(nodesDir, writes) : { errors: new Map(), graphErrors: [], warnings: new Map() };
+  const refused = prepared.some(({ p }) => !p.ok) || v.errors.size || v.graphErrors.length;
+  return prepared.map(({ n, p }) => {
+    const id = n.node.id;
+    if (!p.ok) return { id, ok: false, status: "error", message: p.error };
+    if (p.skip) return { id, ok: true, status: "skipped" };
+    if (v.errors.has(id)) return { id, ok: false, status: "error", message: v.errors.get(id).join("; ") };
+    if (refused) return { id, ok: false, status: "error", message: `not written — the batch was refused${v.graphErrors.length ? ` (${v.graphErrors.join("; ")})` : ""}` };
+    const w = writePreparedPutNode(p, []);
+    return { id, ok: true, status: w.status };
+  });
+}
+
+// The shared core: scan one checkout, plan against the graph, write (unless
+// dryRun). -> {ok, repo, ref, tip, since, hits: [{id, findingId, draftId,
+// commits, finding, draft}], skipped, unverified} | {ok:false, error}
+async function reconcileLanded(cfg, { dir, ref = null, tip = null, since = null, last = landedShell.DEFAULT_LAST, dryRun = false, exclude = [], exportOpts = {} }) {
+  const top = (git(dir, ["rev-parse", "--show-toplevel"]).stdout || "").trim();
+  if (!top) return { ok: false, error: `${dir} is not inside a git checkout` };
+  const repo = u.projectSlug(top);
+  const loaded = await loadLandedGraph(cfg, exportOpts);
+  if (loaded.error) return { ok: false, error: loaded.error };
+  try {
+    const { graph } = loaded;
+    const got = landedShell.collect({ kernel: landedKernel, graph, dir: top, repo, ref, tip, since, last });
+    if (got.error) return { ok: false, error: got.error };
+    const { hits, skipped } = landedKernel.plan({ graph, repo, trailered: got.trailered, stamped: got.stamped, exclude });
+    const date = new Date().toISOString().slice(0, 10);
+    const check = { ref: got.ref, tip: got.tip };
+    const rendered = hits.map((h) => ({
+      h,
+      r: landedKernel.render(h, { repo, check, date, hash: landedHash, completion: graph.registry && graph.registry.completionStatus(h.node.type) }),
+    }));
+    // Draft first, then its finding: a finding never names a draft that did
+    // not land.
+    const results = dryRun ? [] : await putNodesSkip(cfg, rendered.flatMap(({ r }) => [r.draft, r.finding]));
+    const byId = new Map(results.map((x) => [x.id, x]));
+    return {
+      ok: !results.some((x) => !x.ok),
+      repo, ref: got.ref, tip: got.tip, since: got.since,
+      hits: rendered.map(({ h, r }) => ({
+        id: h.id, findingId: r.findingId, draftId: r.draftId,
+        commits: h.commits.map((c) => ({ sha: c.sha, subject: c.subject, source: c.source })),
+        draft: dryRun ? { status: "planned" } : byId.get(r.draftId),
+        finding: dryRun ? { status: "planned" } : byId.get(r.findingId),
+      })),
+      skipped, unverified: got.unverified,
+    };
+  } finally {
+    loaded.cleanup();
+  }
+}
+
+// --confirm: for each `find-shipped-on-main-*` finding, promote its draft
+// (in-review -> merged, so it becomes a live resolver), add `resolves` to the
+// subject, set the subject to its type's completion status, and resolve the
+// finding — each step through the ordinary validated doors, in that order so
+// the completion gate sees a live resolver. The graph is read ONCE per batch
+// and judged the way a scan judges it: a subject a person has since closed,
+// abandoned, superseded or handed to a factory hold is refused ("dismiss the
+// finding"), never re-closed over their decision, and the completion status
+// comes from THIS graph's registry. One call confirms a whole batch; a failure
+// on one finding never aborts the rest.
+async function confirmLanded(cfg, ids, { json }) {
+  const loaded = await loadLandedGraph(cfg);
+  if (loaded.error) {
+    err(`reconcile-landed: ${loaded.error}`);
+    return 1;
+  }
+  const results = [];
+  const quiet = async (fn) => {
+    const saved = { out: process.stdout.write, err: process.stderr.write };
+    const lines = [];
+    process.stdout.write = (s) => (lines.push(String(s)), true);
+    process.stderr.write = (s) => (lines.push(String(s)), true);
+    try {
+      return { code: await fn(), lines };
+    } catch (e) {
+      return { code: 1, lines: [...lines, e && e.message ? e.message : String(e)] };
+    } finally {
+      process.stdout.write = saved.out;
+      process.stderr.write = saved.err;
+    }
+  };
+  try {
+    const { graph } = loaded;
+    const resolved = resolution.resolutionMap(graph);
+    for (const id of ids) {
+      const finding = graph.nodes[id];
+      if (!finding) {
+        results.push({ id, ok: false, error: "no such node" });
+        continue;
+      }
+      const t = landedKernel.confirmTargets(finding, landedHash);
+      if (t.error) {
+        results.push({ id, ok: false, error: t.error });
+        continue;
+      }
+      const status = String(finding.status || "open").toLowerCase();
+      if (status !== "open") {
+        results.push({ id, ok: false, subject: t.subject, error: `finding is '${status}', not open — nothing to confirm` });
+        continue;
+      }
+      if (!graph.nodes[t.draft]) {
+        results.push({ id, ok: false, subject: t.subject, error: `its draft ${t.draft} is missing — re-run the scan` });
+        continue;
+      }
+      const subj = graph.nodes[t.subject];
+      // Resuming a confirm that half-ran (the draft is already this subject's
+      // live resolver) is not "closed by someone else": finish its steps.
+      const resuming = !!(resolved[t.subject] && resolved[t.subject].by === t.draft);
+      const why = resuming ? null : landedKernel.skipReason(graph, subj, resolved);
+      if (why) {
+        results.push({ id, ok: false, subject: t.subject, error: `subject is ${why === "unknown" ? "missing" : why} — nothing to close; dismiss the finding` });
+        continue;
+      }
+      const completion = graph.registry && graph.registry.completionStatus(subj.type);
+      if (!completion) {
+        results.push({ id, ok: false, subject: t.subject, error: `a '${subj.type}' has no completion status to confirm` });
+        continue;
+      }
+      const steps = [
+        ...(resuming ? [] : [
+          ["draft merged", () => cmdSetStatus(cfg, { positionals: [t.draft, "merged"] })],
+          ["resolves edge", () => cmdEdge(cfg, { values: {}, positionals: [t.draft, "resolves", t.subject] })],
+        ]),
+        ...(String(subj.status || "").toLowerCase() === completion ? [] : [[`subject ${completion}`, () => cmdSetStatus(cfg, { positionals: [t.subject, completion] })]]),
+        ["finding resolved", () => cmdSetStatus(cfg, { positionals: [id, "resolved"] })],
+      ];
+      let failed = null;
+      const done = [];
+      for (const [label, fn] of steps) {
+        const r = await quiet(fn);
+        if (r.code !== 0) {
+          failed = `${label}: ${r.lines.join("").trim().split("\n").filter(Boolean).slice(0, 3).join(" / ") || "failed"}`;
+          break;
+        }
+        done.push(label);
+      }
+      results.push(failed ? { id, ok: false, subject: t.subject, draft: t.draft, done, error: failed } : { id, ok: true, subject: t.subject, draft: t.draft, status: completion });
+    }
+  } finally {
+    loaded.cleanup();
+  }
+  if (json) out(JSON.stringify({ confirmed: results }, null, 2));
+  else {
+    for (const r of results) {
+      if (r.ok) out(`confirmed: ${r.id} — ${r.draft} resolves ${r.subject} (${r.status})`);
+      else err(`not confirmed: ${r.id}${r.subject ? ` (${r.subject})` : ""} — ${r.error}${r.done && r.done.length ? ` [done: ${r.done.join(", ")}]` : ""}`);
+    }
+    out(`reconcile-landed confirm: ${results.filter((r) => r.ok).length}/${results.length} confirmed`);
+    out(writeTargetLine(cfg));
+  }
+  return results.every((r) => r.ok) ? 0 : 1;
+}
+
+async function cmdReconcileLanded(cfg, { values, positionals }) {
+  if (values.confirm) {
+    if (!positionals.length) {
+      err("usage: spor reconcile-landed --confirm <find-shipped-on-main-…> [<more>…]");
+      return 1;
+    }
+    return confirmLanded(cfg, positionals, { json: !!values.json });
+  }
+  if (positionals.length) {
+    err(`unexpected argument '${positionals[0]}' — finding ids go with --confirm`);
+    return 1;
+  }
+  let last = landedShell.DEFAULT_LAST;
+  if (values.last != null) {
+    last = Number(values.last);
+    if (!Number.isInteger(last) || last < 1) {
+      err(`bad --last '${values.last}' — a positive whole number of commits`);
+      return 1;
+    }
+    if (values.since) {
+      err("--last and --since are exclusive: --since bounds the range itself");
+      return 1;
+    }
+  }
+  const res = await reconcileLanded(cfg, {
+    dir: values.dir ? path.resolve(values.dir) : process.cwd(),
+    ref: values.ref || null, since: values.since || null, last, dryRun: !!values["dry-run"],
+  });
+  if (res.error) {
+    err(`reconcile-landed: ${res.error}`);
+    return 1;
+  }
+  if (values.json) {
+    out(JSON.stringify(res, null, 2));
+    return res.ok ? 0 : 1;
+  }
+  const range = res.since ? `${res.since.slice(0, 12)}..${res.ref}` : `the last ${last} commits of ${res.ref}`;
+  out(`reconcile-landed ${res.repo}: scanned ${range} (${res.ref} at ${res.tip.slice(0, 12)})`);
+  for (const h of res.hits) {
+    const verb = values["dry-run"] ? "would file" : !(h.finding && h.finding.ok) || !(h.draft && h.draft.ok) ? "FAILED" : h.finding.status === "created" ? "filed" : "already filed";
+    out(`  ${verb}: ${h.findingId}  (${h.commits.map((c) => c.sha.slice(0, 12)).join(", ")})`);
+    for (const x of [h.draft, h.finding]) if (x && x.ok === false) err(`    error: ${x.id}: ${x.message}`);
+  }
+  const ungated = res.unverified.filter((x) => x.reason === "git-error");
+  if (ungated.length) err(`  note: git could not judge ${ungated.length} commit(s) — not filed: ${ungated.map((x) => x.sha.slice(0, 12)).join(", ")}`);
+  const created = res.hits.filter((h) => h.finding && h.finding.status === "created").length;
+  const failed = res.hits.filter((h) => !(h.finding && h.finding.ok) || !(h.draft && h.draft.ok)).length;
+  out(values["dry-run"]
+    ? `${res.hits.length} open item(s) shipped on ${res.ref} (dry run — nothing written)`
+    : `${created} new finding(s), ${res.hits.length - created - failed} already filed${failed ? `, ${failed} FAILED` : ""}; confirm with: spor reconcile-landed --confirm <finding ids…>`);
+  if (!values["dry-run"]) out(writeTargetLine(cfg));
+  return res.ok ? 0 : 1;
+}
+
+// The integration stage's post-land hook: after a candidate LANDS on the
+// target ref, reconcile exactly the landed range (pre-land tip .. landed sha)
+// so any other open item those commits name gets its draft + finding now.
+// Fail-open — a land has already happened and must never read as failed
+// because this bookkeeping could not run. `log` is the work loop's logger.
+async function reconcileAfterLand(cfg, { dir, ref, targetSha, landedSha, itemId = null, log }) {
+  if (!dir || !landedSha) return null;
+  try {
+    // The run's own item is the runner's to complete (its completion write
+    // may still be owed), never a confirm-close candidate. Its graph read is
+    // bounded and reports into the work loop's log, not bare stderr.
+    const res = await reconcileLanded(cfg, {
+      dir, ref, tip: landedSha, since: targetSha || null, exclude: itemId ? [itemId] : [],
+      exportOpts: { timeoutMs: 30000, report: (m) => log(`work: reconcile-landed: ${m}`) },
+    });
+    if (res.error) {
+      log(`work: reconcile-landed after the land on ${ref} could not run (${res.error})`);
+      return null;
+    }
+    const created = res.hits.filter((h) => h.finding && h.finding.status === "created");
+    if (created.length) log(`work: reconcile-landed filed ${created.length} confirm-close finding(s) for open items the landed commits name: ${created.map((h) => h.findingId).join(", ")}`);
+    for (const h of res.hits) for (const x of [h.draft, h.finding]) if (x && x.ok === false) log(`work: reconcile-landed could not write ${x.id} (${x.message})`);
+    return res;
+  } catch (e) {
+    log(`work: reconcile-landed after the land on ${ref} threw (${e.message})`);
+    return null;
+  }
+}
+
 // --- spor history: per-node git-log lineage --------------------------------
 // (task-spor-history-cli-verb) The shell front-door for a single node's commit
 // history — every revision's actor, time, and what changed — as a `git log`
@@ -2707,8 +3015,9 @@ async function queryRemote(cfg, args) {
 // gunzip on the magic bytes so an older plain-tar server still works. Returns
 // {nodesDir, cleanup} on success, or {error:true} after printing a `<label>
 // error …` line (the fail-clean contract). The caller MUST call cleanup().
-async function fetchRemoteExportNodes(cfg, label) {
-  const r = await remote.download(cfg, "/v1/export?gzip=1", { timeoutMs: 120000 });
+async function fetchRemoteExportNodes(cfg, label, { report = err, timeoutMs = 120000 } = {}) {
+  const err = report; // callers that own their output (a work-loop hook) route these lines to their log
+  const r = await remote.download(cfg, "/v1/export?gzip=1", { timeoutMs });
   if (r.transport) {
     err(`offline — could not reach server (${r.error})`);
     return { error: true };
@@ -17951,6 +18260,15 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       if (again.state === "passed" && again.head !== head) ctx.log(`work: the re-gate of ${item.node_id} judged ${String(again.head || "an unknown head").slice(0, 12)}, not the moved head ${String(head).slice(0, 12)}`);
       return again;
     };
+  // The code repo the land moves, resolved BEFORE the stage: its
+  // cleanupImplementer removes the dispatch worktree record.cwd names, and the
+  // post-land reconcile below reads the main checkout that outlives it.
+  const landRepoDir = (() => {
+    const dir = record && record.cwd;
+    if (!dir) return null;
+    const common = (git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout || "").trim();
+    return common ? path.dirname(common) : null;
+  })();
   intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null, deps: makeIntegrationDeps(cfg, { ...intCtx, gateResult: () => gateResult, regate }) });
   const intState = completionKernel.INTEGRATION_STATES.includes(intResult.state) ? intResult.state : intResult.state === "passed" ? "landed" : "failed";
   const allFacts = [...gateFacts, ...(intResult.facts || [])];
@@ -17964,6 +18282,15 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   if (controller && boundary === "integration" && intState === "landed") {
     const written = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: makeCompletionDeps(cfg, { home, runId: entry.run_id, execution: executionCompletionDeps(reporter) }), log: ctx.log, facts: allFacts, boundary: "integration" });
     if (!written.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the integration boundary (${written.reason}); the debt stands and the next pass retries it`);
+  }
+  // Landed work detection (task-spor-landing-detect-shipped-resolver-draft):
+  // the landed range may carry `Spor:` trailers naming OTHER open items — a
+  // drive-by fix, a follow-up folded in — so each gets a draft resolver and a
+  // confirm-close finding now, never an automatic close. This run's own item
+  // is excluded — its completion is the runner's (written above, or still
+  // owed). Fail-open.
+  if (intState === "landed" && cfg.getBool("work.reconcileLanded", true)) {
+    await reconcileAfterLand(cfg, { dir: landRepoDir, ref: intResult.target_ref, targetSha: intResult.target_sha, landedSha: intResult.landed_sha, itemId: entry.node_id, log: ctx.log });
   }
   if (intCtx.completedBeforeIntegration && intResult.state !== "passed" && intResult.state !== "parked") {
     return leave({ ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: allFacts, demoted: false, demote_reason: null, reason: `${intResult.reason || intResult.state} (the item was completed at the 'gates' boundary and stays completed; the landing is a person's to finish)` });
@@ -21497,6 +21824,46 @@ const COMMANDS = {
     },
     examples: ["spor blame b384469", "spor commits b384469 --repo spor", "spor blame b384469 --json"],
     run: (cfg, p) => cmdBlame(cfg, p),
+  },
+  "reconcile-landed": {
+    group: "Graph", parse: "strict", args: "[--since <ref> | --last N] [--ref <ref>] | --confirm <finding…>",
+    summary: "draft resolvers + confirm-close findings for open items whose commits are on main",
+    help:
+      "Detect landed work: an open task/issue named by a commit that is REACHABLE\n" +
+      "FROM the trunk ref — through a `Spor: <id>` trailer, or a `commits:` stamp for\n" +
+      "this repo — gets an unlinked DRAFT resolver (art-shipped-<id>: status in-review,\n" +
+      "a `mentions` edge, never `resolves`) and a finding (find-shipped-on-main-<id>)\n" +
+      "naming the sha(s), the repo, and the reachability check each passed:\n" +
+      "`git merge-base --is-ancestor <sha> <ref>`. A commit that exists only on a\n" +
+      "branch never files anything. Terminal status is NEVER flipped by a scan.\n\n" +
+      "Range: --since <ref> scans <ref>..tip (what the integration stage runs after a\n" +
+      "land); otherwise the last --last N commits of the ref (default 200) — the\n" +
+      "catch-up over history. `commits:` stamps are judged against the whole ref\n" +
+      "(with --since, only stamps that landed inside the range). --ref picks the\n" +
+      "trunk (default: the first of main, master, origin/main, origin/master that\n" +
+      "resolves); --dir the checkout (default: cwd). Ids are deterministic and the\n" +
+      "writes are if-exists skip, so re-running over the same range files nothing.\n\n" +
+      "Confirm (batch — every id in one call): --confirm <finding ids…> marks each\n" +
+      "draft merged, adds `resolves` to the item, sets the item's completion status\n" +
+      "(task done, issue resolved) and resolves the finding, through the ordinary\n" +
+      "validated doors. If a commit only relates to the item, set the finding\n" +
+      "`dismissed` instead; the draft stays inert. Mode-aware: local reads/writes\n" +
+      "the graph home; remote judges against GET /v1/export and writes /v1/nodes.",
+    options: {
+      since: { type: "string", value: "ref", desc: "scan <ref>..tip instead of the last N commits" },
+      last: { type: "string", value: "N", desc: "scan the last N commits of the ref (default 200)" },
+      ref: { type: "string", value: "ref", desc: "the trunk ref commits must be reachable from (default main/master)" },
+      dir: { type: "string", value: "path", desc: "the code checkout to scan (default: cwd)" },
+      "dry-run": { type: "boolean", desc: "report what would be filed; write nothing" },
+      confirm: { type: "boolean", desc: "confirm the close for the finding ids given as arguments" },
+      json: { type: "boolean", desc: "machine-readable JSON output" },
+    },
+    examples: [
+      "spor reconcile-landed --last 500",
+      "spor reconcile-landed --since HEAD~20 --dry-run",
+      "spor reconcile-landed --confirm find-shipped-on-main-task-x find-shipped-on-main-issue-y",
+    ],
+    run: (cfg, p) => cmdReconcileLanded(cfg, p),
   },
   history: {
     group: "Graph", parse: "strict", args: "<id> [<sha>] [--limit N]",

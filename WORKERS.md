@@ -2747,6 +2747,27 @@ stage's own escalation, closed over the `art-merge-…` fact by the same
 `art-gate-retry-…` artifact), and `spor work --regate <run-id>` — which
 re-runs the gates AND this stage off the run record — once it gives up.
 
+**A landing reconciles the landed range** (task-spor-landing-detect-shipped-resolver-draft).
+The commits a candidate puts on the target ref may carry `Spor: <id>`
+trailers naming OTHER open items — a drive-by fix, a folded-in follow-up —
+and nothing else would ever write their resolver. So once a `landed` verdict
+is settled (after the completion write, so this run's own item already reads
+closed), the runner runs the `spor reconcile-landed` core over exactly
+`target_sha..landed_sha` in the code checkout: each open task/issue a commit
+in that range names — or whose `commits:` stamp landed in it — gets an
+UNLINKED draft resolver (`art-shipped-<id>`, status `in-review`, a `mentions`
+edge, never `resolves`) and a `find-shipped-on-main-<id>` finding naming the
+sha, the repo and the `git merge-base --is-ancestor` check it passed. It
+never flips a status (dec-spor-gardener-reversible-auto-write-class keeps
+terminal status human); a person confirms in one batch call with `spor
+reconcile-landed --confirm <finding ids…>`, which promotes the draft to
+`merged`, adds the `resolves` edge, sets the item's completion status and
+resolves the finding. Fail-open — a landing never reads as failed because
+this bookkeeping could not run; `work.reconcileLanded: false`
+(`SPOR_WORK_RECONCILE_LANDED=0`) turns it off. Propose mode does not run it
+(the PR merges outside the runner); run the verb over the merged range, or
+the catch-up form (`spor reconcile-landed --last <N>`) over history.
+
 **Cleanup runs on a landing OR a proposal.** The candidate worktree is always
 removed, win or lose (it is throwaway by construction); the implementer's own
 dispatch worktree and branch are removed once their work has either actually
