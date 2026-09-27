@@ -4867,6 +4867,20 @@ test("spor attestation verify: binds a PR body to the graph artifact, verifies t
   assert.strictEqual(cli(["attestation", "verify", "--pr-body", prFile, "--max-age", "1ms"], env).status, 1);
   assert.match(cli(["attestation", "verify", "--pr-body", prFile, "--commit", "other"], env).stdout, /FAIL {2}commit/);
   assert.match(cli(["attestation", "verify", "--pr-body", prFile, "--factory-digest", "sha256:9999"], env).stdout, /FAIL {2}config/);
+  // `--factory <id>` reuses loadFactoryDefinition, which resolves the id
+  // through the SAME resolveNode as every other door — so the guard now
+  // living inside resolveNode itself (issue-spor-resolvenode-guard-at-source)
+  // catches a traversal id here too, refusing before the file it names
+  // outside nodes/ is ever read.
+  const outsideFactory = path.join(home, "x.md");
+  const outsideFactoryMd = "---\nid: ../x\ntype: factory\ntitle: Outside factory\nsummary: A markdown file outside the nodes dir.\ndate: 2026-08-26\n---\n```json\n{}\n```\n";
+  fs.writeFileSync(outsideFactory, outsideFactoryMd);
+  const traversal = cli(["attestation", "verify", "--pr-body", prFile, "--factory", "../x"], env);
+  assert.strictEqual(traversal.status, 1, traversal.stdout);
+  assert.match(traversal.stdout, /FAIL {2}config/);
+  assert.match(traversal.stdout, /the factory '\.\.\/x' could not be loaded to compare against.*could not be read from the graph/);
+  assert.doesNotMatch(traversal.stdout, /Outside factory/);
+  assert.strictEqual(fs.readFileSync(outsideFactory, "utf8"), outsideFactoryMd, "the traversal target itself is untouched");
   fs.writeFileSync(path.join(home, "prose.md"), "no attestation here");
   assert.match(cli(["attestation", "verify", "--pr-body", path.join(home, "prose.md")], env).stdout, /FAIL {2}schema/);
   assert.match(cli(["attestation", "verify", "--pr-body", prFile, "--max-age", "soon"], env).stderr, /not a duration/);

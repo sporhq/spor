@@ -3177,6 +3177,42 @@ test("a factory id that is not a factory node says so, and points at the candida
   assert.match(missing.stderr, /could not be read from the graph/);
 });
 
+// issue-spor-resolvenode-guard-at-source: --factory and work.factory (the
+// latter settable by a repo-committed .spor.json — not in REPO_FORBIDDEN_PATHS,
+// since a repo naming its own factory is legitimate) both feed
+// loadFactoryDefinition, which resolves the id through resolveNode like every
+// other door. The guard now lives INSIDE resolveNode itself, so a traversal id
+// is refused before either caller's local nodes/<id>.md read ever happens —
+// proven here by planting a real file at the resolved traversal target and
+// checking it is never read.
+test("spor work --factory ../x: refuses the traversal id before any file outside nodes/ is read", () => {
+  const { home } = cliFixture();
+  const outside = path.join(home, "x.md");
+  const outsideMd = "---\nid: ../x\ntype: factory\ntitle: Outside factory\nsummary: A markdown file outside the nodes dir.\ndate: 2026-08-26\n---\n```json\n{}\n```\n";
+  fs.writeFileSync(outside, outsideMd);
+  const r = cli(["work", "--once", "--factory", "../x"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() });
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.match(r.stderr, /the factory definition '\.\.\/x' cannot be used/);
+  assert.match(r.stderr, /could not be read from the graph/);
+  assert.doesNotMatch(r.stdout, /Outside factory/);
+  assert.strictEqual(fs.readFileSync(outside, "utf8"), outsideMd, "the traversal target itself is untouched");
+});
+
+test("a repo .spor.json's work.factory pointing outside nodes/ is refused the same way, not exempted via REPO_FORBIDDEN_PATHS", () => {
+  const { home } = cliFixture();
+  const outside = path.join(home, "x.md");
+  const outsideMd = "---\nid: ../x\ntype: factory\ntitle: Outside factory\nsummary: A markdown file outside the nodes dir.\ndate: 2026-08-26\n---\n```json\n{}\n```\n";
+  fs.writeFileSync(outside, outsideMd);
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-factory-repo-"));
+  fs.writeFileSync(path.join(repoDir, ".spor.json"), `${JSON.stringify({ enabled: true, work: { factory: "../x" } }, null, 2)}\n`);
+  const r = cli(["work", "--once"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() }, repoDir);
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.match(r.stderr, /the factory definition '\.\.\/x' cannot be used/);
+  assert.match(r.stderr, /could not be read from the graph/);
+  assert.doesNotMatch(r.stdout, /Outside factory/);
+  assert.strictEqual(fs.readFileSync(outside, "utf8"), outsideMd, "the traversal target itself is untouched");
+});
+
 // task-spor-agent-review-gate-satisfiability-precheck, then task-spor-work-
 // honor-claude-launch-mode-and-retire-native-precheck: an agent-review gate's
 // verdict is read off the dispatched run's own final report, which only a

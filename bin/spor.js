@@ -4993,9 +4993,14 @@ const NODE_ID_RE = /^[a-z0-9][a-z0-9-]*$/; // mirrors the server's ID_RE/SLUG_RE
 // well-formed id. `spor dispatch --node`/`--from-queue` (cmdDispatch, above
 // resolveNode) and `spor history` (cmdHistory, via lib/history.js's isNodeId
 // twin of this same grammar) are guarded too
-// (issue-spor-node-id-guard-remaining-read-paths); resolveNode's other
-// callers are internal, graph-sourced ids (factory/profile/fact ids, queue
-// records) and are intentionally left unguarded here.
+// (issue-spor-node-id-guard-remaining-read-paths). resolveNode itself now
+// runs this same check before either its local or remote branch runs at all
+// (issue-spor-resolvenode-guard-at-source), so every OTHER caller — notably
+// loadFactoryDefinition's --factory/work.factory, which a repo-committed
+// .spor.json can set — inherits the guard whether or not it checks first.
+// These per-command doors keep their own check anyway, purely so their
+// refusal names their own flag/verb instead of the generic message
+// resolveNode would otherwise surface.
 function badNodeIdReason(id) {
   return NODE_ID_RE.test(String(id)) ? null : `bad node id '${id}' — expected kebab-case`;
 }
@@ -8703,6 +8708,21 @@ function nodeUnreadable(node) {
 // never returns the marker.
 async function resolveNode(cfg, id, out = null) {
   if (out) out.unreadable = false;
+  // Guard the node id itself, at the source, before either branch below
+  // builds a filesystem path or a URL from it (issue-spor-resolvenode-guard-
+  // at-source): a caller-supplied id that isn't well-formed kebab-case can
+  // never name a real node, so refuse it here rather than relying on every
+  // caller to check first. This is what closes --factory/work.factory (a
+  // repo-committed .spor.json can set the latter) — loadFactoryDefinition
+  // just calls resolveNode like everything else. A malformed id reads the
+  // same as "no such node" (local: ENOENT; remote: 404) rather than the
+  // distinguished unreadable marker, since the read never happens at all —
+  // there is nothing ambiguous to flag as a failed attempt. Per-command
+  // callers (cmdGet, cmdDispatch --node, spor attestation verify, ...) keep
+  // their own check ahead of this one for a message naming their own flag;
+  // graph-sourced callers (factory/gate refs, profile/fact ids, queue
+  // records) already mint canonical ids, so this never rejects them.
+  if (badNodeIdReason(id)) return null;
   let raw = "";
   // The server's get(node) hook attaches read-time enrichment as additive
   // top-level keys (API.md §3): `resolution` is the live inbound resolves/answers
