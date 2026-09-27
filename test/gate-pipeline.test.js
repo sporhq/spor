@@ -2004,6 +2004,46 @@ test("a stop marks its abandoned pipelines INTERRUPTED — the state the next wo
   assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"]);
 });
 
+test("a pipeline that REPORTS interrupted on a stop keeps its slot, so the next worker can resume it (F1)", async () => {
+  // The outage backoff answers a stop by returning `interrupted` rather than
+  // hanging — so, unlike an abandoned pipeline, it HAS a result by the time
+  // the loop folds verdicts. Folding it like a verdict would drop the slot,
+  // and orphanedGateRuns joins a dead worker's slot to an unsettled record:
+  // with no slot, the un-judged run could never be resumed.
+  const marks = [];
+  const logs = [];
+  const state = { clock: 1_700_000_000_000, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  const deps = {
+    now: () => state.clock,
+    log: (l) => logs.push(l),
+    publish: () => {},
+    candidates: async () => [{ id: "task-a", readiness: "agent" }],
+    dispatch: async () => ({ ok: true, run: { run_id: "run-1", harness: "fake" } }),
+    pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true } })),
+    gate: async () => {
+      control.stopping = true;
+      return { state: "interrupted", reason: "the worker was asked to stop while gate review was waiting out an outage" };
+    },
+    markGate: (runId, patch) => marks.push({ run_id: runId, ...patch }),
+    sleep: async (ms) => {
+      state.clock += ms;
+      await new Promise((r) => setImmediate(r));
+      if ((state.ticks += 1) >= 5) control.stopping = true; // a backstop
+    },
+  };
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000 }, deps, control });
+  assert.deepStrictEqual(status.gating.map((g) => g.run_id), ["run-1"], "the slot stands in the published record");
+  assert.strictEqual(status.gates.failed, 0, "an interruption is not a refusal");
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"], "stamped once, unsettled");
+  assert.match(marks[0].gate_reason, /outage/);
+  assert.strictEqual(logs.filter((l) => /abandoned by the stop/.test(l) && /task-a gate pipeline/.test(l)).length, 0, "and it is not re-reported as abandoned");
+  const orphans = workLoop.orphanedGateRuns([{ worker_id: "w", live: false, gating: status.gating }], {
+    records: new Map([["run-1", { run_id: "run-1", node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true, gate_state: "interrupted" }]]),
+  });
+  assert.deepStrictEqual(orphans.map((o) => o.run_id), ["run-1"], "which is exactly the pair the next worker resumes from");
+});
+
 test("the resume scan reads back what the run journal and the worker status files actually store", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-resume-"));
   const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
@@ -7012,7 +7052,7 @@ test("a reviewer OUTAGE is not a rejection: the pool pays for asking again, no f
   assert.strictEqual(seen.reviews.length, 2, "the SAME gate was asked again");
   assert.deepStrictEqual(seen.reviews.map((r) => r.cycle), [0, 0], "at the same cycle — an outage charges no fix cycle");
   assert.strictEqual(seen.fixes.length, 0, "no fixer is dispatched at a finding nobody made");
-  assert.deepStrictEqual(seen.pools, { retry: { spent: 1 } }, "one charge on the shared infrastructure pool");
+  assert.strictEqual(seen.pools.retry.spent, 1, "one charge on the shared infrastructure pool");
   assert.strictEqual(seen.slept > 0, true, "the declared backoff was waited out");
   assert.strictEqual(seen.facts.length, 1, "one gate fact — the pass, not the outage");
 });
@@ -7031,7 +7071,7 @@ test("an exhausted infrastructure pool refuses naming the OUTAGE, never the code
   assert.strictEqual(res.state, "failed");
   assert.strictEqual(seen.reviews.length, 2, "the initial ask plus exactly one pool-funded retry");
   assert.strictEqual(seen.fixes.length, 0);
-  assert.deepStrictEqual(seen.pools, { retry: { spent: 1 } });
+  assert.strictEqual(seen.pools.retry.spent, 1);
   assert.strictEqual(res.gates[0].verdict, "infrastructure");
   assert.match(seen.escalations[0].detail, /never answered/);
   assert.match(seen.escalations[0].detail, /not a verdict on the change/);
@@ -7321,16 +7361,88 @@ test("...but a fix that COMMITTED before its harness died is judged like any oth
   assert.deepStrictEqual(seen.pools, { retry: { spent: 0 } }, "and the infrastructure pool is untouched — the fix produced a tree to judge");
 });
 
-test("a stop before the charge says so — it does not tell a person the retry budget ran out", async () => {
-  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 3 } } });
+test("a stop inside an outage settles NOTHING — it is interrupted, not a refusal, and the retry it was owed is charged for the resume", async () => {
+  // issue-spor-review-gate-reviewer-outage-read-as-rejection, F1/F3: a worker
+  // stopped while a reviewer backend is down must not hand a person an
+  // escalation for an outage nobody was allowed to wait out — and the resume
+  // must not get a fresh, uncharged dispatch either.
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 3, backoff_ms: 60000 } } });
   const { deps, seen } = fakes({ pools: { retry: { spent: 0 } }, review: () => outageReview() });
   deps.stopping = () => true;
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
-  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.state, "interrupted");
+  assert.match(res.reason, /asked to stop/);
+  assert.doesNotMatch(res.reason, /spent \(/i, "the pool still has headroom — the reason must not say it ran out");
+  assert.strictEqual(seen.reviews.length, 1, "no retry is dispatched by a stopping worker");
+  assert.strictEqual(seen.escalations.length, 0, "no escalation — nothing was judged");
+  assert.strictEqual(seen.demotions.length, 0, "no demotion");
+  assert.strictEqual(seen.facts.length, 0, "no gate fact — an outage is not a verdict");
+  assert.strictEqual(seen.pools.retry.spent, 1, "the retry is CHARGED before the pipeline is left, so a resume never takes it for free");
+  assert.strictEqual(seen.pools.retry.due_at, 1_700_000_000_000 + 60000, "with the time it is owed at");
+  assert.strictEqual(seen.slept, 0, "and nothing was waited on the way out");
+});
+
+test("a stop DURING the outage backoff is interrupted too, with the one charge it already paid", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 3, backoff_ms: 90000 } } });
+  const { deps, seen } = fakes({ pools: { retry: { spent: 0 } }, review: () => outageReview() });
+  deps.stopping = () => seen.slept >= 1; // the SIGTERM lands inside the first slice
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "interrupted");
+  assert.match(res.reason, /backoff/);
   assert.strictEqual(seen.reviews.length, 1);
-  assert.deepStrictEqual(seen.pools, { retry: { spent: 0 } }, "a stopping worker spends nothing");
-  assert.match(seen.escalations[0].outage.notRetried, /asked to stop/);
-  assert.doesNotMatch(seen.escalations[0].outage.notRetried, /spent/i, "the pool still has headroom — saying it ran out sends a person to the wrong place");
+  assert.strictEqual(seen.pools.retry.spent, 1);
+  assert.strictEqual(seen.pools.retry.due_at, 1_700_000_000_000 + 90000);
+  assert.strictEqual(seen.escalations.length + seen.facts.length + seen.demotions.length, 0);
+});
+
+test("a RESUME waits out the rest of a charged backoff before dispatching, and takes the retry without charging it again (F2)", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 3, backoff_ms: 90000 } } });
+  const due = 1_700_000_000_000 + 45000;
+  const at = [];
+  const { deps, seen } = fakes({ pools: { retry: { spent: 1, due_at: due } }, review: () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }) });
+  const review = deps.review;
+  deps.review = async (args) => {
+    at.push(deps.now());
+    return review(args);
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.strictEqual(seen.reviews.length, 1);
+  assert.ok(at[0] >= due, `the review was dispatched at ${at[0]}, before the retry it was charged for was due (${due})`);
+  assert.strictEqual(seen.pools.retry.spent, 1, "the resume takes the retry already paid for — no second charge");
+  assert.strictEqual(seen.poolSaves, 0);
+});
+
+test("a resume whose due time has PASSED waits for nothing, and a stop during a resumed wait is interrupted again", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 3, backoff_ms: 90000 } } });
+  const past = fakes({ pools: { retry: { spent: 1, due_at: 1_600_000_000_000 } } });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: past.deps })).state, "passed");
+  assert.strictEqual(past.seen.slept, 0);
+
+  const again = fakes({ pools: { retry: { spent: 1, due_at: 1_700_000_000_000 + 90000 } } });
+  again.deps.stopping = () => again.seen.slept >= 1;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: again.deps });
+  assert.strictEqual(res.state, "interrupted");
+  assert.strictEqual(again.seen.reviews.length, 0, "nothing is dispatched before the owed backoff ends");
+  assert.strictEqual(again.seen.pools.retry.spent, 1, "and nothing more is charged");
+});
+
+test("a stop with the pool EXHAUSTED is still the refusal it always was — waiting could not have helped", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 1 } } });
+  const { deps, seen } = fakes({ pools: { retry: { spent: 1 } }, review: () => outageReview() });
+  deps.stopping = () => true;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(seen.escalations[0].outage.notRetried, /retry pool is spent \(1\/1\)/);
+});
+
+test("a stop whose charge cannot land refuses rather than leaving an uncounted retry for the resume", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 3 } } });
+  const { deps, seen } = fakes({ pools: { retry: { spent: 0 } }, review: () => outageReview(), savePools: () => { throw new Error("EROFS"); } });
+  deps.stopping = () => true;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(seen.escalations[0].outage.notRetried, /could not be charged durably/);
 });
 
 test("an exhausted pool, an undeclared pool and a stop are three different reasons on the refusal", async () => {
