@@ -161,6 +161,23 @@ id, sanitized by dispatch).
    your CAS landed); if it moved, use `git revert` instead so you don't clobber
    their commit.
 
+   Once it's green, **reconcile the landed range** — the commits you just put on
+   `main` may carry `Spor:` trailers naming OTHER open items (a drive-by fix, a
+   follow-up folded in), which otherwise stay open forever because nothing writes
+   their resolver (task-spor-landing-detect-shipped-resolver-draft):
+
+   ```bash
+   spor reconcile-landed --dir <shared root or the step-5 worktree> --ref main --since "$OLD"
+   ```
+
+   It only DRAFTS: each open task/issue a newly reachable commit names gets an
+   unlinked `art-shipped-*` draft and a `find-shipped-on-main-*` finding; it
+   never flips a status. The merged item itself is already resolved and is
+   skipped. List any `filed:` finding ids in your report so the orchestrator can
+   batch-confirm them (`spor reconcile-landed --confirm <ids…>`) or dismiss the
+   ones where the commit only relates to the item. A failure here is not a merge
+   failure — note it and move on.
+
 7. **Clean up — ONLY the exact worktree you just merged.** Never target any
    other worktree, never glob or "clean up everything", and never force past
    uncommitted changes — issue-spor-orchestrator-cleanup-worktree-leak was
