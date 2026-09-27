@@ -1477,11 +1477,12 @@ function preparePutNodeLocal(nodesDir, raw, node, policy, revision, stampIdentit
   }
   const priority = exists ? "" : createPriority(node);
   if (priority) {
-    // rewriteStamp itself now accepts and preserves CRLF
-    // (issue-spor-rewrite-stamp-crlf-frontmatter); this path still normalizes
-    // to LF first because put-node's own byte-preservation contract is a
-    // separate, broader issue (issue-spor-put-node-crlf-preservation-violation).
-    raw = rewriteStamp("priority", raw.replace(/\r\n/g, "\n"), priority, stampIdentity(), "cli");
+    // rewriteStamp itself accepts and preserves CRLF
+    // (issue-spor-rewrite-stamp-crlf-frontmatter) — feed it the raw input
+    // untouched so a CRLF-terminated node keeps its line endings through the
+    // priority stamp instead of being pre-flattened to LF here
+    // (issue-spor-put-node-crlf-preservation-violation).
+    raw = rewriteStamp("priority", raw, priority, stampIdentity(), "cli");
     if (raw == null) return { ok: false, error: `could not locate frontmatter in ${id}` };
     try {
       node = require(path.join(ROOT, "lib", "graph.js")).parseFrontmatter(raw, `${id}.md`);

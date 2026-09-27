@@ -733,13 +733,27 @@ test("put-node (local) a legacy priority on an existing node does not block skip
   assert.ok(!fs.existsSync(path.join(nodes, "task-new-legacy.md")));
 });
 
-test("put-node (local) stamps a priority on a CRLF node", () => {
+// issue-spor-put-node-crlf-preservation-violation: put-node must preserve a
+// CRLF-terminated input's line endings — with no priority the write is
+// byte-identical to the input, and with a priority only the new
+// priority_by/_at/_via lines are added, also CRLF.
+test("put-node (local) a CRLF node with no priority is written byte-identical", () => {
+  const { home, nodes } = fixtureGraph();
+  const raw = taskMd("task-crlf-plain").replace(/\n/g, "\r\n");
+  const r = run(["put-node", tmpNodeFile(raw)], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(readNode(nodes, "task-crlf-plain"), raw);
+});
+
+test("put-node (local) stamps a priority on a CRLF node while preserving CRLF line endings", () => {
   const { home, nodes } = fixtureGraph();
   spawnSync("git", ["-C", home, "config", "user.name", "Batch Tester"]);
   spawnSync("git", ["-C", home, "config", "user.email", "batch@example.com"]);
   const r = run(["put-node", tmpNodeFile(taskMd("task-crlf", "priority: p2\n").replace(/\n/g, "\r\n"))], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(readNode(nodes, "task-crlf"), /\npriority: p2\npriority_by: Batch Tester <batch@example\.com>\npriority_at: \S+\npriority_via: cli\n---\n/);
+  const written = readNode(nodes, "task-crlf");
+  assert.doesNotMatch(written, /(?<!\r)\n/, "every line ending stays CRLF, none flattened to bare LF");
+  assert.match(written, /\r\npriority: p2\r\npriority_by: Batch Tester <batch@example\.com>\r\npriority_at: \S+\r\npriority_via: cli\r\n---\r\n/);
 });
 
 test("put-node (remote) --if-exists error refuses a bad priority before writing", async () => {
