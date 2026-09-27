@@ -16,6 +16,10 @@
         "staleness": 0,
         "age_days": 2
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "your active front (40 writes in the last 7 days); 2d old"
     },
@@ -35,6 +39,10 @@
         "staleness": 0,
         "age_days": 2
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "priority p2 (source unrecorded); your active front (2 writes in the last 7 days); 2d old"
     },
@@ -54,6 +62,10 @@
         "staleness": 0,
         "age_days": 2
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "priority p2 (source unrecorded); your active front (2 writes in the last 7 days); 2d old"
     }

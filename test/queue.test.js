@@ -15,7 +15,7 @@ const path = require("path");
 
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
 const { rankQueue, warmQueueIndex, viewerFor } = require(path.join(__dirname, "..", "lib", "queue.js"));
-const { readinessOf } = require(path.join(__dirname, "..", "lib", "kernel", "queue.js"));
+const { readinessOf, requiresList, effectiveRequires } = require(path.join(__dirname, "..", "lib", "kernel", "queue.js"));
 
 // The Symbol the queue kernel memoizes its HEAD-pure indexes under
 // (task-cc-rankqueue-memoization). Global registry key, so the test reads the
@@ -1583,6 +1583,53 @@ test("readiness: requires:human derives human with the reason (list AND bare-sca
     assert.deepEqual(it.readiness_reasons, ["requires human"]);
     assert.ok(it.why.startsWith("needs human: requires human"), "the clause leads the why-line");
   }
+});
+
+// dec-spor-requires-default-derived-at-read-time: an unset requires: on a
+// repo-stamped (project:) task/issue defaults to [shell, filesystem-write] at
+// READ time, never written to the node — explicit requires: (any spelling
+// requiresList tolerates) always wins outright. Mirrors server/dispatch-
+// guard.js's effectiveRequires (spor-server, e93be80) exactly.
+test("effectiveRequires: an unset requires: on a repo-stamped task/issue defaults to [shell, filesystem-write]", () => {
+  const task = { type: "task", project: "my-project" };
+  assert.deepEqual(effectiveRequires(task), ["shell", "filesystem-write"]);
+  const issue = { type: "issue", project: "my-project" };
+  assert.deepEqual(effectiveRequires(issue), ["shell", "filesystem-write"]);
+});
+
+test("effectiveRequires: an explicit requires: always wins outright, however small (list or bare-scalar spelling)", () => {
+  assert.deepEqual(effectiveRequires({ type: "task", project: "my-project", requires: ["human"] }), ["human"]);
+  assert.deepEqual(effectiveRequires({ type: "task", project: "my-project", requires: "human" }), ["human"]);
+  assert.deepEqual(effectiveRequires({ type: "task", project: "my-project", requires: ["shell"] }), ["shell"]);
+});
+
+test("effectiveRequires: no default without a project stamp, or off a non-task/issue type", () => {
+  assert.deepEqual(effectiveRequires({ type: "task" }), [], "no repo stamp — nothing to derive from");
+  assert.deepEqual(effectiveRequires({ type: "decision", project: "my-project" }), [], "not a task/issue");
+  assert.deepEqual(effectiveRequires({ type: "norm", project: "my-project" }), []);
+});
+
+test("effectiveRequires: never includes human or prod-creds — the default can't flip a node into requires:human by itself", () => {
+  const eff = effectiveRequires({ type: "task", project: "my-project" });
+  assert.ok(!eff.includes("human"));
+  assert.ok(!eff.includes("prod-creds"));
+});
+
+test("rankQueue item: surfaces the effective requires: list, explicit wins, omitted (not []) when empty", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-default", "task", { status: "open" }), // project: my-project, no explicit requires:
+    raw("task-explicit", "task", "status: open\nrequires: [human, shell]\n"),
+    node("dec-plain", "decision", { status: "active" }),
+  ])).load();
+  assert.deepEqual(rd(g, "task-default").requires, ["shell", "filesystem-write"], "unset requires: on a repo-stamped task derives the default");
+  assert.deepEqual(rd(g, "task-explicit").requires, ["human", "shell"], "explicit requires: always wins outright");
+  const decItem = rankQueue(g, { now: NOW, includeTypes: ["decision"] }).items.find((i) => i.id === "dec-plain");
+  assert.equal(decItem?.requires, undefined, "a non-task/issue type gets no derived default");
+});
+
+test("readinessOf: the requires:human check reads the same effective list as rankQueue — the default itself never flips a node to human", () => {
+  const g = tmpGraph(Object.fromEntries([node("task-default", "task", { status: "open" })])).load();
+  assert.deepEqual(readinessOf(g, "task-default"), { readiness: "untriaged", reasons: [] }, "the [shell, filesystem-write] default never includes human");
 });
 
 test("readiness: assigned→person is human, assigned→agent is agent (edge target type decides)", () => {

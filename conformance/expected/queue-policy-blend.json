@@ -36,6 +36,10 @@
         "staleness": 0,
         "age_days": 42
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "priority p2 (source unrecorded); blocks 1 live node; 42d old; 1 open gardener finding: finding-open",
       "findings": [
@@ -58,6 +62,10 @@
         "staleness": 1,
         "age_days": 89
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "close",
       "why": "89d old; 100% of anchors superseded or gone — consider closing"
     },
@@ -77,6 +85,10 @@
         "staleness": 0,
         "age_days": 33
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "33d old"
     },
@@ -96,6 +108,10 @@
         "staleness": 0,
         "age_days": 11
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "11d old"
     },

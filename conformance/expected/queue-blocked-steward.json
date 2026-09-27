@@ -16,6 +16,10 @@
         "staleness": 0,
         "age_days": 42
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "priority p2 (source unrecorded); blocks 1 live node; neighborhood active (heat 50); 42d old"
     },
@@ -35,6 +39,10 @@
         "staleness": 0,
         "age_days": 72
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "blocked",
       "why": "priority p1 (source unrecorded); blocked by task-unblock — do the unblocker first; neighborhood active (heat 50); 72d old",
       "blocked_by": [

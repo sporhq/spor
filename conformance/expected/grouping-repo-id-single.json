@@ -16,6 +16,10 @@
         "staleness": 0,
         "age_days": 11
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "11d old"
     }

@@ -16,6 +16,10 @@
         "staleness": 0,
         "age_days": 90
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "90d old"
     },
@@ -35,6 +39,10 @@
         "staleness": 0,
         "age_days": 90
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "90d old"
     },
@@ -54,6 +62,10 @@
         "staleness": 0,
         "age_days": 90
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "90d old"
     }

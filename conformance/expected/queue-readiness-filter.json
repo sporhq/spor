@@ -16,6 +16,10 @@
         "staleness": 0,
         "age_days": 10
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "dispatch",
       "readiness": "agent",
       "readiness_reasons": [
@@ -42,6 +46,10 @@
         "staleness": 0,
         "age_days": 10
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "dispatch",
       "readiness": "agent",
       "readiness_reasons": [

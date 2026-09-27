@@ -17,6 +17,10 @@
         "age_days": 90,
         "cold_neighbors": 2
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "context moved around it (2 newer neighbors); 90d old"
     },
@@ -36,6 +40,10 @@
         "staleness": 0,
         "age_days": 90
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "90d old"
     },
@@ -55,6 +63,10 @@
         "staleness": 0,
         "age_days": 90
       },
+      "requires": [
+        "shell",
+        "filesystem-write"
+      ],
       "suggest": "do",
       "why": "90d old"
     }
