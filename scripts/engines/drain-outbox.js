@@ -24,6 +24,10 @@ const u = require("./util");
 // the outbox's oldest mtime as how long captures have been stuck, and an
 // outage must not read as minutes old because every drain re-stamped it. `maxWallSec` (0 = none) bounds
 // the whole pass besides the per-file `maxTimeSec` and the `maxFiles` cap.
+// Outbox files this process is draining right now, by unclaimed path.
+const inFlight = new Set();
+const suffixOf = (name) => (name.endsWith(".capture.json") ? ".capture.json" : ".json");
+
 async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0, maxWallSec = 0) {
   const summary = { attempted: 0, drained: 0, deadLettered: 0, failed: 0 };
   if (!u.serverBase()) return summary;
@@ -44,51 +48,63 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0, 
       fs.rmSync(stampOf(name), { force: true });
     } catch {}
   };
+  // Every outbox entry is claimed by RENAME before it is read or POSTed
+  // (u.claimSpoolResult, the one spool claim — lib/shell/spool.js), because
+  // session-start's detached drain, distill, and `spor drain` can overlap on
+  // one outbox and a read→POST→unlink with no claim sent the same capture
+  // twice. A claimed name keeps its spool suffix (`.capture.json` / `.json`),
+  // so it still routes to the same endpoint, still counts in doctor's outbox
+  // depth/age (u.spoolStats globs *.json), and a drain that crashes mid-POST
+  // strands nothing: a live owner's claim is skipped, a dead or expired one
+  // (SPOOL_TTL.claimHold) is re-claimed. Stamps and dead-letter names use the
+  // UNCLAIMED base name, so the attempt rotation survives claim and release.
   let files;
   try {
     files = fs
       .readdirSync(outbox)
       .filter((f) => f.endsWith(".json"))
       .map((name) => {
+        const suffix = suffixOf(name);
+        const base = u.spoolResultHash(name, suffix) + suffix;
         let m = 0;
         try {
-          m = fs.statSync(stampOf(name)).mtimeMs;
+          m = fs.statSync(stampOf(base)).mtimeMs;
         } catch {
           try {
             m = fs.statSync(path.join(outbox, name)).mtimeMs;
           } catch {}
         }
-        return { name, m };
+        return { name, base, suffix, m };
       })
-      .sort((a, b) => a.m - b.m || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-      .map((e) => e.name);
+      .sort((a, b) => a.m - b.m || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   } catch {
     return summary;
   }
   // A stamp whose file is gone (drained or dead-lettered by another drain) is
   // litter; prune it so the sidecar dir stays bounded by the outbox itself.
   try {
-    const live = new Set(files);
+    const live = new Set(files.map((e) => e.base));
     for (const s of fs.readdirSync(attempts)) if (!live.has(s)) clearStamp(s);
   } catch {}
 
   const deadline = maxWallSec > 0 ? Date.now() + maxWallSec * 1000 : 0;
-  for (const name of files) {
-    if (maxFiles > 0 && summary.attempted >= maxFiles) {
-      rlog(`file cap (${maxFiles}) reached; deferring the rest to the next drain`);
-      break;
-    }
-    if (deadline && Date.now() >= deadline) {
-      rlog(`time budget (${maxWallSec}s) spent; deferring the rest to the next drain`);
-      break;
-    }
-    const file = path.join(outbox, name);
+  // Hand a claimed file back under its base name so a later drain retries it.
+  // If even that rename fails the claimed name still ends in .json: it stays
+  // counted, and is re-claimable once this process exits or the hold expires.
+  const release = (file, name) => {
+    try {
+      fs.renameSync(file, path.join(outbox, name));
+    } catch {}
+  };
+  const drainOne = async (claimedName, name) => {
+    const file = path.join(outbox, claimedName);
     const endpoint = name.endsWith(".capture.json") ? "/v1/capture" : "/v1/nodes";
     let body;
     try {
       body = fs.readFileSync(file);
     } catch {
-      continue;
+      release(file, name);
+      return;
     }
     const { http } = await u.curl(`${u.serverBase()}${endpoint}`, {
       method: "POST",
@@ -139,7 +155,32 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0, 
         const now = new Date();
         fs.utimesSync(stampOf(name), now, now);
       } catch {}
+      // Release the claim (rename back) so the file is retried later.
+      release(file, name);
       rlog(`drain failed for ${name} (http=${http}); leaving spooled`);
+    }
+  };
+  for (const { name: entry, base: name, suffix } of files) {
+    if (maxFiles > 0 && summary.attempted >= maxFiles) {
+      rlog(`file cap (${maxFiles}) reached; deferring the rest to the next drain`);
+      break;
+    }
+    if (deadline && Date.now() >= deadline) {
+      rlog(`time budget (${maxWallSec}s) spent; deferring the rest to the next drain`);
+      break;
+    }
+    // The claim honors other LIVE pids; an overlapping drain in this same
+    // process (distill's in-process drain vs `spor drain`) carries our own pid,
+    // which the claim treats as retakeable, so it is fenced here instead.
+    const key = path.join(outbox, name);
+    if (inFlight.has(key)) continue;
+    const claimedName = u.claimSpoolResult(outbox, entry, undefined, suffix);
+    if (!claimedName) continue; // held by a live drain, or already taken
+    inFlight.add(key);
+    try {
+      await drainOne(claimedName, name);
+    } finally {
+      inFlight.delete(key);
     }
   }
   return summary;

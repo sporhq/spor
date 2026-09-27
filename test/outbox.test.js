@@ -250,3 +250,62 @@ test('drain: the wall-clock budget stops a pass and leaves the rest spooled', as
   );
   assert.strictEqual(s.attempted, 1);
 });
+
+// task-spor-client-spool-single-module: the drain claims each file by rename
+// (u.claimSpoolResult) before reading it, so overlapping drains — session-start's
+// detached drain, distill, `spor drain` — never POST one capture twice.
+test('drain: two overlapping drains POST one spooled capture exactly once', async () => {
+  const graph = scratchGraph();
+  spool(graph, 's-1-0.capture.json');
+  const posts = [];
+  const s = await withServer(
+    async (url, init) => {
+      posts.push(String(url));
+      await new Promise((r) => setTimeout(r, 50));
+      return fakeResponse(200);
+    },
+    () => Promise.all([drainOutbox(graph, 'a', 2), drainOutbox(graph, 'b', 2)])
+  );
+  assert.strictEqual(posts.length, 1, 'exactly one POST');
+  assert.match(posts[0], /\/v1\/capture$/, 'a claimed capture still routes to /v1/capture');
+  assert.strictEqual(s[0].drained + s[1].drained, 1);
+  assert.deepStrictEqual(fs.readdirSync(path.join(graph, 'outbox')).filter((f) => f.endsWith('.json')), []);
+});
+
+test('drain: a file claimed by another live drain is skipped; a stale claim is re-claimed', async () => {
+  const graph = scratchGraph();
+  // process.ppid is alive (the test runner), so this claim is held.
+  const held = `h.claim-${process.ppid}-${Date.now()}.json`;
+  spool(graph, held);
+  // A claim past SPOOL_TTL.claimHold is stale even if the pid is alive.
+  const stale = `t.claim-${process.ppid}-${Date.now() - u.SPOOL_TTL.claimHold - 1000}.capture.json`;
+  spool(graph, stale);
+  // doctor's outbox depth/age still sees claimed files.
+  assert.strictEqual(u.spoolStats(path.join(graph, 'outbox')).count, 2);
+  const posts = [];
+  const s = await withServer(
+    async (url) => {
+      posts.push(String(url));
+      return fakeResponse(200);
+    },
+    () => drainOutbox(graph, 'test', 2)
+  );
+  assert.deepStrictEqual(posts.map((p) => p.replace(/^.*\/v1/, '/v1')), ['/v1/capture']);
+  assert.strictEqual(s.attempted, 1);
+  assert.ok(live(graph, held), 'the live claim is left to its owner');
+  assert.ok(!fs.readdirSync(path.join(graph, 'outbox')).some((f) => f.startsWith('t.')), 'the stale claim was drained');
+});
+
+test('drain: a failed POST releases the claim back under the original name', async () => {
+  const graph = scratchGraph();
+  spool(graph, 'r.capture.json');
+  const s = await withServer(async () => fakeResponse(503), () => drainOutbox(graph, 'test', 2));
+  assert.strictEqual(s.failed, 1);
+  assert.deepStrictEqual(fs.readdirSync(path.join(graph, 'outbox')).filter((f) => f.endsWith('.json')), ['r.capture.json']);
+  assert.deepStrictEqual(fs.readdirSync(path.join(graph, 'outbox', '.attempts')), ['r.capture.json']);
+  // and it is retried (and drained) by a later pass
+  const s2 = await withServer(async () => fakeResponse(200), () => drainOutbox(graph, 'test', 2));
+  assert.strictEqual(s2.drained, 1);
+  assert.ok(!live(graph, 'r.capture.json'));
+  assert.deepStrictEqual(fs.readdirSync(path.join(graph, 'outbox', '.attempts')), []);
+});
