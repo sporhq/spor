@@ -193,9 +193,9 @@ right failure but a rude way to discover a typo:
 - every risk class a gate names is declared in `risk_classes` (any kind that
   arms: command, agent-review, human);
 - gate ids are unique and kebab-case;
-- if you wrote a `rescue:` block: `profile` names a supervised, write-capable
-  strong-model profile (the worker refuses a native-background one at load
-  time), and `attempts` is 1-3;
+- if you wrote a `rescue:` block: `profile` names a write-capable strong-model
+  profile (every harness dispatch launches supervised now — there is no
+  native-background mode left to route to), and `attempts` is 1-3;
 - if you wrote an `implementation:` block: it names NO command/args/argv/bin/
   exec/entrypoint/env/report/session/launch_mode/identity_mode (the same rule
   that binds a profile — each is a parse error naming the key), every

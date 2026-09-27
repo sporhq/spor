@@ -997,8 +997,7 @@ server-side (issue-cc-onboarding-email-mismatch-silent-degradation).
 ### Agents (person-owned principals)
 
 An `agent` node (prefix `agent-`) is a person's automation principal — the
-durable identity of a dispatched Claude Code run (a supervised `claude -p`, or
-an opt-in `claude --bg` session)
+durable identity of a dispatched Claude Code run (a supervised `claude -p`)
 (dec-spor-agent-identity-nodes). It generalizes the workflow-run principal: a
 dispatched session is just another principal kind owned by a person, so work it
 creates reads "agent **on behalf of** person" rather than person-direct.

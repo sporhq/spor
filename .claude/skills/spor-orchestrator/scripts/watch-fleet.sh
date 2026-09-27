@@ -5,54 +5,42 @@
 # package, so it is exempt from the repo's zero-dep plain-Node rule
 # (CLAUDE.md "Hard rules" — Zero dependencies) and may use bash+jq.
 #
-# Exits 0 printing "AGENT_DONE <node> status=<s>" the moment any named agent's
-# status leaves working/busy/starting (or, for a node with no listed session,
-# its `spor runs` record goes terminal — status=run:<state>), "NODE_RESOLVED <node>" if the node
-# resolved on the graph even while the session lingers (trust the graph over
-# the process table), or "AGENT_STALLED <node> idle_secs=<n> session=<sid>"
-# when a busy agent's session transcript hasn't moved for WATCH_STALL seconds
-# (default 1800) — the early-warning for a wedged agent. Exits 2 on timeout
-# with a status dump.
+# Exits 0 printing "AGENT_DONE <node> status=<state>" the moment any named
+# node's `spor runs --node <id> --json` record goes terminal
+# (done/failed/failed_launch/vanished), or "NODE_RESOLVED <node> status=<s>"
+# if the node resolved on the graph while its run record is absent or already
+# terminal (trust the graph as a backstop over a run record that never
+# existed or has nothing more to tell us), or "AGENT_STALLED <node>
+# idle_secs=<n> session=<sid>" when a still-running node's log file hasn't
+# been touched for WATCH_STALL seconds (default 1800) — the early-warning for
+# a wedged agent. Exits 2 on timeout with a status dump.
 #
 # Run it via the Bash tool with run_in_background: true; its exit re-invokes
 # the orchestrator. Poll cadence 90s, ~45min ceiling.
 #
-# Paid-for gotchas, centralized in lib.sh so fleet-status.sh and
-# link-live-skill.sh share the same fix instead of drifting:
-# - `claude agents --json` emits a BARE ARRAY (defend against a future
-#   {agents:[...]} wrapper with `.agents? // .`, see fleet_agents_array). A
-#   wrong shape here fails SILENT — the 2026-07-16 watcher looped to timeout
-#   while 4 agents sat idle.
-# - Watch `status`, never `state` alone — `state` sticks at "working" after
-#   the agent finishes (inc-spor-orchestration-watcher-stuck-state; see
-#   fleet_status_active).
-# - An agent can vanish from the list entirely when it exits; treat a node
-#   that WAS seen and is now absent as done.
-# - AGENT_DONE status=idle with the node UNRESOLVED is ambiguous: the agent
-#   may have idled awaiting the orchestrator's SendMessage reply to a blocking
-#   question (a reply resumes it), not failed — check inbound cross-session
-#   messages before routing to Recover (SKILL.md "Talking to the fleet").
-# - AGENT_STALLED is a NOTIFICATION, not a verdict: the transcript-mtime proxy
-#   can't tell a wedged agent from one legitimately awaiting a long background
-#   task (the 2026-08-05 hung-test deadlock looked exactly like the latter —
-#   a `node --test` child at ~0 CPU for 44min while the agent waited for its
-#   completion notification). On firing, the orchestrator should inspect the
-#   agent's child processes and last transcript message before intervening
-#   (kill the hung child, or re-arm with a longer WATCH_STALL / WATCH_STALL=0
-#   if the wait is genuine). The stall check only runs while the session is
-#   working/busy/starting — a finished agent exits via AGENT_DONE instead.
+# Every dispatch launches SUPERVISED (task-spor-deprecate-native-bg-dispatch):
+# there is no `claude agents --json` listing to poll and no session to check
+# `status`/`state` drift on — the run record's own `state` is the only
+# liveness signal there is, and it goes terminal exactly once, when the
+# supervisor's child exits. So a run still `launching`/`running` is
+# unambiguously still going; anything else means it is over. See lib.sh for
+# the shared run-record helpers this script and fleet-status.sh share.
 #
-# Scope: like fleet-status.sh, this polls `claude agents --json` — which
-# lists only native-background (`--bg`) agents — and falls back to the
-# `spor runs --node <id>` record for a node not listed there (a supervised
-# `claude -p` run, the claude-code default since c1ab5b6, or a Codex run):
-# a non-terminal run state counts as working, a terminal one fires
-# AGENT_DONE status=run:<state>. The stall check has no transcript for a
-# supervised run, so it only covers listed sessions. A Codex-harness
-# implementer (assets/codex-agent-prompt.md) is contractually forbidden from
-# resolving its own node, so NODE_RESOLVED never fires for one — read its
-# final report from the run's report_path instead (see SKILL.md "The Codex
-# implementer").
+# Paid-for gotchas this still carries:
+# - AGENT_DONE status=<terminal> with the node UNRESOLVED is ambiguous:
+#   finished-without-resolving (-> Recover) *or* the agent deferred a blocker
+#   and said so in its final report (read it before treating it as failed —
+#   SKILL.md "Recover"). A dispatched agent has no live channel back to you,
+#   so there is no "idled awaiting your reply" case anymore — everything it
+#   has to say is in the report file.
+# - AGENT_STALLED is a NOTIFICATION, not a verdict: the log-mtime proxy can't
+#   tell a wedged agent from one legitimately awaiting a long background task
+#   (the 2026-08-05 hung-test deadlock: a `node --test` child at ~0 CPU for
+#   44min while the agent waited for its completion notification — the log
+#   itself goes quiet the same way whether the agent is wedged or genuinely
+#   waiting). On firing, inspect the agent's child processes and the tail of
+#   its report/log before intervening (kill the hung child, or re-arm with a
+#   longer WATCH_STALL / WATCH_STALL=0 if the wait is genuine).
 set -u
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -60,59 +48,37 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 NODES=("$@")
 INTERVAL="${WATCH_INTERVAL:-90}"
 ROUNDS="${WATCH_ROUNDS:-30}"
-STALL="${WATCH_STALL:-1800}"   # seconds of transcript silence before AGENT_STALLED; 0 disables
-declare -A seen
-declare -A tpath
+STALL="${WATCH_STALL:-1800}"   # seconds of log silence before AGENT_STALLED; 0 disables
 for i in $(seq 1 "$ROUNDS"); do
   sleep "$INTERVAL"
-  out=$(fleet_agents_array "$(claude agents --json 2>/dev/null)")
   for n in "${NODES[@]}"; do
-    st=$(fleet_node_status "$out" "$n")
-    if [ -n "$st" ]; then
-      seen[$n]=1
-      fleet_status_active "$st" || { echo "AGENT_DONE $n status=$st"; exit 0; }
-    elif [ "${seen[$n]:-}" = "1" ]; then
-      echo "AGENT_DONE $n status=gone"; exit 0
+    run=$(fleet_run_json "$n")
+    st=$(fleet_run_state "$run")
+    if fleet_run_active "$st"; then
+      if [ "$STALL" -gt 0 ]; then
+        log=$(fleet_run_log "$run")
+        [ -n "$log" ] && [ -f "$log" ] || continue
+        idle=$(( $(date +%s) - $(stat -c %Y "$log" 2>/dev/null || echo "$(date +%s)") ))
+        if [ "$idle" -ge "$STALL" ]; then
+          echo "AGENT_STALLED $n idle_secs=$idle session=$(fleet_run_session "$run")"
+          exit 0
+        fi
+      fi
+      continue
     fi
-  done
-  # Stall check: a busy session whose transcript file hasn't been touched for
-  # STALL seconds is likely wedged (hung child process, lost notification).
-  # Transcript mtime is the activity proxy — every tool result, message, and
-  # notification appends a JSONL line, so a live agent touches it constantly.
-  if [ "$STALL" -gt 0 ]; then
-    for n in "${NODES[@]}"; do
-      row=$(printf '%s' "$out" | jq -r --arg n "$n" '.[]? | select(.name==$n) | "\(.status) \(.sessionId // .id)"' 2>/dev/null | head -1)
-      [ -n "$row" ] || continue
-      st=${row%% *}; sid=${row#* }
-      fleet_status_active "$st" || continue
-      if [ -z "${tpath[$n]:-}" ]; then
-        tpath[$n]=$(find "$HOME/.claude/projects" -maxdepth 2 -name "$sid.jsonl" 2>/dev/null | head -1)
-      fi
-      tp=${tpath[$n]:-}
-      [ -n "$tp" ] && [ -f "$tp" ] || continue
-      idle=$(( $(date +%s) - $(stat -c %Y "$tp" 2>/dev/null || echo "$(date +%s)") ))
-      if [ "$idle" -ge "$STALL" ]; then
-        echo "AGENT_STALLED $n idle_secs=$idle session=$sid"
-        exit 0
-      fi
-    done
-  fi
-  # Cheap authoritative cross-check: the graph. A resolved node = finished — BUT
-  # only trust it once the SESSION is also idle/gone. An implementer can resolve
-  # the node a beat before its final commit lands (or while a review runs), so a
-  # resolved node whose session is still working/busy is NOT merge-ready yet:
-  # firing here would hand the orchestrator an empty branch (the 2026-07-16
-  # share-cli / connection-scoped premature-resolve stalls).
-  inflight=$(spor next --json 2>/dev/null | jq -r '[.items[]? | select(.in_flight==true) | .id] | join("\n")')
-  for n in "${NODES[@]}"; do
-    [ "${seen[$n]:-}" = "1" ] || continue
-    printf '%s\n' "$inflight" | grep -qxF -- "$n" && continue
-    cur=$(fleet_node_status "$out" "$n")
-    fleet_status_active "$cur" && continue   # still committing — wait
-    st=$(spor get "$n" --json 2>/dev/null | jq -r '.frontmatter.status // empty')
-    case "$st" in resolved|done|answered) echo "NODE_RESOLVED $n status=$st"; exit 0 ;; esac
+    if [ -n "$st" ]; then
+      echo "AGENT_DONE $n status=$st"
+      exit 0
+    fi
+    # No run record at all for this node (not yet started, or aged out past
+    # dispatch.runRetentionMs) — the graph is the only remaining signal.
+    gs=$(spor get "$n" --json 2>/dev/null | jq -r '.frontmatter.status // empty')
+    case "$gs" in resolved|done|answered) echo "NODE_RESOLVED $n status=$gs"; exit 0 ;; esac
   done
 done
 echo "TIMEOUT after $((INTERVAL * ROUNDS / 60))min — current fleet:"
-fleet_agents_array "$(claude agents --json 2>/dev/null)" | jq -r '.[]? | "\(.name)  status=\(.status // "?")"'
+for n in "${NODES[@]}"; do
+  run=$(fleet_run_json "$n")
+  echo "  $n  state=$(fleet_run_state "$run")"
+done
 exit 2

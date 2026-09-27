@@ -16,7 +16,7 @@ const path = require("node:path");
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const runner = require("../lib/shell/agent-dispatch-runner.js");
 const gates = require("../lib/kernel/gates.js");
-const { writeSpawnableNodeStub, pathWithOnlyGit } = require("./helpers/portable");
+const { pathWithOnlyGit } = require("./helpers/portable");
 
 // Isolated env: no SPOR_*/SUBSTRATE_* leakage, local mode, and a scratch
 // CLAUDE_CONFIG_DIR so nothing here can touch the real ~/.claude.
@@ -838,31 +838,6 @@ test("spor runs: a record still owing its terminal-state contract shows a pendin
     /outcome:\s+reported \(unenforced\) \(contract pending\)/,
     "the operator can see the run still owes its contract, not just its best-effort reading"
   );
-});
-
-test("dispatch: a SIBLING agent's session is never adopted as this run's identity", () => {
-  // issue-spor-dispatch-run-liveness-same-cwd-misattribution, at the capture
-  // step: during the poll window our own agent is often unregistered while a
-  // sibling in the same checkout already is. Binding "newest in this directory"
-  // would stamp the run with the sibling's session — and every later inference
-  // (liveness, transcript) would then be about the wrong run.
-  const { home, repo } = fixture();
-  const stub = writeSpawnableNodeStub(home, "claude-ok", "process.exit(0);");
-  cli(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const base = { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub };
-
-  // Learn the checkout this dispatch actually launches into…
-  cli(["dispatch", "dec-x", "--no-brief"], base);
-  const cwd = runRecords(home)[0].cwd;
-
-  // …then dispatch again while a DIFFERENT agent is live in that same checkout.
-  const sibling = JSON.stringify([
-    { kind: "background", name: "some-other-node", sessionId: "sid-of-the-sibling", cwd, state: "running", startedAt: Date.now() },
-  ]);
-  cli(["dispatch", "dec-x", "--no-brief"], { ...base, SPOR_FAKE_AGENTS_JSON: sibling });
-  for (const rec of runRecords(home)) {
-    assert.notStrictEqual(rec.session_id, "sid-of-the-sibling", "a sibling's session is not this run's identity");
-  }
 });
 
 test("dispatch: a PRE-LAUNCH refusal stays an explicit refusal — non-zero, a reason, and no phantom run record", () => {

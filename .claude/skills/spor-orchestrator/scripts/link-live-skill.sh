@@ -107,35 +107,39 @@ else
   echo "absent — live path does not exist yet; nothing to back up."
 fi
 
-# Guard 2: an active fleet. Background agents only — an idle interactive session
-# is not a fleet. Watch `status`, never `state`: `state` sticks at "working"
-# after an agent finishes (inc-spor-orchestration-watcher-stuck-state), so a
-# finished agent's corpse would otherwise read as live.
+# Guard 2: an active fleet. Every dispatch launches SUPERVISED
+# (task-spor-deprecate-native-bg-dispatch), so there is no `claude agents
+# --json` listing anymore — the run records under this machine's dispatch
+# home are the only signal: any record whose `state` is still
+# launching/running means a dispatched agent (this skill's own worktree
+# agents, or anything else dispatched from this box) is still going.
 #
-# Exclude THIS session by sessionId: a dispatched agent running this script is
-# itself a busy background agent, and self-blocking would push the operator
-# toward a force flag for no reason.
-agents_json=$(fleet_agents_array "$(claude agents --json 2>/dev/null)")
-# `$me == ""` disables the exclusion entirely: with no session id to match, the
-# `// ""` fallback would otherwise equate every entry MISSING a sessionId with
-# "self" and drop a real fleet on the floor.
-active=$(printf '%s' "$agents_json" | jq -r --arg me "${CLAUDE_CODE_SESSION_ID:-}" --arg re "$SPOR_FLEET_ACTIVE_STATUS_RE" '
-  .[]? | select(.kind == "background")
-  | select($me == "" or (.sessionId // "") != $me)
-  | select((.status // "") | test($re)) | .name // .id' 2>/dev/null)
+# A dispatched agent running THIS script is itself one of those active runs
+# (it's mid-dispatch, running the skill-drift check as part of its own
+# work) — self-blocking on its own run would push the operator toward a
+# force flag for no reason, so exclude the run whose captured session_id
+# matches this Claude Code session's own id (`CLAUDE_CODE_SESSION_ID`, a
+# Claude-Code-native env var — set inside any `claude` session, interactive
+# or supervised; empty outside one, so nothing is excluded when this script
+# runs interactively at the operator's own prompt).
+# `$me == ""` disables the exclusion entirely: with no session id to match,
+# the `// ""` fallback would otherwise equate every run MISSING a captured
+# session_id (one that hasn't announced it yet) with "self" and drop a real
+# fleet on the floor.
+active=$(spor runs --json --limit 200 2>/dev/null | jq -r --arg me "${CLAUDE_CODE_SESSION_ID:-}" --arg re "$SPOR_RUN_ACTIVE_STATE_RE" '
+  .runs[]? | select($me == "" or (.session_id // "") != $me)
+  | select((.state // "") | test($re)) | .node_id // .name // .run_id' 2>/dev/null)
 jq_rc=$?
 if [ -n "$active" ]; then
-  echo "FLEET UP — background agents still running:"
+  echo "FLEET UP — dispatched agents still running:"
   printf '%s\n' "$active" | sed 's/^/  /'
   echo "The watcher scripts are load-bearing mid-run; do this after the run drains."
   blocked_fleet=1
-elif [ -z "$agents_json" ] || [ "$jq_rc" != 0 ]; then
+elif [ "$jq_rc" != 0 ]; then
   # Fail open, but say so: this guard is about avoiding disruption, not data
   # loss (guard 1 covers that and fails closed). Still, "no fleet" and "could
-  # not tell" must not look the same in the output — so key on jq actually
-  # having parsed something, not merely on `claude` having printed something
-  # (an auth error on stdout, or a missing jq, is not an empty fleet).
-  echo "NOTE: could not determine fleet state — \`claude agents --json\` gave nothing parseable."
+  # not tell" must not look the same in the output.
+  echo "NOTE: could not determine fleet state — \`spor runs --json\` gave nothing parseable."
 fi
 
 if [ "$blocked_diverged" = 1 ] && [ "$FORCE_DIVERGED" != 1 ]; then

@@ -28,15 +28,18 @@ next item — until the eligible queue drains or the user stops you.
 The heavy lifting already exists. `spor dispatch --worktree` claims a team-wide
 heartbeat lease on the node, creates a git worktree on a branch named after the
 node id, compiles the briefing into the agent's prompt, and launches the implementer
-named after the node. **This skill passes `--bg` explicitly** so a Claude
-implementer runs as a native-background `claude --bg` agent: since spor
-c1ab5b6 (dec-spor-claude-code-supervised-by-default) the default claude-code
-dispatch is a supervised headless `claude -p` run, which never enters
-`claude agents --json` and cannot be reached by `claude attach`/`claude stop`/
-`SendMessage` — every fleet affordance below depends on the `--bg` opt-in.
-(The watcher scripts fall back to `spor runs --node <id> --json` for a node
-absent from the agents list, so a supervised run is still followed, just not
-talked to.) You are the loop around it.
+named after the node. Every dispatch runs **supervised** — a headless `claude -p`
+(or `codex exec`) child under `spor`'s own supervisor, never a native-background
+`claude --bg` agent (`--bg` is refused outright, task-spor-deprecate-native-bg-dispatch)
+— so there is no `claude agents --json` listing, no `claude attach`/`claude stop`,
+and no `SendMessage` channel to a dispatched agent: it is a one-shot process that
+runs to completion and exits, with nothing on the other end to receive a mid-run
+message. What you get instead, and what every affordance below is built on, is a
+**durable run record**: `spor dispatch` mints one before the child even starts and
+prints its `run:`/`log:`/`report:` paths at launch; `spor runs --node <id> --json`
+follows it to a terminal state (`done`/`failed`/`failed_launch`/`vanished`), and the
+child's final message lands in the printed `report:` file regardless of harness —
+Claude and Codex both. You are the loop around it.
 
 ## Mental model — four things that make this safe
 
@@ -205,20 +208,20 @@ loop:
 
   # --- supervise: wait for a change, then act ---
   wait_for_change()                       # see Waiting — don't spin
-  for node in running whose agent is no longer active:
+  for node in running whose run record has gone terminal:
       report = final_report(node)   # ALWAYS read it, resolved or not — a
                                     #   HANDED BACK block is debt the graph
                                     #   does not yet record, and a node that
                                     #   another actor resolved meanwhile still
-                                    #   owes it. codex: read(running[node]
-                                    #   .report_path) — NOT agent-report.sh,
-                                    #   which only reads claude session
-                                    #   transcripts; a codex process never
-                                    #   writes one. Read the report_path `spor
-                                    #   dispatch` printed at launch (its Codex
-                                    #   supervisor writes Codex's final message
-                                    #   there). claude: scripts/agent-report.sh
-                                    #   <session>
+                                    #   owes it. Every harness (Claude and
+                                    #   Codex both) writes its final message to
+                                    #   the run's report_path — read it with
+                                    #   scripts/agent-report.sh <node-id>, or
+                                    #   fetch it any time with `spor runs
+                                    #   --node <id> --json` -> .runs[0]
+                                    #   .report_path. No per-harness branch:
+                                    #   there is no session transcript to read
+                                    #   for either kind anymore.
       if report has a HANDED BACK block:
           if not split_handed_back(node, report):  # sibling + marker, run
               continue          #   BEFORE the resolved check: it reconciles
@@ -267,15 +270,14 @@ Dispatch the specific item you selected, in its own worktree, with the delegated
 workflow as the prompt template:
 
 ```bash
-spor dispatch --node <id> --worktree --bg --model <sonnet|opus|fable> \
+spor dispatch --node <id> --worktree --model <sonnet|opus|fable> \
   --permission-mode bypassPermissions \
   --template ~/.claude/skills/spor-orchestrator/assets/agent-prompt.md
 ```
 
-- `--bg` launches the native-background `claude --bg` agent instead of the
-  supervised default — required for the attach/stop/`SendMessage` affordances
-  this skill leans on (see the note under "Mental model"). Claude-only; a
-  Codex profile dispatch refuses it.
+- No `--bg` — it's refused outright (the native launch is retired,
+  task-spor-deprecate-native-bg-dispatch). Every dispatch runs supervised;
+  you follow it via its run record (see "Waiting" below), not a session.
 - `--model` right-sizes the implementer per item — your biggest token lever;
   pick it deliberately (see "Right-size the model per item" below).
 - `--node <id>` runs the item *you* chose (so you control non-overlap). Use
@@ -287,8 +289,7 @@ spor dispatch --node <id> --worktree --bg --model <sonnet|opus|fable> \
   full command and how completion differs.
 - `--worktree` isolates the checkout; the branch is the node id.
 - `--permission-mode bypassPermissions` is **required** for an unattended Claude
-  agent: a detached `claude --bg` agent (or a supervised `claude -p` run) has
-  no human to answer permission
+  agent: a supervised `claude -p` run has no human to answer permission
   prompts, so the default mode leaves it **stuck/blocked** the first time it
   wants to write, run a test, or commit — the whole point of the agent is to do
   those without asking. `bypassPermissions` is the right call on an **isolated
@@ -308,10 +309,11 @@ spor dispatch --node <id> --worktree --bg --model <sonnet|opus|fable> \
   profile, e.g. no `codex` CLI on PATH), skip that item — something else owns
   it, or this box isn't the right one to run it. Don't `--force` past a live
   lease.
-- **After a Claude dispatch, send the orchestrator handshake** (see "Talking
-  to the fleet" below) — one `SendMessage` to the agent's node-id name. It's
-  what gives the agent a reply address for blocking questions and long-wait
-  heads-ups; skip it for Codex dispatches (no message channel).
+- `spor dispatch` prints `run:`/`log:`/`report:` (and `session:`, once the
+  harness announces it) the moment it launches — that's the whole handle you
+  need. There is nothing to message: a supervised run is a one-shot process
+  with no live channel back to you, so the agent's final report (step "Final
+  report" in its own prompt) is the only voice it has. See "Waiting" below.
 - Record `{ node, agent_name (= node id), branch, worktree_path, kind }` in
   `running`. `kind` is `'claude'` for `agent-prompt.md`/`infra-agent-prompt.md`/
   `agent-prompt-inplace.md` (self-resolving) or `'codex'` for
@@ -518,134 +520,95 @@ After dispatching, block until something actually changes rather than re-checkin
 in a tight loop. **Use the shipped helpers — do not hand-roll the poll:**
 
 ```bash
-# Block until any tracked agent finishes (run via Bash run_in_background: true;
-# its exit re-invokes you). Prints AGENT_DONE <node>, NODE_RESOLVED <node>, or
-# AGENT_STALLED <node> idle_secs=<n> session=<sid> — a busy agent whose session
-# transcript hasn't moved for WATCH_STALL seconds (default 1800 = 30min).
+# Block until any tracked agent's run record goes terminal (run via Bash
+# run_in_background: true; its exit re-invokes you). Prints
+# AGENT_DONE <node> status=<state> (done/failed/failed_launch/vanished),
+# NODE_RESOLVED <node> status=<s> (graph backstop for a node with no run
+# record), or AGENT_STALLED <node> idle_secs=<n> session=<sid> — a still-
+# running node whose log file hasn't moved for WATCH_STALL seconds (default
+# 1800 = 30min).
 ~/.claude/skills/spor-orchestrator/scripts/watch-fleet.sh <node-id> [<node-id> ...]
 
-# One-shot triangulated view: session status × graph status × verdict
-# (RUNNING / FINISHED — gate+merge it / RECOVER — session gone, node unresolved).
+# One-shot triangulated view: run state × graph status × verdict
+# (RUNNING / FINISHED — gate+merge it / RECOVER — run over, node unresolved).
 ~/.claude/skills/spor-orchestrator/scripts/fleet-status.sh [<node-id> ...]
 ```
 
+Both scripts, and `agent-report.sh` below, read **run records only** — every
+dispatch launches supervised (task-spor-deprecate-native-bg-dispatch: `--bg`
+is refused, so there is no `claude agents --json` listing to poll, and no
+session to check `status`/`state` drift on). `spor runs --node <id> --json`'s
+own `state` field is the single, unambiguous liveness signal: `launching` or
+`running` means still going, and it goes terminal exactly once, the moment
+the supervisor's child exits — for Claude and Codex alike, no per-harness
+branch.
+
 **On `AGENT_STALLED`, inspect before intervening — it's a notification, not a
-verdict.** The transcript-mtime proxy can't distinguish a wedged agent from one
+verdict.** The log-mtime proxy can't distinguish a wedged agent from one
 legitimately awaiting a long background task. The paid-for case (2026-08-05): an
 implementer launched `node --test` as a background task, the test hung with an
 open server listener (`--test-timeout=0` never fires), and the agent waited 44
-minutes for a completion notification that could never come. The fix was to
+minutes for a completion notification that could never come — its log went
+just as quiet as a genuinely wedged agent's would have. The fix was to
 kill ONLY the hung child processes — the background task then completed and the
 agent resumed on its own. So on a stall: check the agent's child processes
 (`ps --ppid <pid>` — near-zero CPU over a long elapsed time = hung child) and
-its last transcript message; kill a hung child rather than the agent when
+the tail of its log/report; kill a hung child rather than the agent when
 that's the diagnosis; re-arm with a longer `WATCH_STALL` (or `WATCH_STALL=0`)
-if the wait is genuine (e.g. a docker matrix run). Escalate to Recover only if
-the agent itself is dead or looping.
+if the wait is genuine (e.g. a docker matrix run). There is no live channel to
+ping the agent and ask (see "No live channel to a dispatched agent" below) —
+process/log inspection is the only diagnostic there is. Escalate to Recover
+only if the agent itself is dead or looping.
 
-The gotchas the scripts encode (so a hand-rolled replacement doesn't re-pay
-them):
+**`AGENT_DONE`/terminal `state` with the node UNRESOLVED is not automatically
+a failure**: read the report first (below) — the agent may have deliberately
+deferred a blocker and said so in its final message (see "Recover"). A
+supervised agent has no way to idle mid-run awaiting your reply (there is
+nothing to reply to), so unlike the retired native path there is no
+"waiting on you" case to rule out here — everything it has to say about why
+it stopped is already in the report.
 
-- `claude agents --json` emits a **bare array**, not `{agents: [...]}` — a
-  wrong jq shape fails SILENT and the watcher spins to timeout while finished
-  agents sit idle (the 2026-07-16 watcher bug).
-- Watch the **`status` field, never `state` alone** — `state` can stick at
-  `working` indefinitely after the agent finishes (the 2026-07-14 stuck-watcher
-  incident, inc-spor-orchestration-watcher-stuck-state), while `status`
-  correctly flips to `idle`. An agent can also vanish from the list entirely.
-- The cheap authoritative check is the graph: **`status: idle` + the node
-  resolved on the graph = finished**, even if `state` still says `working` —
-  proceed to gate+merge and reap the session with an explicit
-  `claude stop <agent>` so it can't linger.
-- **`AGENT_DONE status=idle` + node UNRESOLVED is ambiguous**: finished-
-  without-resolving (→ Recover) *or* idled awaiting your reply to a
-  `<cross-session-message>` question it sent you (→ answer it; the reply
-  resumes it). Check your inbound messages before treating it as failed —
-  see "Talking to the fleet".
-- **`claude agents --json` only lists native-background (`--bg`) agents.** A
-  supervised run — a Claude implementer dispatched WITHOUT `--bg` (the default
-  since c1ab5b6), or any Codex-harness implementer
-  (`assets/codex-agent-prompt.md`) — never appears in that list, session or
-  gone. Both scripts therefore fall back to `spor runs --node <id> --json` for
-  a node absent from the list: a run whose `state` is still non-terminal
-  reads RUNNING (`session=run:<state>`), and a terminal `state`
-  (`done`/`failed`/`vanished`/`failed_launch`) reads as the session having
-  finished (`AGENT_DONE <node> status=run:<state>`). Only a node with NEITHER
-  a listed session NOR a run record reads `session gone`. What the fallback
-  cannot give you is a voice: no `claude attach`/`stop`/`SendMessage` for a
-  supervised run — read its final report from the `.runs[0].report_path` that
-  `spor runs --node <id> --json` returns (JSON shape `{reconciled, count,
-  runs}`), see "The Codex implementer" below.
-
-To read a finished agent's final report, never `claude logs` (it replays raw
-TUI escape frames — huge and unreadable). Use:
+To read a finished agent's final report:
 
 ```bash
-~/.claude/skills/spor-orchestrator/scripts/agent-report.sh <session-id>            # final message
-~/.claude/skills/spor-orchestrator/scripts/agent-report.sh <session-id> --findings # just the FINDINGS block
+~/.claude/skills/spor-orchestrator/scripts/agent-report.sh <node-id>            # final message
+~/.claude/skills/spor-orchestrator/scripts/agent-report.sh <node-id> --findings # just the FINDINGS block
 ```
 
-(It reads the session transcript JSONL under `~/.claude/projects/`; the
-session id is printed by `spor dispatch` at launch — an 8-char prefix works.)
+(It reads the run's `report_path` — the same file `spor dispatch` printed at
+launch and `spor runs --node <id> --json` returns as `.runs[0].report_path`.
+Takes a node id, not a session id.)
 
-### Talking to the fleet (SendMessage)
+### No live channel to a dispatched agent
 
-Every **Claude-harness** agent you dispatch is a peer session on this machine,
-named after its node id: it shows up in `ListAgents`, and you reach it with
-`SendMessage({to: "<node-id>"})`. The channel is bidirectional — an agent's
-message to you arrives automatically as a `<cross-session-message from="...">`
-block (no inbox to poll). This is a *control* channel layered on top of the
-watcher, not a replacement: `watch-fleet.sh` stays the standing wait
-mechanism, and you still never poll agents with "are you done?" messages.
+Every dispatch is a one-shot supervised process (`claude -p`/`codex exec`
+under `spor`'s own supervisor) that runs to completion and exits — it never
+registers as a peer Claude Code session, so `ListAgents`/`SendMessage`/
+`claude attach`/`claude stop` have nothing to reach. This is uniform across
+harnesses now: a Codex implementer never had a message channel either (it
+isn't a Claude session), and a Claude implementer no longer does. Three
+things this changes from a channel-based workflow:
 
-**Handshake at dispatch — this is what creates the reverse channel.** The
-agent cannot guess your session name, so right after each Claude dispatch,
-send it one line:
-
-```
-SendMessage({to: "<node-id>", summary: "orchestrator handshake",
-  message: "I'm your orchestrator. Reply to this address if you hit a decision only I can make, or before starting a long (30min+) quiet step."})
-```
-
-The agent's prompt tells it to note the `from` address on this message and use
-it for the narrow cases below; without the handshake it has no way to reach
-you. Messages enqueue and deliver at the agent's next tool round, so the
-handshake never interrupts its work. (Optionally add `notify_when_idle: true`
-for a free one-shot backstop to the watcher — but remember it fires at the
-agent's *first* idle, which may be a pending question, not completion.)
-
-**What the channel is for** — sparingly; every message lands in both contexts:
-
-- **Answering an agent's blocking question.** The agent prompt permits one
-  narrow kind of mid-run question: a decision that's cheap for you but would
-  otherwise force the agent to guess or bail (a scope call, contradictory
-  instructions). The agent sends it and goes idle; **your reply resumes it
-  exactly where it stopped.** So an idle session + an unresolved node + an
-  unanswered inbound question from that agent = *waiting on you, not failed* —
-  answer it (or escalate to the user and tell the agent to defer) before
-  routing anything through Recover.
-- **Mid-flight course corrections.** The user re-scoped or killed an item, or
-  a just-landed merge changes an in-flight agent's ground — tell that agent
-  directly rather than letting it finish the wrong thing.
-- **Probing a stall.** On `AGENT_STALLED`, a ping ("what are you waiting
-  on?") is a cheap first probe — but it only lands if the agent is still
-  taking tool rounds; a truly wedged agent (blocked on a notification that
-  will never come) never sees it. Keep the child-process inspection from
-  Waiting as the diagnostic that always works.
-- **Resuming a finished agent for follow-up work.** Sending to an idle or
-  finished session resumes it from its transcript, full context intact. That
-  makes it the cheap path after a merge subagent's `FAILED`/`ESCALATE`:
-  message the implementer ("rebase onto new main, resolve the conflict in X,
-  re-run the tests, recommit, tell me when the branch is clean") instead of a
-  cold re-dispatch. Reserve actual re-dispatch (Recover) for a dead session,
-  a ruined worktree, or a model-tier bump.
-
-**Scope limits:** don't broadcast chatter to the pool; don't use the channel
-for status polling; and never route through an agent an action your own
-session's permissions blocked (cross-session permission laundering). **Codex
-implementers have no message channel** — they aren't Claude sessions, so
-neither end has SendMessage; their report file remains their only voice, per
-"The Codex implementer".
+- **An agent can't ask you a blocking question mid-run.** Its prompt (see
+  "If it won't converge" in `assets/agent-prompt.md`) tells it to use its own
+  best judgment on an ordinary scope call, and to `/spor:defer` and stop —
+  leaving the node **unresolved** with the blocker stated in its final
+  report — for anything it genuinely can't resolve alone. You see that
+  report once the run goes terminal, not while it's still running; there is
+  no reply that resumes it.
+- **Follow-up after a merge failure is a re-dispatch, not a resumed
+  session.** After a merge-subagent's `FAILED`/`ESCALATE` verdict (see "Gate
+  + merge" below), there is no idle session to message with "rebase and fix
+  X" — the implementer's process is long gone. Re-dispatch the node instead,
+  pointing the template/prompt at what needs fixing (a fresh
+  `--template`, or fold the ask into the node's briefing before
+  re-dispatching); this is the same path as any other Recover, not a special
+  case.
+- **Mid-flight course corrections wait for the run to finish.** If the user
+  re-scopes or kills an item while its agent is still running, there is
+  nothing to tell it — let the run finish (or kill its process group
+  yourself if it must stop now — see "Recover"), then handle the outcome
+  when its run goes terminal rather than trying to redirect it live.
 
 ### Gate + merge
 
@@ -680,10 +643,11 @@ reality.
 **Serialize** these: only one merge-subagent in flight at a time (the CAS guard
 makes it safe, and one-at-a-time keeps main coherent), even though the
 implementer agents keep working in parallel. On a `FAILED`/`ESCALATE` verdict,
-send the (idle) implementer a `SendMessage` follow-up to rebase and fix in its
-worktree — resuming its session keeps all its context, far cheaper than a cold
-re-dispatch (see "Talking to the fleet") — or escalate to the user; don't
-hand-resolve a semantic conflict you don't understand.
+there is no live implementer session to resume (see "No live channel to a
+dispatched agent") — re-dispatch the node with a follow-up prompt (rebase,
+resolve the conflict in X, re-run the tests, recommit) as a fresh supervised
+run in the same worktree, or escalate to the user; don't hand-resolve a
+semantic conflict you don't understand.
 
 **Shut merge subagents down when done.** A merge subagent's contract ends at
 its verdict — it must never idle on and autonomously claim or merge other
@@ -712,11 +676,10 @@ you run "The split contract" and resolve it yourself — not Recover.
 The agent finished or died without resolving its node, so the work is incomplete
 or it deliberately bailed:
 
-- **First rule out "waiting on you":** if that agent sent you a
-  `<cross-session-message>` question you haven't answered, it idled on purpose —
-  answer it (the reply resumes it) and skip the rest of Recover. See "Talking
-  to the fleet".
-- Read its final message and worktree diff to see how far it got.
+- Read its final report (`scripts/agent-report.sh <node-id>`) and worktree
+  diff to see how far it got — a supervised agent has no live channel to be
+  "waiting on you" through, so its report is the whole story (see "No live
+  channel to a dispatched agent").
 - If it **deferred a blocker** (a new capture in `spor next`, or it says so in
   its final message — e.g. the item needs a coordinated cross-repo change),
   escalate to the user and don't merge.
@@ -761,23 +724,20 @@ on the graph, identical to one that never started: unresolved. That's
 expected, not a failure signal — but it collides head-on with
 completion-detection paths built for **self-resolving** agents:
 `fleet-status.sh`'s `RECOVER` branch and the supervisor loop's default
-`recover()` fallthrough both read "unresolved" as "didn't finish," and
-neither script can see a Codex session (they poll `claude agents --json`,
-which a Codex process never enters — they follow it only through the
-`spor runs` fallback, which reports liveness, not a resolution).
+`recover()` fallthrough both read "unresolved" as "didn't finish." Every
+dispatch is followed the same way regardless of harness (there is no
+`claude agents --json` listing for anything to be absent from anymore — see
+"Waiting"), so the one thing that's Codex-specific here is entirely about the
+graph, not about visibility.
 
 Two things close the gap:
 
-1. **Track which nodes are Codex-dispatched, and record where dispatch says
-   its report landed.** Record `kind: 'codex'` alongside the node in
-   `running` at dispatch time (see Dispatch, above), plus the `report_path`
-   line `spor dispatch` printed at launch (or fetch it any time afterward with
-   `spor runs --node <id> --json` → `.runs[0].report_path`) — that's what tells the
-   supervisor loop both that this node's absence from `claude agents --json`
-   means nothing on its own, and where to actually find its report once it
-   exits. Poll `spor runs --node <id> --json` for completion (its `state`
-   goes terminal on its own once the Codex supervisor exits), not
-   `fleet-status.sh`/`watch-fleet.sh` — see the Waiting section's scope note.
+1. **Track which nodes are Codex-dispatched.** Record `kind: 'codex'`
+   alongside the node in `running` at dispatch time (see Dispatch, above) —
+   that's what tells the supervisor loop this node's own contract never
+   resolves it, so an unresolved node here isn't automatically a Recover.
+   Follow it exactly like a Claude node: `watch-fleet.sh`/`fleet-status.sh`,
+   `spor runs --node <id> --json` for its `report_path`.
 2. **Resolve before you status-check.** When a tracked Codex run's state goes
    terminal, read its final report from `running[node].report_path` — same
    shape as a Claude agent's: ends with `MERGE-READY` or `BLOCKED` and why,
@@ -821,8 +781,7 @@ Two things close the gap:
    its node unresolved — handle it identically, it is the same debt.
 
 Never resolve a Codex node preemptively — because it's been running a while,
-or because it isn't in `claude agents --json`, or any signal short of a
-`MERGE-READY` report. Resolving on a guess is exactly the failure mode
+or any signal short of a `MERGE-READY` report. Resolving on a guess is exactly the failure mode
 issue-spor-orchestrator-implementer-resolves-before-commit already paid for:
 it must never happen before you know the work is actually done.
 
@@ -836,7 +795,7 @@ the code agents use. Run them through a **dedicated infra agent** instead, and
 dedicate at most ONE pool slot to it:
 
 ```bash
-spor dispatch --node <infra-id> --no-worktree --bg --permission-mode bypassPermissions \
+spor dispatch --node <infra-id> --no-worktree --permission-mode bypassPermissions \
   --template ~/.claude/skills/spor-orchestrator/assets/infra-agent-prompt.md
 ```
 
@@ -874,7 +833,7 @@ promises an isolated worktree and a branch for you to CAS-merge, neither of
 which exists when the agent lands directly in the shared checkout.
 
 ```bash
-spor dispatch --node <id> --no-worktree --bg --model <sonnet|opus|fable> \
+spor dispatch --node <id> --no-worktree --model <sonnet|opus|fable> \
   --permission-mode bypassPermissions \
   --template ~/.claude/skills/spor-orchestrator/assets/agent-prompt-inplace.md
 ```
@@ -913,10 +872,9 @@ Both implementer prompts (`agent-prompt.md`, `codex-agent-prompt.md`) end with a
 Agents do NOT write these to the graph (so the graph isn't flooded with
 uncurated, duplicated defer nodes, and so Codex — which can't write the graph at
 all — can still surface them). **You curate them.** Pull the block with
-`scripts/agent-report.sh <session-id> --findings` for a Claude agent; for a
-Codex node, read `running[node].report_path` directly instead —
-`agent-report.sh` only resolves Claude session transcripts, it has no id to
-look up a Codex process by. When you read an agent's final report (at
+`scripts/agent-report.sh <node-id> --findings` — the same lookup for a Claude
+agent or a Codex node, since both write their final message to a run
+record's `report_path` now (see "Waiting"). When you read an agent's final report (at
 merge/recover time), triage its FINDINGS: drop dupes/noise,
 then `put_node` each keeper as the right type (`issue` for a bug/hazard, `task`
 for a refactor/improvement) linked `relates-to`/`derived-from` the node it came

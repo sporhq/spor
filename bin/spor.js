@@ -9072,12 +9072,16 @@ async function topQueueItem(cfg, slug) {
 // REMOTE-MODE ONLY: a claim is a server-held lease; local mode has no pool or
 // contention (dec-cc-task-claim-lease "Local mode"), so the caller skips it and
 // local dispatch stays byte-identical. PRE-LAUNCH the claim is PERSON-SCOPED
-// (session omitted, dec-spor-dispatch-bg-session-late-bind): `claude --bg`
-// IGNORES `--session-id` and self-allocates its real session, so the working
-// session is NOT knowable up front — binding the lease to a forced uuid was a
-// phantom (issue-spor-dispatch-bg-ignores-forced-session-id). Dispatch instead
-// captures the real session post-launch and binds it via renewDispatch (and the
-// bg agent's own post-tool heartbeat renews the same-session lease thereafter).
+// (session omitted, dec-spor-dispatch-bg-session-late-bind): every supervised
+// harness reports its own real session id only on its first stream event, so
+// the working session is NOT knowable up front — binding the lease to a forced
+// uuid was a phantom (issue-spor-dispatch-bg-ignores-forced-session-id, from the
+// retired native launch that ignored a forced `--session-id` outright). Dispatch
+// instead captures the real session post-launch and binds it via the supervisor's
+// own renew call (`renewNode`/`renewToken`, threaded into `launchSupervisedHarness`
+// and posted from inside lib/shell/agent-dispatch-runner.js once the session is
+// known — not from here) — and the dispatched agent's own post-tool heartbeat
+// renews the same-session lease thereafter.
 // A per-invocation `dispatch` nonce tags the claim so the server can distinguish
 // a SECOND concurrent dispatch of the same node BY THE SAME PERSON from this
 // person's own idempotent renew (inc-spor-dispatch-duplicate-task-2026-06-18):
@@ -9336,40 +9340,6 @@ function releaseLocalDispatchLock(token) {
   }
 }
 
-// Renew the dispatch lease, binding it to the REAL session captured post-launch
-// (dec-spor-dispatch-bg-session-late-bind). The pre-launch claim was person-scoped;
-// this binds the lease's session to the real `claude --bg` run so the lease and the
-// rebound agent token agree from the start (instead of waiting for the agent's first
-// heartbeat to self-heal it). Best-effort: a lapsed/stolen lease (409) or any other
-// failure is swallowed — the bg agent's heartbeat still renews it. Returns {ok}.
-async function renewDispatch(cfg, nodeId, session) {
-  const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/renew`, { session }, { timeoutMs: 3000 });
-  return { ok: !!r.ok };
-}
-
-// Late-bind the agent token's run session (dec-spor-dispatch-bg-session-late-bind).
-// The token was minted session-DEFERRED before launch (the session wasn't knowable
-// yet); this reports the REAL session captured from `claude agents --json`,
-// authenticated by the AGENT TOKEN ITSELF (not the person token) so the server can
-// set it on that token's record. Every subsequent write under the token then stamps
-// the real session. Best-effort/fail-open: a server without the route (404), a
-// conflict (409), or any transport error leaves the token session-null (writes
-// carry no session — honest, never a phantom) rather than blocking dispatch — but
-// the caller now reports it loudly (issue-spor-remote-stale-socket-after-blocking-spawn:
-// a silent skip here is how a stale pooled socket after the launch's blocking
-// spawn went unnoticed). Setting a token's session is idempotent — re-sending the
-// SAME session has the same effect — so it's marked `idempotent: true`,
-// making it eligible for remote.js's one stale-pooled-socket retry. Returns
-// {ok}|{absent}|{conflict}|{error}.
-async function bindAgentSession(cfg, agentToken, session) {
-  const r = await remote.post(cfg, `/v1/agents/session`, { session }, { timeoutMs: 3000, token: agentToken, idempotent: true });
-  if (r.ok) return { ok: true };
-  if (r.status === 404) return { ok: false, absent: true };
-  if (r.status === 409) return { ok: false, conflict: true };
-  const code = r.json && r.json.error && r.json.error.code;
-  return { ok: false, error: r.transport ? r.error : `HTTP ${r.status}${code ? ` (${code})` : ""}` };
-}
-
 // Resolve the directory to launch in. --dir wins; else a known slug is looked up
 // in the map; else the cwd's durable repo root. { dir:null } means "slug unknown
 // here". The cwd fallback uses dispatchRoot() (not repoRoot()) so a dispatch run
@@ -9443,10 +9413,11 @@ function shellQuote(s) {
 // concurrent dispatches never race the shared working tree/index — the
 // stale-working-tree / shared-checkout-CAS class (issue-spor-live-server-stale-
 // working-tree). Opt-in per repo (dispatch.worktree); dispatch OWNS the
-// lifecycle (create + setup hook + launch cwd) rather than `claude --bg`'s own
-// --worktree, because that is a bare `git worktree add` we can't prep before the
-// agent starts AND the launcher env never reaches the bg agent (it self-allocates
-// a spare worker). So the per-repo setup hook is the only place spor-server-class
+// lifecycle (create + setup hook + launch cwd) rather than leaving it to the
+// harness's own worktree support (the retired native `claude --bg --worktree`
+// was a bare `git worktree add` we couldn't prep before the agent started, and
+// its launcher env never reached the detached agent). So the per-repo setup
+// hook is the only place spor-server-class
 // deps (a node_modules symlink, $SPOR_LIB via the worktree's own
 // .claude/settings.local.json `env`) can be staged. The generic client knows
 // nothing of those — it just runs the configured hook.
@@ -9619,8 +9590,9 @@ function mainCheckoutOf(dir) {
 
 // The `env` block a worktree's own `.claude/settings.local.json` declares — the
 // channel the spor-server setup hook uses to pin `$SPOR_LIB` for the agent
-// that will run there (a launcher's env never reaches a `claude --bg` agent,
-// so the hook writes it where the harness reads it). A gate's suite runs in
+// that will run there (the dispatcher's own env never reaches the detached
+// supervised child, so the hook writes it where the harness reads it). A
+// gate's suite runs in
 // such a tree under THIS process, not under a harness, so the same block is
 // folded into the suite's env here — otherwise the hook's pin reaches the
 // implementer and not the judge. Fail-soft: no file, or an unreadable one, is
@@ -9840,8 +9812,9 @@ function onboardRepo(cfg, dir) {
 
 // --- dispatch agent identity (dec-spor-session-identity-active-record) -----
 // A dispatched session runs AS this machine's agent, carried on a per-session
-// agent-scoped MCP token (env does NOT propagate through `claude --bg`, so
-// identity rides the token in --mcp-config, never env). These helpers report
+// agent-scoped MCP token (identity rides the token in --mcp-config, never
+// plain env, so it never shows up in the child's environment or a process
+// listing). These helpers report
 // what they found or minted; the CALLER (cmdDispatch) decides what to do with
 // a miss — per dec-spor-worker-strictness-split-interactive-lenient that is a
 // HARD FAIL by default (no agent configured, or minting failed), never a
@@ -9865,10 +9838,12 @@ function dispatchAgentId(cfg) {
 // OWNS agent {id} (the owned-by edge) — so a normal teammate can mint a token for
 // their own machine's agent without being an admin. REMOTE only. The token is
 // minted session-DEFERRED (session omitted) when the real session isn't yet known
-// — the standing case, since `claude --bg` allocates it only at launch
-// (dec-spor-dispatch-bg-session-late-bind); dispatch binds the real session
-// afterward via bindAgentSession. The `session` param is kept for a caller that
-// genuinely knows it up front (none today — dispatch always defers). Returns
+// — the standing case, since a supervised harness reports its real session only
+// on its first stream event (dec-spor-dispatch-bg-session-late-bind); dispatch
+// binds the real session afterward from inside launchSupervisedHarness
+// (`bindToken`/`renewToken`, lib/shell/agent-dispatch-runner.js). The `session`
+// param is kept for a caller that genuinely knows it up front (none today —
+// dispatch always defers). Returns
 // { ok, token } on success, { absent:true } when the mint surface isn't deployed
 // yet (404), or { error } on any other failure incl. 403/owner-mismatch — both
 // misses are reported to the caller, which hard-fails by default
@@ -9884,15 +9859,17 @@ async function mintAgentToken(cfg, { agent, session }) {
   return { ok: true, token };
 }
 
-// Write the 0600 --mcp-config JSON that gives the bg agent ONLY its own
+// Write the 0600 --mcp-config JSON that gives the dispatched agent ONLY its own
 // agent-scoped Spor MCP (account connector excluded by --strict-mcp-config,
 // verified #1). Machine-local, gitignored-adjacent path under the user config
 // home's outbox; per-dispatch filename (`key`, a fresh uuid) so concurrent
 // dispatches don't collide — the session id is no longer known at this point
 // (deferred until post-launch, dec-spor-dispatch-bg-session-late-bind). Returns
-// the file path. The bg agent reads it on startup AFTER this process exits (claude
-// --bg detaches), so we cannot delete it eagerly — cleanup is a best-effort sweep
-// of stale files here, plus the documented short-TTL token inside it.
+// the file path. The supervised child reads it on startup after this CLI
+// invocation has already returned (dispatch launches the supervisor and exits;
+// the supervisor and its child keep running detached), so we cannot delete it
+// eagerly — cleanup is a best-effort sweep of stale files here, plus the
+// documented short-TTL token inside it.
 function writeDispatchMcpConfig(cfg, { token, key }) {
   const dir = path.join(cfg.userConfigHome(), "outbox", "dispatch");
   fs.mkdirSync(dir, { recursive: true });
@@ -9922,8 +9899,9 @@ function writeDispatchMcpConfig(cfg, { token, key }) {
 }
 
 // Best-effort cleanup: remove dispatch mcp-config files older than a day. The
-// tokens inside are short-TTL, but the files linger because claude --bg reads
-// them after we exit; sweep on the next dispatch so they don't accumulate.
+// tokens inside are short-TTL, but the files linger because the detached
+// supervisor and its child read them after this CLI invocation exits; sweep on
+// the next dispatch so they don't accumulate.
 function sweepStaleMcpConfigs(dir) {
   try {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
@@ -11165,8 +11143,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   const translated = harnessOptionsCheck && harnessOptionsCheck.translate;
   const effectiveSandbox = (translated && translated.sandbox) || sandbox || "workspace-write";
   const effectiveApprovalPolicy = (translated && translated.approvalPolicy) || approvalPolicy || "never";
-  // NB: no `--session-id` — `claude --bg` ignores it (warns) and manages its own
-  // session; we capture the real one post-launch (dec-spor-dispatch-bg-session-late-bind).
+  // NB: no `--session-id` — the harness allocates and announces its own real
+  // session on its supervised stream; we capture that post-launch instead of
+  // forcing one (dec-spor-dispatch-bg-session-late-bind).
   // The adapter's own read-only posture rides into buildArgs only under
   // --read-only, so a plain dispatch's argv is byte-identical.
   const readOnlyPosture = readOnly && harnessAdapter ? harnessAdapter.readOnly || null : null;
@@ -11541,9 +11520,11 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     // a 0600 --mcp-config that exposes ONLY the agent's own Spor MCP, and add
     // --strict-mcp-config so the account connector is excluded by construction. The
     // server then stamps authored_by_agent + session from that token. The token is
-    // minted session-DEFERRED — the run session isn't known until `claude --bg`
-    // self-allocates it, so we bind it AFTER launch (dec-spor-dispatch-bg-session-
-    // late-bind), keeping `agentToken` to authenticate that late bind. Per
+    // minted session-DEFERRED — the run session isn't known until the harness's
+    // supervised stream reports it, so we bind it AFTER launch
+    // (dec-spor-dispatch-bg-session-late-bind, from inside launchSupervisedHarness
+    // via `bindToken`/`renewToken`), keeping `agentToken` to authenticate that
+    // bind. Per
     // dec-spor-worker-strictness-split-interactive-lenient a mint failure now HARD
     // FAILS — a server without the mint surface, or a transient minting error, must
     // not silently attribute the dispatched agent's writes to the person — unless
@@ -11608,9 +11589,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     // claim, it skips the redundant claim-nudge). Remote node-mode only; --no-claim
     // opts out (dispatch with no lease, the prior behavior). PERSON-SCOPED here
     // (session omitted, dec-spor-dispatch-bg-session-late-bind): the real session
-    // isn't known until after launch in ANY launch mode (the supervised stream
-    // announces it, `claude --bg` self-allocates it), so we bind it to the lease
-    // via renewDispatch below; until then any of this person's sessions may renew it.
+    // isn't known until the harness's supervised stream announces it after launch,
+    // so we bind it to the lease from inside launchSupervisedHarness (renewNode/
+    // renewToken, below) once it does; until then any of this person's sessions
+    // may renew it.
     let claimEstablished = false;
     if (nodeId && !backfill && !noClaim && cfg.mode() === "remote") {
       // Tag this claim with a per-invocation dispatch nonce so the server refuses a

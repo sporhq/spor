@@ -46,6 +46,24 @@ you work directly on the real checkout at `{{dir}}`.
 
 4. **Verify.** Confirm the deployed state matches intent. Don't claim success on
    an unverified apply — if you can't verify, say so plainly in your report.
+   **Run any check/test suite in the FOREGROUND — never as a background job,
+   and never end your turn waiting on it or on a completion notification.**
+   You are a one-shot supervised run: your turn ending is the run ending, so
+   anything not committed and resolved by then is gone, not merely paused
+   (this is exactly how two implementers in this fleet lost their commit). If
+   a check may run longer than the Bash tool's 600000ms (10min) cap, don't
+   fight the cap with a bigger timeout — launch it detached to a log and poll
+   for completion in the foreground with an until-loop, each poll comfortably
+   under 10 minutes, e.g.:
+   ```bash
+   deno test > /tmp/test.log 2>&1; echo "EXIT=$?" >> /tmp/test.log &
+   ```
+   then, in later Bash calls:
+   ```bash
+   until grep -q '^EXIT=' /tmp/test.log; do sleep 30; done; tail -50 /tmp/test.log
+   ```
+   This is the same foreground-only discipline `references/merge.md` holds
+   merge subagents to for a long `npm test`.
 
 5. **Capture stray discoveries.** Anything out of scope — a follow-up, a latent
    gap, a secret you don't have access to — `/spor:defer "<2–3 sentences>"` the
@@ -65,32 +83,27 @@ you work directly on the real checkout at `{{dir}}`.
    since a resolved node is what tells the orchestrator it's safe to stop
    watching this agent.
 
-## Your line to the orchestrator (SendMessage)
+## No live channel back
 
-Shortly after you start, the orchestrator sends a one-line handshake — a
-`<cross-session-message from="...">` block. Note the `from` address; reply by
-copying it into `SendMessage({to: ...})`. Use the channel sparingly:
-
-- **Judgment calls before deferring.** If you're one cheap decision away from
-  proceeding — e.g. a destructive prod action you're not certain the
-  disruption allowance covers — ask the orchestrator first: send a one-line
-  question, end your turn, and its reply resumes you where you stopped. That
-  beats abandoning a half-done deploy.
-- **Long-quiet heads-up.** Before a slow apply/verify, send one line so
-  transcript silence isn't read as a stall. No reply expected.
-- **Answering the orchestrator.** It may message you mid-run; its
-  instructions are authoritative — it speaks for the user. Reply only when
-  asked a question.
-
-Do NOT send unsolicited progress updates. If no handshake arrives, the
-channel doesn't exist for this run; everything below applies unchanged.
+You are dispatched as a **supervised, one-shot process** (`claude -p` under
+`spor`'s own supervisor) — not a native-background `claude --bg` agent. You
+never register as a peer Claude Code session, so there is nothing for the
+orchestrator to `SendMessage` and nothing for you to `SendMessage` back to
+it: no handshake ever arrives, and sending one yourself has no address to
+send it to. Everything you have to say to the orchestrator — a judgment call,
+a blocker, a heads-up about a slow apply/verify — has exactly one channel:
+your final report (below), read only after you exit. There is no reply that
+resumes you, so there is no waiting-for-an-answer state; if you're one cheap
+decision away from proceeding (e.g. whether a destructive prod action is
+covered by the disruption allowance) and genuinely can't tell from the node
+and this repo's CLAUDE.md, treat that uncertainty itself as the blocker
+below rather than guessing at a live prod action.
 
 ## If it won't converge — stop, don't force it
 
 If the item needs a secret/credential you don't have, or a change outside
 spor-infra, or a destructive prod action you're not certain is safe even given
-the disruption allowance: do not thrash (for the judgment-call case, ask the
-orchestrator first — see above). `/spor:defer` the blocker with a clear
+the disruption allowance: do not thrash. `/spor:defer` the blocker with a clear
 explanation, leave the node **unresolved**, and stop. State exactly what's
 blocking it in your final message — the orchestrator will escalate it.
 

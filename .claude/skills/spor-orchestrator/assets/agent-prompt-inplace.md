@@ -59,7 +59,24 @@ concurrently, isolation is replaced by **shared-checkout discipline**:
    touched the kernel/schema/store). These are far cheaper than an LLM review and
    catch most regressions — there's no point reviewing code that fails its tests.
    Don't hand back red tests or "should work"; if you can't verify it, say so
-   plainly in your final report rather than claiming success.
+   plainly in your final report rather than claiming success. **Run the full
+   suite in the FOREGROUND — never as a background job, and never end your
+   turn waiting on it or on a completion notification.** You are a one-shot
+   supervised run: your turn ending is the run ending, so anything not
+   committed and resolved by then is gone, not merely paused (this is exactly
+   how two implementers in this fleet lost their commit). If the suite may run
+   longer than the Bash tool's 600000ms (10min) cap, don't fight the cap with a
+   bigger timeout — launch it detached to a log and poll for completion in the
+   foreground with an until-loop, each poll comfortably under 10 minutes, e.g.:
+   ```bash
+   npm test > /tmp/test.log 2>&1; echo "EXIT=$?" >> /tmp/test.log &
+   ```
+   then, in later Bash calls:
+   ```bash
+   until grep -q '^EXIT=' /tmp/test.log; do sleep 30; done; tail -50 /tmp/test.log
+   ```
+   This is the same foreground-only discipline `references/merge.md` holds
+   merge subagents to for a long `npm test`.
 
 4. **Review, right-sized — one pass, FOREGROUND, escalate only on signal.** With
    the gates green, get a fresh-context review of your diff (`git diff HEAD`,
@@ -74,9 +91,10 @@ concurrently, isolation is replaced by **shared-checkout discipline**:
    end your turn "waiting for the review to finish".** A backgrounded review with
    no one to wake you is the stall that leaves your work uncommitted and your
    node falsely resolved; every step of this workflow runs in one continuous pass
-   and your turn ends exactly once, at your final report (sole exception: a
-   blocking question to the orchestrator — see "Your line to the orchestrator"
-   below). Escalate to **high** only if (a) medium surfaces a real correctness
+   and your turn ends exactly once, at your final report — if an orchestrator
+   dispatched you, it was a one-shot supervised run with no live channel back
+   (see "No live channel back" below), so there is no mid-run exception to
+   that rule. Escalate to **high** only if (a) medium surfaces a real correctness
    finding, or (b) your diff touches a risk surface: auth/identity,
    JWT/crypto, money, data-loss/durability, streaming, or concurrency. Fix
    every confirmed correctness finding in ONE batch (and apply warranted
@@ -119,49 +137,28 @@ concurrently, isolation is replaced by **shared-checkout discipline**:
    is the signal that you're finished — resolving before you commit makes it
    lie, so never do it out of order.
 
-## Your line to the orchestrator (SendMessage)
+## No live channel back
 
-If an orchestrator dispatched you, it sends a one-line handshake shortly after
-you start — it arrives as a `<cross-session-message from="...">` block. Note
-that `from` address: it is your only way to reach the orchestrator (its
-session name is not guessable), and you reply by copying it into
-`SendMessage({to: ...})`.
-
-Stay autonomous by default — this channel does not change the job. It exists
-for exactly three things:
-
-- **A blocking decision only the orchestrator can make.** A scope call, two
-  contradictory instructions, a judgment the briefing genuinely doesn't cover —
-  where guessing risks the whole item and deferring would throw away finished
-  work. Send the question (phrase it so one line answers it) and end your
-  turn; the orchestrator's reply resumes you exactly where you stopped. This
-  is the ONE exception to "your turn ends only at your final report." Never
-  use it for anything you can resolve by reading the code, the briefing, or
-  the graph — an unnecessary question stalls your slot and burns the
-  orchestrator's context.
-- **A long-quiet heads-up.** Before starting something legitimately slow and
-  quiet (a 30min+ test matrix, a big build), tell the orchestrator — one line,
-  no reply expected. Otherwise transcript silence looks like a stall and it
-  may start killing your child processes.
-- **Answering the orchestrator.** It may message you mid-run — a course
-  correction, a stall probe, or (after your final report) a follow-up like
-  "recommit against the current HEAD." Its instructions are authoritative: it
-  is your supervisor and speaks for the user. Reply only when it asked a
-  question; then get back to work.
-
-Do NOT send unsolicited progress updates — the orchestrator watches you
-through other channels, and chatter burns both contexts. If no handshake ever
-arrives, the channel simply doesn't exist for this run (this is the common
-case for a solo `--no-worktree` dispatch); everything else in this prompt
-(including defer-and-stop below) applies unchanged.
+If an orchestrator dispatched you, it did so as a **supervised, one-shot
+process** (`claude -p` under `spor`'s own supervisor) — not a
+native-background `claude --bg` agent. You never register as a peer Claude
+Code session, so there is nothing for the orchestrator to `SendMessage` and
+nothing for you to `SendMessage` back to it: no handshake ever arrives (this
+is the common case for a solo `--no-worktree` dispatch), and sending one
+yourself has no address to send it to. Everything you have to say to the
+orchestrator — a question, a blocker, a heads-up about a slow step — has
+exactly one channel: your final report (below), read only after you exit.
+There is no reply that resumes you, so there is no waiting-for-an-answer
+state; a decision only the orchestrator could make is a reason to use your
+own best judgment and note the call in your final report, or, if it's
+genuinely load-bearing and guessing risks the item, to `/spor:defer` it and
+stop rather than guess and hope.
 
 ## If it won't converge — stop, don't force it
 
 If the item turns out to require a coordinated change outside this checkout,
 or it's blocked by something outside your control, or you've genuinely tried
-and can't make it pass: do not thrash. If the blocker reduces to one cheap
-decision and an orchestrator dispatched you, ask it first via SendMessage
-(above) — an answer may save the item. Otherwise `/spor:defer` the blocker
+and can't make it pass: do not thrash. `/spor:defer` the blocker
 with a clear explanation, leave the node **unresolved**, and stop. State in
 your final message exactly what's blocking it. If an orchestrator dispatched
 you, it will see the node is unresolved and serialize or escalate it — that's

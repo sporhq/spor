@@ -348,11 +348,12 @@ and lives beside `gates` and `integration` in the same payload:
 Keys (`lib/kernel/gates.js parseRescue` is the authority):
 
 - **`profile`** (required) — the profile the rescue dispatches under. Route
-  it to a strong model on a SUPERVISED harness that can WRITE (it commits in
-  the implementer's checkout), run the suite, and run `spor put-node` — the
-  worker refuses to start if the profile's harness launches native-background,
-  because the diagnosis is read off the run's final report. Never a command:
-  the machine's own binding decides what runs.
+  it to a strong model that can WRITE (it commits in the implementer's
+  checkout), run the suite, and run `spor put-node` — every dispatch launches
+  supervised now (task-spor-deprecate-native-bg-dispatch), so the diagnosis is
+  always read off the run's final report; there is no native-background mode
+  left to route to. Never a command: the machine's own binding decides what
+  runs.
 - **`attempts`** (default 1, at most 3) — rescue attempts per pipeline; each
   is a full dispatch plus a whole re-run of the gate list, so keep it at 1
   unless the telemetry argues otherwise.
@@ -533,9 +534,8 @@ not parse `gates`, `integration` or `rescue` the way the runner does. `spor work
 the same way the real loop would, prints the resolved pipeline, and dispatches
 nothing — so a bad `integration:` block surfaces there as a load error before
 anyone hands the factory off, (for `mode: propose`) a missing `gh` on
-PATH surfaces as a refusal to start rather than a silent no-op, and a
-`rescue.profile` routed to a native-background harness is refused the same
-way an agent-review gate's would be. The same `--print` load is where an
+PATH surfaces as a refusal to start rather than a silent no-op. The same
+`--print` load is where an
 `implementation:`/`completion:` mistake surfaces: an `author_checks` name that
 is not a declared command gate, a launch field written inside the stage, an
 `after: integration` with no integration block, or an unreachable
