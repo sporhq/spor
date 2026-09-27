@@ -293,6 +293,26 @@ test("dispatch <node-id>: auto-detects node mode and resolves the dir cross-repo
   assert.match(r.stdout, /Work on dec-x — A demo decision about auth token rotation/);
 });
 
+// issue-spor-node-id-guard-remaining-read-paths: `--node <id>` is the one
+// unchecked path into resolveNode's local `nodes/<id>.md` read (the queue
+// and auto-detect paths above it are already graph-sourced/regex-checked).
+// A node file planted just OUTSIDE nodes/ with a frontmatter id that would
+// satisfy resolveNode's read but only via a `../`-relative path.
+test("dispatch --node ../x: refuses the traversal id before any file read", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-trav-"));
+  const home = path.join(root, "home");
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const outside = path.join(home, "x.md");
+  const outsideMd = `---\nid: ../x\ntype: task\ntitle: Outside file\nsummary: A markdown file outside the nodes dir.\ndate: 2026-06-01\n---\nOutside body.\n`;
+  fs.writeFileSync(outside, outsideMd);
+  const r = run(["dispatch", "--node", "../x", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /bad node id '\.\.\/x'/);
+  assert.doesNotMatch(r.stdout, /Outside body/);
+  assert.strictEqual(fs.readFileSync(outside, "utf8"), outsideMd);
+});
+
 test("dispatch --from-queue: dispatches the top-ranked queue item into its repo", () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home }); // both fixture nodes are repo:demo

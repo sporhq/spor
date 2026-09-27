@@ -1419,6 +1419,21 @@ b
   assert.ok(r.errors.some((e) => /!= filename/.test(e)));
 });
 
+test("validateNode: rejects non-kebab-case id", () => {
+  const node = graph.parseFrontmatter(`---
+id: Bad_ID
+type: decision
+title: t
+summary: s
+date: 2026-06-01
+---
+b
+`, "Bad_ID.md");
+  const r = graph.validateNode(null, node);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => /not kebab-case/.test(e)));
+});
+
 test("validateNode: rejects correction without target", () => {
   const node = graph.parseFrontmatter(`---
 id: corr-notarget
@@ -1691,6 +1706,22 @@ b
   });
   const v = graph.validateGraph(fx.nodesDir);
   assert.ok(v.errors.some((e) => /duplicate id 'dup-id'/.test(e)));
+});
+
+test("validateGraph: non-kebab-case id is an error", () => {
+  const fx = tmpGraph({
+    "Bad_ID.md": `---
+id: Bad_ID
+type: decision
+title: A
+summary: s
+date: 2026-06-01
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.ok(v.errors.some((e) => /not kebab-case/.test(e)));
 });
 
 test("validateGraph: unparseable file is an error, not a throw", () => {

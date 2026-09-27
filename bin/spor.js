@@ -4990,9 +4990,12 @@ const NODE_ID_RE = /^[a-z0-9][a-z0-9-]*$/; // mirrors the server's ID_RE/SLUG_RE
 // filesystem. The grammar admits no `/`, `\`, or `.`, so a conforming id can
 // only name a file directly inside the nodes dir — `../x` or an absolute path
 // never reaches path.join. Returns the refusal message, or null for a
-// well-formed id. Other local doors built on resolveNode (e.g. `spor dispatch
-// --node`) are NOT all covered yet — tracked in
-// issue-spor-node-id-guard-remaining-read-paths.
+// well-formed id. `spor dispatch --node`/`--from-queue` (cmdDispatch, above
+// resolveNode) and `spor history` (cmdHistory, via lib/history.js's isNodeId
+// twin of this same grammar) are guarded too
+// (issue-spor-node-id-guard-remaining-read-paths); resolveNode's other
+// callers are internal, graph-sourced ids (factory/profile/fact ids, queue
+// records) and are intentionally left unguarded here.
 function badNodeIdReason(id) {
   return NODE_ID_RE.test(String(id)) ? null : `bad node id '${id}' — expected kebab-case`;
 }
@@ -11018,6 +11021,18 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   }
 
   if (!backfill && nodeId) {
+    // `nodeId` may still be the raw, unchecked `--node <id>` flag value at
+    // this point (`--from-queue`'s top.id and the auto-detect branch above
+    // are already graph-sourced/regex-checked) — refuse a non-canonical id
+    // here, before it ever reaches resolveNode's local-mode
+    // `nodes/<id>.md` read, closing the gap `../x` could otherwise use to
+    // pull an outside file into a dispatch prompt
+    // (issue-spor-node-id-guard-remaining-read-paths).
+    const bad = badNodeIdReason(nodeId);
+    if (bad) {
+      err(bad);
+      return 1;
+    }
     const node = await resolveNode(cfg, nodeId);
     if (!node) {
       err(`no such node: ${nodeId}`);
@@ -17675,7 +17690,7 @@ function executionWorkerPrincipal(cfg) {
 function executionPinRead(cfg) {
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
   return (id) => {
-    if (cfg.mode() === "remote" || !/^[a-z0-9][a-z0-9-]*$/.test(String(id || ""))) return null;
+    if (cfg.mode() === "remote" || badNodeIdReason(id)) return null;
     let raw;
     try {
       raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`));
