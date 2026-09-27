@@ -2101,6 +2101,31 @@ Body.
   assert.ok(!v.warnings.some((w) => /author/.test(w)));
 });
 
+test("validator accepts the optional immutable created_by scalar field", () => {
+  const fx = tmpGraph({
+    "dec-created-by.md": `---
+id: dec-created-by
+type: decision
+project: my-project
+title: A decision with an original-author stamp
+summary: A decision the server stamped with created_by on creation, which the validator must accept as an ordinary scalar field.
+author: Bob Dev <bob@example.com>
+created_by: Alice Dev <alice@example.com>
+date: 2026-09-27
+---
+Body.
+`,
+  });
+  // parseFrontmatter exposes it as a plain scalar, distinct from author.
+  const g = fx.load();
+  assert.equal(g.nodes["dec-created-by"].created_by, "Alice Dev <alice@example.com>");
+  assert.equal(g.nodes["dec-created-by"].author, "Bob Dev <bob@example.com>");
+  // and the full-graph validator treats it as clean (no new error/warning).
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(!v.warnings.some((w) => /created_by/.test(w)));
+});
+
 // Regression: a token equal to an Object.prototype key (constructor, toString,
 // …) must be an ordinary term, not collide with the inherited member. The bug
 // (issue-cc-gardener-near-dup-unnormalized-cosine): tf/df were plain {}, so

@@ -68,7 +68,19 @@ Rules:
   it writes (`capture` marks nodes drafted by the ingestion path, QUEUE.md
   §2.3; `gardener` marks sweep findings, §6); any payload-supplied value is
   discarded. Both are simple `key: value` scalars. Locally written nodes may
-  omit them.
+  omit them. `author` means the most recent writer, not the original one — it
+  is restamped on every write the server makes to a node (a `put_node`
+  update, `add_edge`, `set_status`, or `claim` alike).
+- `created_by` is optional and, where present, immutable: the server stamps
+  `created_by: Name <email>` from the verified identity the first time a node
+  is written (CREATE only) and carries it forward unchanged on every later
+  write to that node, discarding any payload-supplied value
+  (dec-spor-node-created-by-write-once). It is the write-once counterpart to
+  `author`/`authored_via` above — read `created_by` for who originated a
+  node, `author` for who last touched it. Nodes written before this field
+  shipped, or written locally, may lack it; an operator-run backfill in the
+  private server repo (`server/backfill-created-by.js`) fills it in from each
+  node file's first commit.
 - Edges may point at ids that don't exist yet; the compiler skips them. Don't
   delete an edge just because the target is missing — it marks a node worth
   creating. An edge may also carry extra flat attributes after `to:` —
