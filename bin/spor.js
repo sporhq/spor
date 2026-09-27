@@ -19462,15 +19462,33 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     err(`spor work --regate: run ${shortId} already read '${record.gate_state}'${record.gate_reason ? ` (${record.gate_reason})` : ""} — there is nothing to re-judge.`);
     return 1;
   }
-  if (record.gate_state === "running" && record.gate_worker) {
+  if ((record.gate_state === "running" || record.gate_state === "interrupted") && record.gate_worker) {
     const live = workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === record.gate_worker);
     if (live) {
-      err(`spor work --regate: run ${shortId} is being gated right now by worker ${String(record.gate_worker).slice(0, 8)} — wait for its verdict.`);
+      err(
+        record.gate_state === "interrupted"
+          ? `spor work --regate: run ${shortId}'s interrupted gate pipeline is parked with live worker ${String(record.gate_worker).slice(0, 8)}, which re-offers it — wait for its verdict.`
+          : `spor work --regate: run ${shortId} is being gated right now by worker ${String(record.gate_worker).slice(0, 8)} — wait for its verdict.`
+      );
       return 1;
     }
   }
-  // Attempt 1 was the pipeline that refused; each re-gate counts up from there.
-  const attempt = (Number(record.gate_regate_count) || 0) + 2;
+  // RESUME rather than re-open (issue-spor-regate-interrupted-evidence-pending-
+  // stranded). An `interrupted` pipeline settled nothing, so there is no
+  // verdict to re-judge — only an attempt to FINISH; and an attempt that still
+  // owes flake occurrence evidence can only be finished under its own attempt
+  // key, since that is where the evidence is journaled and the pipeline's
+  // preflight replays it from. Opening a new attempt over either would be
+  // refused by the claim (the evidence is owed) and leave the run stranded: a
+  // --regate publishes no gating slot, so no worker resumes it. So this call
+  // continues the CURRENT attempt: same attempt number, same ids, the owed
+  // evidence replayed first, no branch refresh or stage re-open (the attempt
+  // already did both when it started).
+  const owesEvidence = Object.values((record.gate_progress && record.gate_progress.gates) || {}).some((p) => p && (p.filingIntent || (p.evidence && p.evidence.complete !== true)));
+  const resume = record.gate_state === "interrupted" || (owesEvidence && !gatesKernel.SETTLED_GATE_STATES.has(record.gate_state));
+  // Attempt 1 was the pipeline that refused; each re-gate counts up from
+  // there. A resume keeps the attempt it continues.
+  const attempt = (Number(record.gate_regate_count) || 0) + (resume ? 1 : 2);
   // The item's OWN repo stamp, exactly as the loop's slot would carry it --
   // which means AS CLAIMED, not as it reads now. The record carries it since
   // task-spor-factory-no-code-outcome-convention; for a record predating that,
@@ -19489,7 +19507,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   const status = { worker_id: workerId, pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), started_at: new Date().toISOString(), updated_at: new Date().toISOString(), kind: "regate" };
   if (!workLoop.writeWorkerStatus(home, status)) { err("spor work --regate: could not publish worker liveness; no judgement started"); return 1; }
   try {
-  const gateClaim = dispatchRuns.claimGateRecord(home, record.run_id, { workerId, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), reopen: { settleId: record.gate_settle_id || null, regateCount: Number(record.gate_regate_count) || 0, state: record.gate_state } });
+  const gateClaim = dispatchRuns.claimGateRecord(home, record.run_id, { workerId, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), reopen: { settleId: record.gate_settle_id || null, regateCount: Number(record.gate_regate_count) || 0, state: record.gate_state, ...(resume ? { resume: true } : {}) } });
   if (!gateClaim.ok) { err(`spor work --regate: ${gateClaim.refused || gateClaim.reason}`); return 1; }
   if (report) report.claimed = true;
   const owns = () => freshRecord(home, record).gate_settle_id === gateClaim.token;
@@ -19501,7 +19519,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // re-gate re-tests the same stale tree and fails the same way. A merge
   // conflict is refused loudly (the branch needs a person or a fix cycle);
   // a dirty tree is left alone and refused by the gate as before.
-  const refreshed = refreshBranchFromTrustedRef(record.cwd, factory.trustedRef);
+  const refreshed = resume ? {} : refreshBranchFromTrustedRef(record.cwd, factory.trustedRef);
   if (refreshed.refused) {
     stamp({ gate_state: "failed", gate_reason: refreshed.refused, gate_failing_tests: null, gate_empty_diff: false });
     err(`spor work --regate: ${refreshed.refused}`);
@@ -19512,11 +19530,11 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // Every escalation this run has accumulated across attempts — a passing
   // re-gate answers all of them, not only the latest.
   const escalatedBefore = [...new Set([...(Array.isArray(record.gate_escalation_ids) ? record.gate_escalation_ids : []), record.gate_escalated_to].filter(Boolean))];
-  out(`work: re-gating ${record.node_id} — run ${shortId}, attempt ${attempt}, under ${factoryId} (previously ${previous})`);
+  out(`work: ${resume ? "resuming the interrupted re-gate of" : "re-gating"} ${record.node_id} — run ${shortId}, attempt ${attempt}, under ${factoryId} (previously ${previous})`);
   // A re-gate re-opens a controller record's completion: a refusal's
   // `consumed` stamp (reconcileCompletions) must not hide a completion this
   // attempt may now write and then owe.
-  if (completionKernel.isControllerRecord(record) && record.completion_consumed_at) {
+  if (!resume && completionKernel.isControllerRecord(record) && record.completion_consumed_at) {
     dispatchRuns.stampCompletionState(home, record.run_id, { completion_consumed_at: null, completion_note: null });
   }
   // ...and a settled implementation-stage REFUSAL (task-spor-factory-
@@ -19527,7 +19545,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // (a fresh code pool beside the fresh infrastructure pool). A settled
   // `candidate` or `declined` is a verdict on what the run produced and is
   // left alone — the gates re-judge the candidate as before.
-  if (["exhausted", "escalated", "unroutable", "mismatch"].includes(String(record.impl_state || ""))) {
+  if (!resume && ["exhausted", "escalated", "unroutable", "mismatch"].includes(String(record.impl_state || ""))) {
     dispatchRuns.stampImplState(home, record.run_id, { impl_state: "running", impl_attempt: 1 }, { force: true });
     out(`work: re-gating ${record.node_id} — its implementation stage had settled '${record.impl_state}'; re-judging the run under attempt ${attempt}`);
   }
@@ -19548,6 +19566,15 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   if (!owns() || res?.superseded || res?.not_run) { err("spor work --regate: ownership changed; no final mutation is applied"); return 1; }
   const state = (res && res.state) || "failed";
   const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
+  // Interrupted AGAIN: nothing settled, so nothing but the state is stamped —
+  // the loop's own markGate shape — leaving the attempt's evidence, escalation
+  // bookkeeping and failing-test list exactly as the attempt holds them, for
+  // the next --regate to resume.
+  if (state === "interrupted") {
+    stamp({ gate_state: state, gate_reason: reason });
+    out(`work: re-gate of ${record.node_id} interrupted${reason ? ` — ${reason}` : ""} — nothing settled; resume attempt ${attempt} with 'spor work --regate ${record.run_id}'`);
+    return 1;
+  }
   stamp({
     gate_state: state,
     gate_reason: reason,

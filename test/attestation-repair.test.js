@@ -248,6 +248,90 @@ test("re-gate publishes liveness before claiming and cannot overwrite a successo
   }
 });
 
+// issue-spor-regate-interrupted-evidence-pending-stranded: a --regate whose
+// pipeline stops `interrupted` on flake evidence it could not yet publish
+// settled nothing and publishes no gating slot, so no worker resumes it; and a
+// second --regate that opened a NEW attempt over it was refused because that
+// evidence is still owed. The second --regate must RESUME the interrupted
+// attempt instead — same attempt key, so the owed evidence is visible to (and
+// replayed by) the pipeline's preflight — and finish with nothing owed.
+test("an interrupted --regate on pending flake evidence is resumed by the next --regate under the same attempt and completes with nothing owed", async () => {
+  const gatesLib = require("../lib/shell/gate-runner.js");
+  const loop = require("../lib/shell/work-loop.js");
+  const f = fixture();
+  const gate = { id: "acceptance", kind: "command", command: "true", timeoutMs: 60000, cycles: 0, source: "inline", risk: [] };
+  const factory = { ...f.factory, gates: [gate] };
+  runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "failed", gate_worker: "old", gate_regate_count: 0 });
+  const owed = () => Object.values((runner.readJson(f.file).gate_progress || {}).gates || {}).some((p) => p && (p.filingIntent || (p.evidence && p.evidence.complete !== true)));
+  const regate = () => cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory, factoryId: factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home });
+  const evidence = (complete) => ({ complete, gate, origin: cli.attestationGraphOrigin(f.cfg), outcome: { state: "passed", flake: { issues: ["issue-flake-one"] } } });
+  const PENDING = { state: "interrupted", gates: [], facts: [], reason: "flake occurrence evidence is pending graph publication; resume this attempt to retry it" };
+  const seen = [];
+  const passes = [
+    // 1: the re-gate opens attempt 2, journals evidence it cannot publish, and is interrupted.
+    async ({ item, deps }) => {
+      await deps.saveGateProgress({ gate, item, progress: { evidence: evidence(false) } });
+      return PENDING;
+    },
+    // 2: the resume sees that owed evidence under the SAME attempt, and is interrupted again.
+    async ({ item, deps }) => {
+      const pre = await deps.checkEvidenceOrigins();
+      seen.push({ attempt: item.attempt, pending: (pre.pending || []).length });
+      return PENDING;
+    },
+    // 3: the next resume publishes it (the preflight's replay) and reaches the real verdict.
+    async ({ item, deps }) => {
+      const pre = await deps.checkEvidenceOrigins();
+      seen.push({ attempt: item.attempt, pending: (pre.pending || []).length });
+      await deps.saveGateProgress({ gate, item, progress: { evidence: evidence(true) } });
+      return f.gateResult;
+    },
+  ];
+  const original = gatesLib.runGatePipeline;
+  gatesLib.runGatePipeline = (args) => passes.shift()(args);
+  try {
+    assert.equal(await regate(), 1);
+    let rec = runner.readJson(f.file);
+    assert.equal(rec.gate_state, "interrupted");
+    assert.equal(rec.gate_regate_count, 1);
+    assert.ok(owed(), "the interrupted attempt owes its evidence");
+    assert.ok(!rec.gate_attestation && !rec.gate_attestation_pending, "an interruption attests nothing");
+    // The trap: opening a NEW attempt over the owed evidence is refused, and
+    // the --regate left no gating slot for a worker to resume from.
+    const reopen = { settleId: rec.gate_settle_id, regateCount: 1, state: "interrupted" };
+    assert.match(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "probe", reopen }).refused, /flake occurrence publication is still owed/);
+    assert.equal(runner.readJson(f.file).gate_settle_id, rec.gate_settle_id, "the refused probe changed nothing");
+    assert.ok(!loop.readWorkerStatuses(f.home, { alive: cli.workerAlive }).some((w) => w.live), "no live worker holds it");
+
+    assert.equal(await regate(), 1, "interrupted again");
+    rec = runner.readJson(f.file);
+    assert.equal(rec.gate_state, "interrupted");
+    assert.equal(rec.gate_regate_count, 1, "a resume does not open another attempt");
+    assert.ok(owed(), "still owed, still journaled under the attempt that owes it");
+
+    assert.equal(await regate(), 0);
+  } finally { gatesLib.runGatePipeline = original; }
+  assert.deepEqual(seen, [{ attempt: 2, pending: 1 }, { attempt: 2, pending: 1 }], "each resume ran attempt 2 and saw its owed evidence");
+  const rec = runner.readJson(f.file);
+  assert.equal(rec.gate_state, "passed");
+  assert.equal(rec.gate_regate_count, 1);
+  assert.equal(owed(), false, "nothing is left owed");
+  assert.ok(rec.gate_attestation, "the real verdict attests");
+  assert.equal(rec.gate_attestation_pending || null, null);
+});
+
+test("a --regate does not resume an interrupted pipeline a live worker has parked", async () => {
+  const f = fixture();
+  const loop = require("../lib/shell/work-loop.js");
+  const workerId = "parking-worker";
+  loop.writeWorkerStatus(f.home, { worker_id: workerId, pid: process.pid, started_ticks: runner.processStartTicks(process.pid), started_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "interrupted", gate_worker: workerId });
+  const before = fs.readFileSync(f.file, "utf8");
+  const code = await cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory: f.factory, factoryId: f.factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home });
+  assert.equal(code, 1);
+  assert.equal(fs.readFileSync(f.file, "utf8"), before, "the parked record is untouched");
+});
+
 test("proposal push and trusted-ref merge never execute repository hooks with judge credentials", () => {
   if (process.platform === "win32") return; // the gh stub and the hooks are sh scripts
   const f = fixture();
