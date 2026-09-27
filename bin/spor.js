@@ -1200,6 +1200,11 @@ async function cmdGet(cfg, { positionals, values }) {
     return 0;
   }
   // local: read the node file
+  const bad = badNodeIdReason(id);
+  if (bad) {
+    err(bad);
+    return 1;
+  }
   const nodesDir = cfg.nodesDir();
   const f = path.join(nodesDir, `${id}.md`);
   if (!values.json) {
@@ -4868,6 +4873,11 @@ async function stampField(cfg, { id, field, value }) {
     return 0;
   }
 
+  const bad = badNodeIdReason(id);
+  if (bad) {
+    err(bad);
+    return 1;
+  }
   const nodesDir = cfg.nodesDir();
   const file = path.join(nodesDir, `${id}.md`);
   let raw;
@@ -4972,6 +4982,16 @@ async function cmdReady(cfg, { values, positionals }) {
 // "Local mode": no pool or contention), so an active status sets the field
 // without a claim — symmetric with local dispatch skipping the claim.
 const NODE_ID_RE = /^[a-z0-9][a-z0-9-]*$/; // mirrors the server's ID_RE/SLUG_RE
+
+// The local-mode path-confinement guard (issue-spor-ready-identifier-directory-
+// traversal): every local door that builds `nodes/<id>.md` from a caller-supplied
+// id checks it against NODE_ID_RE FIRST, before touching the filesystem. The
+// grammar admits no `/`, `\`, or `.`, so a conforming id can only name a file
+// directly inside the nodes dir — `../x` or an absolute path never reaches
+// path.join. Returns the refusal message, or null for a well-formed id.
+function badNodeIdReason(id) {
+  return NODE_ID_RE.test(String(id)) ? null : `bad node id '${id}' — expected kebab-case`;
+}
 
 // The one id-length invariant (issue-spor-server-node-id-length-unbounded):
 // NODE_ID_RE is shape-only and imposes no cap, mirroring the server's
@@ -5177,6 +5197,8 @@ async function cmdSetStatus(cfg, { positionals }) {
 // since one of them is a CLI command and the other is a fail-soft step inside a
 // worker loop. `graph` lets a caller that already loaded one pass it in.
 function setStatusLocal(cfg, id, value, { graph = null } = {}) {
+  const bad = badNodeIdReason(id);
+  if (bad) return { ok: false, reason: bad };
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
   const nodesDir = cfg.nodesDir();
   const file = path.join(nodesDir, `${id}.md`);

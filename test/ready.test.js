@@ -153,6 +153,50 @@ test("ready (local) on a missing node exits 1", () => {
   assert.match(r.stderr, /no such node: task-nope/);
 });
 
+// issue-spor-ready-identifier-directory-traversal: local mode builds
+// nodes/<id>.md from the caller's id, so an id outside the NODE_ID_RE grammar
+// must be refused (exit 1) BEFORE any filesystem touch — never read or
+// rewritten through a `../` step. The planted files sit one and two levels
+// above nodes/ and carry frontmatter ids that would otherwise satisfy the
+// post-rewrite id==filename check, so only the up-front guard stops them.
+function traversalFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "spor-ready-trav-"));
+  const home = path.join(root, "home");
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  spawnSync("git", ["init", "-q", home]);
+  spawnSync("git", ["-C", home, "config", "user.email", "alice@example.com"]);
+  spawnSync("git", ["-C", home, "config", "user.name", "Alice"]);
+  const plant = (file, id) => {
+    const md = `---\nid: ${id}\ntype: task\ntitle: Outside file\nsummary: A markdown file outside the nodes dir.\ndate: 2026-06-01\n---\nOutside body.\n`;
+    fs.writeFileSync(file, md);
+    return md;
+  };
+  const one = path.join(home, "x.md");
+  const two = path.join(root, "x.md");
+  return { root, home, nodes, one, two, oneMd: plant(one, "../x"), twoMd: plant(two, "../../x") };
+}
+
+for (const [label, args] of [
+  ["ready ../x", ["ready", "../x"]],
+  ["ready ../../x --needs-input", ["ready", "../../x", "--needs-input"]],
+  ["priority ../../x p1", ["priority", "../../x", "p1"]],
+  ["priority ../x clear", ["priority", "../x", "clear"]],
+  ["set-status ../x done", ["set-status", "../x", "done"]],
+  ["get ../../x", ["get", "../../x"]],
+]) {
+  test(`${label} (local) refuses the traversal id and leaves the outside file unchanged`, () => {
+    const fx = traversalFixture();
+    const r = run(args, { SPOR_HOME: fx.home });
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /bad node id '\.\.\/(\.\.\/)?x'/);
+    assert.doesNotMatch(r.stdout, /Outside body/);
+    assert.strictEqual(fs.readFileSync(fx.one, "utf8"), fx.oneMd);
+    assert.strictEqual(fs.readFileSync(fx.two, "utf8"), fx.twoMd);
+    assert.deepStrictEqual(fs.readdirSync(fx.nodes), []);
+  });
+}
+
 test("ready (local) without a git identity omits readiness_by, still sets the value", () => {
   // a graph home that is NOT a git repo, with global+system git config disabled
   // so `git config user.*` finds no identity (otherwise it walks up to the dev
