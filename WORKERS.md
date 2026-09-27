@@ -1242,6 +1242,15 @@ describe. Point it at one — `spor work --factory <id>`, or the `work.factory`
 config key — and the declared gates run between the run ending and the item
 counting as done. There is no adoption cliff in either direction.
 
+The implementation stage — implementation as a declared stage of its own, with
+a pinned candidate and a controller-written completion, so that a claim of
+"done" stops preceding the gates that judge it — was designed in
+`FACTORY-IMPLEMENTATION-STAGE.md` (task-spor-factory-implementation-stage)
+before it was built. That document is a design record, not a contract: what
+shipped is §10.12-§10.16 below, and where the two disagree these sections are
+what a worker must implement. Its §11 lists every divergence the
+reconciliation found (task-spor-reconcile-implementation-stage-design-source).
+
 ### 10.1 The factory definition is graph data
 
 A `type: factory` node (candidate schema `schema-factory`; `spor schema adopt
