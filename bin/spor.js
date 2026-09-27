@@ -18414,13 +18414,16 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     if (stage.handoff) ctx.log(`work: ${entry.node_id} — implementation stage hands the run to the gates: ${stage.handoff}`);
   }
   let gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: gateDeps });
-  // A stop that caught the pipeline waiting out a dispatch OUTAGE settled
-  // nothing (issue-spor-review-gate-reviewer-outage-read-as-rejection): it
-  // is not a verdict to settle or attest, and an attestation written now
-  // would occupy the run's one attestation id before the resumed pipeline
-  // reaches its real verdict. It returns UNSETTLED, like the implementation
-  // stage's own `interrupted` above; the loop stamps it and keeps its slot.
-  if (gateResult.state === "interrupted" && gateResult.outage_interrupted) {
+  // An `interrupted` pipeline settled nothing — a stop that caught it waiting
+  // out a dispatch OUTAGE (issue-spor-review-gate-reviewer-outage-read-as-
+  // rejection), or evidence it could not yet publish (flake occurrence
+  // evidence pending, issue-spor-gate-evidence-pending-interrupted-drops-
+  // slot-and-attests): it is not a verdict to settle or attest, and an
+  // attestation written now would occupy the run's one attestation id before
+  // the resumed pipeline reaches its real verdict. It returns UNSETTLED, like
+  // the implementation stage's own `interrupted` above; the loop stamps it
+  // and keeps its slot.
+  if (gateResult.state === "interrupted") {
     if (reporter) reporter.leave();
     return gateResult;
   }
@@ -18540,12 +18543,12 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     return common ? path.dirname(common) : null;
   })();
   intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null, deps: makeIntegrationDeps(cfg, { ...intCtx, gateResult: () => gateResult, regate }) });
-  // The same unsettled stop as the gate list's own (above), reached through
-  // the integration stage's re-gate of a moved head: nothing is stamped,
-  // settled or attested, and the resume re-runs the pipeline.
-  if (intResult.state === "interrupted" && intResult.outage_interrupted) {
+  // The same unsettled interruption as the gate list's own (above), reached
+  // through the integration stage's re-gate of a moved head: nothing is
+  // stamped, settled or attested, and the resume re-runs the pipeline.
+  if (intResult.state === "interrupted") {
     if (reporter) reporter.leave();
-    return { state: "interrupted", outage_interrupted: true, gates: gateResult.gates || [], facts: [...gateFacts, ...(intResult.facts || [])], reason: intResult.reason };
+    return { state: "interrupted", ...(intResult.outage_interrupted ? { outage_interrupted: true } : {}), gates: gateResult.gates || [], facts: [...gateFacts, ...(intResult.facts || [])], reason: intResult.reason };
   }
   const intState = completionKernel.INTEGRATION_STATES.includes(intResult.state) ? intResult.state : intResult.state === "passed" ? "landed" : "failed";
   const allFacts = [...gateFacts, ...(intResult.facts || [])];

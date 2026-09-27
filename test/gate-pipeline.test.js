@@ -2044,6 +2044,197 @@ test("a pipeline that REPORTS interrupted on a stop keeps its slot, so the next 
   assert.deepStrictEqual(orphans.map((o) => o.run_id), ["run-1"], "which is exactly the pair the next worker resumes from");
 });
 
+// issue-spor-gate-evidence-pending-interrupted-drops-slot-and-attests: the
+// OTHER unsettled `interrupted` — flake occurrence evidence the pass could not
+// yet publish — reaches the loop while the worker is NOT stopping. Folding it
+// like a verdict dropped the slot (and cooled the node), and orphanedGateRuns
+// only ever joins a slot, so the un-judged run could never be resumed.
+const EVIDENCE_PENDING = { state: "interrupted", gates: [], facts: [], reason: "flake occurrence evidence is pending graph publication; resume this attempt to retry it" };
+const evidenceLoopDeps = ({ state, control, gate, marks, logs }) => {
+  let dispatched = false;
+  return {
+    now: () => state.clock,
+    log: (l) => logs.push(l),
+    publish: () => {},
+    candidates: async () => (dispatched ? [] : [{ id: "task-a", readiness: "agent" }]),
+    dispatch: async () => {
+      dispatched = true;
+      return { ok: true, run: { run_id: "run-1", harness: "fake" } };
+    },
+    pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true } })),
+    gate,
+    markGate: (runId, patch) => {
+      marks.push({ run_id: runId, ...patch });
+      return { run_id: runId, node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true, ...patch };
+    },
+    sleep: async (ms) => {
+      state.clock += ms;
+      await new Promise((r) => setImmediate(r));
+      if ((state.ticks += 1) >= 60) control.stopping = true; // a backstop
+    },
+  };
+};
+
+test("an evidence-pending INTERRUPTED keeps its slot while the worker runs, is re-offered after the retry window, and its real verdict settles normally", async () => {
+  const marks = [];
+  const logs = [];
+  const state = { clock: 1_700_000_000_000, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  const calls = [];
+  const deps = evidenceLoopDeps({
+    state, control, marks, logs,
+    gate: async (entry, record) => {
+      calls.push({ at: state.clock, entry, record });
+      if (calls.length === 1) return EVIDENCE_PENDING;
+      control.stopping = true;
+      return { state: "passed", gates: [{ id: "review", verdict: "pass" }], facts: [] };
+    },
+  });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 5000 }, deps, control });
+  assert.strictEqual(calls.length, 2, "the pipeline is re-offered by the worker that parked it");
+  assert.ok(calls[1].at - calls[0].at >= 5000, `re-offered only once the retry window passed (after ${calls[1].at - calls[0].at}ms)`);
+  assert.strictEqual(calls[1].entry.resumed, true, "as a resume — it re-runs over what the interrupted pass recorded");
+  assert.strictEqual(calls[1].record.gate_state, "interrupted", "handed the record as the interruption left it");
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted", "passed"], "stamped unsettled, then settled by the real verdict");
+  assert.match(marks[0].gate_reason, /evidence is pending/);
+  assert.strictEqual(status.gates.passed, 1);
+  assert.strictEqual(status.gates.failed, 0, "an interruption is not a refusal");
+  assert.deepStrictEqual(status.gating, [], "the settled verdict frees the slot");
+  assert.ok(!status.skipped.some((s) => s.id === "task-a"), "and nothing ever cooled the node — nothing refused it");
+  assert.ok(logs.some((l) => /gates interrupted/.test(l) && /re-offers it in 5s/.test(l)), logs.join("\n"));
+});
+
+test("a PARKED interrupted pipeline holds its slot until re-offered, and a winding-down worker leaves it for the next one instead of waiting on it", async () => {
+  const marks = [];
+  const logs = [];
+  const state = { clock: 1_700_000_000_000, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  let gateCalls = 0;
+  const deps = evidenceLoopDeps({ state, control, marks, logs, gate: async () => ((gateCalls += 1), EVIDENCE_PENDING) });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 600000, once: true }, deps, control });
+  assert.strictEqual(gateCalls, 1);
+  assert.strictEqual(control.stopping, false, "--once exited on its own — the parked slot did not hold it open until the backstop");
+  assert.deepStrictEqual(status.gating.map((g) => g.run_id), ["run-1"], "the slot stands in the published record");
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"], "stamped once — not re-stamped as abandoned");
+  assert.strictEqual(logs.filter((l) => /abandoned by the stop/.test(l) && /task-a gate pipeline/.test(l)).length, 0);
+  const orphans = workLoop.orphanedGateRuns([{ worker_id: "w", live: false, gating: status.gating }], {
+    records: new Map([["run-1", { run_id: "run-1", node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true, gate_state: "interrupted" }]]),
+  });
+  assert.deepStrictEqual(orphans.map((o) => o.run_id), ["run-1"], "which is exactly the pair the next worker resumes from");
+});
+
+test("the exit-time settle re-offers nothing — a pipeline started there would run on after the worker published itself stopped", async () => {
+  // Review finding: with `--retry-after 0` the park is due at once, and the
+  // final settle on a `--once` exit used to start it — unowned, stamped
+  // abandoned, and adoptable by another worker beside it.
+  const marks = [];
+  const logs = [];
+  const state = { clock: 1_700_000_000_000, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  let gateCalls = 0;
+  const deps = evidenceLoopDeps({ state, control, marks, logs, gate: async () => ((gateCalls += 1), EVIDENCE_PENDING) });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 0, once: true }, deps, control });
+  assert.strictEqual(gateCalls, 1, "not re-offered on the way out");
+  assert.deepStrictEqual(status.gating.map((g) => g.run_id), ["run-1"]);
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"]);
+  assert.ok(logs.some((l) => /left interrupted by this exit/.test(l)), logs.join("\n"));
+});
+
+test("a PARKED pipeline takes no capacity: a --concurrency 1 worker keeps dispatching, and the re-offer waits for a free slot", async () => {
+  // Review finding: an interruption only a person can clear (a renamed gate
+  // still owing evidence) re-parks forever — it must not pin the worker.
+  const logs = [];
+  const marks = [];
+  const state = { clock: 1_700_000_000_000, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  const queue = ["task-a", "task-b"];
+  const calls = [];
+  const deps = {
+    now: () => state.clock,
+    log: (l) => logs.push(l),
+    publish: () => {},
+    candidates: async () => queue.slice(0, 1).map((id) => ({ id, readiness: "agent" })),
+    dispatch: async (item) => {
+      queue.splice(queue.indexOf(item.id), 1);
+      return { ok: true, run: { run_id: `run-${item.id}`, harness: "fake" } };
+    },
+    pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: id.slice(4), state: "done", terminal_state: "resolved", terminal_enforced: true } })),
+    gate: async (entry) => {
+      calls.push(entry.run_id);
+      if (entry.run_id === "run-task-a" && calls.filter((c) => c === "run-task-a").length === 1) return EVIDENCE_PENDING;
+      if (entry.run_id === "run-task-a") control.stopping = true;
+      return { state: "passed", gates: [], facts: [] };
+    },
+    markGate: (runId, patch) => {
+      marks.push({ run_id: runId, ...patch });
+      return { run_id: runId, state: "done", terminal_state: "resolved", terminal_enforced: true, ...patch };
+    },
+    sleep: async (ms) => {
+      state.clock += ms;
+      await new Promise((r) => setImmediate(r));
+      if ((state.ticks += 1) >= 60) control.stopping = true;
+    },
+  };
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 2000 }, deps, control });
+  assert.deepStrictEqual(calls, ["run-task-a", "run-task-b", "run-task-a"], "task-b was dispatched and gated while task-a was parked, then task-a was re-offered");
+  assert.strictEqual(status.gates.passed, 2);
+  assert.deepStrictEqual(status.gating, []);
+});
+
+test("a WINDING-DOWN worker re-offers no parked pipeline, even with a free slot — it is the next worker's", async () => {
+  // --once with --concurrency 2: task-a parks while task-b's run keeps the
+  // draining loop alive, and the park comes due with a slot free.
+  const logs = [];
+  const marks = [];
+  const state = { clock: 1_700_000_000_000, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  const calls = [];
+  let handed = false;
+  let pollsB = 0;
+  const deps = {
+    now: () => state.clock,
+    log: (l) => logs.push(l),
+    publish: () => {},
+    candidates: async () => (handed ? [] : ((handed = true), [{ id: "task-a", readiness: "agent" }, { id: "task-b", readiness: "agent" }])),
+    dispatch: async (item) => ({ ok: true, run: { run_id: `run-${item.id}`, harness: "fake" } }),
+    pollRuns: async (ids) =>
+      ids.map((id) => ({ run_id: id, terminal: id === "run-task-a" || (pollsB += 1) > 6, record: { run_id: id, node_id: id.slice(4), state: "done", terminal_state: "resolved", terminal_enforced: true } })),
+    gate: async (entry) => (calls.push(entry.run_id), entry.run_id === "run-task-a" ? EVIDENCE_PENDING : { state: "passed", gates: [], facts: [] }),
+    markGate: (runId, patch) => {
+      marks.push({ run_id: runId, ...patch });
+      return { run_id: runId, state: "done", terminal_state: "resolved", terminal_enforced: true, ...patch };
+    },
+    sleep: async (ms) => {
+      state.clock += ms;
+      await new Promise((r) => setImmediate(r));
+      if ((state.ticks += 1) >= 60) control.stopping = true;
+    },
+  };
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 2, intervalMs: 1000, retryAfterMs: 0, once: true }, deps, control });
+  assert.deepStrictEqual(calls, ["run-task-a", "run-task-b"], "the draining worker never re-offered the parked pipeline");
+  assert.strictEqual(control.stopping, false, "and exited on its own");
+  assert.deepStrictEqual(status.gating.map((g) => g.run_id), ["run-task-a"], "leaving it standing for the next worker");
+});
+
+test("a stop that lands while a pipeline is PARKED leaves its slot standing and does not re-offer it", async () => {
+  const marks = [];
+  const logs = [];
+  const state = { clock: 1_700_000_000_000, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  let gateCalls = 0;
+  const deps = evidenceLoopDeps({ state, control, marks, logs, gate: async () => ((gateCalls += 1), EVIDENCE_PENDING) });
+  const sleep = deps.sleep;
+  deps.sleep = async (ms) => {
+    await sleep(ms);
+    if (gateCalls >= 1 && marks.length >= 1) control.stopping = true;
+  };
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 1000 }, deps, control });
+  assert.strictEqual(gateCalls, 1, "a stopping worker re-offers nothing");
+  assert.deepStrictEqual(status.gating.map((g) => g.run_id), ["run-1"]);
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"]);
+  assert.strictEqual(logs.filter((l) => /abandoned by the stop/.test(l) && /task-a gate pipeline/.test(l)).length, 0);
+});
+
 test("the resume scan reads back what the run journal and the worker status files actually store", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-resume-"));
   const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");

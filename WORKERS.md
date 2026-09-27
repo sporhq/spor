@@ -2497,6 +2497,26 @@ slot held by a worker that is not live, whose run record is terminal, carries a
 claim worth gating (§10.2), and has no settled `gate_state`, is adopted and
 re-gated.
 
+**A pipeline can also REPORT `interrupted` — and that is not a verdict
+either.** Besides a stop inside an outage backoff (§10.4), a pass whose gate
+evidence could not yet be published (flake occurrence evidence pending, pending
+evidence it could not inspect or replay) returns `interrupted` with its debt
+retained on the record. Such a result is stamped unsettled and **settles
+nothing**: no fact beyond what the pass already recorded, no escalation, no
+demotion, no cooldown, and **no attestation** — the attestation id is one per
+(node, run, attempt), so one minted for the interruption would occupy the id the
+real verdict needs (issue-spor-gate-evidence-pending-interrupted-drops-slot-and-attests).
+Its gating slot stays in the worker's status, because a slot is the half of the
+pair the resume join reads. A worker that is stopping leaves it for the next
+one; a worker that is still running PARKS it and re-offers the pipeline to
+itself, as a resume, once `work.retryAfterMs` has passed and a slot is free —
+nobody else will while it is alive. While parked it takes no capacity (an
+interruption only a person can clear, such as a renamed gate that still owes
+evidence, would otherwise pin a `--concurrency 1` worker), though its node stays
+out of selection; nor does it hold a winding-down worker (`--max`, `--once`,
+`--restart-on-land`) open, and the exit never re-offers it: that exit leaves it
+standing for the next worker, exactly as a stop does.
+
 Which slots count is a question of **provenance**, and the two lists differ. A
 `gating` slot only ever exists on a gate-armed worker, so it is owed a verdict
 by construction. An `active` slot exists on **every** worker, bare ones

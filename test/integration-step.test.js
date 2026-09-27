@@ -4534,6 +4534,25 @@ test("a re-gate a STOP caught inside an outage settles nothing — the stage han
   assert.strictEqual(seen.leaseReleased, seen.leaseAcquired, "and the serialize lease is handed back on the way out");
 });
 
+test("a re-gate INTERRUPTED on pending evidence settles nothing either — the same unsettled hand-up, without the outage flag", async () => {
+  // issue-spor-gate-evidence-pending-interrupted-drops-slot-and-attests: the
+  // re-gate's other `interrupted` (flake occurrence evidence it could not yet
+  // publish) is no more a verdict than an outage stop.
+  const heads = ["head-v1", "head-v2"];
+  let reads = 0;
+  const { deps, seen } = integrationFakes({ build: [{ ok: false, conflict: true, reason: "merging onto main conflicts" }, { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" }] });
+  deps.changedTree = async () => ({ ok: true, top: "/repo", head: heads[Math.min(reads++, heads.length - 1)], cwd: "/repo/wt" });
+  deps.regate = async () => ({ state: "interrupted", reason: "flake occurrence evidence is pending graph publication; resume this attempt to retry it", gates: [], facts: [] });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps, gatedHead: "head-v1" });
+  assert.strictEqual(res.state, "interrupted");
+  assert.strictEqual(res.outage_interrupted, undefined, "not dressed up as an outage");
+  assert.match(res.reason, /evidence is pending/);
+  assert.strictEqual(seen.lands, 0);
+  assert.strictEqual(seen.escalations.length, 0, "no escalation");
+  assert.strictEqual(seen.facts.length, 0, "no merge fact");
+  assert.strictEqual(seen.demotions.length, 0, "no demotion");
+});
+
 test("a re-gate that passes at a DIFFERENT head than the moved one is not a pass for the moved head", async () => {
   const heads = ["head-v1", "head-v2"];
   let reads = 0;
@@ -4611,6 +4630,59 @@ test("runGateAndIntegration settles the run record BEFORE writing the attestatio
   const att = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(md)[1]);
   assert.strictEqual(att.passed, true);
   assert.strictEqual(att.subject.commit, git(repo, "rev-parse", "HEAD").trim());
+});
+
+// issue-spor-gate-evidence-pending-interrupted-drops-slot-and-attests: an
+// evidence-pending `interrupted` is not a verdict, so runGateAndIntegration
+// must neither settle nor attest it — the attestation id is per (node, run,
+// attempt), and one minted for the interruption would occupy the id the
+// resumed pipeline's REAL verdict needs.
+test("runGateAndIntegration: an evidence-pending INTERRUPTED writes no attestation and settles nothing, and the resumed real verdict attests under the run's one id", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const gateRunnerLib = require("../lib/shell/gate-runner.js");
+  const attestationLib = require("../lib/shell/attestation.js");
+  const { loadConfig } = require("../lib/config.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-evidence-pending-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(path.join(nodes, "task-pending.md"), "---\nid: task-pending\ntype: task\ntitle: Evidence pending\nsummary: A work item whose first gate pass is interrupted on flake evidence it could not yet publish, then resumed.\nstatus: done\ndate: 2026-09-27\n---\n\nBody.\n");
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const repo = integrationRepo();
+  git(repo, "checkout", "-q", "branch");
+  const entry = { node_id: "task-pending", run_id: "11111111-2222-3333-4444-000000000099", attempt: 0 };
+  const recordPath = dispatchRuns.runPaths(home, entry.run_id).record;
+  dispatchRuns.atomicJson(recordPath, { run_id: entry.run_id, node_id: entry.node_id, state: "done", cwd: repo, created_at: new Date().toISOString() });
+  const factory = {
+    id: "factory-pending", trustedRef: "main", protectedPaths: [], riskClasses: {}, testLaneProfile: null, integration: null,
+    gates: [{ id: "acceptance", kind: "command", command: "true", timeoutMs: 60000, cycles: 0, source: "inline", risk: [] }],
+    definition: { factory: { id: "factory-pending", revision: null, digest: "sha256:0000" }, gates: [{ id: "acceptance", source: "inline", revision: null, digest: "sha256:1111" }] },
+  };
+  const ctx = { factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home, stopping: () => false, workerId: "w-1", ownerLive: () => true };
+  const real = gateRunnerLib.runGatePipeline;
+  gateRunnerLib.runGatePipeline = async () => ({ state: "interrupted", gates: [], facts: [], reason: "flake occurrence evidence is pending graph publication; resume this attempt to retry it" });
+  let first;
+  try {
+    first = await sporCli.runGateAndIntegration(cfg, entry, { cwd: repo, run_id: entry.run_id }, ctx);
+  } finally {
+    gateRunnerLib.runGatePipeline = real;
+  }
+  assert.strictEqual(first.state, "interrupted");
+  assert.ok(!first.attestation, "no attestation for a non-verdict");
+  assert.deepStrictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-attest-")), [], "nothing occupies the run's attestation id");
+  let rec = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  assert.ok(!gates.SETTLED_GATE_STATES.has(rec.gate_state), `the record is left unsettled (${rec.gate_state})`);
+  assert.ok(!rec.gate_attestation && !rec.gate_attestation_pending, "and owes no attestation");
+  // What the loop does with it (settleGates): stamp it unsettled, then re-offer it.
+  dispatchRuns.stampGateState(home, entry.run_id, { gate_state: "interrupted", gate_worker: "w-1" });
+  const second = await sporCli.runGateAndIntegration(cfg, { ...entry, resumed: true }, JSON.parse(fs.readFileSync(recordPath, "utf8")), ctx);
+  assert.strictEqual(second.state, "passed", second.reason);
+  assert.strictEqual(second.attestation, attestationLib.attestationId(entry.node_id, entry.run_id, 0), "the real verdict attests under the run's one id");
+  rec = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  assert.strictEqual(rec.gate_state, "passed");
+  assert.strictEqual(rec.gate_attestation, second.attestation);
+  const md = fs.readFileSync(path.join(nodes, `${second.attestation}.md`), "utf8");
+  assert.strictEqual(JSON.parse(/```json\n([\s\S]*?)\n```/.exec(md)[1]).passed, true);
 });
 
 // Cross-model review, blocking findings 1 and 2: a duplicate pipeline for the
