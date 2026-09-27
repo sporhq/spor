@@ -2656,7 +2656,7 @@ Body.
 // rerankScores covers a..c and deliberately omits d (unscored structural) and
 // e (unscored content), so a single fixture exercises every tier: pinned (none
 // here) -> reranked candidates -> remaining structural -> remaining content.
-function rerankFixture() {
+function rerankFixture(extra = {}) {
   return tmpGraph({
     "dec-root.md": `---
 id: dec-root
@@ -2723,6 +2723,7 @@ date: 2026-06-01
 ---
 Shares the root's vocabulary but carries no edge to it.
 `,
+    ...extra, // a same-named file here REPLACES the fixture's copy
   }).load();
 }
 
@@ -2825,6 +2826,89 @@ Pinned-only node zulu.
     rerankScores: { "node-a": { score: 1, noul: true }, "node-b": { score: 0, noul: false } },
   });
   assert.deepEqual(digestOrder(r.text), ["node-z", "node-a", "node-b"]);
+});
+
+// meta.rerank must mean rerank actually placed a node
+// (issue-spor-digest-rerank-metadata-regression): a scored id that add() never
+// renders — already rendered as a pin, or a superseded node the digest drops —
+// was not reordered, and must count toward neither `applied` nor `candidates`.
+const PIN_NODE_Z = {
+  "corr-pin-z.md": `---
+id: corr-pin-z
+type: correction
+title: Pin node-z for dec-root
+target: dec-root
+pin: [node-z]
+summary: Force node-z into the digest for dec-root.
+date: 2026-06-01
+---
+Always surface node-z for dec-root.
+`,
+  "node-z.md": `---
+id: node-z
+type: artifact
+project: p
+title: Pinned-only node zulu
+summary: Pinned-only node zulu, unrelated vocabulary widget gadget.
+date: 2026-06-01
+---
+Pinned-only node zulu.
+`,
+};
+const SUPERSEDED_NODE_D = {
+  "node-d.md": `---
+id: node-d
+type: artifact
+project: p
+title: Structural child delta
+summary: Structural child delta node, tied weight with its siblings, unscored.
+date: 2026-06-01
+status: superseded
+---
+Structural child delta node.
+`,
+};
+
+test("rerank: rerankScores matching only pinned picks yields no meta.rerank and byte-identical text", () => {
+  const g = rerankFixture(PIN_NODE_Z);
+  const plain = graph.compile(g, { rootId: "dec-root", digest: true });
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankScores: { "node-z": { score: 3, noul: 1 } },
+  });
+  assert.equal(digestOrder(plain.text)[0], "node-z", "the pin renders node-z first");
+  assert.equal(r.text, plain.text);
+  assert.equal(r.meta.rerank, undefined);
+});
+
+test("rerank: rerankScores matching only a dropped superseded node yields no meta.rerank and byte-identical text", () => {
+  const g = rerankFixture(SUPERSEDED_NODE_D);
+  const plain = graph.compile(g, { rootId: "dec-root", digest: true });
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankScores: { "node-d": { score: 3, noul: 1 } },
+  });
+  assert.ok(!digestOrder(plain.text).includes("node-d"), "the digest drops the superseded node-d");
+  assert.equal(r.text, plain.text);
+  assert.equal(r.meta.rerank, undefined);
+});
+
+test("rerank: meta.rerank.candidates counts only the non-pinned picks rerank rendered", () => {
+  const g = rerankFixture({ ...PIN_NODE_Z, ...SUPERSEDED_NODE_D });
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankScores: {
+      "node-z": { score: 3, noul: 1 }, // pinned — rendered by the pin, not by rerank
+      "node-d": { score: 3, noul: 1 }, // superseded — dropped, never rendered
+      "node-c": { score: 2, noul: 1 },
+      "node-b": { score: 1, noul: 0 },
+    },
+  });
+  assert.deepEqual(digestOrder(r.text), ["node-z", "node-c", "node-b", "node-a", "node-e"]);
+  assert.deepEqual(r.meta.rerank, { applied: true, candidates: 2 });
 });
 
 test("rerank: a malformed rerankScores entry (missing fields) sorts last among scored, never throws", () => {
