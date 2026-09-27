@@ -9581,11 +9581,16 @@ async function renewDispatch(cfg, nodeId, session) {
 // authenticated by the AGENT TOKEN ITSELF (not the person token) so the server can
 // set it on that token's record. Every subsequent write under the token then stamps
 // the real session. Best-effort/fail-open: a server without the route (404), a
-// conflict (409), or any transport error leaves the token session-null (writes carry
-// no session — honest, never a phantom) rather than blocking dispatch. Returns
+// conflict (409), or any transport error leaves the token session-null (writes
+// carry no session — honest, never a phantom) rather than blocking dispatch — but
+// the caller now reports it loudly (issue-spor-remote-stale-socket-after-blocking-spawn:
+// a silent skip here is how a stale pooled socket after the launch's blocking
+// spawn went unnoticed). Setting a token's session is idempotent — re-sending the
+// SAME session has the same effect — so it's marked `idempotent: true`,
+// making it eligible for remote.js's one stale-pooled-socket retry. Returns
 // {ok}|{absent}|{conflict}|{error}.
 async function bindAgentSession(cfg, agentToken, session) {
-  const r = await remote.post(cfg, `/v1/agents/session`, { session }, { timeoutMs: 3000, token: agentToken });
+  const r = await remote.post(cfg, `/v1/agents/session`, { session }, { timeoutMs: 3000, token: agentToken, idempotent: true });
   if (r.ok) return { ok: true };
   if (r.status === 404) return { ok: false, absent: true };
   if (r.status === 409) return { ok: false, conflict: true };
@@ -12176,7 +12181,11 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     // (b) renew the lease to it so lease and token agree (instead of waiting for
     // the agent's first heartbeat to self-heal). Best-effort throughout — a capture
     // miss or any bind failure leaves the token session-null (writes carry no
-    // session: honest, never a phantom) and the lease self-healing via heartbeat.
+    // session: honest, never a phantom) and the lease self-healing via heartbeat —
+    // but a bind failure is now reported loudly on stderr rather than skipped in
+    // silence (issue-spor-remote-stale-socket-after-blocking-spawn: a silent skip
+    // here is exactly how a stale pooled socket, closed by the server while this
+    // launch's blocking spawn held the event loop, went unnoticed).
     // Remote only, and only when there's something to bind (an agent token and/or a
     // claimed node).
     //
@@ -12200,7 +12209,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
           const b = await bindAgentSession(cfg, agentToken, realSession);
           if (b.ok) out(`session: ${realSession} (bound — the agent's writes trace to this run)`);
           else if (b.conflict) err(`note: the agent token is already bound to another session — leaving it.`);
-          // absent/transport error: token stays session-deferred (no phantom) — silent, fail-open.
+          else if (b.absent) err(`warning: could not bind the run session (server has no /v1/agents/session route) — the agent's writes will carry no session stamp; the lease still self-heals via heartbeat.`);
+          else err(`warning: could not bind the run session (${b.error}) — the agent's writes will carry no session stamp; the lease still self-heals via heartbeat.`);
         } else {
           out(`session: ${realSession}`);
         }

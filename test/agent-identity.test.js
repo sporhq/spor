@@ -684,7 +684,7 @@ fs.writeFileSync(${JSON.stringify(outFile)}, [process.cwd(), ...process.argv.sli
 // the session it received), and the SELF-SERVE owner-gated per-session mint
 // POST /v1/agents/{id}/token (configurable status; records the agent {id} in the
 // path + the session in the body).
-function dispatchStub({ mintStatus = 201, mintBody = null, queueItem = null } = {}) {
+function dispatchStub({ mintStatus = 201, mintBody = null, queueItem = null, sessionBindStatus = 200 } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -706,7 +706,11 @@ function dispatchStub({ mintStatus = 201, mintBody = null, queueItem = null } = 
       }
       // late session bind (dec-spor-dispatch-bg-session-late-bind): the dispatcher
       // authenticates with the AGENT token; record + echo the session it bound.
+      // sessionBindStatus lets a test force this route to fail (e.g. 500) to
+      // exercise the loud-warning path (issue-spor-remote-stale-socket-after-
+      // blocking-spawn) without needing a real stale-socket transport error.
       if (req.method === "POST" && req.url === "/v1/agents/session") {
+        if (sessionBindStatus !== 200) return j(sessionBindStatus, { error: { code: "boom", message: "bind failed" } });
         const p = JSON.parse(body || "{}");
         return j(200, { ok: true, agent: "agent-anthony-laptop", session: p.session });
       }
@@ -922,6 +926,37 @@ test("dispatch (remote, real): mints a session-DEFERRED token + 0600 mcp-config,
     const renew = hits.find((h) => /\/renew$/.test(h.url) && h.method === "POST");
     assert.ok(renew, "renewed the lease to the captured run session");
     assert.strictEqual(JSON.parse(renew.body).session, SID, "lease renewed with the real session");
+  } finally {
+    srv.close();
+  }
+});
+
+// issue-spor-remote-stale-socket-after-blocking-spawn: a failed session bind
+// used to be swallowed in total silence (a comment saying so, no output at
+// all) — exactly how the stale-pooled-socket failure after a blocking launch
+// went unnoticed. It must now warn on stderr, and the run still succeeds
+// (best-effort: the lease self-heals via heartbeat) rather than failing the
+// dispatch.
+test("dispatch (remote, real): a failed session bind now warns loudly on stderr instead of skipping in silence", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-bindfail-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-bindfailr-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
+  const stub = argvStub(home, outFile);
+  const { srv, hits, base } = await dispatchStub({ mintStatus: 201, sessionBindStatus: 500 });
+  try {
+    const r = await runAsync(
+      ["dispatch", "dec-x", "--dir", repo, "--no-brief"],
+      remoteEnv(home, base, { ...NATIVE_BG, SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub })
+    );
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stderr, /warning: could not bind the run session \(HTTP 500 \(boom\)\)/);
+    assert.doesNotMatch(r.stdout, /\(bound/, "not reported as bound — the bind genuinely failed");
+    // best-effort: the lease still renews to the captured session regardless of the bind outcome
+    const renew = hits.find((h) => /\/renew$/.test(h.url) && h.method === "POST");
+    assert.ok(renew, "the lease renew still runs even though the bind failed");
+    assert.strictEqual(JSON.parse(renew.body).session, SID);
   } finally {
     srv.close();
   }
