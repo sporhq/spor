@@ -243,6 +243,19 @@ test("a reset past the gate's pause cap is refused naming the reset — a person
   assert.strictEqual(w.seen.pools.retry.spent, 0, "nothing was charged for a review that will not happen");
 });
 
+test("the EFFECTIVE wake (reset plus the factory's own infra backoff), not the bare reset, is what the pause cap bounds", async () => {
+  // A reset only 2 minutes out clears a 5-minute pause cap on its own, but the
+  // factory's infra backoff (up to 10 minutes) still floors the wake below —
+  // `wake = max(at + backoffMs, resetAt)` — so the effective park is 10
+  // minutes, past the declared cap. The cap must bound THAT, not the reset.
+  const factory = reviewFactory({ pause_max_ms: 5 * 60000 }, { attempts: 2, backoff_ms: 600000 });
+  const w = world({ review: () => outage({ resetAt: T0 + 2 * 60000 }) });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: w.deps });
+  assert.strictEqual(res.state, "failed", "the 10-minute effective wake exceeds the 5-minute cap");
+  assert.match(w.seen.escalations[0].outage.notRetried, /past this gate's pause cap of 0h/);
+  assert.strictEqual(w.seen.pools.retry.spent, 0, "nothing was charged for a review that will not happen");
+});
+
 test("a pool declared at zero authorizes no review after the wake: refused, naming the reset", async () => {
   const factory = reviewFactory({}, null);
   const w = world({ review: () => outage() });
