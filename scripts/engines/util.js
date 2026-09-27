@@ -1267,6 +1267,8 @@ function probeCapabilities(graphHomeDir, opts) {
 // cannot treat the write as free: drainPendingNudges consumes a
 // classifier-verified finding on the strength of its `.nudged-injected` marker,
 // so a silently failed marker write would discharge a debt nothing recorded.
+// Test polling a plain-appended file (e.g. journal/llm-calls) for a torn
+// read: use test/helpers/llm-calls.js's tryLlmCalls, not a raw JSON.parse.
 function appendLine(file, line) {
   try {
     fs.appendFileSync(file, line + "\n");

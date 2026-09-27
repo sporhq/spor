@@ -12,6 +12,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { runHook, spawnHook, writeNodeScript, nodeCommand } = require("./helpers/portable");
+const { llmCalls, tryLlmCalls } = require("./helpers/llm-calls");
 
 const PROSE = Array.from({ length: 8 }, (_, i) =>
   `Finding ${i}: the retry path in server X was dismissed because the upstream ` +
@@ -88,28 +89,6 @@ function nudgedLines(home, session = "s1") {
   const p = path.join(home, "journal", `${session}.nudged`);
   if (!fs.existsSync(p)) return [];
   return fs.readFileSync(p, "utf8").split("\n").filter(Boolean);
-}
-
-function llmCalls(home) {
-  const dir = path.join(home, "journal", "llm-calls");
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir).flatMap((f) =>
-    fs.readFileSync(path.join(dir, f), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
-  );
-}
-
-// The detached worker's own recordLlm() APPENDS to this same file with a plain
-// fs.appendFileSync (util.js's appendLine) — not the atomic temp-file+rename
-// runSpoolWorker uses for its `.out.json` result — so a poll landing mid-write
-// can hit a torn/partial line and JSON.parse throws. Retry like `awaitJson`
-// (test/helpers/launch.js, commit 74aa2e8) rather than letting that exception
-// escape the poll (issue-spor-nudge-async-test-torn-json-read).
-function tryLlmCalls(home) {
-  try {
-    return llmCalls(home);
-  } catch {
-    return null;
-  }
 }
 
 function journal(home, session = "s1") {

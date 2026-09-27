@@ -14,6 +14,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { runHook, writeNodeScript, nodeCommand } = require("./helpers/portable");
+const { llmCalls, tryLlmCalls } = require("./helpers/llm-calls");
 
 // A prompt that reliably fires the local digest against the corpus below.
 const PROMPT = "what is our widget thumbnail caching strategy in redis for gallery page";
@@ -103,14 +104,6 @@ function outFiles(home, session = "s1") {
   }
 }
 
-function llmCalls(home) {
-  const dir = path.join(home, "journal", "llm-calls");
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir).flatMap((f) =>
-    fs.readFileSync(path.join(dir, f), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
-  );
-}
-
 function journal(home, session = "s1") {
   const p = path.join(home, "journal", `${session}.jsonl`);
   if (!fs.existsSync(p)) return [];
@@ -187,7 +180,7 @@ test("async: prompt spools + injects nothing; WARRANTED worker result injects on
 test("async UNWARRANTED verdict: no result file, nothing ever injects", async () => {
   const { root, home, cwd } = scratch();
   assert.strictEqual(promptContext(home, cwd, { intentCmd: unwarrantedStub(root) }).trim(), "");
-  assert.ok(await waitFor(() => llmCalls(home).length === 1), "worker never ran");
+  assert.ok(await waitFor(() => tryLlmCalls(home)?.length === 1), "worker never ran");
   assert.match(llmCalls(home)[0].response, /UNWARRANTED/);
   assert.strictEqual(outFiles(home).length, 0, "an UNWARRANTED verdict writes no result");
   assert.strictEqual(promptContext(home, cwd, { prompt: "ok" }).trim(), "");
