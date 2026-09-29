@@ -927,8 +927,9 @@ as if the graph is empty" (§6).
 A `429 rate_limited` response SHOULD carry a `Retry-After` header (delay
 seconds or an HTTP-date); clients honor it, otherwise backing off
 exponentially, capped, before retrying. Mechanical writers
-(drain-outbox, distill) classify `401`, `400`, `413`, and `422` as
-**permanent** — a revoked token will not un-revoke, so these are
+(drain-outbox, distill) classify `401`/`403`, `400`, `413`, and `422` as
+**permanent** (one shared classifier, `classifyHttpFailure` in
+`scripts/engines/util.js`, which session-start also reads its banner from) — a revoked token will not un-revoke, so these are
 dead-lettered to `outbox/dead/` with a loud `journal/remote.log` line
 rather than re-POSTed forever; `429` and `5xx` stay transient and are
 retried with backoff.

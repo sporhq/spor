@@ -1375,6 +1375,81 @@ function backoffMs(attempt, retryAfterMs, capMs) {
   return Math.min(base, capMs);
 }
 
+// The ONE reading of a curl()-shaped status for every remote engine
+// (session-start, drain-outbox, distill), so no engine re-derives its own set
+// and drifts (issue-cc-auth-transport-conflation-silent-loss,
+// issue-cc-401-429-contract-gap — each engine had grown a different list, and
+// distill still re-POSTed a 403 the drain then dead-lettered). Kinds:
+//   ok         — 2xx.
+//   auth       — 401/403: the token is revoked, expired or mis-pasted. NOT an
+//                outage, and it does not recover by waiting (the engines carry
+//                no token refresh), so it is PERMANENT and must be named loudly.
+//   rejected   — 400/413/422: the server's verdict on these exact bytes; a
+//                re-POST can only be rejected again, so PERMANENT.
+//   rate-limit — 429: transient, retried only after its Retry-After/backoff.
+//   transport  — "000": no response at all (timeout, refused, DNS, abort).
+//   server     — anything else (5xx, an unexpected 404/409): transient.
+// API.md §5: mechanical writers dead-letter the permanent kinds to
+// outbox/dead/ and keep the transient ones spooled.
+function classifyHttpFailure(http) {
+  const s = http == null ? "000" : String(http);
+  if (s === "000" || s === "") return "transport";
+  const n = Number(s);
+  if (n >= 200 && n < 300) return "ok";
+  if (n === 401 || n === 403) return "auth";
+  if (n === 429) return "rate-limit";
+  if (n === 400 || n === 413 || n === 422) return "rejected";
+  return "server";
+}
+
+// Permanent kinds: dead-letter, never re-POST (API.md §5).
+function isPermanentHttpFailure(kind) {
+  return kind === "auth" || kind === "rejected";
+}
+
+// A headless invocation the system itself spawned (the distiller, the capture
+// ingester, the nudge/digest-intent classifiers — every spawn site exports
+// SPOR_DISTILLING, client and server). Hooks firing inside one must not nudge,
+// digest, drain or distill: nobody reads that output, and the distiller's own
+// SessionEnd would recurse. The ONE spelling of the check (legacy
+// SUBSTRATE_DISTILLING dual-read included).
+function isSystemSession(env = process.env) {
+  return Boolean(env.SPOR_DISTILLING || env.SUBSTRATE_DISTILLING);
+}
+
+// A signal that aborts when EITHER does — the per-call timeout, or a caller's
+// shared deadline (session-start's one budget over its concurrent reads).
+function anySignal(signals) {
+  const live = signals.filter(Boolean);
+  if (live.length <= 1) return live[0];
+  if (typeof AbortSignal.any === "function") return AbortSignal.any(live);
+  const ctl = new AbortController();
+  for (const sig of live) {
+    if (sig.aborted) {
+      ctl.abort(sig.reason);
+      break;
+    }
+    sig.addEventListener("abort", () => ctl.abort(sig.reason), { once: true });
+  }
+  return ctl.signal;
+}
+
+// sleep() that ends early when `signal` aborts, so a retry backoff never
+// outlives the caller's deadline.
+function sleepUnless(ms, signal) {
+  if (!signal) return sleep(ms);
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const t = setTimeout(done, ms);
+    function done() {
+      clearTimeout(t);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
 // curl-shaped HTTP: resolves to {http: "200", body: "...", headers: {...}}
 // with "000" on any transport failure (timeout, refused, DNS). Never throws.
 // `headers` is a plain lowercased-key object (fetch's Headers normalizes
@@ -1383,34 +1458,40 @@ function backoffMs(attempt, retryAfterMs, capMs) {
 // followed. Transient failures (transport, 429, 5xx) are retried up to
 // `retry` times; between retries we honor a 429 Retry-After header and
 // otherwise back off exponentially (capped at backoffCapMs). With retry=0
-// (the session-start hook budget) no backoff ever runs.
+// (the session-start hook budget) no backoff ever runs. An optional `signal`
+// is a caller-owned DEADLINE layered over the per-call timeout: whichever
+// fires first aborts the request (reported as transport, "000"), and it also
+// cuts a retry backoff short and stops further attempts.
 async function curl(
   url,
-  { method = "GET", headers = {}, body, timeoutMs = 6000, retry = 0, backoffCapMs = 8000 } = {}
+  { method = "GET", headers = {}, body, timeoutMs = 6000, retry = 0, backoffCapMs = 8000, signal } = {}
 ) {
   for (let attempt = 0; ; attempt++) {
+    const canRetry = attempt < retry && !(signal && signal.aborted);
     let res;
+    let text;
     try {
       res = await fetch(url, {
         method,
         headers,
         body,
         redirect: "manual",
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: anySignal([AbortSignal.timeout(timeoutMs), signal]),
       });
+      text = await res.text().catch(() => "");
     } catch {
-      if (attempt < retry) {
-        await sleep(backoffMs(attempt, null, backoffCapMs));
-        continue;
+      if (canRetry) {
+        await sleepUnless(backoffMs(attempt, null, backoffCapMs), signal);
+        if (!(signal && signal.aborted)) continue;
       }
       return { http: "000", body: "" };
     }
-    const text = await res.text().catch(() => "");
-    const transient = res.status === 429 || res.status >= 500;
-    if (transient && attempt < retry) {
-      const retryAfterMs = res.status === 429 ? parseRetryAfter(res.headers.get("retry-after")) : null;
-      await sleep(backoffMs(attempt, retryAfterMs, backoffCapMs));
-      continue;
+    const kind = classifyHttpFailure(res.status);
+    const transient = kind === "rate-limit" || res.status >= 500;
+    if (transient && canRetry) {
+      const retryAfterMs = kind === "rate-limit" ? parseRetryAfter(res.headers.get("retry-after")) : null;
+      await sleepUnless(backoffMs(attempt, retryAfterMs, backoffCapMs), signal);
+      if (!(signal && signal.aborted)) continue;
     }
     const respHeaders = {};
     res.headers.forEach((v, k) => {
@@ -1875,6 +1956,10 @@ module.exports = {
   journalLoadMs,
   gcJournal,
   curl,
+  classifyHttpFailure,
+  isPermanentHttpFailure,
+  isSystemSession,
+  anySignal,
   bearer,
   serverBase,
   fetchAssigneeMineItems,

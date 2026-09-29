@@ -309,3 +309,88 @@ test('drain: a failed POST releases the claim back under the original name', asy
   assert.ok(!live(graph, 'r.capture.json'));
   assert.deepStrictEqual(fs.readdirSync(path.join(graph, 'outbox', '.attempts')), []);
 });
+
+// task-spor-session-start-deadline-and-http-failure-classifier: ONE reading of
+// a status for session-start, drain-outbox and distill.
+test('classifyHttpFailure: ok / auth / rejected / rate-limit / transport / server', () => {
+  const cases = {
+    200: 'ok', 207: 'ok', 401: 'auth', 403: 'auth', 400: 'rejected', 413: 'rejected',
+    422: 'rejected', 429: 'rate-limit', '000': 'transport', 500: 'server', 503: 'server', 404: 'server',
+  };
+  for (const [http, kind] of Object.entries(cases)) assert.strictEqual(u.classifyHttpFailure(http), kind, http);
+  assert.strictEqual(u.classifyHttpFailure(undefined), 'transport');
+  assert.strictEqual(u.classifyHttpFailure(401), 'auth', 'numeric status reads the same as the string');
+  for (const k of ['auth', 'rejected']) assert.ok(u.isPermanentHttpFailure(k), k);
+  for (const k of ['ok', 'rate-limit', 'transport', 'server']) assert.ok(!u.isPermanentHttpFailure(k), k);
+});
+
+test('drain dead-letters a 403 exactly as a 401 (auth kind)', async () => {
+  const graph = scratchGraph();
+  spool(graph, 'a.json');
+  await withServer(async () => fakeResponse(403), () => drainOutbox(graph, 't', 1));
+  assert.ok(fs.existsSync(path.join(graph, 'outbox', 'dead', 'a.json')));
+  const log = fs.readFileSync(path.join(graph, 'journal', 'remote.log'), 'utf8');
+  assert.match(log, /http=403, revoked\/invalid token/);
+});
+
+test('isSystemSession: either marker spelling', () => {
+  assert.strictEqual(u.isSystemSession({}), false);
+  assert.strictEqual(u.isSystemSession({ SPOR_DISTILLING: '1' }), true);
+  assert.strictEqual(u.isSystemSession({ SUBSTRATE_DISTILLING: '1' }), true);
+});
+
+test('u.curl: a caller deadline signal ends the request as transport (000) before its own timeout', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url, opts) =>
+    new Promise((_, reject) => opts.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+  try {
+    const t0 = Date.now();
+    const r = await u.curl('http://127.0.0.1:9/x', { timeoutMs: 30000, signal: AbortSignal.timeout(50) });
+    assert.strictEqual(r.http, '000');
+    assert.ok(Date.now() - t0 < 5000, 'the deadline, not the 30s per-call timeout, ended it');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('u.curl: an expired deadline cuts a Retry-After backoff short and stops retrying', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return fakeResponse(429, { headers: { 'Retry-After': '30' } });
+  };
+  try {
+    const t0 = Date.now();
+    const r = await u.curl('http://127.0.0.1:9/x', {
+      retry: 3, backoffCapMs: 30000, signal: AbortSignal.timeout(50),
+    });
+    assert.strictEqual(r.http, '429');
+    assert.strictEqual(calls, 1);
+    assert.ok(Date.now() - t0 < 5000);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('anySignal: aborts when any input aborts', () => {
+  const a = new AbortController();
+  const b = new AbortController();
+  const s = u.anySignal([a.signal, b.signal]);
+  assert.strictEqual(s.aborted, false);
+  b.abort();
+  assert.strictEqual(s.aborted, true);
+  assert.strictEqual(u.anySignal([a.signal, undefined]), a.signal);
+});
+
+test('drainOutbox: a pinned retry of 0 POSTs a failing file once even with a long per-file window', async () => {
+  const graph = scratchGraph();
+  spool(graph, 'a.capture.json');
+  let calls = 0;
+  const s = await withServer(async () => {
+    calls++;
+    return fakeResponse(503);
+  }, () => drainOutbox(graph, 't', 120, 10, 60, 0));
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(s.failed, 1);
+});

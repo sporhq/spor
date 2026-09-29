@@ -75,7 +75,7 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   // Nudge on by default; SPOR_NUDGE=0 (env) or nudge.enabled:false (config)
   // disables. No active config falls back to the exact env dual-read.
   if (u.config() ? !u.config().getBool("nudge.enabled", true) : (u.envDual("NUDGE") ?? "1") === "0") return null;
-  if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null; // headless calls don't nudge
+  if (u.isSystemSession()) return null; // headless calls don't nudge
   if (!file.endsWith(".md")) return null;
   const home = process.env.HOME || require("os").homedir();
   const norm = (p) => path.resolve(String(p || "")).replace(/\\/g, "/").toLowerCase();
@@ -369,7 +369,7 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
   // exact env dual-read when no config is active (byte-identical standalone).
   if (u.config() ? !u.config().getBool("claimNudge.enabled", true) : (u.envDual("CLAIM_NUDGE") ?? "1") === "0") return null;
   // Headless calls (the distiller's claude -p) don't nudge.
-  if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null;
+  if (u.isSystemSession()) return null;
   // In-repo only: a real git root must back the slug, else this is a loose
   // directory and there is no project pool to claim from. (projectSlug falls
   // back to the cwd basename for a non-repo; the claim model is repo-scoped.)
@@ -707,7 +707,7 @@ async function remoteCouplingData(graph) {
 
 async function couplingNudge({ input, graph, slug, session, cwd, remote }) {
   if (u.config() ? !u.config().getBool("couplingNudge.enabled", true) : (u.envDual("COUPLING_NUDGE") ?? "1") === "0") return null;
-  if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null; // headless calls don't nudge
+  if (u.isSystemSession()) return null; // headless calls don't nudge
   const tool = input.tool_name ?? "";
   if (!["Write", "Edit", "write", "edit"].includes(tool)) return null;
   const file = input.tool_input?.file_path ?? "";
@@ -813,7 +813,7 @@ async function agentHeartbeat({ graph, session, remote }) {
     if (!remote) return null; // local mode: no fleet, no-op (keeps output byte-identical)
     const cfg = u.config();
     if (cfg ? !cfg.getBool("dispatch.heartbeat", true) : (u.envDual("HEARTBEAT") ?? "1") === "0") return null;
-    if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null; // headless calls don't tick
+    if (u.isSystemSession()) return null; // headless calls don't tick
     const agent = cfg ? cfg.get("dispatch.agent", null) : u.envDual("DISPATCH_AGENT") || null;
     if (!agent) return null; // no dispatch identity on this box — nothing to keep alive
 

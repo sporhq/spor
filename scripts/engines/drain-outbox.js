@@ -28,7 +28,7 @@ const u = require("./util");
 const inFlight = new Set();
 const suffixOf = (name) => (name.endsWith(".capture.json") ? ".capture.json" : ".json");
 
-async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0, maxWallSec = 0) {
+async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0, maxWallSec = 0, retryOverride = null) {
   const summary = { attempted: 0, drained: 0, deadLettered: 0, failed: 0 };
   if (!u.serverBase()) return summary;
   const outbox = path.join(graph, "outbox");
@@ -38,8 +38,11 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0, 
   const rlog = u.makeLogger(path.join(graph, "journal", "remote.log"), `${tag} drain: `);
 
   // Retries multiply wall-clock cost; with a tight per-file budget
-  // (session-start) skip them so one slow file can't eat the hook budget.
-  const retry = maxTimeSec <= 5 ? 0 : 2;
+  // (session-start) skip them so one slow file can't eat the hook budget. A
+  // caller may pin the count instead: a window already sized to cover a slow
+  // ingest gains nothing from re-POSTing the same bytes while the first is
+  // still in flight server-side.
+  const retry = retryOverride != null ? retryOverride : maxTimeSec <= 5 ? 0 : 2;
 
   const attempts = path.join(outbox, ".attempts");
   const stampOf = (name) => path.join(attempts, name);
@@ -114,19 +117,20 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0, 
       retry,
     });
     summary.attempted++;
-    if (http === "200" || http === "207") {
+    const kind = u.classifyHttpFailure(http);
+    if (kind === "ok") {
       try {
         fs.unlinkSync(file);
       } catch {}
       clearStamp(name);
       summary.drained++;
       rlog(`drained ${name} (http=${http})`);
-    } else if (http === "401" || http === "403" || http === "400" || http === "413" || http === "422") {
-      // Permanent client error: dead-letter it so it can't starve the drain.
-      // A 401 means the token is revoked/invalid (dec-cc-fail-open-hooks: 4xx
-      // is dead-lettered) — re-POSTing it on every session start and distill
-      // cycle never succeeds, so it gets the same treatment, but louder: the
-      // fix is a new token, not patience.
+    } else if (u.isPermanentHttpFailure(kind)) {
+      // Permanent (u.classifyHttpFailure): dead-letter it so it can't starve
+      // the drain. An auth failure means the token is revoked/invalid
+      // (dec-cc-fail-open-hooks: 4xx is dead-lettered) — re-POSTing it on
+      // every session start and distill cycle never succeeds, so it gets the
+      // same treatment, but louder: the fix is a new token, not patience.
       try {
         u.ensureDir(path.join(outbox, "dead"));
         fs.renameSync(file, path.join(outbox, "dead", name));
@@ -137,9 +141,9 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0, 
       }
       clearStamp(name);
       summary.deadLettered++;
-      if (http === "401") {
+      if (kind === "auth") {
         rlog(
-          `dead-lettered ${name} (http=401, revoked/invalid token); ` +
+          `dead-lettered ${name} (http=${http}, revoked/invalid token); ` +
             `re-mint SPOR_TOKEN and replay outbox/dead/ — auth will not recover on its own`
         );
       } else {
@@ -190,14 +194,16 @@ module.exports = { drainOutbox };
 
 // CLI entry so session-start can fire the drain DETACHED (off the response
 // critical path) the same way it fires link-commits.js — argv: tag, perFileSec,
-// maxFiles, maxWallSec. The graph home is re-derived from the environment,
+// maxFiles, maxWallSec[, retry]. The graph home is re-derived from the environment,
 // identical to the in-process call. Fail-open, always exits 0.
 if (require.main === module) {
   const tag = process.argv[2] || "drain";
   const maxTimeSec = Number(process.argv[3]) || 30;
   const maxFiles = Number(process.argv[4]) || 0;
   const maxWallSec = Number(process.argv[5]) || 0;
-  drainOutbox(u.graphHome(), tag, maxTimeSec, maxFiles, maxWallSec)
+  const retryArg = process.argv[6];
+  const retryOverride = retryArg != null && /^\d+$/.test(retryArg) ? Number(retryArg) : null;
+  drainOutbox(u.graphHome(), tag, maxTimeSec, maxFiles, maxWallSec, retryOverride)
     .catch(() => {})
     .finally(() => process.exit(0));
 }

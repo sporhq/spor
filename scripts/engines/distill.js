@@ -552,13 +552,15 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
       // write and the unlink) overwrites its own byte-identical file instead of
       // piling a second copy into the spool.
       const spoolName = `${session}-${key.slice(0, 16)}.capture.json`;
-      if (post && post.http === "200") {
+      const kind = u.classifyHttpFailure(post ? post.http : "000");
+      if (kind === "ok") {
         rlog(`captured session-final finding from ${r.file}`);
         consume(fp);
-      } else if (post && ["400", "401", "413", "422"].includes(post.http)) {
+      } else if (u.isPermanentHttpFailure(kind)) {
         // The server's verdict on this exact body — a re-post can only be
-        // rejected again, so it is PERMANENT. API.md §5 names the set for a
-        // mechanical writer (`distill` included): 401, 400, 413 and 422 are
+        // rejected again, so it is PERMANENT (u.classifyHttpFailure, the one
+        // classifier the engines share). API.md §5 names the set for a
+        // mechanical writer (`distill` included): 401/403, 400, 413 and 422 are
         // permanent and dead-lettered to `outbox/dead/` with a loud remote.log
         // line, never discarded and never re-POSTed forever; 429 and 5xx stay
         // transient. Dead-lettering preserves the rejected payload for
@@ -578,8 +580,8 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
         }
         if (dead) {
           rlog(
-            post.http === "401"
-              ? `session-final finding from ${r.file} rejected (http=401, revoked/invalid token); ` +
+            kind === "auth"
+              ? `session-final finding from ${r.file} rejected (http=${post.http}, revoked/invalid token); ` +
                   `dead-lettered to outbox/dead/${spoolName} — re-mint SPOR_TOKEN and replay outbox/dead/, ` +
                   `auth will not recover on its own`
               : `session-final finding from ${r.file} rejected (http=${post.http}, permanent); ` +
@@ -911,7 +913,7 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
 }
 
 async function distill(input) {
-  if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null;
+  if (u.isSystemSession()) return null;
 
   const graph = u.graphHome();
   const remote = Boolean(u.serverBase());
@@ -1157,18 +1159,34 @@ async function distill(input) {
         body,
         timeoutMs: 90000,
       });
-      if (http === "200") {
+      const kind = u.classifyHttpFailure(http);
+      const spoolName = `${session}-${Math.floor(Date.now() / 1000)}-${spooled + rejected}.capture.json`;
+      if (kind === "ok") {
         sent++;
-      } else if (http === "400" || http === "413" || http === "422") {
+      } else if (u.isPermanentHttpFailure(kind)) {
+        // PERMANENT (auth or rejected — u.classifyHttpFailure): dead-letter it
+        // straight to outbox/dead/ (API.md §5), where session-start and
+        // `spor-hook doctor` surface it, rather than dropping a rejected fact
+        // or spooling a 401/403 for one more doomed POST before drain-outbox
+        // dead-letters the identical bytes.
         rejected++;
-        rlog(`capture rejected (http=${http}) for fact-${factNo}.txt`);
+        let dead = false;
+        if (u.ensureDir(path.join(graph, "outbox", "dead"))) {
+          try {
+            u.writeSpoolFile(path.join(graph, "outbox", "dead", spoolName), body);
+            dead = true;
+          } catch {}
+        }
+        rlog(
+          kind === "auth"
+            ? `capture rejected (http=${http}, revoked/invalid token) for fact-${factNo}.txt` +
+                `${dead ? `; dead-lettered to outbox/dead/${spoolName}` : ""} — re-mint SPOR_TOKEN and replay outbox/dead/`
+            : `capture rejected (http=${http}) for fact-${factNo}.txt` +
+                `${dead ? `; dead-lettered to outbox/dead/${spoolName}` : ""}`
+        );
       } else {
         u.ensureDir(path.join(graph, "outbox"));
-        const spool = path.join(
-          graph,
-          "outbox",
-          `${session}-${Math.floor(Date.now() / 1000)}-${spooled}.capture.json`
-        );
+        const spool = path.join(graph, "outbox", spoolName);
         try {
           u.writeSpoolFile(spool, body);
         } catch {}

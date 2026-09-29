@@ -18,7 +18,18 @@ function envelope(ctx) {
   return { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: ctx } };
 }
 
-function localCompile(graph, prompt, rlogFile, project) {
+// The ONE description of what a prompt-time compile asks for, consumed by
+// BOTH digest branches — the remote POST /v1/digest body and the local
+// lib/compile.js argv — so the two cannot drift on project/scope threading
+// again (issue-spor-remote-digest-project-blind: the remote branch posted only
+// `query` for months while the local one scoped by project). Absent a slug the
+// request carries no `project` key, keeping both branches byte-identical to
+// their project-blind forms.
+function buildCompileRequest(prompt, slug) {
+  return slug ? { query: prompt, project: slug } : { query: prompt };
+}
+
+function localCompile(graph, req, rlogFile) {
   const r = spawnSync(
     process.execPath,
     [
@@ -26,14 +37,14 @@ function localCompile(graph, prompt, rlogFile, project) {
       "--nodes",
       path.join(graph, "nodes"),
       "--query",
-      prompt,
+      req.query,
       "--digest",
       "--quiet",
       // The session slug scopes `project:<slug>` corrections (issue-cc-
       // corrections-silent-noop-query-mode). Absent any such correction the
       // digest is byte-identical to before, so local mode stays unchanged for
       // every existing graph.
-      ...(project ? ["--project", project] : []),
+      ...(req.project ? ["--project", req.project] : []),
     ],
     { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }
   );
@@ -780,7 +791,7 @@ async function promptContext(input) {
   // injected there is compile work no human reads, and it polluted the digest
   // eval set (issue-spor-digest-fires-on-headless-backend-personas). Same
   // guard post-tool already applies ("headless calls don't nudge").
-  if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null;
+  if (u.isSystemSession()) return null;
 
   const graph = u.graphHome();
   const slug = u.projectSlug(input.cwd ?? "");
@@ -905,6 +916,7 @@ async function computeDigest(input, graph, slug, meta = {}) {
   if (prompt.startsWith("/")) return "";
   if (isContinuationPrompt(prompt)) return "";
   if (u.wordCount(prompt) < 6) return "";
+  const req = buildCompileRequest(prompt, slug);
 
   // -------------------------------------------------------------------------
   // REMOTE MODE
@@ -919,15 +931,15 @@ async function computeDigest(input, graph, slug, meta = {}) {
     // relevance boost, the grouping union, and the norm `applies_to_*`
     // ride-along (issue-spor-remote-digest-project-blind). The remote digest
     // was project-blind: it posted only `query`, so every compile() session-
-    // project feature silently no-opped in remote mode. `slug` is the same
-    // `projectSlug(cwd)` already fed to the local merge below. Absent a slug
-    // the body is byte-identical to the prior project-blind POST, and an older
+    // project feature silently no-opped in remote mode. The body is the same
+    // buildCompileRequest() the local merge below compiles from. Absent a slug
+    // it is byte-identical to the prior project-blind POST, and an older
     // server simply ignores the field (it stays the default), so this is safe
     // either way.
     const resp = await u.curl(`${u.serverBase()}/v1/digest`, {
       method: "POST",
       headers: { ...u.bearer(), "Content-Type": "application/json" },
-      body: JSON.stringify(slug ? { query: prompt, project: slug } : { query: prompt }),
+      body: JSON.stringify(req),
       timeoutMs: 4000,
     });
 
@@ -956,7 +968,7 @@ async function computeDigest(input, graph, slug, meta = {}) {
     // graph exists.
     let local = "";
     if (fs.existsSync(path.join(graph, "nodes"))) {
-      local = localCompile(graph, prompt, rlogFile, slug);
+      local = localCompile(graph, req, rlogFile);
     }
 
     if (!team && !local) return "";
@@ -980,7 +992,7 @@ async function computeDigest(input, graph, slug, meta = {}) {
   // missing signal; it is journal-only, so the injected digest stays
   // byte-identical. Best-effort; never blocks.
   const t0 = Date.now();
-  const digest = localCompile(graph, prompt, null, slug);
+  const digest = localCompile(graph, req, null);
   u.journalLoadMs(graph, input.session_id, "prompt-context", Date.now() - t0, {
     cached: false,
   });
@@ -992,6 +1004,7 @@ async function computeDigest(input, graph, slug, meta = {}) {
 
 module.exports = {
   promptContext,
+  buildCompileRequest,
   mergeDigests,
   isContinuationPrompt,
   stripSystemReminders,

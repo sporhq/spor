@@ -267,8 +267,9 @@ first — since each result is its own capture round trip and the transcript
 distiller runs after this. The bound is admissible only because stopping early
 has no durable consequence: the `.out.json` IS the debt, an unreached result is
 left byte-for-byte as found, and the collector is itself what comes back for it
-(6h horizon, well inside `gc.maxAgeMs`). A server 401/400/413/422 is
-permanent but NOT discardable: per API.md §5 a mechanical writer preserves a
+(6h horizon, well inside `gc.maxAgeMs`). A server 401/403/400/413/422 is
+permanent (`u.classifyHttpFailure`, the one status reading shared by
+session-start, drain-outbox and distill) but NOT discardable: per API.md §5 a mechanical writer preserves a
 rejected payload in `outbox/dead/` (the channel session-start and `spor-hook
 doctor` already surface), so the consume waits on that write like any other.
 The consume therefore trails the durable write, so a crash in the gap re-drains
@@ -450,7 +451,8 @@ that the engines' constants now read from. Add a spool file class there, not in
 the engine that happens to touch it. The outbox drain takes files
 oldest-ATTEMPT first and re-stamps a transiently failed file's mtime, so a
 failing head rotates behind the rest instead of blocking them; session-start's
-detached drain takes up to 10 files in a 20s pass. `node:sqlite` was weighed as
+detached drain takes up to 10 files, stops taking files after 60s, and gives
+each a 120s window with no retry (a capture ingest runs up to ~90s). `node:sqlite` was weighed as
 the store and dismissed while `engines.node` is `>=20` (it needs 22.5+).
 
 The prompt-context engine's digest has the same async pattern as an INTENT GATE

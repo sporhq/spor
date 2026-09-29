@@ -716,6 +716,51 @@ process.stdin.on("end", () => {
   }
 });
 
+// task-spor-session-start-deadline-and-http-failure-classifier: the live
+// distill POST reads its status through u.classifyHttpFailure, so a 401/403 is
+// dead-lettered at once (API.md §5) instead of spooled for a doomed re-POST,
+// and a 5xx still spools.
+for (const [code, where] of [[401, 'dead'], [403, 'dead'], [422, 'dead'], [503, 'spool']]) {
+  test(`distill (remote): a live capture answered ${code} is ${where === 'dead' ? 'dead-lettered' : 'spooled'}`, async () => {
+    const { root, home, cwd } = scratch();
+    fs.rmSync(path.join(home, 'nodes'), { recursive: true });
+    const transcript = path.join(root, 'transcript.jsonl');
+    fs.writeFileSync(transcript, [
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: words(60, 'alpha') }] } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: words(60, 'beta') }] } }),
+    ].join('\n') + '\n');
+    const stub = path.join(root, 'stub-fact.js');
+    writeNodeScript(stub, `
+process.stdin.resume();
+process.stdin.on("end", () => { process.stdout.write("===FACT===\\nA durable fact.\\n===END===\\n"); });
+`);
+    const { srv, base } = await statusServer(code);
+    try {
+      const env = freshEnv(home);
+      env.SPOR_SERVER = base;
+      env.SPOR_TOKEN = 'spor_pat_test';
+      env.SPOR_DISTILL_CMD = nodeCommand(stub);
+      await runAsync(
+        ['distill', '--host', 'claude-code'],
+        JSON.stringify({ cwd, session_id: `sess-${code}`, transcript_path: transcript, hook_event_name: 'SessionEnd' }),
+        env
+      );
+      const ls = (d) => { try { return fs.readdirSync(d).filter((f) => f.endsWith('.capture.json')); } catch { return []; } };
+      const dead = ls(path.join(home, 'outbox', 'dead'));
+      const spooled = ls(path.join(home, 'outbox'));
+      if (where === 'dead') {
+        assert.strictEqual(dead.length, 1, 'permanent kind dead-lettered');
+        assert.strictEqual(spooled.length, 0, 'and not spooled for a re-POST');
+      } else {
+        assert.strictEqual(spooled.length, 1, 'transient kind stays spooled');
+        assert.strictEqual(dead.length, 0);
+      }
+    } finally {
+      srv.close();
+    }
+  });
+}
+
 test('cursor session-start: payload mapped, output is flat {additional_context}', () => {
   const { home, cwd } = scratch();
   fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
@@ -1217,6 +1262,28 @@ test('session-start: a transport failure (000/dead port) still says OFFLINE, not
   const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
   assert.match(ctx, /OFFLINE/);
   assert.doesNotMatch(ctx, /AUTH FAILED/);
+});
+
+test('session-start: a 429 says RATE LIMITED, not OFFLINE or AUTH (task-spor-session-start-deadline-and-http-failure-classifier)', async () => {
+  const { home, cwd } = scratch();
+  fs.mkdirSync(path.join(home, 'cache'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'cache', 'brief-projx.md'),
+    '<!-- spor cache: brief-projx version=2 fetched=2026-01-01 host=x -->\ncached body\n');
+  const { srv, base } = await statusServer(429);
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_test';
+    let out = '';
+    await runAsync2(['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), env, (s) => (out += s));
+    const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /RATE LIMITED/);
+    assert.match(ctx, /cached body/);
+    assert.doesNotMatch(ctx, /OFFLINE|AUTH FAILED/);
+  } finally {
+    srv.close();
+  }
 });
 
 // async spawn that captures stdout (runAsync above discards it).

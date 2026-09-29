@@ -2,7 +2,7 @@
 // SessionStart engine: inject the standing project briefing plus a one-line
 // status. Node port of session-start.sh — LOCAL mode is byte-identical to the
 // original pure-file-read behavior; REMOTE mode keeps the same budgets
-// (drain 2s/1 file, briefing 6s, queue 3s), cache format, and fail-open
+// (drain detached, briefing 6s, queue 3s, all under one 6s deadline), cache format, and fail-open
 // fallbacks. Returns the Claude-shaped envelope object, or null for no output.
 
 const fs = require("fs");
@@ -195,6 +195,13 @@ function degradationNudge(graph) {
   return "";
 }
 
+// The ONE wall-clock budget over remote session-start's concurrent server work
+// (SERVER.md §7.1's ~6s; issue-cc-session-start-serial-timeout-budget). Each
+// call keeps its own per-call timeout, but every call also rides this shared
+// deadline signal, so the critical path is bounded by construction — a future
+// call added to the batch cannot stack onto it, and no retry can outlive it.
+const SESSION_START_DEADLINE_MS = 6000;
+
 // Auto-publish this box's dispatch capabilities to the fleet scheduler
 // (task-spor-fleet-capabilities-autopublish-session-start), the client half that
 // makes the remote fleet scheduler (task-spor-remote-fleet-scheduler) live: the
@@ -214,7 +221,7 @@ function degradationNudge(graph) {
 // with the briefing/queue reads so it adds nothing to the session-start critical
 // path. Opt out with SPOR_CAPABILITIES_PUBLISH=0 (dispatch.capabilitiesPublish:
 // false). Always returns null — it never alters this run's output.
-async function publishCapabilities(probed, rlog) {
+async function publishCapabilities(probed, rlog, signal) {
   try {
     const cfg = u.config();
     // Opt-out lever, resolved through the cascade with the env dual-read fallback
@@ -233,6 +240,7 @@ async function publishCapabilities(probed, rlog) {
       headers: { ...u.bearer(), "content-type": "application/json" },
       body: JSON.stringify(eff),
       timeoutMs,
+      signal,
     });
     if (r.http === "200") {
       rlog(
@@ -375,10 +383,18 @@ async function sessionStart(input) {
     // ~6s session-start budget (§7.1, issue-cc-session-start-serial-timeout-
     // budget). Detaching it (and the commit catch-up) leaves only the two
     // server reads on the critical path, which now run concurrently. Being
-    // detached, it can afford a BATCH — up to 10 files in a 20s pass — where
+    // detached, it can afford a BATCH — up to 10 files per pass — where
     // one file per session-start left a 41-deep post-outage backlog needing 41
     // sessions to clear (issue-spor-outbox-drain-file-cap-hol-block).
-    u.spawnDetached([path.join(__dirname, "drain-outbox.js"), "session-start", "2", "10", "20"]);
+    // The per-file window is 120s, not the 2s it once was: a /v1/capture
+    // ingests with a model call (up to ~90s), so a 2s window timed out EVERY
+    // capture and re-POSTed it each session (issue-cc-capture-transport-
+    // idempotency) — the idempotency key made that safe, not useful. Retries
+    // are pinned to 0: a window that covers the ingest gains nothing from a
+    // second POST of bytes still in flight server-side. Detached, the window
+    // costs no hook latency; the pass stops TAKING files after 60s, so it ends
+    // within 60s + one file's window (well inside SPOOL_TTL's claim hold).
+    u.spawnDetached([path.join(__dirname, "drain-outbox.js"), "session-start", "120", "10", "60", "0"]);
 
     // Commit-link catch-up (task-cc-commit-linking): detached, costs nothing.
     if (cwd && fs.existsSync(cwd)) {
@@ -398,19 +414,24 @@ async function sessionStart(input) {
     // it overlaps the reads already on the critical path so it adds no latency. Its
     // result is ignored (publishCapabilities always resolves null); we still await
     // it here so the POST completes before the process exits.
+    // Every call rides ONE deadline (SESSION_START_DEADLINE_MS): whichever
+    // of it and the call's own timeout fires first ends that call.
+    const deadline = AbortSignal.timeout(SESSION_START_DEADLINE_MS);
     const [brief, qresp] = await Promise.all([
       u.curl(
         `${u.serverBase()}/v1/briefing/${slug}${fp.length ? `?fp=${encodeURIComponent(fp.join(","))}` : ""}`,
         {
           headers: u.bearer(),
           timeoutMs: 6000,
+          signal: deadline,
         }
       ),
       u.curl(`${u.serverBase()}/v1/queue?limit=1`, {
         headers: u.bearer(),
         timeoutMs: 3000,
+        signal: deadline,
       }),
-      publishCapabilities(probedCaps, rlog),
+      publishCapabilities(probedCaps, rlog, deadline),
     ]);
     const host = u.serverHost();
 
@@ -440,6 +461,7 @@ async function sessionStart(input) {
       /* fail open */
     }
 
+    const briefKind = u.classifyHttpFailure(brief.http);
     if (brief.http === "200" && brief.body) {
       let resp = null;
       try {
@@ -482,16 +504,23 @@ ${u.byteHead(body, 7000)}${projectBriefBlock(resp)}${pathScopedBriefsBlock(cwd, 
     // the one fact the user can act on, and silently strands every captured
     // node. So name the cause and the fix loudly instead of blaming the host.
     // Fail-open is preserved: we still inject the cache (or nothing) and exit 0.
-    const isAuth = brief.http === "401" || brief.http === "403";
+    // A 429 is likewise not an outage — the server answered and asked us to
+    // back off; say so rather than claim it is unreachable. The reading is the
+    // shared u.classifyHttpFailure, the same one drain-outbox and distill use.
+    const isAuth = briefKind === "auth";
     if (isAuth) {
       rlog(`auth failure (http=${brief.http}); token invalid/revoked — surfacing, falling back to cache`);
+    } else if (briefKind === "rate-limit") {
+      rlog(`rate limited (http=${brief.http}); falling back to cache`);
     } else {
       rlog(`server unreachable (http=${brief.http}); falling back to cache`);
     }
     const statusLine =
       (isAuth
         ? `team graph: AUTH FAILED (${host} rejected the token, http ${brief.http}) — your spor token is invalid, revoked, or expired. Re-mint it and update SPOR_TOKEN; until then captures are NOT shipping (they spool to the outbox and dead-letter).`
-        : `team graph: OFFLINE (could not reach ${host}).`) + dline;
+        : briefKind === "rate-limit"
+          ? `team graph: RATE LIMITED (${host} asked this client to back off, http 429).`
+          : `team graph: OFFLINE (could not reach ${host}).`) + dline;
     if (fs.existsSync(cache)) {
       let raw = "";
       try {
