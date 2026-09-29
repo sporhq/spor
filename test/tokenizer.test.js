@@ -73,6 +73,16 @@ test("slugify: ASCII id stem, transliterated, symbol-separated", () => {
   assert.match(slugify("Møte på Østergaard"), /^[a-z0-9][a-z0-9-]*$/);
 });
 
+test("slugify: Cyrillic and Greek romanize (the server's former charmap), fold() keeps them", () => {
+  assert.equal(slugify("Привет мир, это тест"), "privet-mir-eto-test");
+  assert.equal(slugify("Йод, Ёлка, Їжак, Щука"), "jod-yolka-yizhak-shuka", "й/ё/ї keep their spelling through NFKD");
+  assert.equal(slugify("Γειά σου κόσμε"), "geia-soy-kosme", "accented Greek vowels romanize after the tonos strip");
+  assert.equal(slugify("ΘΕΟΣ ξένος"), "8eos-3enos", "the charmap's own quirks, so server-minted ids stay stable");
+  assert.equal(slugify("Привет мир это тест", 12), "privet-mir");
+  assert.equal(fold("Привет"), "Привет", "retrieval fold is unchanged");
+  assert.deepEqual(words("Привет мир"), ["привет", "мир"]);
+});
+
 test("slugify(max) truncates on a word boundary, never mid-word", () => {
   assert.equal(slugify("alpha beta gamma delta", 13), "alpha-beta");
   assert.equal(slugify("alpha beta gamma delta", 10), "alpha-beta", "a cut landing exactly on a hyphen keeps the whole word");

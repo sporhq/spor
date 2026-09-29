@@ -215,8 +215,8 @@
       "это",
       "тест"
     ],
-    "slug": "",
-    "slugMax": ""
+    "slug": "privet-mir-eto-test",
+    "slugMax": "privet-mir-eto-test"
   },
   {
     "input": "Γειά σου κόσμε",
@@ -231,8 +231,8 @@
       "σου",
       "κοσμε"
     ],
-    "slug": "",
-    "slugMax": ""
+    "slug": "geia-soy-kosme",
+    "slugMax": "geia-soy-kosme"
   },
   {
     "input": "東京で会議をしました。予算と日程を確認しました。",

@@ -360,3 +360,10 @@ test("changes (local): a bad --since sha exits 1 with a clear message", async ()
   assert.equal(r.status, 1);
   assert.match(r.stderr, /changes:.*could not resolve --since/);
 });
+
+test("sinceDateArg: a bare date pins to UTC midnight; anything else passes through", () => {
+  assert.equal(changesLib.sinceDateArg("2026-09-29"), "2026-09-29T00:00:00Z");
+  assert.equal(changesLib.sinceDateArg("2026-09-29T12:00:00Z"), "2026-09-29T12:00:00Z");
+  assert.equal(changesLib.sinceDateArg("2 days ago"), "2 days ago");
+  assert.ok(changesLib.DATE_ONLY_RE.test("2026-09-29") && !changesLib.DATE_ONLY_RE.test("2026-9-29"));
+});

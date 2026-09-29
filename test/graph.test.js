@@ -1369,6 +1369,41 @@ test("correction: full multi-line body renders in the digest footer", () => {
   assert.match(r.text, /> Always surface the actor-model spec and never the stale pricing notes\./);
 });
 
+// ---------- liveCorrections (task-spor-client-lib-exports-for-server-dedup)
+// ----------
+//
+// The exported scope+liveness list must be exactly compile()'s
+// picks.corrections for the same root/project, without running the compile.
+
+test("liveCorrections: equals a root compile's picks.corrections across projects", () => {
+  const g = correctionScopeFixture().load();
+  const ids = (cs) => cs.map((c) => c.id);
+  for (const project of [null, "my-project", "different-proj"]) {
+    for (const rootId of ["dec-new", "spec-rc"]) {
+      const r = graph.compile(g, { rootId, project });
+      assert.deepEqual(ids(graph.liveCorrections(g, { rootId, project })), ids(r.picks.corrections), `${rootId} / ${project}`);
+    }
+  }
+  assert.deepEqual(ids(graph.liveCorrections(g, { rootId: "dec-new", project: "my-project" })).sort(),
+    ["corr-dec-new-1", "corr-project-my-project-1"]);
+  assert.deepEqual(ids(graph.liveCorrections(g, { rootId: "spec-rc" })), []);
+});
+
+test("liveCorrections: seedIds reproduce query mode; unknown root is empty; applied is dropped", () => {
+  const fx = correctionScopeFixture();
+  let g = fx.load();
+  // the query below seeds dec-new, so its node-targeted correction fires
+  const r = graph.compile(g, { query: "provider neutral catalogue pricing", digest: true });
+  assert.deepEqual(r.picks.corrections.map((c) => c.id), ["corr-dec-new-1"]);
+  assert.deepEqual(graph.liveCorrections(g, { seedIds: ["dec-new"] }).map((c) => c.id), ["corr-dec-new-1"]);
+  assert.deepEqual(graph.liveCorrections(g, {}).map((c) => c.id), [], "no root, no seeds, no project: nothing in scope");
+  assert.deepEqual(graph.liveCorrections(g, { rootId: "nope-missing" }), []);
+  const raw = fs.readFileSync(path.join(fx.nodesDir, "corr-dec-new-1.md"), "utf8");
+  fs.writeFileSync(path.join(fx.nodesDir, "corr-dec-new-1.md"), raw.replace("date: 2026-06-10", "status: applied\ndate: 2026-06-10"));
+  g = fx.load();
+  assert.deepEqual(graph.liveCorrections(g, { rootId: "dec-new" }).map((c) => c.id), []);
+});
+
 // ---------- correction lifecycle (issue-spor-corrections-no-applied-lifecycle)
 // ----------
 //
