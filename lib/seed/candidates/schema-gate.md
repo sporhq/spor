@@ -2,7 +2,7 @@
 id: schema-gate
 type: schema
 kind: node-schema
-schema_version: 2026.09.27.1
+schema_version: 2026.09.29.1
 title: Shareable factory gate
 summary: One reusable gate — command, agent-review or human — that any factory definition can reference by id, so an org vets a gate once (a `gate-security-review`) and reuses it product-wide instead of copying it into every factory.
 date: 2026-08-26
@@ -67,6 +67,23 @@ Keys by kind:
   failure that names or references a changed file, one that fails alone too,
   and one the runner could not read enough to judge are all charged exactly
   as before.
+  Optionally `ci` — `{"workflow": "test.yaml"}` — runs the suite on the
+  repo's CI instead of the worker box (dec-spor-command-gate-ci-mode): the
+  runner pushes the candidate commit (the judged head with the protected paths
+  forced to the trusted copy) to `spor/candidate/<node>` on `remote` (default
+  `origin`), waits up to `timeout_ms` for the named workflow's run for that
+  exact commit through `gh`, and reads its conclusion — `success` passes,
+  `failure`/`timed_out` fails, and anything else (cancelled, skipped, no run
+  within `discover_ms`, gh/git unreachable) is an OUTAGE: never a pass, never
+  a fix cycle, paid from the implementation retry pool and otherwise failed
+  closed. A rerun re-runs the same CI run. The branch is deleted once the
+  verdict is read. `.github/**` is protected on top of the factory's paths,
+  so a candidate is never judged by a workflow it wrote. Optional `repo`
+  (`owner/name`), `poll_ms` (default 30s) and `local_fallback` (default
+  false: run the suite on this box only when CI cannot be reached). `isolate`
+  cannot be combined with it. The workflow must trigger on a push to
+  `spor/candidate/**`, and the worker box needs `gh` plus push credentials
+  for the remote.
 - **agent-review** — `profile` (required: the review lane, cross-model by
   convention; the machine's declared binding decides what that actually
   executes), `instructions`, `await_ms`, and `risk`. The reviewer answers with a

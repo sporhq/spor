@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - main
+      # A factory `ci` suite pushes the candidate it is judging here and reads
+      # this workflow's run for that commit as the gate verdict
+      # (dec-spor-command-gate-ci-mode); the branch is deleted afterwards.
+      - "spor/candidate/**"
   pull_request:
   workflow_dispatch:
 

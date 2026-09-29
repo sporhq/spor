@@ -90,6 +90,7 @@ const gateRunner = lazyModule(path.join(ROOT, "lib", "shell", "gate-runner.js"))
 const candidatePublish = lazyModule(path.join(ROOT, "lib", "shell", "candidate-publish.js"));
 const factoryAvailability = lazyModule(path.join(ROOT, "lib", "shell", "factory-availability.js"));
 const integrationRunner = lazyModule(path.join(ROOT, "lib", "shell", "integration-runner.js"));
+const ciGate = lazyModule(path.join(ROOT, "lib", "shell", "ci-gate.js"));
 const implementationStage = lazyModule(path.join(ROOT, "lib", "shell", "implementation-stage.js"));
 const workerContractLib = lazyModule(path.join(ROOT, "lib", "shell", "worker-contract.js"));
 // workerContractLib is lazy, so this can't be a destructure (that would force
@@ -12264,7 +12265,7 @@ function integrationSatisfiability(cfg, factory, { persistProbe = true } = {}) {
   // whose integration isn't propose mode) — a full probe re-reads the
   // claude-plugins manifest and re-scans PATH, not worth paying on every
   // dispatch attempt of an unrelated factory.
-  if (!factory || !factory.integration || factory.integration.mode !== "propose") return { ok: true, reasons: [] };
+  if (!sat.needsGh(factory)) return { ok: true, reasons: [] };
   const rawCap = cfg.get("dispatch.capabilities", {}) || {};
   let probed = null;
   try {
@@ -14837,6 +14838,112 @@ function makeGateDeps(
     );
   };
 
+  const openLocalSuite = async ({ gate, trustedRef, protectedPaths }) => {
+    if (!change) return { ok: false, reason: "the change under judgement could not be read" };
+    // The repo's own worktree-setup hook stages the throwaway tree exactly as
+    // it stages an implementer's worktree (node_modules, a pinned sibling
+    // checkout) — without it a repo whose suite needs anything not in git
+    // fails its own gate on a missing dependency, never on the change.
+    const tree = prepareGateTree(change, {
+      trustedRef,
+      protectedPaths,
+      setup: (dir) => stageThrowawayTree(dir, change.top, { slug, nodeId: entry.node_id, what: "gate", role: "gate" }),
+      teardown: (dir) => teardownThrowawayTree(dir, change.top, { slug, nodeId: entry.node_id, role: "gate", warn }),
+    });
+    if (!tree.ok) return tree;
+    return {
+      ok: true,
+      dir: tree.dir,
+      // `command` overrides the gate's declared one for THIS run only — the
+      // door the off-diff isolation pass uses (WORKERS.md §10.3 `isolate`)
+      // to re-run just the failing files on this same prepared tree. Absent,
+      // the run is the declared suite, byte-identical to before.
+      run: async (attempt = 1, command = null) => {
+        // What the suite is judging, in its env (task-spor-gate-command-
+        // change-env): a script can `git diff $SPOR_GATE_BASE..$SPOR_GATE_HEAD`
+        // inside the tree and decide what to run, the way a CI job reads the
+        // pull request's file list.
+        const env = {
+          ...worktreeDeclaredEnv(tree.dir),
+          SPOR_GATE_STAGE: "gate",
+          SPOR_GATE_BASE: change.base,
+          SPOR_GATE_HEAD: change.head,
+          SPOR_TRUSTED_REF: trustedRef,
+          SPOR_GATE_NODE: entry.node_id || "",
+          // 1 for the declared run, N+1 for the Nth same-tree rerun — a
+          // suite can log or tighten itself on a rerun.
+          SPOR_GATE_ATTEMPT: String(attempt),
+          // Set only for the isolation run, so a suite that wants to skip its
+          // own setup for a single-file re-run can tell the two apart.
+          ...(command ? { SPOR_GATE_ISOLATE: "1" } : {}),
+        };
+        return await runGateCommand(command ? { ...gate, command } : gate, tree.dir, { env });
+      },
+      // Called by the runner only after the LAST run has returned (its loop
+      // awaits each run), never under a running suite.
+      close: () => tree.cleanup(),
+    };
+  };
+
+  // A `ci` suite (dec-spor-command-gate-ci-mode): the verdict comes from the
+  // repo's CI run for the candidate commit, not a suite on this box. The
+  // candidate is the judged head with the protected paths — the CI definition
+  // included — forced back to the trusted ref's copy and re-committed
+  // (integration-runner's reconcileCandidateSha, the same restore-and-amend
+  // the integration stage lands), so CI judges exactly the tree a local gate
+  // would. The throwaway tree only builds that commit: no setup hook is
+  // staged, since nothing runs here. `local_fallback` is the one door back to
+  // this box, taken only when CI could not be reached.
+  const openCiGateSuite = async (args) => {
+    const { gate, trustedRef, protectedPaths } = args;
+    if (!change) return { ok: false, reason: "the change under judgement could not be read" };
+    const tree = prepareGateTree(change, { trustedRef, protectedPaths });
+    if (!tree.ok) return tree;
+    let sha = null;
+    try {
+      const pinned = integrationRunner.reconcileCandidateSha({ dir: tree.dir, sha: change.head, protectedPaths, message: `spor candidate for ${entry.node_id}` });
+      if (!pinned || !pinned.ok) return { ok: false, reason: (pinned && pinned.reason) || "the CI candidate commit could not be built" };
+      sha = pinned.sha;
+    } finally {
+      tree.cleanup();
+    }
+    const opened = await ciGate.openCiSuite({
+      top: change.top, sha, branch: gatesKernel.ciCandidateBranch(entry.node_id, "gate"), ci: gate.ci,
+      timeoutMs: gate.timeoutMs, label: `CI workflow \`${gate.ci.workflow}\` for gate ${gate.id}`, log,
+    });
+    if (!gate.ci.localFallback) return opened;
+    // The declared fallback: a CI that could not be reached — at the push, or
+    // on any later run — hands THAT run to the local suite, lazily opened once
+    // and kept for the rest of the gate's reruns.
+    let local = null;
+    const fallBack = async (why, attempt) => {
+      log(`work: gate ${gate.id} — CI could not be reached (${why}); running it on this box under local_fallback`);
+      if (!local) local = await openLocalSuite(args);
+      if (!local.ok) return { ...local, fallback: why };
+      return { ...(await local.run(attempt)), fallback: why };
+    };
+    const closeLocal = async () => {
+      if (local && local.ok) await local.close();
+    };
+    if (!opened.ok) {
+      const why = (opened.outage && opened.outage.reason) || opened.reason || "the candidate could not be pushed";
+      return { ok: true, dir: "", run: (attempt = 1) => fallBack(why, attempt), close: closeLocal };
+    }
+    return {
+      ok: true,
+      dir: "",
+      run: async (attempt = 1) => {
+        if (local) return fallBack("CI was already unreachable earlier in this gate", attempt);
+        const r = await opened.run(attempt);
+        return r && r.outage ? fallBack(r.outage.reason || r.reason, attempt) : r;
+      },
+      close: async () => {
+        await opened.close();
+        await closeLocal();
+      },
+    };
+  };
+
   return {
     now: () => Date.now(),
     sleep,
@@ -15218,52 +15325,7 @@ function makeGateDeps(
     // dependencies — so a rerun is literally the same tree, not a fresh
     // build that happens to have the same sha, and the setup/teardown hooks
     // fire once for the whole loop rather than once per run.
-    openSuite: async ({ gate, trustedRef, protectedPaths }) => {
-      if (!change) return { ok: false, reason: "the change under judgement could not be read" };
-      // The repo's own worktree-setup hook stages the throwaway tree exactly as
-      // it stages an implementer's worktree (node_modules, a pinned sibling
-      // checkout) — without it a repo whose suite needs anything not in git
-      // fails its own gate on a missing dependency, never on the change.
-      const tree = prepareGateTree(change, {
-        trustedRef,
-        protectedPaths,
-        setup: (dir) => stageThrowawayTree(dir, change.top, { slug, nodeId: entry.node_id, what: "gate", role: "gate" }),
-        teardown: (dir) => teardownThrowawayTree(dir, change.top, { slug, nodeId: entry.node_id, role: "gate", warn }),
-      });
-      if (!tree.ok) return tree;
-      return {
-        ok: true,
-        dir: tree.dir,
-        // `command` overrides the gate's declared one for THIS run only — the
-        // door the off-diff isolation pass uses (WORKERS.md §10.3 `isolate`)
-        // to re-run just the failing files on this same prepared tree. Absent,
-        // the run is the declared suite, byte-identical to before.
-        run: async (attempt = 1, command = null) => {
-          // What the suite is judging, in its env (task-spor-gate-command-
-          // change-env): a script can `git diff $SPOR_GATE_BASE..$SPOR_GATE_HEAD`
-          // inside the tree and decide what to run, the way a CI job reads the
-          // pull request's file list.
-          const env = {
-            ...worktreeDeclaredEnv(tree.dir),
-            SPOR_GATE_STAGE: "gate",
-            SPOR_GATE_BASE: change.base,
-            SPOR_GATE_HEAD: change.head,
-            SPOR_TRUSTED_REF: trustedRef,
-            SPOR_GATE_NODE: entry.node_id || "",
-            // 1 for the declared run, N+1 for the Nth same-tree rerun — a
-            // suite can log or tighten itself on a rerun.
-            SPOR_GATE_ATTEMPT: String(attempt),
-            // Set only for the isolation run, so a suite that wants to skip its
-            // own setup for a single-file re-run can tell the two apart.
-            ...(command ? { SPOR_GATE_ISOLATE: "1" } : {}),
-          };
-          return await runGateCommand(command ? { ...gate, command } : gate, tree.dir, { env });
-        },
-        // Called by the runner only after the LAST run has returned (its loop
-        // awaits each run), never under a running suite.
-        close: () => tree.cleanup(),
-      };
-    },
+    openSuite: (args) => (args && args.gate && args.gate.ci ? openCiGateSuite(args) : openLocalSuite(args)),
     // The per-gate serialize lease (task-spor-gate-serialize-lease) reuses the
     // integration stage's: keyed on the repo's MAIN checkout locally, the
     // synthetic per-repo lock node remotely, so a `serialize: repo` command
@@ -16509,6 +16571,9 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
   const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
   const runKey = gateRunner.gateRunKey(entry.run_id, entry.attempt);
   let top = null;
+  // The open `ci` candidate suite, if the integration block declares one:
+  // {head, handle, unreachable} — one push per candidate, reused by its reruns.
+  let ciSuite = null;
   // The change-set behind the pinCandidate dep below — kept current by
   // `changedTree`, which integration-runner.js re-calls before every fix
   // cycle (issue-spor-integration-fix-cycle-does-not-repin-candidate). Unlike
@@ -16734,7 +16799,24 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       const pin = git(top, ["rev-parse", "--verify", `${factory.trustedRef}^{commit}`]);
       const trustedSha = pin.status === 0 ? (pin.stdout || "").trim() : null;
       if (!trustedSha) return { ok: false, reason: `the trusted ref '${factory.trustedRef}' does not resolve to a commit in ${top}, so the candidate's protected paths cannot be pinned to it` };
-      const forced = gateRunner.forceProtectedPaths({ top, dir, trustedRef: trustedSha, protectedPaths: factory.protectedPaths });
+      // A `ci` candidate suite also pins the CI definition to the trusted
+      // copy (gates.suiteProtectedPaths): CI must not judge the candidate
+      // with a workflow the candidate wrote.
+      const protectedPaths = gatesKernel.suiteProtectedPaths(integration, factory.protectedPaths);
+      // ...and a candidate that EDITS the CI definition is refused, never
+      // quietly reverted: forcing it back would land (or propose) a change
+      // with its workflow edit silently dropped. A command gate refuses the
+      // same edit up front for its own ci suite; this is the integration
+      // stage's twin, for a factory whose gates run locally.
+      if (integration.ci && base) {
+        const touched = git(dir, ["diff", "--name-only", "--no-renames", base, sha], { maxBuffer: 64 * 1024 * 1024 });
+        if (touched.status !== 0) return { ok: false, reason: `could not read which paths the candidate changes, so its CI definition cannot be checked: ${(touched.stderr || "").trim().split("\n")[0] || "git diff failed"}` };
+        const hits = gatesKernel.matchPaths((touched.stdout || "").split("\n").map((l) => l.trim()).filter(Boolean), gatesKernel.CI_PROTECTED_PATHS);
+        if (hits.length) {
+          return { ok: false, reason: `the candidate changes the CI definition that would judge it (${hits.slice(0, 5).join(", ")}${hits.length > 5 ? ` +${hits.length - 5} more` : ""}); a ci candidate suite is never run from a change that edits it — land the CI change on its own` };
+        }
+      }
+      const forced = gateRunner.forceProtectedPaths({ top, dir, trustedRef: trustedSha, protectedPaths });
       if (!forced.ok) return forced;
       // The restore above only touches the candidate worktree's WORKING
       // DIRECTORY — `sha` still names the pre-restoration commit. Landing it
@@ -16747,23 +16829,50 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       // touched a protected path
       // (issue-spor-integration-rebase-intermediate-protected-paths).
       const reconciled = integrationRunner.reconcileCandidateSha({
-        dir, sha, base, protectedPaths: factory.protectedPaths,
+        dir, sha, base, protectedPaths,
         message: `Integrate ${entry.node_id} onto ${integration.targetRef}`,
       });
       return reconciled && reconciled.ok ? { ...reconciled, trusted_sha: trustedSha } : reconciled;
     },
-    runSuite: ({ dir, base, head, attempt = 1 }) =>
-      gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir, {
-        env: {
-          ...worktreeDeclaredEnv(dir),
-          SPOR_GATE_STAGE: "integration",
-          SPOR_GATE_BASE: base || "",
-          SPOR_GATE_HEAD: head || "",
-          SPOR_TRUSTED_REF: factory.trustedRef,
-          SPOR_GATE_NODE: entry.node_id || "",
-          SPOR_GATE_ATTEMPT: String(attempt),
-        },
-      }),
+    runSuite: async ({ dir, base, head, attempt = 1 }) => {
+      const runLocal = () =>
+        gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir, {
+          env: {
+            ...worktreeDeclaredEnv(dir),
+            SPOR_GATE_STAGE: "integration",
+            SPOR_GATE_BASE: base || "",
+            SPOR_GATE_HEAD: head || "",
+            SPOR_TRUSTED_REF: factory.trustedRef,
+            SPOR_GATE_NODE: entry.node_id || "",
+            SPOR_GATE_ATTEMPT: String(attempt),
+          },
+        });
+      if (!integration.ci) return runLocal();
+      // A `ci` candidate suite (dec-spor-command-gate-ci-mode): the merged
+      // candidate `head` (protected paths already forced and re-committed by
+      // forceProtected) is pushed once per candidate and its CI run is the
+      // verdict; a rerun re-runs that same CI run. `local_fallback` runs the
+      // suite here instead when CI cannot be reached.
+      if (!ciSuite || ciSuite.head !== head) {
+        if (ciSuite && ciSuite.handle.ok) await ciSuite.handle.close();
+        const handle = await ciGate.openCiSuite({
+          top, sha: head, branch: gatesKernel.ciCandidateBranch(entry.node_id, "integration"), ci: integration.ci,
+          timeoutMs: integration.timeoutMs, label: `CI workflow \`${integration.ci.workflow}\` for the integration candidate`, log,
+        });
+        ciSuite = { head, handle, unreachable: handle.ok ? null : handle.reason };
+      }
+      let r = ciSuite.unreachable ? ciSuite.handle : await ciSuite.handle.run(attempt);
+      if (r && r.outage && integration.ci.localFallback) {
+        const why = (r.outage && r.outage.reason) || r.reason;
+        log(`work: the integration candidate's CI could not be reached (${why}); running the suite on this box under local_fallback`);
+        r = { ...(await runLocal()), fallback: why };
+      }
+      return r;
+    },
+    closeSuite: async () => {
+      if (ciSuite && ciSuite.handle.ok) await ciSuite.handle.close();
+      ciSuite = null;
+    },
     land: (args) => integrationRunner.landCandidate(args),
     // The PR body carries the run's attestation (task-spor-factory-gate-
     // attestation, piece 4): the gate verdicts as they stand, bound to the head
@@ -20009,7 +20118,7 @@ async function cmdWork(cfg, { values }) {
     // run.
     const startupGh = integrationSatisfiability(cfg, factory);
     if (!startupGh.ok) {
-      err(`spor work: factory '${factoryId}' declares integration mode 'propose', but ${startupGh.reasons[0]}`);
+      err(`spor work: factory '${factoryId}' ${factory.integration && factory.integration.mode === "propose" ? "declares integration mode 'propose'" : "declares a 'ci' suite"}, but ${startupGh.reasons[0]}`);
       err("  every candidate under this factory will be skipped here (see 'spor work --status') until gh is available, or run this worker on a box that has it.");
     }
     // Invalid declarations remain fatal. Runtime store/remote outages are

@@ -5266,3 +5266,26 @@ test("integration refusal snapshots completed-before-integration into its retry 
   const result = await integrationRunner.runIntegrationStage({ item: ITEM, factory: { ...FACTORY, integration: { ...FACTORY.integration, cycles: 0 } }, deps });
   assert.equal(result.escalation_retry.completedBeforeIntegration, true);
 });
+
+// dec-spor-command-gate-ci-mode: an integration candidate suite declared on CI
+// that never judged the candidate is an OUTAGE — the stage fails closed, but
+// spends no rerun, no fix cycle, and lands nothing; the CI handle is let go.
+test("a `ci` candidate suite OUTAGE is handed up INTERRUPTED — no rerun, no fix cycle, no landing, no fact — and closes the suite", async () => {
+  const { deps, seen } = integrationFakes({ suite: () => ({ ok: false, reason: "CI workflow `test.yaml` run 9 concluded 'cancelled'", outage: { outcome: "infrastructure", reason: "cancelled" } }) });
+  let closed = 0;
+  deps.closeSuite = async () => {
+    closed += 1;
+  };
+  const factory = { ...FACTORY, integration: { ...FACTORY.integration, reruns: 2, ci: { workflow: "test.yaml" } } };
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "interrupted", "the work loop's bounded re-offer takes it from here");
+  assert.strictEqual(res.outage_interrupted, true);
+  assert.strictEqual(seen.suites, 1, "a declared rerun is not spent on an outage");
+  assert.strictEqual(seen.fixes.length, 0, "no fixer is dispatched at a candidate nobody judged");
+  assert.strictEqual(seen.lands, 0);
+  assert.strictEqual(seen.escalations.length, 0, "not yet a person's item — the re-offer cap decides that");
+  assert.strictEqual(seen.demotions.length, 0);
+  assert.strictEqual(closed, 1);
+  assert.match(res.reason, /an outage, not a verdict on the change/);
+  assert.doesNotMatch(res.reason, /run 9/, "the reason is stable across re-offers, so the re-offer cap can count it");
+});

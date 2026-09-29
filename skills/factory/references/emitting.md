@@ -119,7 +119,18 @@ Keys by kind (`lib/kernel/gates.js` is the authority):
   edits — checked by reading them and, transitively, everything they import),
   so in a repo whose tests all drive one
   large entry point it will rarely fire and `reruns` stays the flake
-  mitigation that does the work. Deliberately *no* ref or protected-path key: those
+  mitigation that does the work.
+  Optionally `ci` — `{"workflow": "test.yaml"}` (also valid on the
+  `integration` block) — runs the suite on the repo's GitHub CI instead of
+  the worker box: the candidate commit is pushed to `spor/candidate/<node>`,
+  the named workflow's run for that commit is the verdict, and a CI that never
+  judged it (cancelled, skipped, unreachable, past `timeout_ms`) fails closed
+  as an outage, never a fix cycle. Propose it where the repo already runs its
+  suite on GitHub Actions and the workers share a box: the workflow must list
+  `spor/candidate/**` under `on.push.branches`, every worker box needs `gh`
+  and push access, `.github/**` becomes protected for that gate, and it
+  cannot be combined with `isolate`. `local_fallback: true` (default false)
+  runs the suite locally only when CI is unreachable. Deliberately *no* ref or protected-path key: those
   belong to the factory, so one shared gate can never relax another team's
   trusted boundary.
 - **agent-review** — `profile` (required), `instructions`, `await_ms` (default

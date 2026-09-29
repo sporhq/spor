@@ -2,7 +2,7 @@
 id: schema-factory
 type: schema
 kind: node-schema
-schema_version: 2026.09.06.2
+schema_version: 2026.09.29.1
 title: Software-factory definition
 summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, the repos it may judge, protected test paths, test-change lane, risk classes those gates key on, an optional integration (merge-queue landing) stage, an optional rescue lane (a strong-model step before any human escalation), an optional implementation stage and the completion boundary that says who writes the resolving edge. Candidate pack; adopt it into a graph to use `spor work --factory`.
 date: 2026-08-26
@@ -96,6 +96,14 @@ convention schema nodes use:
   and finally a person (WORKERS.md §10.3). Declaring nothing keeps the prior
   behaviour; either way a charged command-gate failure now records WHICH
   files it failed in, so flakes are countable per file.
+- `gates[].ci` (command gates) and `integration.ci` — `{"workflow": "<file>"}`
+  moves the suite off the worker box onto the repo's CI
+  (dec-spor-command-gate-ci-mode): the candidate commit is pushed to
+  `spor/candidate/<node>` (the integration candidate to
+  `spor/candidate/<node>-integration`), the named workflow's run for that
+  commit is the verdict, and a CI that never judges it is an outage that fails
+  closed unless `local_fallback: true`. `.github/**` joins the protected paths
+  for that suite. The `gate` candidate node documents the keys.
 - `rescue` (optional, WORKERS.md §10.10) — the rescue lane: when any gate has
   spent its fix cycles, BEFORE the human escalation, the runner dispatches
   `rescue.profile` (a strong model by intent; profile-routed only, like a

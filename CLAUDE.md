@@ -1119,6 +1119,17 @@ command on the SAME tree before a failure is charged — a flaky full suite then
 costs one more suite run, not a fix dispatch or a rescue — and a rerun-rescued
 pass keeps the first failure as evidence on its fact so flakes stay countable
 (`gates.rerunDecision`, task-spor-factory-spor-flaky-command-gate-needs-fix-cycle-or-rerun).
+A declared `ci` block (`{"workflow": "test.yaml"}`, on a command gate or on
+`integration:`) moves the suite OFF the worker box
+(task-spor-command-gate-waits-on-ci-run, dec-spor-command-gate-ci-mode,
+`lib/shell/ci-gate.js`): the candidate — the head with the protected paths
+forced to the trusted copy — is pushed to `spor/candidate/<node>`, the named
+workflow's run for that exact commit is read through `gh`, `success` passes,
+`failure`/`timed_out` is charged, and anything else (cancelled, skipped, no
+run, a gh/push failure, a wait past `timeout_ms`) is an OUTAGE — the
+reviewer-outage path, never a pass or a fix cycle, fail-closed unless
+`local_fallback: true`. `.github/**` is protected for a ci suite, a rerun is
+`gh run rerun`, and `gh` becomes a required capability.
 A declared `isolate` (a command template carrying a `{files}` token) adds the
 OFF-DIFF pass after those reruns
 (task-spor-factory-flake-rescue-should-not-burn-when-failure-is-off-diff): the

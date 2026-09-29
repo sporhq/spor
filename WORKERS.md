@@ -1727,6 +1727,61 @@ item every `work.retryAfterMs` and re-run this whole routine (harmless, since
 the write is idempotent, but noisy), which the assignee filter above (§3)
 backstops in any case.
 
+**`ci` — the suite on the repo's CI, not this box**
+(task-spor-command-gate-waits-on-ci-run, dec-spor-command-gate-ci-mode). A
+command gate declaring `"ci": {"workflow": "test.yaml"}` — and an `integration`
+block declaring the same — does not spawn its suite on the worker box, which is
+shared with the implementers it judges and whose load was the source of most
+acceptance-gate escalations. Instead (lib/shell/ci-gate.js):
+
+1. The CANDIDATE commit is built exactly as a local gate's tree would be — the
+   judged head with every protected path forced back to the pinned trusted copy
+   and re-committed (`reconcileCandidateSha`) — and pushed with `--force` to
+   `spor/candidate/<node>` (`…-integration` for the integration candidate, which
+   is already the forced, landable sha) on `remote` (default `origin`). The push
+   is what triggers the workflow, so the repo's workflow must list
+   `spor/candidate/**` under `on.push.branches` (this repo's `test.yaml` does).
+2. The runner finds the named workflow's run for that exact commit (`gh run list
+   --workflow … --commit …`, waiting up to `discover_ms`, default 5min, for it to
+   appear) and polls it (`poll_ms`, default 30s) until it completes or the
+   gate's `timeout_ms` runs out.
+3. The conclusion is the verdict: `success` passes; `failure` and `timed_out`
+   are a failure charged like a local one (the failed jobs' log is the
+   evidence). EVERYTHING else — `cancelled`, `skipped`, `stale`, `neutral`,
+   `action_required`, `startup_failure`, a run that never appeared, a push or
+   `gh` call that failed, a wait past `timeout_ms` — is an OUTAGE: CI did not
+   judge the change. An outage is never a pass and never a fix cycle; it goes
+   down the same path as a reviewer outage (§10.4), paid from the
+   implementation stage's infrastructure `retry` pool when one is declared and
+   otherwise a fail-closed refusal naming the outage. The integration stage
+   treats it the same way — settled failed, no fix cycle, nothing landed.
+4. A declared rerun (`reruns`) is `gh run rerun` of the SAME run — the same
+   commit judged again, as a local rerun is the same tree.
+5. The candidate branch is deleted once the verdict is read, only while it
+   still names the pushed commit (`--force-with-lease`); a failure to delete is
+   logged and harmless — the next push overwrites it. The run and its logs stay
+   on GitHub under the commit.
+
+`.github/**` is PROTECTED for a `ci` suite on top of the factory's declared
+paths (`gates.CI_PROTECTED_PATHS`): a change touching it fails closed into the
+test-change lane like a change to a declared test path, and the pushed
+candidate carries the trusted copy, so a candidate is never judged by a
+workflow it wrote. `isolate` cannot be combined with `ci` (its re-run needs the
+local tree).
+
+Credentials are the box's own: `git push` uses whatever `remote` is configured
+with and `gh` its own login or `GH_TOKEN` — the same two a `propose`-mode
+factory needs, and `spor work` treats `gh` as a required capability for any
+factory declaring a `ci` suite (it skips candidates visibly on a box without
+it). The judge's graph token and attestation key are scrubbed from both and git
+hooks are disabled (`judgeGitEnv`). `repo` (`owner/name`) names the GitHub repo
+when the remote's URL does not.
+
+`local_fallback: true` is the explicit escape hatch: when CI cannot be reached
+(an outage above, not a failure), the suite runs on this box instead, through
+the ordinary local path, and the fact says it did. It defaults to `false`
+because the point of the mode is that acceptance does not run here.
+
 ### 10.4 Agent-review gates — a verdict that is read, not asserted
 
 The runner composes the review dispatch itself: a launch under the gate's
