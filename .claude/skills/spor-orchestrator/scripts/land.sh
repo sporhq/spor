@@ -47,6 +47,17 @@
 #      is bare — no node_modules — so a repo with dependencies must stage them
 #      in the command itself (the same thing its dispatch.worktreeSetup does).
 #
+# THE TIP RESOLVES IN THE CALLER'S CWD. `--repo` is the shared root, which is
+# parked at (or near) the target, so a per-worktree name like HEAD resolved THERE
+# names the root's commit, not the branch the caller meant, and the land came out
+# NOOP while reporting success (issue-spor-land-sh-symbolic-tip-resolves-in-repo-
+# and-noops). When the caller's cwd is a worktree of the same repository the tip
+# is resolved to a sha there first; from anywhere else a per-worktree name
+# (HEAD, ORIG_HEAD, …) is refused as `symbolic-tip` — pass a sha or a branch.
+# Git's replace refs are ignored throughout (GIT_NO_REPLACE_OBJECTS=1 on the
+# ref and ancestry probes), so a `refs/replace` graft cannot make ancestry read differently than
+# the objects a checkout will write.
+#
 # Usage:
 #   land.sh --repo <dir> --tip <commit-ish> [--target main] [--verify "<cmd>"] [--keep]
 #
@@ -88,13 +99,30 @@ unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PA
   GIT_SHALLOW_FILE GIT_WORK_TREE
 
 refuse() { printf 'REFUSED reason=%s\n' "$1"; [ -n "${2:-}" ] && printf 'land.sh: %s\n' "$2" >&2; exit 1; }
-g() { git -C "$repo" "$@"; }
+g() { GIT_NO_REPLACE_OBJECTS=1 git -C "$repo" "$@"; }
+
+# The tip, resolved where the caller stands (see THE TIP RESOLVES ABOVE).
+callerdir=$PWD
+commondir() { (cd "$1" 2>/dev/null && cd "$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P) || true; }
+tipdir="$repo"
+if [ -n "$(commondir "$callerdir")" ] && [ "$(commondir "$callerdir")" = "$(commondir "$repo")" ]; then
+  tipdir="$callerdir"
+else
+  case "$tip" in
+    HEAD*|@*|ORIG_HEAD*|FETCH_HEAD*|MERGE_HEAD*|CHERRY_PICK_HEAD*|REVERT_HEAD*|REBASE_HEAD*)
+      refuse symbolic-tip "tip '$tip' names a per-worktree ref and the caller's cwd is not a worktree of $repo — pass a sha or branch" ;;
+  esac
+fi
 
 ref="refs/heads/$target"
 old=$(g rev-parse --verify --quiet "$ref^{commit}") || refuse unresolvable "cannot resolve $ref in $repo"
-new=$(g rev-parse --verify --quiet "$tip^{commit}") || refuse unresolvable "cannot resolve tip $tip in $repo"
+new=$(GIT_NO_REPLACE_OBJECTS=1 git -C "$tipdir" rev-parse --verify --quiet "$tip^{commit}") || refuse unresolvable "cannot resolve tip $tip in $tipdir"
 
-if [ "$old" = "$new" ]; then printf 'NOOP old=%s\n' "$old"; exit 0; fi
+if [ "$old" = "$new" ]; then
+  printf 'land.sh: NOOP — tip %s (%s, resolved in %s) is already %s; nothing landed\n' "$tip" "$new" "$tipdir" "$target" >&2
+  printf 'NOOP old=%s\n' "$old"
+  exit 0
+fi
 
 # merge-base --is-ancestor: 0 = yes, 1 = no, anything else = git could not
 # answer. Only a yes lands; the other two refuse with different reasons, so a
@@ -153,10 +181,16 @@ if [ "$maindetached" -eq 1 ]; then
 fi
 behind=()
 for wt in ${advance[@]+"${advance[@]}"}; do
-  git -C "$wt" checkout --quiet --detach "$new" >&2
+  # HEAD decides whether the checkout advanced (a refused checkout leaves it
+  # put); the exit status only qualifies it — git passes a post-checkout hook's
+  # status through AFTER the checkout completed, so a non-zero exit with HEAD at
+  # NEW is a landed advance with a noisy hook, reported on stderr, not behind.
+  git -C "$wt" checkout --quiet --detach "$new" >&2; rc=$?
   if [ "$(git -C "$wt" rev-parse --verify --quiet HEAD)" != "$new" ]; then
     behind+=("$wt")
-    printf 'land.sh: git refused to advance %s to %s (local changes in the way); left detached at %s\n' "$wt" "$new" "$(git -C "$wt" rev-parse --short HEAD)" >&2
+    printf 'land.sh: git refused to advance %s to %s (exit %s; local changes in the way); left detached at %s\n' "$wt" "$new" "$rc" "$(git -C "$wt" rev-parse --short HEAD)" >&2
+  elif [ "$rc" -ne 0 ]; then
+    printf 'land.sh: %s advanced to %s but git checkout exited %s (a post-checkout hook?)\n' "$wt" "$new" "$rc" >&2
   fi
 done
 [ ${#behind[@]} -gt 0 ] && extra="$extra behind=$(joined "${behind[@]}")"

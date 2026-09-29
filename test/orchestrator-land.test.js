@@ -39,8 +39,8 @@ function fixture() {
 
 // TMPDIR points into the fixture so a kept verify worktree is cleaned with it.
 let tmpBase = os.tmpdir();
-function land(args) {
-  return spawnSync("bash", [LAND, ...args], { encoding: "utf8", env: gitEnv({ TMPDIR: tmpBase }) });
+function land(args, cwd) {
+  return spawnSync("bash", [LAND, ...args], { encoding: "utf8", cwd, env: gitEnv({ TMPDIR: tmpBase }) });
 }
 
 test("lands a descendant tip, parking the root detached and advancing it by git checkout", { skip }, () => {
@@ -154,4 +154,44 @@ test("a failing --verify reports VERIFY-FAILED (the swap landed) and keeps the w
   assert.ok(m, r.stdout);
   assert.equal(m[1], sha("main"));
   assert.ok(fs.existsSync(path.join(m[2], "a.txt")), "worktree kept for inspection");
+});
+
+test("--tip HEAD resolves in the caller's worktree, not in the parked root", { skip }, () => {
+  const { root, wt, sha } = fixture();
+  const old = sha("main");
+  const tip = sha("HEAD", wt);
+  const r = land(["--repo", root, "--tip", "HEAD"], wt);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), `LANDED old=${old} new=${tip} parked=${root}`);
+  assert.equal(sha("main"), tip);
+});
+
+test("a NOOP says so on stderr, naming where the tip resolved", { skip }, () => {
+  const { root } = fixture();
+  const r = land(["--repo", root, "--tip", "HEAD"], root);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /^NOOP /);
+  assert.match(r.stderr, /NOOP .*nothing landed/);
+});
+
+test("a per-worktree tip from outside the repo is refused as symbolic-tip", { skip }, () => {
+  const { root, sha } = fixture();
+  const old = sha("main");
+  const r = land(["--repo", root, "--tip", "HEAD"], os.tmpdir());
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^REFUSED reason=symbolic-tip/);
+  assert.equal(sha("main"), old);
+});
+
+test("a failing post-checkout hook on a parked root is advanced but reported on stderr", { skip }, () => {
+  const { root, sha } = fixture();
+  const hooks = path.join(root, ".git", "hooks");
+  fs.mkdirSync(hooks, { recursive: true });
+  fs.writeFileSync(path.join(hooks, "post-checkout"), "#!/bin/sh\n[ \"$3\" = 1 ] && [ \"$2\" != \"$1\" ] && exit 1\nexit 0\n", { mode: 0o755 });
+  const r = land(["--repo", root, "--tip", "feature"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /behind=/);
+  assert.match(r.stderr, /advanced to .* but git checkout exited/);
+  assert.equal(sha("HEAD"), sha("feature"));
+  assert.equal(sha("main"), sha("feature"));
 });
