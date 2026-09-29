@@ -352,7 +352,10 @@ keys say, as registry data, what the hooks below enforce: `status.vocabulary`
 the full set *including* the give-up outcomes `abandoned`/`superseded`/
 `rejected`), and `status.resolver_required` (whether reaching that value also
 demands a live resolving `decision`/`artifact`, the completion-resolver
-invariant). **Declaring them gates nothing** — the hooks are still the only
+invariant), with `status.resolver_types` naming WHICH node types count as that
+resolver (task/issue: `["decision", "artifact"]`; only legal beside
+`resolver_required: true`; read as `registry.resolverTypes(type)`,
+task-spor-registry-sole-terminal-status-source). **Declaring them gates nothing** — the hooks are still the only
 write door, and this is exactly why they are not a field list or an enforced
 enum. They exist so a READER can name the right terminal status without
 parsing hook source: the gardener's finding remedies used to keep hand-written

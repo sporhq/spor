@@ -52,24 +52,46 @@ function parseStatusOffer(promptText) {
   return pairs;
 }
 
-test("distill-local.md status offer: every (type, status) pair passes that type's validate() gate", () => {
-  const promptText = fs.readFileSync(PROMPT_PATH, "utf8");
-  const pairs = parseStatusOffer(promptText);
-  const seedSchemas = graph.loadSeedSchemas();
-
+// Runs every offered pair through its type's validate() gate and returns how
+// many were actually gated. A pair whose type has no validate() (e.g. norm) is
+// trivially in-vocabulary and is skipped — so a prompt left offering ONLY
+// ungated types would check nothing, and the caller must refuse that
+// (issue-spor-status-vocab-drift-guard-false-pass).
+function checkPairsAgainstGates(pairs, seedSchemas) {
+  let gated = 0;
   for (const { type, status } of pairs) {
     const schema = seedSchemas.find((s) => s.key === type);
     assert.ok(schema, `prompt offers a status for unknown seed type '${type}'`);
     const sb = sandboxFor(schema);
-    // No attached validate() = the type has no status-membership gate at all
-    // (e.g. norm), so any offered status is trivially in-vocabulary.
     if (!sb || !sb.has("validate")) continue;
     const errors = sb.call("validate", [{ id: `${type}-x`, status }], SLACK);
     assert.deepEqual(
       errors, [],
       `distill-local.md offers '${type}: ${status}' but schema-${type}'s validate() rejects it: ${errors.join("; ")}`
     );
+    gated++;
   }
+  const ungated = [...new Set(pairs.map((p) => p.type))].filter((t) => {
+    const sb = sandboxFor(seedSchemas.find((s) => s.key === t));
+    return !sb || !sb.has("validate");
+  });
+  assert.ok(gated > 0,
+    `no offered (type, status) pair reached a validate() gate — every offered type is ungated ` +
+    `(${ungated.join(", ")}), so this drift guard checked nothing`);
+  return gated;
+}
+
+test("distill-local.md status offer: every (type, status) pair passes that type's validate() gate", () => {
+  const promptText = fs.readFileSync(PROMPT_PATH, "utf8");
+  checkPairsAgainstGates(parseStatusOffer(promptText), graph.loadSeedSchemas());
+});
+
+test("the status-offer drift guard fails loudly when only ungated types are offered", () => {
+  const onlyNorm = "status: <x — must be valid for the type — norm: active>";
+  assert.throws(
+    () => checkPairsAgainstGates(parseStatusOffer(onlyNorm), graph.loadSeedSchemas()),
+    /reached a validate\(\) gate.*norm/
+  );
 });
 
 // The prompt's own prose rule (line 21: "never a completion status ... those

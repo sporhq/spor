@@ -2,7 +2,7 @@
 id: schema-task
 type: schema
 kind: node-schema
-schema_version: 2026.09.06.2
+schema_version: 2026.09.29.1
 title: Seed schema for task nodes
 summary: Node schema for the task type — active or planned work. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -155,6 +155,16 @@ would have reclassified any type adopting one for an unrelated purpose.
 Declaration only — enforcement stays in the hooks — no stored-shape change, no
 upgrade chain.
 
+`status.resolver_types` (2026.09.29.1, task-spor-registry-sole-terminal-status-
+source): WHICH resolver the completion gate accepts, declared as data —
+`["decision", "artifact"]`, the durable-outcome types the `transitions()` gate
+below tests for before allowing `done`. Readers (the gardener's
+terminal-without-resolver check, a remedy naming what to write) read it off the
+registry (`resolverTypes(type)`) instead of mirroring the hook's type test;
+`test/seed-declarative-status-policy.test.js` drives the hook with each declared
+type and with an undeclared one, so the two cannot drift. Declaration only —
+enforcement stays in the hook — backward-readable, no upgrade chain.
+
 ```json
 {
   "node_type": "task",
@@ -174,7 +184,11 @@ upgrade chain.
       "abandoned"
     ],
     "completion": "done",
-    "resolver_required": true
+    "resolver_required": true,
+    "resolver_types": [
+      "decision",
+      "artifact"
+    ]
   },
   "resolution": {
     "verified_by": "edge"

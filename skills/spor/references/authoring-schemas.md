@@ -50,7 +50,8 @@ that should retire only ONE type in that schema's `status.inert`/
     "non_resolving": ["abandoned"],
     "vocabulary": ["open", "active", "done", "abandoned"],
     "completion": "done",
-    "resolver_required": true
+    "resolver_required": true,
+    "resolver_types": ["decision", "artifact"]
   },
   "resolution": { "verified_by": "edge" }
 }
@@ -90,7 +91,9 @@ that should retire only ONE type in that schema's `status.inert`/
   single SUCCESS terminal value (task `done`, issue `resolved`, question
   `answered` — not the whole `terminal` set, which also holds `abandoned` and
   friends); `resolver_required: true` says reaching it also needs a live
-  resolving `decision`/`artifact`. **These declare, they do not enforce** — your
+  resolving resolver, and `resolver_types` (only beside `resolver_required:
+  true`) names which node types count as one — the seed task/issue declare
+  `["decision", "artifact"]`. **These declare, they do not enforce** — your
   hooks are still the only write door. They exist so read surfaces (the
   gardener's finding remedies, `spor schema`) can name the right terminal status
   without parsing hook source, instead of falling back to a generic `resolved`

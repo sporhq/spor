@@ -549,34 +549,19 @@ test("Registry: an org schema declares an inert status distinct from terminal (n
   assert.equal(reg.terminalStatuses().has("shelved"), true, "terminal partition unaffected");
 });
 
-test("seed pack: the terminal-status register reproduces resolution.js's fallback byte-identically", () => {
-  // The contract resolution.js documents: TERMINAL_FALLBACK (what a graph-less
-  // caller like coupling.js reads) and the seed register's classes are ONE set,
-  // so the two paths cannot drift (issue-spor-coupling-resolution-terminal-
-  // status-divergence). `released` is deliberately in NEITHER: it is
-  // artifact-scoped via schema-artifact's own partition
+test("seed pack: resolution.js's graph-less vocabularies ARE the seed registry's", () => {
+  // task-spor-registry-sole-terminal-status-source: resolution.js holds no
+  // terminal/non-resolving table of its own — a registry-less reader reads the
+  // seed registry lib/shell/seed.js installs — so these are identities, not a
+  // byte-identical pin between two hand-kept copies. `released` is in neither:
+  // it is artifact-scoped via schema-artifact's own partition
   // (task-spor-terminal-status-type-aware-migration).
   const resolution = require(path.join(__dirname, "..", "lib", "kernel", "resolution.js"));
   const reg = graph.seedRegistry();
   const classes = [...reg.registerClasses("terminal-status")].sort();
-  assert.deepEqual(classes, [...resolution.terminalStatuses],
-    "seed register classes == TERMINAL_FALLBACK (sorted)");
+  assert.deepEqual([...resolution.terminalStatuses], classes);
   assert.equal(classes.includes("released"), false, "released is artifact-scoped, not type-blind");
-});
-
-test("seed pack: the type-blind non-resolving union reproduces resolution.js's FALLBACK_NON_RESOLVING byte-identically", () => {
-  // The mirror pin of the terminal-status test above, for the sibling
-  // partition (issue-spor-fallback-non-resolving-missing-in-review): a
-  // registry-less reader (a hand-built test graph, coupling.js's graph-less
-  // scan) falls back to resolution.js's FALLBACK_NON_RESOLVING, which must
-  // equal the seed's type-blind nonResolvingStatuses() union — otherwise the
-  // two readers disagree about whether an in-review/approved artifact
-  // resolver retires its target.
-  const resolution = require(path.join(__dirname, "..", "lib", "kernel", "resolution.js"));
-  const reg = graph.seedRegistry();
-  const union = [...reg.nonResolvingStatuses()].sort();
-  assert.deepEqual(union, [...resolution.nonResolvingStatuses],
-    "seed nonResolvingStatuses() union == FALLBACK_NON_RESOLVING (sorted)");
+  assert.deepEqual([...resolution.nonResolvingStatuses], [...reg.nonResolvingStatuses()].sort());
 });
 
 test("parseSchemaNode: rejects a malformed completion policy", () => {
@@ -598,6 +583,10 @@ test("parseSchemaNode: rejects a malformed completion policy", () => {
     .errors.some((e) => /completion 'done' is not in status.vocabulary/.test(e)));
   assert.ok(parse("schema-r", { node_type: "r", status: { completion: "done", resolver_required: "yes" } })
     .errors.some((e) => /resolver_required must be a boolean/.test(e)));
+  assert.ok(parse("schema-t", { node_type: "t", status: { vocabulary: ["done"], completion: "done", resolver_types: ["decision"] } })
+    .errors.some((e) => /resolver_types requires status.resolver_required: true/.test(e)));
+  assert.ok(parse("schema-u", { node_type: "u", status: { vocabulary: ["done"], completion: "done", resolver_required: true, resolver_types: [""] } })
+    .errors.some((e) => /resolver_types must be an array of non-empty strings/.test(e)));
   assert.ok(parse("schema-g", { node_type: "g", status: { resolver_required: true } })
     .errors.some((e) => /resolver_required requires a status.completion to gate/.test(e)));
   // the well-formed shape parses clean, and case-insensitively

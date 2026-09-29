@@ -172,6 +172,39 @@ test("status.resolver_required matches what each type's transitions() gate actua
   }
 });
 
+// ---- resolver_types: exactly the resolver types the gate accepts ----
+//
+// task-spor-registry-sole-terminal-status-source: a resolver-required type
+// declares WHICH node types satisfy its gate, so a reader never mirrors the
+// hook's `type === "decision" || type === "artifact"` test. Pinned in both
+// directions: every declared type opens the gate, and a probe set of
+// undeclared types does not.
+const RESOLVER_TYPE_PROBES = ["decision", "artifact", "task", "issue", "norm", "question", "finding", "spec"];
+
+test("status.resolver_types is declared by, and matches, every resolver-required transitions() gate", () => {
+  for (const s of nodeSchemas()) {
+    const st = statusOf(s);
+    if (st.resolver_required !== true) {
+      assert.equal(st.resolver_types, undefined, `${s.id} declares resolver_types with no resolver gate`);
+      continue;
+    }
+    assert.ok(Array.isArray(st.resolver_types) && st.resolver_types.length,
+      `${s.id} requires a completion resolver but does not declare status.resolver_types — a reader ` +
+      `cannot know which resolver to name without parsing hook source`);
+    const declared = new Set(st.resolver_types.map((t) => t.toLowerCase()));
+    const h = hooks(s);
+    const proposed = { id: `${s.key}-probe`, status: st.completion };
+    for (const type of new Set([...RESOLVER_TYPE_PROBES, ...declared])) {
+      const view = { resolvers: [{ id: `${type}-x`, type, status: "" }], non_resolving_statuses: [] };
+      const allow = h.transitions({ status: "active" }, proposed, view).allow;
+      assert.equal(allow, declared.has(type),
+        declared.has(type)
+          ? `${s.id} declares '${type}' in status.resolver_types but its transitions() refuses '${st.completion}' with one`
+          : `${s.id}'s transitions() accepts a '${type}' resolver for '${st.completion}' but status.resolver_types omits it`);
+    }
+  }
+});
+
 // ---- the declaration reaches readers through the registry, not hook source ----
 
 test("the registry accessors expose the seed completion policy the gardener derives from", () => {
@@ -185,6 +218,9 @@ test("the registry accessors expose the seed completion policy the gardener deri
   assert.equal(reg.requiresCompletionResolver("issue"), true);
   assert.equal(reg.requiresCompletionResolver("question"), false,
     "a question's `answered` takes any live answers edge — no completion-resolver gate");
+  assert.deepEqual([...reg.resolverTypes("task")].sort(), ["artifact", "decision"]);
+  assert.deepEqual([...reg.resolverTypes("issue")].sort(), ["artifact", "decision"]);
+  assert.equal(reg.resolverTypes("question").size, 0);
 
   // The types whose closed vocabulary has no single mechanical success value:
   // a reader must get null here rather than a generic fallback its door refuses

@@ -169,17 +169,56 @@ test("isTerminalStatus: legacy off-vocab closed is covered by the type-blind reg
   assert.equal(isTerminalStatus("closed", null, g), true, "even with no type at all");
 });
 
-test("isTerminalStatus: graph-less and type-less callers read the fallback vocabulary", () => {
+test("isTerminalStatus: graph-less and type-less callers read the SEED registry", () => {
   // coupling.js (hook tool loop, no loaded graph) and single-node REST readers
-  // pass no graph: they get TERMINAL_FALLBACK — the seed register's classes —
-  // which excludes per-type statuses like released by construction.
+  // pass no graph: they read the seed registry the kernel's fallback source
+  // installs (task-spor-registry-sole-terminal-status-source) — the
+  // terminal-status register AND the per-type partitions, with no
+  // hand-mirrored table in between.
   assert.equal(isTerminalStatus("done", null), true);
   assert.equal(isTerminalStatus("merged", "capture-pending"), true);
   assert.equal(isTerminalStatus("settled", "decision"), false);
-  assert.equal(isTerminalStatus("released", "artifact"), false,
-    "a graph-less caller cannot see per-type declarations (documented limitation)");
+  assert.equal(isTerminalStatus("released", "artifact"), true,
+    "a graph-less caller sees artifact's own seed partition");
+  assert.equal(isTerminalStatus("released", "task"), false, "released does not leak cross-type");
+  assert.equal(isTerminalStatus("released", null), false, "a type-less caller reads the type-blind register only");
   assert.equal(isTerminalStatus("", null), false);
   assert.equal(isTerminalStatus(undefined, undefined), false);
+});
+
+test("isTerminalStatus: a graph WITHOUT a registry reads the seed, same as a graph-less caller", () => {
+  const bare = { nodes: {}, supersededBy: {} };
+  assert.equal(isTerminalStatus("released", "artifact", bare), true);
+  assert.equal(isTerminalStatus("dismissed", "finding", bare), true);
+  assert.equal(isTerminalStatus("settled", "decision", bare), false);
+});
+
+test("the fallback vocabularies are VIEWS of the installed registry, not tables of their own", () => {
+  // The drift guard that used to pin a hand-written TERMINAL_FALLBACK /
+  // FALLBACK_NON_RESOLVING to the seed is gone because there is nothing left
+  // to drift: install a different registry and every export follows it.
+  const resolution = require("../lib/kernel/resolution.js");
+  const { Registry } = require("../lib/kernel/registry.js");
+  const reg = new Registry();
+  const parsed = [
+    { id: "schema-register-terminal-status", kind: "register", schema_version: "2026.01.01.1",
+      body: "```json\n" + JSON.stringify({ register: "terminal-status", classes: [{ id: "finito" }] }) + "\n```" },
+    { id: "schema-widget", kind: "node-schema", schema_version: "2026.01.01.1",
+      body: "```json\n" + JSON.stringify({ node_type: "widget", prefix: ["w-"], status: { non_resolving: ["draft"], terminal: ["scrapped"] } }) + "\n```" },
+  ].map((n) => require("../lib/kernel/registry.js").parseSchemaNode(n));
+  for (const r of parsed) { assert.ok(r.ok, JSON.stringify(r.errors)); reg.add(r.schema, "seed"); }
+  try {
+    resolution.useFallbackRegistry(() => reg);
+    assert.deepEqual([...resolution.terminalStatuses], ["finito"]);
+    assert.deepEqual([...resolution.nonResolvingStatuses], ["draft"]);
+    assert.equal(isTerminalStatus("finito", null), true);
+    assert.equal(isTerminalStatus("done", null), false, "no seed word survives outside the registry");
+    assert.equal(isTerminalStatus("scrapped", "widget"), true, "per-type partition from the installed registry");
+    assert.equal(resolution.isGiveUpStatus("draft", "widget"), false, "non-resolving but not inert");
+  } finally {
+    require("../lib/shell/seed.js").installSeedFallback();
+  }
+  assert.equal(isTerminalStatus("done", null), true, "the seed source is restored");
 });
 
 test("isTerminalStatus: passing the graph as the second argument throws (stale-caller tripwire)", () => {
