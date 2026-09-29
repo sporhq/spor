@@ -1255,12 +1255,20 @@ function probeCapabilities(graphHomeDir, opts) {
   // task-spor-worker-preflight-validation). Every other caller keeps the
   // refresh-on-read behavior byte-identically.
   if (opts && opts.persist === false) return probed;
+  persistProbedCapabilities(graphHomeDir, probed);
+  return probed;
+}
+
+// Write a probe taken earlier with `persist: false` — for a caller that has to
+// decide on it BEFORE it may write anything (`spor dispatch`'s plan phase,
+// task-spor-extract-dispatch-and-work-from-bin-spor). Same no-op-when-unchanged
+// refresh probeCapabilities does itself.
+function persistProbedCapabilities(graphHomeDir, probed) {
   editCapabilities(graphHomeDir, (cap) => {
     if (JSON.stringify(cap.probed || null) === JSON.stringify(probed)) return false;
     cap.probed = probed;
     return true;
   });
-  return probed;
 }
 
 // Best-effort by default — every caller that ignores the return value behaves
@@ -1945,6 +1953,7 @@ module.exports = {
   setDispatchAgent,
   whichSync,
   editCapabilities,
+  persistProbedCapabilities,
   probeCapabilities,
   appendLine,
   makeLogger,

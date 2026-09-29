@@ -837,7 +837,14 @@ test("dispatch <node>: a dispatch.repos mapping poisoned to a linked worktree se
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stderr, new RegExp(`dispatch\\.repos\\['demo'\\] pointed inside a linked worktree \\(${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\); correcting to the main checkout ${main.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.match(r.stdout, new RegExp(`dir:    ${main.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via config`));
-  assert.strictEqual(readRepos(home).demo, main, "the healed path is persisted, not just used for this run");
+  // --print is a preview: the heal is PLANNED, never persisted
+  // (task-spor-extract-dispatch-and-work-from-bin-spor — the plan phase writes
+  // nothing). A real dispatch persists it through its own self-registration.
+  assert.strictEqual(readRepos(home).demo, wt, "a --print preview leaves dispatch.repos as it found it");
+  const sentinel = path.join(home, "heal-launched");
+  const real = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: claudeStub(home, sentinel) });
+  assert.strictEqual(real.status, 0, real.stderr);
+  assert.strictEqual(readRepos(home).demo, main, "the healed path is persisted by a real dispatch, not just used for this run");
 });
 
 test("dispatch --dir: an ordinary subdirectory of a main checkout is NOT mistaken for a linked worktree", () => {
@@ -1529,6 +1536,38 @@ test("dispatch --from-queue: an item's own `profile:` frontmatter routes it, wit
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /can't satisfy profile profile-codex \(via --profile\)/);
   assert.ok(!fs.existsSync(mark), "never launched under an unsatisfiable auto-routed profile");
+});
+
+// The plan phase persists nothing (task-spor-extract-dispatch-and-work-from-
+// bin-spor): the capability probe profile resolution takes rides the plan, and
+// only a dispatch that reaches its side effects writes it to config.json. Before
+// the split, a FORK B refusal — reached after profile resolution — had already
+// refreshed `.probed` (the residue issue-spor-dispatch-probe-side-effect-before-
+// refusal left for every guard below the cheap node-derived ones).
+const readProbed = (home) => {
+  try {
+    const c = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+    return (c.dispatch && c.dispatch.capabilities && c.dispatch.capabilities.probed) || null;
+  } catch {
+    return null;
+  }
+};
+test("dispatch (local): an UNSATISFIABLE refusal persists no capability probe; a launched dispatch does", async () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  writeProfile(nodes, "profile-cc", "harness: claude-code");
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const env = { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark, ...cleanProbeEnv() };
+  const refused = run(["dispatch", "do the thing now please", "--dir", repo, "--profile", "profile-codex", "--no-brief"], env);
+  assert.strictEqual(refused.status, 1, refused.stderr);
+  assert.match(refused.stderr, /can't satisfy profile profile-codex/);
+  assert.strictEqual(readProbed(home), null, "a refused dispatch must not persist the probe it resolved with");
+  const ok = run(["dispatch", "do the thing now please", "--dir", repo, "--profile", "profile-cc", "--no-brief"], env);
+  assert.strictEqual(ok.status, 0, ok.stderr);
+  assert.ok(await waitForFile(mark), "the satisfiable dispatch launched");
+  assert.ok(readProbed(home), "a dispatch that reached its side effects refreshes .probed");
 });
 
 test("dispatch --from-queue: an explicit --profile still wins over the item's own `profile:` frontmatter", async () => {
