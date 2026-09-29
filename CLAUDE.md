@@ -1656,7 +1656,12 @@ spool-sweeper) turn the refusal into "inject nothing, write nothing to EITHER
 graph" plus a `journal/remote.log` line — never the local-graph fallthrough the
 null tenant would otherwise resolve to. It is moot (not reported) under an
 explicit `mode: local`/`off`. `spor config explain` is exempt from the CLI
-refusal: it is where you go to see it. The org for a freshly-minted token is the
+refusal: it is where you go to see it. A committed repo `.spor.json` `server:`
+is honored but paired only with a credential RECORDED for that server — the
+flat user `token` when the user/global config names the same server, else a
+store tenant for it — and otherwise refuses as `server-mismatch` through the
+same doors (dec-spor-repo-server-key-requires-matching-credential,
+`fromConfig` in `_resolveTenant`; see test/repo-server-credential.test.js). The org for a freshly-minted token is the
 JWT `org` claim (opaque-token deployments need `--org`, or the future `/v1/me`
 org echo).
 

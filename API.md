@@ -1111,6 +1111,18 @@ machine-local — never committed, always in the shared-graph `.gitignore`):
   `journal/remote.log`. Under an explicit `mode: local`/`off` no tenant is
   consulted, so a stray ambient org is moot there. `spor config explain` shows
   which selector chose (or refused) the tenant.
+- **A repo `server` gets only a credential recorded for it.** A committed repo
+  `.spor.json` may set `server` (how a repo points contributors at a team
+  server), but the flat `token` is never repo-sourced — it was recorded beside
+  the server the user/global config names. When the repo layer wins `server`
+  (legacy flat path, or an ambient org satisfied by it), that token is sent only
+  if its recorded server equals the repo's; otherwise a store credential
+  recorded for exactly that server is used, else the cascade refuses
+  (`server-mismatch`, naming both servers) the same way an unknown ambient org
+  does (dec-spor-repo-server-key-requires-matching-credential). `spor auth
+  login` is exempt and defaults to the repo's server — signing in there is the
+  cure, and that credential is stored for that server only, not as the store
+  default (which would move every other repo onto it). A repo `server` with no credential on hand at all resolves tokenless.
 - **Refresh.** A 401/403 on a tenant carrying a `refresh_token` transparently
   refreshes against its issuer (`grant_type=refresh_token`) and retries once.
 - **Byte-identical.** With no credential store and only a flat

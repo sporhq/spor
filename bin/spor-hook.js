@@ -97,7 +97,8 @@ function tenantRefused(cfg) {
     if (Date.now() - last < 3600000) return true;
     fs.writeFileSync(stamp, "");
     const log = u.makeLogger(path.join(journal, "remote.log"), "config: ");
-    log(`org '${te.org}' (from ${te.origin}) has no stored credential — hook skipped; run 'spor auth login --org ${te.org}' or fix the selector`);
+    if (te.kind === "server-mismatch") log(`${require("../lib/config.js").describeTenantRefusal(te)} — hook skipped; run 'spor auth login' for that server or override it`);
+    else log(`org '${te.org}' (from ${te.origin}) has no stored credential — hook skipped; run 'spor auth login --org ${te.org}' or fix the selector`);
   } catch {
     /* logging must never break fail-open */
   }

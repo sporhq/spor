@@ -68,7 +68,7 @@ function lazyModule(id) {
   );
 }
 
-const { loadConfig, DEFAULT_SERVER } = require(path.join(ROOT, "lib", "config.js"));
+const { loadConfig, DEFAULT_SERVER, describeTenantRefusal } = require(path.join(ROOT, "lib", "config.js"));
 const remote = require(path.join(ROOT, "lib", "remote.js"));
 const auth = require(path.join(ROOT, "lib", "auth.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
@@ -326,7 +326,8 @@ function cmdConfig(cfg, p) {
   const te = cfg.tenantError();
   const t = te ? null : cfg.tenant();
   const tenant = te
-    ? { refused: te.kind, org: te.org, source: te.source, origin: te.origin, stored_orgs: te.orgs }
+    ? { refused: te.kind, org: te.org, source: te.source, origin: te.origin, stored_orgs: te.orgs,
+        ...(te.kind === "server-mismatch" ? { server: te.server, credential_server: te.credential_server } : {}) }
     : t ? { server: t.server, org: t.org || null, source: t.source } : null;
   if (p.values.json) {
     out(JSON.stringify({
@@ -345,7 +346,9 @@ function cmdConfig(cfg, p) {
   }
   out("");
   out(`mode:     ${cfg.mode()}`);
-  if (tenant && tenant.refused) {
+  if (tenant && tenant.refused === "server-mismatch") {
+    out(`tenant:   REFUSED — ${describeTenantRefusal(te)}`);
+  } else if (tenant && tenant.refused) {
     out(`tenant:   REFUSED — org '${tenant.org}' (from ${tenant.origin}) has no stored credential; stored: ${tenant.stored_orgs.join(", ") || "(none)"}`);
   } else if (tenant) {
     out(`tenant:   ${tenant.server}${tenant.org ? ` (org ${tenant.org})` : ""}  <- ${tenant.source}`);
@@ -5594,6 +5597,20 @@ async function acquireTenant(cfg, { server, token, org, refresh_token, exp, labe
 // RFC 8628 device authorization grant (works headless / over SSH). Paste-compat:
 // `login <url> <token>` skips the device flow and stores a pasted PAT, exactly
 // like `join` (so the historical `spor login <url> <token>` keeps working).
+// A login for the server a repo `.spor.json` named, run to cure its
+// `server-mismatch` refusal (dec-spor-repo-server-key-requires-matching-credential),
+// must not become the store DEFAULT: the default outranks the user's flat
+// config.json server, so it would quietly move every OTHER repo onto the
+// repo's server. Stored non-default, it is still found by server for that repo.
+function loginMakesDefault(cfg, server) {
+  const te = cfg.tenantError();
+  if (te && te.kind === "server-mismatch" && auth.normServer(server) === te.server) {
+    out(`note: storing this credential for ${te.server} only (not as your default tenant) — the repo at ${path.dirname(te.origin)} names that server.`);
+    return false;
+  }
+  return true;
+}
+
 async function cmdAuthLogin(cfg, args) {
   const web = args.includes("--web");
   const all = args.includes("--all");
@@ -5609,7 +5626,7 @@ async function cmdAuthLogin(cfg, args) {
 
   // Paste path: `login <url> <token>` (or a single bare URL).
   if (pos.length && /^https?:\/\//.test(pos[0])) {
-    return acquireTenant(cfg, { server: pos[0], token: pos[1] || "", org, makeDefault: true });
+    return acquireTenant(cfg, { server: pos[0], token: pos[1] || "", org, makeDefault: loginMakesDefault(cfg, pos[0]) });
   }
 
   // Default to the hosted Spor front door when no server is named — onboarding
@@ -5710,7 +5727,7 @@ async function loginViaDevice(cfg, { server, org, scope, noOpen }) {
     refresh_token: tokens.refresh_token,
     org,
     exp,
-    makeDefault: true,
+    makeDefault: loginMakesDefault(cfg, server),
   });
 }
 
@@ -5881,7 +5898,7 @@ async function loginViaLoopback(cfg, { server, org, scope, noOpen }) {
     refresh_token: tokens.refresh_token,
     org,
     exp,
-    makeDefault: true,
+    makeDefault: loginMakesDefault(cfg, server),
   });
 }
 
@@ -23548,6 +23565,14 @@ function refuseUnknownOrg(cfg, canon, args = []) {
     err(`spor: --org was given an empty value — refusing to fall back to whichever tenant is active.`);
     err(`  an empty selector is malformed input (typically an unset shell variable), not "use the default".`);
     err(te.orgs.length ? `  stored orgs: ${te.orgs.join(", ")}` : "  the credential store is empty");
+    return true;
+  }
+  if (te.kind === "server-mismatch") {
+    // Signing in to the repo's server records a credential FOR it, which is the
+    // cure; the local-only inspection verbs run as for an ambient org refusal.
+    if (isCredentialAcquisition(canon, args) || (canon === "auth" && (args[0] === undefined || args[0] === "list")) || canon === "disable") return false;
+    err(`spor: ${te.origin} sets server ${te.server}, but your stored credential is for ${te.credential_server || "(no recorded server)"} — refusing to send it to a server the repo chose.`);
+    err(`  run 'spor auth login' to sign in to ${te.server} (stored for that server only), or set SPOR_SERVER / --server to override the repo's server ('spor config explain server' shows the layers).`);
     return true;
   }
   if (te.kind !== "unknown-org" || isCredentialAcquisition(canon, args)) return false;
