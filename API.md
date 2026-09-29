@@ -932,7 +932,10 @@ exponentially, capped, before retrying. Mechanical writers
 `scripts/engines/util.js`, which session-start also reads its banner from) — a revoked token will not un-revoke, so these are
 dead-lettered to `outbox/dead/` with a loud `journal/remote.log` line
 rather than re-POSTed forever; `429` and `5xx` stay transient and are
-retried with backoff.
+retried with backoff. Before a `401`/`403` is read as permanent, a writer
+whose tenant carries a `refresh_token` refreshes it once and retries the
+POST (`curlWithRefresh`, the same refresh the CLI does, §6.2) — an expired
+short-lived token is not a revoked one.
 
 `GET /v1/export` response headers: `x-substrate-head` carries the graph
 commit, `x-substrate-node-count` the entry count (plus `x-substrate-auth-files`

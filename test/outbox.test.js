@@ -394,3 +394,169 @@ test('drainOutbox: a pinned retry of 0 POSTs a failing file once even with a lon
   assert.strictEqual(calls, 1);
   assert.strictEqual(s.failed, 1);
 });
+
+// ---------------------------------------------------------------------------
+// Refresh-once before dead-lettering an auth failure
+// (issue-spor-hook-engines-dead-letter-on-401-without-token-refresh): an expired
+// short-lived device-grant token must be refreshed and the POST retried before
+// a 401/403 is read as permanent.
+// ---------------------------------------------------------------------------
+const http = require('node:http');
+const auth = require('../lib/auth');
+const { loadConfig } = require('../lib/config');
+const { hermeticEnv } = require('./helpers/env');
+
+// A fake server: /oauth/token swaps refresh_token RT for FRESH (unless
+// `refreshOk` is false); every other POST answers 200 only for FRESH.
+function authServer({ refreshOk = true } = {}) {
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const bearerTok = (req.headers.authorization || '').replace('Bearer ', '');
+      hits.push({ url: req.url, bearer: bearerTok });
+      const send = (code, obj) => {
+        res.writeHead(code, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(obj));
+      };
+      if (req.url === '/oauth/token') {
+        return refreshOk
+          ? send(200, { access_token: 'FRESH', refresh_token: 'RT2', expires_in: 3600 })
+          : send(400, { error: 'invalid_grant' });
+      }
+      return bearerTok === 'FRESH' ? send(200, { ok: true }) : send(401, { error: 'expired' });
+    });
+  });
+  return new Promise((r) => srv.listen(0, '127.0.0.1', () => r({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+
+// Activate a store-tenant config (refreshable, token STALE) for the engines.
+function useStoreTenant(base) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-outbox-auth-'));
+  const key = `${base}/acme`;
+  auth.writeStore(home, {
+    tenants: { [key]: { server: base, org: 'acme', access_token: 'STALE', refresh_token: 'RT' } },
+    default: key,
+  });
+  u.setConfig(loadConfig({ cwd: home, env: hermeticEnv({ SPOR_MODE: 'auto', SPOR_HOME: home, XDG_CONFIG_HOME: home }) }));
+  return { home, key };
+}
+
+test('drain refreshes an expired token once and delivers instead of dead-lettering', async () => {
+  const { srv, base, hits } = await authServer();
+  try {
+    const { home, key } = useStoreTenant(base);
+    const graph = scratchGraph();
+    spool(graph, 'a.json');
+    spool(graph, 'b.json');
+    const s = await drainOutbox(graph, 'test', 5, 0);
+    assert.strictEqual(s.drained, 2, JSON.stringify(s));
+    assert.strictEqual(s.deadLettered, 0);
+    assert.ok(!dead(graph, 'a.json') && !dead(graph, 'b.json'));
+    assert.strictEqual(hits.filter((h) => h.url === '/oauth/token').length, 1, 'one refresh per run');
+    // the second file goes straight out on the refreshed bearer
+    assert.strictEqual(hits.filter((h) => h.bearer === 'STALE').length, 1);
+    assert.strictEqual(auth.readStore(home).tenants[key].access_token, 'FRESH', 'refreshed token persisted');
+  } finally {
+    u.clearConfig();
+    srv.close();
+  }
+});
+
+test('drain still dead-letters when the refresh itself fails, and tries it only once', async () => {
+  const { srv, base, hits } = await authServer({ refreshOk: false });
+  try {
+    useStoreTenant(base);
+    const graph = scratchGraph();
+    spool(graph, 'a.json');
+    spool(graph, 'b.json');
+    const s = await drainOutbox(graph, 'test', 5, 0);
+    assert.strictEqual(s.deadLettered, 2, JSON.stringify(s));
+    assert.ok(dead(graph, 'a.json') && dead(graph, 'b.json'));
+    assert.strictEqual(hits.filter((h) => h.url === '/oauth/token').length, 1, 'a dead refresh token is not re-tried per file');
+  } finally {
+    u.clearConfig();
+    srv.close();
+  }
+});
+
+test('curlWithRefresh with a flat env token (no refresh_token) is a single plain call', async () => {
+  let calls = 0;
+  const r = await withServer(
+    async (url, init) => {
+      calls++;
+      assert.strictEqual(init.headers.Authorization, 'Bearer spor_pat_test');
+      return fakeResponse(401);
+    },
+    () => u.curlWithRefresh('http://127.0.0.1:9/v1/capture', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+  );
+  assert.strictEqual(r.http, '401');
+  assert.strictEqual(calls, 1);
+});
+
+test('an env token that is not the store tenant\'s own (a dispatched agent) is never refreshed into the person\'s', async () => {
+  const { srv, base, hits } = await authServer();
+  try {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-outbox-auth-'));
+    const key = `${base}/acme`;
+    auth.writeStore(home, {
+      tenants: { [key]: { server: base, org: 'acme', access_token: 'PERSON', refresh_token: 'RT' } },
+      default: key,
+    });
+    u.setConfig(
+      loadConfig({
+        cwd: home,
+        env: hermeticEnv({ SPOR_MODE: 'auto', SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: 'AGENT' }),
+      })
+    );
+    const graph = scratchGraph();
+    spool(graph, 'a.json');
+    const s = await drainOutbox(graph, 'test', 5, 0);
+    assert.strictEqual(s.deadLettered, 1, JSON.stringify(s));
+    assert.strictEqual(hits.filter((h) => h.url === '/oauth/token').length, 0, 'no refresh of the person tenant');
+    assert.ok(hits.every((h) => h.bearer === 'AGENT'), 'never retried as the person');
+    assert.strictEqual(auth.readStore(home).tenants[key].access_token, 'PERSON', 'person credential untouched');
+  } finally {
+    u.clearConfig();
+    srv.close();
+  }
+});
+
+test('a store tenant whose token another process already rotated still refreshes and delivers', async () => {
+  const { srv, base, hits } = await authServer();
+  try {
+    const { home, key } = useStoreTenant(base);
+    u.config().tenant(); // resolve (memoize) with STALE, as a run does at its start
+    const s0 = auth.readStore(home);
+    s0.tenants[key].access_token = 'OTHER'; // a concurrent CLI refresh rewrote the store
+    auth.writeStore(home, s0);
+    const graph = scratchGraph();
+    spool(graph, 'a.json');
+    const s = await drainOutbox(graph, 'test', 5, 0);
+    assert.strictEqual(s.drained, 1, JSON.stringify(s));
+    assert.strictEqual(hits.filter((h) => h.url === '/oauth/token').length, 1);
+  } finally {
+    u.clearConfig();
+    srv.close();
+  }
+});
+
+test('a flat env token equal to the stored one refreshes like the store tenant', async () => {
+  const { srv, base } = await authServer();
+  try {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-outbox-auth-'));
+    const key = `${base}/acme`;
+    auth.writeStore(home, { tenants: { [key]: { server: base, org: 'acme', access_token: 'STALE', refresh_token: 'RT' } }, default: key });
+    u.setConfig(
+      loadConfig({ cwd: home, env: hermeticEnv({ SPOR_MODE: 'auto', SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: 'STALE' }) })
+    );
+    const graph = scratchGraph();
+    spool(graph, 'a.json');
+    const s = await drainOutbox(graph, 'test', 5, 0);
+    assert.strictEqual(s.drained, 1, JSON.stringify(s));
+  } finally {
+    u.clearConfig();
+    srv.close();
+  }
+});

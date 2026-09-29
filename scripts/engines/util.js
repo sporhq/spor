@@ -1390,8 +1390,11 @@ function backoffMs(attempt, retryAfterMs, capMs) {
 // distill still re-POSTed a 403 the drain then dead-lettered). Kinds:
 //   ok         — 2xx.
 //   auth       — 401/403: the token is revoked, expired or mis-pasted. NOT an
-//                outage, and it does not recover by waiting (the engines carry
-//                no token refresh), so it is PERMANENT and must be named loudly.
+//                outage, and it does not recover by waiting, so it is
+//                PERMANENT and must be named loudly. Callers that write send
+//                through curlWithRefresh, which refreshes a store tenant's
+//                token once and retries first — so an auth verdict here has
+//                already survived the one refresh that could have fixed it.
 //   rejected   — 400/413/422: the server's verdict on these exact bytes; a
 //                re-POST can only be rejected again, so PERMANENT.
 //   rate-limit — 429: transient, retried only after its Retry-After/backoff.
@@ -1514,8 +1517,76 @@ async function curl(
 // remote-mode hooks authenticate as the active tenant, not a flat config field.
 // Byte-identical when no credential store / org selector is in play.
 function bearer() {
-  const v = _config ? _config.token() : home.envDual("TOKEN");
+  const v = _refreshed && _refreshed.config === _config ? _refreshed.token : _config ? _config.token() : home.envDual("TOKEN");
   return { Authorization: `Bearer ${v || ""}` };
+}
+
+// One token refresh per run, then a retry (issue-spor-hook-engines-dead-letter-
+// on-401-without-token-refresh). A capture answered 401/403 is PERMANENT to
+// classifyHttpFailure and gets dead-lettered, so an expired short-lived
+// device-grant token would strand facts a refresh delivers. curlWithRefresh is
+// curl() for an authenticated call: on 401/403 it refreshes the active tenant
+// through lib/remote.js's own door (the CLI's refresh-once-on-401) and retries
+// ONCE with the fresh bearer; the caller classifies whatever comes back, so a
+// still-rejected token dead-letters exactly as before. The refresh is attempted
+// at most once per active config — a distill loop over N facts must not POST N
+// refresh grants against a dead refresh token — and a fresh token is remembered
+// so every later bearer() in the run sends it (Config memoizes its tenant, so
+// its token() would keep answering the stale one). The flat/env path carries no
+// refresh_token, so there the refresh is a no-op and the call is byte-identical
+// to curl(). Callers pass their headers WITHOUT Authorization; it is supplied
+// here so the retry can swap it.
+//
+// Only the store tenant's OWN token is refreshed. A flat env SPOR_TOKEN aimed at
+// a server the store knows still carries that store tenant's refresh_token
+// (Config's flat() selection), and a dispatched agent run is exactly that shape:
+// its SPOR_TOKEN is an agent-scoped child token while HOME — and so the person's
+// credentials.json — is unchanged. Refreshing there would retry the agent's
+// rejected POST as the PERSON (a 403 retried past the agent's scope) and hand
+// every later bearer() in the run the person's token. So a tenant the selector
+// took FROM the store (by key: the default, or an org selector) is always
+// eligible — its bearer is the store's own even when another process has since
+// refreshed the file under us — while a flat server+token selection is eligible
+// only when the bearer we sent IS the stored access_token.
+const STORE_TENANT_SOURCES = new Set(["store-default", "cli-org", "env-org", "repo-marker"]);
+let _refreshed = null; // { config, token } — the fresh bearer for this run
+let _refreshTried = null; // the config a refresh was already attempted under
+function sentIsStoreToken(sent) {
+  try {
+    const t = _config.tenant();
+    if (!t || !t.key || !t.refresh_token) return false;
+    if (STORE_TENANT_SOURCES.has(t.source)) return true;
+    const auth = require(path.join(ROOT, "lib", "auth.js"));
+    const stored = auth.readStore(_config.userConfigHome()).tenants[t.key];
+    return !!(stored && stored.access_token === sent);
+  } catch {
+    return false;
+  }
+}
+async function refreshBearer(sent) {
+  if (!_config || _refreshTried === _config) return null;
+  if (!sentIsStoreToken(sent)) return null;
+  _refreshTried = _config;
+  let fresh = null;
+  try {
+    fresh = await require(path.join(ROOT, "lib", "remote.js")).refreshAfterAuthFailure(_config);
+  } catch {
+    fresh = null;
+  }
+  if (fresh) _refreshed = { config: _config, token: fresh };
+  return fresh;
+}
+async function curlWithRefresh(url, opts = {}) {
+  const headers = opts.headers || {};
+  const sentBearer = bearer().Authorization;
+  const r = await curl(url, { ...opts, headers: { ...bearer(), ...headers } });
+  if (classifyHttpFailure(r.http) !== "auth") return r;
+  // A sibling call in this run may already have refreshed: retry with that
+  // token rather than refreshing again.
+  const fresh =
+    bearer().Authorization !== sentBearer ? true : await refreshBearer(sentBearer.replace(/^Bearer /, ""));
+  if (!fresh) return r;
+  return curl(url, { ...opts, headers: { ...bearer(), ...headers } });
 }
 
 function serverBase() {
@@ -1966,6 +2037,7 @@ module.exports = {
   gcJournal,
   curl,
   classifyHttpFailure,
+  curlWithRefresh,
   isPermanentHttpFailure,
   isSystemSession,
   anySignal,

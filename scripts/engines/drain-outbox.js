@@ -109,9 +109,9 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0, 
       release(file, name);
       return;
     }
-    const { http } = await u.curl(`${u.serverBase()}${endpoint}`, {
+    const { http } = await u.curlWithRefresh(`${u.serverBase()}${endpoint}`, {
       method: "POST",
-      headers: { ...u.bearer(), "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body,
       timeoutMs: maxTimeSec * 1000,
       retry,

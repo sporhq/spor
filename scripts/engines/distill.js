@@ -540,9 +540,9 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
         idempotency_key: key,
       });
       const post = await u
-        .curl(`${u.serverBase()}/v1/capture`, {
+        .curlWithRefresh(`${u.serverBase()}/v1/capture`, {
           method: "POST",
-          headers: { ...u.bearer(), "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json" },
           body,
           timeoutMs: 30000,
         })
@@ -567,10 +567,11 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
         // inspection or replay after a fix, and it is the channel session-start
         // and `spor-hook doctor` already count and surface — so the consume
         // waits on the dead-letter write landing, exactly as the outbox spool
-        // below does. 401 belongs here (F23): the engines carry no token
-        // refresh, so a revoked/invalid token does not un-revoke by being
-        // spooled — routing it through the outbox only bought one more failed
-        // POST before drain-outbox dead-lettered the identical bytes.
+        // below does. 401 belongs here (F23): curlWithRefresh already refreshed
+        // the token once and retried, so an auth failure that survives it is a
+        // revoked/invalid token that does not un-revoke by being spooled —
+        // routing it through the outbox only bought one more failed POST
+        // before drain-outbox dead-lettered the identical bytes.
         let dead = false;
         if (u.ensureDir(path.join(graph, "outbox", "dead"))) {
           try {
@@ -1153,9 +1154,9 @@ async function distill(input) {
         source: "distill",
         idempotency_key: crypto.createHash("sha256").update(`${session}\n${text}`).digest("hex"),
       });
-      const { http } = await u.curl(`${u.serverBase()}/v1/capture`, {
+      const { http } = await u.curlWithRefresh(`${u.serverBase()}/v1/capture`, {
         method: "POST",
-        headers: { ...u.bearer(), "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json" },
         body,
         timeoutMs: 90000,
       });

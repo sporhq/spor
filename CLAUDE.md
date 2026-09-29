@@ -278,7 +278,8 @@ has no durable consequence: the `.out.json` IS the debt, an unreached result is
 left byte-for-byte as found, and the collector is itself what comes back for it
 (6h horizon, well inside `gc.maxAgeMs`). A server 401/403/400/413/422 is
 permanent (`u.classifyHttpFailure`, the one status reading shared by
-session-start, drain-outbox and distill) but NOT discardable: per API.md §5 a mechanical writer preserves a
+session-start, drain-outbox and distill; a 401/403 counts only after
+`u.curlWithRefresh` refreshed a store tenant's token once and retried) but NOT discardable: per API.md §5 a mechanical writer preserves a
 rejected payload in `outbox/dead/` (the channel session-start and `spor-hook
 doctor` already surface), so the consume waits on that write like any other.
 The consume therefore trails the durable write, so a crash in the gap re-drains
