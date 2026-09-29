@@ -14955,23 +14955,33 @@ function makeGateDeps(
     checkEvidenceOrigins: () => {
       const r = readRecordNow();
       const progress = r && r.gate_progress;
-      if (!progress || progress.key !== runKey) return { ok: true };
-      const saved = Object.values(progress.gates || {});
-      const evidence = saved.flatMap((p) => p ? [p.evidence, p.filingIntent] : []).filter(Boolean);
+      if (!progress) return { ok: true };
+      // This attempt's own rows, plus every obligation an earlier attempt
+      // still owes — carried onto this stamp already, or still sitting on the
+      // prior attempt's stamp this attempt has not yet written over
+      // (task-spor-gate-regate-obligation-semantics). A re-gate never hides a
+      // debt by changing the key.
+      const owed = gatesKernel.owedGateObligations(progress, runKey);
+      const saved = progress.key === runKey ? Object.values(progress.gates || {}) : [];
+      const evidence = [...saved.flatMap((p) => p ? [p.evidence, p.filingIntent] : []), ...owed.filter((o) => o.carryKey).flatMap((o) => [o.progress.evidence, o.progress.filingIntent])].filter(Boolean);
       // Enumerate the journal, not the current gate list: removing/renaming a
       // declaration must not make an existing graph obligation unreachable.
       const current = new Set((factory.gates || []).map((g) => g.id));
-      const orphan = saved.flatMap((p) => p ? [p.filingIntent, p.evidence && !p.evidence.complete ? p.evidence : null] : [])
-        .filter(Boolean).find((e) => !e.gate || !current.has(e.gate.id));
+      const orphan = owed.map((o) => o.progress.filingIntent || o.progress.evidence).find((e) => !e.gate || !current.has(e.gate.id));
       if (orphan) return { ok: false, reason: "pending flake evidence belongs to a removed or renamed gate; restore its original declaration and settle its obligation before changing the factory" };
       if (!evidence.every((e) => attestationOriginMatches(cfg, e.origin))) return { ok: false, reason: "pending flake evidence belongs to a different or unknown graph; resume against its original graph" };
-      const pending = Object.entries(progress.gates || {}).filter(([, p]) => p && (p.filingIntent || p.evidence && !p.evidence.complete)).map(([key, p]) => ({
-        gate: (p.filingIntent || p.evidence).gate,
-        rescue: Number((/#x(\d+)$/.exec(key) || [])[1]) || 0,
-        progress: p,
+      const pending = owed.map((o) => ({
+        gate: (o.progress.filingIntent || o.progress.evidence).gate,
+        rescue: o.rescue,
+        progress: o.progress,
+        ...(o.carryKey ? { carryKey: o.carryKey, attempt: o.attempt } : {}),
       }));
       return pending.length ? { ok: true, pending } : { ok: true };
     },
+    // A carried obligation's receipt is written back where it was carried to,
+    // never onto this attempt's own row for the same gate (which is this
+    // attempt's own judgement and would overwrite, or be overwritten by, it).
+    saveCarriedProgress: async ({ carryKey, progress }) => updateGateProgress((prior) => ({ carried: { ...(prior.carried || {}), [carryKey]: progress } })),
     saveGateProgress,
     loadRescueState,
     saveRescueState,
@@ -19236,7 +19246,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // continues the CURRENT attempt: same attempt number, same ids, the owed
   // evidence replayed first, no branch refresh or stage re-open (the attempt
   // already did both when it started).
-  const owesEvidence = Object.values((record.gate_progress && record.gate_progress.gates) || {}).some((p) => p && (p.filingIntent || (p.evidence && p.evidence.complete !== true)));
+  const owesEvidence = gatesKernel.owedGateObligations(record.gate_progress, null).length > 0;
   const resume = record.gate_state === "interrupted" || (owesEvidence && !gatesKernel.SETTLED_GATE_STATES.has(record.gate_state));
   // Attempt 1 was the pipeline that refused; each re-gate counts up from
   // there. A resume keeps the attempt it continues — and a pipeline no

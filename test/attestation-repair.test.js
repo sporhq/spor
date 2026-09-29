@@ -438,18 +438,78 @@ test("re-gating cannot overwrite an unpaid signed outbox; matching-origin replay
   assert.equal(runner.readJson(f.file).gate_regate_count, 1);
 });
 
-test("re-gating cannot clear incomplete flake evidence under the record claim lock", () => {
+// task-spor-gate-regate-obligation-semantics: a SETTLED refusal that still
+// owes flake evidence cannot be resumed (it is settled), so refusing to re-gate
+// it stranded it forever. The re-gate is allowed and the debt is RE-ATTACHED:
+// the claim leaves the owed row byte-for-byte, and the new attempt's first
+// progress write carries it (never clears it) — while an UNSETTLED attempt that
+// owes evidence is still refused a new attempt, since it can be resumed.
+test("re-gating a settled refusal never clears incomplete flake evidence — it is carried into the new attempt", () => {
   const f = fixture();
-  const record = { ...runner.readJson(f.file), gate_state: "failed", gate_settle_id: "prior", gate_regate_count: 0, gate_progress: { key: "attempt-0", gates: { acceptance: { evidence: { complete: false, origin: { mode: "local", nodes: "original" }, outcome: { flake: { issues: ["issue-flake-one"] } } } } } } };
+  const owedRow = { evidence: { complete: false, gate: { id: "acceptance" }, origin: { mode: "local", nodes: "original" }, outcome: { flake: { issues: ["issue-flake-one"] } } } };
+  const record = { ...runner.readJson(f.file), gate_state: "failed", gate_settle_id: "prior", gate_regate_count: 0, gate_progress: { key: f.item.run_id, gates: { acceptance: owedRow, "acceptance#x1": { ledger: [] } } } };
   runner.atomicJson(f.file, record);
-  const reopen = { settleId: "prior", regateCount: 0, state: "failed" };
-  const before = fs.readFileSync(f.file, "utf8");
-  assert.match(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen }).refused, /flake occurrence publication is still owed/);
-  assert.equal(fs.readFileSync(f.file, "utf8"), before, "claim refusal preserves attempt, nonce and exact obligation bytes");
-  record.gate_progress.gates.acceptance.evidence.complete = true;
+  // Unsettled: resumable, so a NEW attempt over it is still refused.
+  runner.atomicJson(f.file, { ...record, gate_state: "interrupted" });
+  const interrupted = fs.readFileSync(f.file, "utf8");
+  assert.match(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen: { settleId: "prior", regateCount: 0, state: "interrupted" } }).refused, /flake occurrence publication is still owed/);
+  assert.equal(fs.readFileSync(f.file, "utf8"), interrupted, "claim refusal preserves attempt, nonce and exact obligation bytes");
+  // Settled: the re-gate claims, and the owed row is untouched by the claim.
   runner.atomicJson(f.file, record);
-  assert.equal(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen }).ok, true);
-  assert.equal(runner.readJson(f.file).gate_regate_count, 1);
+  const claim = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen: { settleId: "prior", regateCount: 0, state: "failed" } });
+  assert.equal(claim.ok, true, claim.refused);
+  let after = runner.readJson(f.file);
+  assert.equal(after.gate_regate_count, 1);
+  assert.deepEqual(after.gate_progress.gates.acceptance, owedRow, "the claim leaves the obligation exactly as it was");
+  // The new attempt's first write rolls the key over and CARRIES the debt.
+  const newKey = `${f.item.run_id}#r2`;
+  const put = runner.updateGateProgress(f.home, f.item.run_id, { gates: { acceptance: { ledger: [] } } }, { key: newKey, attempt: 2, own: claim.token });
+  assert.equal(put.ok, true, put.reason);
+  after = runner.readJson(f.file);
+  assert.equal(after.gate_progress.key, newKey);
+  assert.deepEqual(Object.keys(after.gate_progress.gates), ["acceptance"], "the prior attempt's own state is replaced");
+  const carried = after.gate_progress.carried[`${f.item.run_id}|acceptance`];
+  assert.deepEqual({ ...carried, carried_from: undefined }, { ...owedRow, carried_from: undefined }, "the owed row rides over intact");
+  assert.deepEqual(carried.carried_from, { key: f.item.run_id, row: "acceptance", attempt: 0, rescue: 0 });
+  assert.equal(Object.keys(after.gate_progress.carried).length, 1, "a paid/unowed row is not carried");
+  // A later rollover carries it again while it is still owed.
+  runner.stampGateState(f.home, f.item.run_id, { gate_state: "failed" }, { own: claim.token });
+  const again = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "third", reopen: { settleId: claim.token, regateCount: 1, state: "failed" } });
+  assert.equal(again.ok, true, again.refused);
+  runner.updateGateProgress(f.home, f.item.run_id, { gates: {} }, { key: `${f.item.run_id}#r3`, attempt: 3, own: again.token });
+  assert.deepEqual(Object.keys(runner.readJson(f.file).gate_progress.carried), [`${f.item.run_id}|acceptance`], "still owed, still carried, same row");
+});
+
+// The re-attached obligation is PAID by the new attempt's preflight — under its
+// original attempt, into its carried row — before any gate of the new attempt
+// runs, and the paid row then stops being owed.
+test("a --regate of a settled refusal owing flake evidence pays it first, then judges, and nothing is left owed", async () => {
+  const gatesLib = require("../lib/shell/gate-runner.js");
+  const gatesKernel = require("../lib/kernel/gates.js");
+  const f = fixture();
+  const gate = { id: "acceptance", kind: "command", command: "true", timeoutMs: 60000, cycles: 0, source: "inline", risk: [] };
+  const factory = { ...f.factory, gates: [gate] };
+  const origin = cli.attestationGraphOrigin(f.cfg);
+  const owedRow = { evidence: { complete: false, gate, origin, outcome: { verdict: "passed", flake: { issues: ["issue-flake-one"], files: ["test/one.test.js"] } } } };
+  runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "failed", gate_settle_id: "prior", gate_worker: "old", gate_regate_count: 0, gate_progress: { key: f.item.run_id, gates: { acceptance: owedRow } } });
+  const seen = [];
+  const original = gatesLib.runGatePipeline;
+  gatesLib.runGatePipeline = async ({ item, deps }) => {
+    const pre = await deps.checkEvidenceOrigins();
+    seen.push({ attempt: item.attempt, pending: (pre.pending || []).map((p) => ({ carryKey: p.carryKey, attempt: p.attempt })) });
+    for (const p of pre.pending || []) await deps.saveCarriedProgress({ carryKey: p.carryKey, progress: { evidence: { ...p.progress.evidence, complete: true } } });
+    await deps.saveGateProgress({ gate, item, progress: { ledger: [] } });
+    return f.gateResult;
+  };
+  try {
+    assert.equal(await cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory, factoryId: factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home }), 0);
+  } finally { gatesLib.runGatePipeline = original; }
+  assert.deepEqual(seen, [{ attempt: 2, pending: [{ carryKey: `${f.item.run_id}|acceptance`, attempt: 0 }] }], "the new attempt saw the prior attempt's debt, tagged with its origin");
+  const rec = runner.readJson(f.file);
+  assert.equal(rec.gate_state, "passed");
+  assert.equal(rec.gate_regate_count, 1);
+  assert.equal(gatesKernel.owedGateObligations(rec.gate_progress, rec.gate_progress.key).length, 0, "nothing is left owed");
+  assert.equal(rec.gate_progress.carried[`${f.item.run_id}|acceptance`].evidence.complete, true, "the receipt landed on the carried row");
 });
 
 test("effective token override cannot replay another credential's outbox despite matching stored tenant metadata", async () => {

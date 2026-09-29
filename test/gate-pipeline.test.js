@@ -10621,6 +10621,94 @@ test("all pending gate and rescue-pass evidence settles before tree reads, pins,
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
+// task-spor-gate-regate-obligation-semantics: a re-gate opens a new attempt,
+// and the progress stamp is keyed to it — but what the refused attempt still
+// OWES the graph (in any rescue pass) is re-attached, not dropped or hidden:
+// the new attempt's preflight pays it under its ORIGINAL attempt's fact ids,
+// into its carried row (never the new attempt's own row for the same gate),
+// before any tree read or gate of the new attempt.
+test("a re-gate carries the refused attempt's owed evidence from every rescue pass and pays it under the original ids first", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  try {
+    const entry = { node_id: "task-demo", run_id: "11223344-bbbb-cccc-dddd-ffffffffffff" };
+    const file = dispatchRuns.runPaths(home, entry.run_id).record;
+    dispatchRuns.atomicJson(file, { ...entry, state: "done" });
+    const factory = factoryOf({ ...BASE, gates: [{ id: "first", kind: "command", command: "first" }, { id: "acceptance", kind: "command", command: "acceptance" }] });
+    const first = sporCli.makeGateDeps(cfg, { entry, factory, slug: null, log: () => {} });
+    const origin = first.evidenceOrigin();
+    const gate = factory.gates[1];
+    const savedChange = { head: "original-head", base: "original-base", trustedRef: "original-main", trustedSha: "original-trust" };
+    for (const rescue of [0, 1]) {
+      const outcome = { passed: true, verdict: "passed", detail: "original classified failure", rescue, flake: { issues: ["issue-original"], files: ["test/off.test.js"], linked: [] } };
+      await first.saveGateProgress({ gate, rescue, item: entry, progress: { evidence: { gate, outcome, change: savedChange, definition: null, origin, candidate_id: "cand-original", complete: false } } });
+    }
+    // The attempt settled its refusal with that debt still owed.
+    dispatchRuns.atomicJson(file, { ...dispatchRuns.readJson(file), gate_state: "failed", gate_settle_id: "prior", gate_worker: "old" });
+    const claim = dispatchRuns.claimGateRecord(home, entry.run_id, { workerId: "regate", reopen: { settleId: "prior", regateCount: 0, state: "failed" } });
+    assert.equal(claim.ok, true, claim.refused);
+    const item = { ...entry, attempt: 2 };
+    const real = sporCli.makeGateDeps(cfg, { entry: item, factory, slug: null, log: () => {}, gateOwner: claim.token });
+    assert.deepEqual(real.checkEvidenceOrigins().pending.map((p) => [p.carryKey, p.attempt, p.rescue]), [[`${entry.run_id}|acceptance`, 0, 0], [`${entry.run_id}|acceptance#x1`, 0, 1]], "the new attempt sees the prior attempt's debt in every pass");
+    const calls = [];
+    const f = fakes();
+    f.deps.checkEvidenceOrigins = real.checkEvidenceOrigins;
+    f.deps.acceptsEvidenceOrigin = real.acceptsEvidenceOrigin;
+    f.deps.evidenceOrigin = real.evidenceOrigin;
+    f.deps.loadGateProgress = real.loadGateProgress;
+    f.deps.saveGateProgress = async (args) => { calls.push(`own:${args.gate.id}`); return real.saveGateProgress(args); };
+    f.deps.saveCarriedProgress = real.saveCarriedProgress;
+    const changedPaths = f.deps.changedPaths;
+    f.deps.changedPaths = async (args) => { calls.push("tree"); return changedPaths(args); };
+    const recordFact = f.deps.recordFact;
+    f.deps.recordFact = async (args) => {
+      if (args.flakeIssues && args.flakeIssues.length) {
+        calls.push(`debt:${args.rescue || 0}`);
+        assert.equal(args.id, gateRunner.gateFactId("acceptance", "task-demo", entry.run_id, 0, args.rescue || 0, savedChange.head), "minted under the attempt that owed it");
+        assert.equal(args.head, savedChange.head);
+        return { ok: true, id: args.id };
+      }
+      return recordFact(args);
+    };
+    assert.equal((await gateRunner.runGatePipeline({ item, factory, deps: f.deps })).state, "passed");
+    assert.deepEqual(calls.slice(0, 2), ["debt:0", "debt:1"], "the debt is paid before anything else");
+    assert.ok(calls.indexOf("tree") > 1);
+    const rec = dispatchRuns.readJson(file);
+    assert.equal(rec.gate_progress.key, `${entry.run_id}#r2`);
+    for (const k of [`${entry.run_id}|acceptance`, `${entry.run_id}|acceptance#x1`]) assert.equal(rec.gate_progress.carried[k].evidence.complete, true, `${k} receipt`);
+    assert.equal(rec.gate_progress.gates.acceptance && rec.gate_progress.gates.acceptance.evidence, undefined, "the new attempt's own row never took the carried receipt");
+    assert.deepEqual(real.checkEvidenceOrigins(), { ok: true }, "nothing is left owed");
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("a carried obligation from a re-gate attempt is paid under THAT attempt's fact id, receipted on its carried row, and never reported as this attempt's verdict", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const f = fakes();
+  const gate = factory.gates[0];
+  const change = { head: "h-r2", base: "b-r2" };
+  const debt = { gate, outcome: { passed: false, verdict: "failed", detail: "attempt 2 refused", flake: { issues: ["issue-flake-r2"], files: ["test/off.test.js"], linked: [] } }, change, definition: null, complete: false };
+  const carryKey = `${ITEM.run_id}#r2|acceptance`;
+  const row = { evidence: debt, carried_from: { key: `${ITEM.run_id}#r2`, row: "acceptance", attempt: 2, rescue: 0 } };
+  f.deps.checkEvidenceOrigins = () => ({ ok: true, pending: [{ gate, rescue: 0, progress: row, carryKey, attempt: 2 }] });
+  const carriedWrites = [];
+  f.deps.saveCarriedProgress = async (args) => { carriedWrites.push(args); };
+  const ownWrites = [];
+  const save = f.deps.saveGateProgress;
+  f.deps.saveGateProgress = async (args) => { ownWrites.push(args); return save && save(args); };
+  const reported = [];
+  f.deps.gateEvidenceRecorded = async (args) => { reported.push(args); return { ok: true }; };
+  const ids = [];
+  const recordFact = f.deps.recordFact;
+  f.deps.recordFact = async (args) => { if (args.flakeIssues && args.flakeIssues.length) ids.push(args.id); return recordFact(args); };
+  const result = await gateRunner.runGatePipeline({ item: { ...ITEM, attempt: 3 }, factory, deps: f.deps });
+  assert.equal(result.state, "passed");
+  assert.deepEqual(ids, [gateRunner.gateFactId("acceptance", ITEM.node_id, ITEM.run_id, 2, 0, "h-r2")], "minted under attempt 2, not 3");
+  assert.ok(carriedWrites.length >= 1 && carriedWrites.every((w) => w.carryKey === carryKey));
+  assert.equal(carriedWrites[carriedWrites.length - 1].progress.evidence.complete, true);
+  assert.equal(carriedWrites[carriedWrites.length - 1].progress.carried_from.attempt, 2, "the origin survives the receipt");
+  assert.ok(!ownWrites.some((w) => w.progress && w.progress.evidence && w.progress.evidence.outcome && w.progress.evidence.outcome.detail === "attempt 2 refused"), "the carried receipt never lands on this attempt's own row");
+  assert.ok(!reported.some((r) => r.verdict === "failed"), "attempt 2's refusal is not reported as this attempt's gate verdict");
+});
+
 test("an opted-out command skipped on the ancestor runs when a later fix introduces its risk path", async () => {
   const f = repinWorld();
   f.factory.gates.find((g) => g.id === "fast").risk = ["touches:auth"];
