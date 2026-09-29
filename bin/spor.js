@@ -9945,6 +9945,10 @@ async function mintAgentToken(cfg, { agent, session }) {
   // 404 = no route (surface not deployed) => absent, dispatch falls back cleanly.
   if (r.status === 404) return { absent: true };
   if (!r.ok) return { error: `HTTP ${r.status}${r.json && r.json.error && r.json.error.code ? ` (${r.json.error.code})` : ""}` };
+  // A 2xx whose body did not parse is a mint we could not READ, not a server
+  // without the mint surface: reading it as `absent` would tell the operator the
+  // wrong thing and, under --allow-person-token, quietly drop to person scope.
+  if (r.jsonError) return { error: `unreadable response body (${r.jsonError})` };
   const token = r.json && (r.json.token || r.json.access_token);
   if (!token) return { absent: true };
   return { ok: true, token };
@@ -20160,7 +20164,12 @@ async function fleetAgentCapabilities(cfg, agentId) {
     const msg = r.json && r.json.error && r.json.error.message;
     return { error: `HTTP ${r.status}${code ? ` (${code})` : ""}${msg ? ` — ${msg}` : ""}` };
   }
-  const j = r.json || {};
+  // An unreadable 2xx is an OUTAGE, not an empty answer — read as `{}` it
+  // would report "no host satisfies" / "nothing published" as fact.
+  if (r.jsonError || !r.json || typeof r.json !== "object") {
+    return { error: `unreadable response body${r.jsonError ? ` (${r.jsonError})` : ""}` };
+  }
+  const j = r.json;
   return {
     agent: j.agent || agentId,
     capabilities: j.capabilities || {},
@@ -20275,7 +20284,12 @@ async function fleetHostsForProfile(cfg, profileId, { owner, maxAge } = {}) {
     const msg = r.json && r.json.error && r.json.error.message;
     return { error: `HTTP ${r.status}${code ? ` (${code})` : ""}${msg ? ` — ${msg}` : ""}` };
   }
-  const j = r.json || {};
+  // An unreadable 2xx is an OUTAGE, not an empty answer — read as `{}` it
+  // would report "no host satisfies" / "nothing published" as fact.
+  if (r.jsonError || !r.json || typeof r.json !== "object") {
+    return { error: `unreadable response body${r.jsonError ? ` (${r.jsonError})` : ""}` };
+  }
+  const j = r.json;
   return {
     profile: j.profile || profileId,
     satisfiable: Array.isArray(j.satisfiable) ? j.satisfiable : [],

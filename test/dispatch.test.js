@@ -1626,7 +1626,7 @@ const TASK_MD = (id) =>
 // `hostsScoped` answers an `owner=me` query (what the AUTONOMOUS tier asks) with a
 // DIFFERENT body from `hosts` (what the human tier's unscoped question gets), so a
 // test can pin that the narrow answer is never rendered as the broad one.
-function fleetStub({ hosts, hostsScoped = null, hostsStatus = 200, edgeStatus = 200, deleteEdgeStatus = 200, taskRaw = TASK_MD } = {}) {
+function fleetStub({ hosts, hostsScoped = null, hostsStatus = 200, hostsRaw = null, edgeStatus = 200, deleteEdgeStatus = 200, taskRaw = TASK_MD } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let raw = "";
@@ -1660,6 +1660,10 @@ function fleetStub({ hosts, hostsScoped = null, hostsStatus = 200, edgeStatus = 
       const hm = req.url.match(/^\/v1\/profiles\/([^/?]+)\/hosts/);
       if (hm && req.method === "GET") {
         if (hostsStatus !== 200) return j(hostsStatus, { error: { code: "not_found", message: "x" } });
+        if (hostsRaw != null) {
+          res.writeHead(200, { "content-type": "application/json" });
+          return res.end(hostsRaw);
+        }
         const scoped = hostsScoped && /[?&]owner=me(&|$)/.test(req.url);
         const body = scoped ? hostsScoped : hosts;
         return j(200, body || { profile: decodeURIComponent(hm[1]), satisfiable: [], unsatisfiable: [], counts: {} });
@@ -1738,6 +1742,24 @@ test("dispatch (remote, unsatisfiable, no host satisfies): escalates to the owne
     assert.match(r.stderr, /NO fleet host currently satisfies profile-codex — escalate to the owner/);
     assert.match(r.stderr, /2 box\(es\) checked; none satisfy it/);
     assert.match(r.stderr, /never substituted/);
+  } finally {
+    srv.close();
+  }
+});
+
+// An unreadable 2xx from the host-match is an OUTAGE, never "no host satisfies"
+// (task-spor-extract-dispatch-and-work-from-bin-spor): read as `{}`, it used to
+// escalate to the owner on a scheduler answer nobody could parse.
+test("dispatch (remote, unsatisfiable): an unreadable host-match body is an outage, not a FORK B escalation", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, base } = await fleetStub({ hostsRaw: "<html>gateway</html>" });
+  try {
+    const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"], remoteCapEnv(home, base, cleanProbeEnv()));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /fleet scheduler unavailable: unreadable response body/);
+    assert.doesNotMatch(r.stderr, /NO fleet host currently satisfies/);
+    assert.match(r.stderr, /assignment is unchanged. Re-route to a machine that satisfies it/);
   } finally {
     srv.close();
   }

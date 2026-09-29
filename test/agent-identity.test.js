@@ -675,7 +675,7 @@ fs.writeFileSync(${JSON.stringify(outFile)}, [process.cwd(), ...process.argv.sli
 // the session it received), and the SELF-SERVE owner-gated per-session mint
 // POST /v1/agents/{id}/token (configurable status; records the agent {id} in the
 // path + the session in the body).
-function dispatchStub({ mintStatus = 201, mintBody = null, queueItem = null, sessionBindStatus = 200 } = {}) {
+function dispatchStub({ mintStatus = 201, mintBody = null, mintRaw = null, queueItem = null, sessionBindStatus = 200 } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -709,6 +709,10 @@ function dispatchStub({ mintStatus = 201, mintBody = null, queueItem = null, ses
       if (mintMatch) {
         const agent = decodeURIComponent(mintMatch[1]);
         const p = JSON.parse(body || "{}");
+        if (mintRaw != null) {
+          res.writeHead(mintStatus, { "content-type": "application/json" });
+          return res.end(mintRaw);
+        }
         // session is now OPTIONAL (deferred) — the token id stays stable regardless.
         return j(mintStatus, mintBody || { token: `agtok_${agent.slice(6, 14)}`, agent, session: p.session || null, expires_at: "2026-06-16T23:59:59Z" });
       }
@@ -891,6 +895,27 @@ test("dispatch (remote, real): mint endpoint absent (404) => hard-fails, names '
     assert.match(r.stderr, /cannot dispatch dec-x: could not mint an agent-scoped token for agent-anthony-laptop \(this server can't mint agent-scoped session tokens yet\)/);
     assert.match(r.stderr, /spor agent use/);
     assert.match(r.stderr, /--allow-person-token/);
+    assert.ok(!fs.existsSync(outFile), "nothing launched");
+  } finally {
+    srv.close();
+  }
+});
+
+// An unreadable 2xx mint is a mint we could not READ, not a server without the
+// surface (task-spor-extract-dispatch-and-work-from-bin-spor): it hard-fails
+// naming the body, rather than reading as "can't mint agent-scoped tokens yet".
+test("dispatch (remote, real): an unreadable mint body hard-fails as unreadable, not as an absent surface", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3u-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3ur-"));
+  const outFile = path.join(home, "argv.out");
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
+  const stub = argvStub(home, outFile);
+  const { srv, base } = await dispatchStub({ mintRaw: "<html>proxy</html>" });
+  try {
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /could not mint an agent-scoped token for agent-anthony-laptop \(unreadable response body/);
+    assert.doesNotMatch(r.stderr, /can't mint agent-scoped session tokens yet/);
     assert.ok(!fs.existsSync(outFile), "nothing launched");
   } finally {
     srv.close();
