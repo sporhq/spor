@@ -1194,6 +1194,72 @@ test("correction: pinned node is forced into the neighborhood", () => {
   assert.match(r.text, /pinned by corr-global-1/);
 });
 
+// Pipeline order (task-spor-compile-explicit-pipeline-and-ranker-extraction,
+// issue-spor-compile-pin-dropped-when-also-walked): pins are claimed in stage 1,
+// so a pin the structural walk ALSO reaches renders first and tagged — never in
+// walk order, untagged, where DIGEST_CAP could cut it — and exactly once.
+function pinWalkedFixture() {
+  const fx = pricingFixture();
+  fs.writeFileSync(path.join(fx.nodesDir, "corr-pin-walked.md"), `---
+id: corr-pin-walked
+type: correction
+title: Pin the reliability spec for the pricing decision
+target: dec-new
+pin: [spec-rc]
+date: 2026-06-11
+---
+The reliability spec bounds every pricing call.
+`);
+  return fx.load();
+}
+// The digest's node lines, and the index of the first one no pin claimed.
+const digestLines = (r) => r.text.split("\n").filter((l) => l.startsWith("- **"));
+const firstUnpinned = (lines) => lines.findIndex((l) => !/, pinned by corr-/.test(l));
+
+test("pipeline: a pin the walk also reaches leads the digest, tagged, exactly once", () => {
+  const g = pinWalkedFixture();
+  const base = graph.compile(pricingFixture().load(), { rootId: "dec-new", digest: true });
+  assert.ok(base.picks.structuralSet.has("spec-rc"), "precondition: the walk reaches spec-rc");
+  const r = graph.compile(g, { rootId: "dec-new", digest: true });
+  const lines = digestLines(r);
+  const at = lines.findIndex((l) => /^- \*\*spec-rc .*pinned by corr-pin-walked/.test(l));
+  assert.ok(at >= 0 && at < firstUnpinned(lines), "the walked pin renders in the leading pinned block");
+  assert.equal(lines.filter((l) => l.includes("**spec-rc ")).length, 1, "rendered once");
+  assert.ok(!r.picks.structuralSet.has("spec-rc"), "the structural arm no longer claims a pin");
+  assert.ok(r.picks.pinnedPicks.some(([id, c]) => id === "spec-rc" && c === "corr-pin-walked"));
+  assert.equal(r.meta.pinned, r.picks.pinnedPicks.length);
+});
+
+test("pipeline: a walked pin renders under PINNED in the briefing, not LINEAGE", () => {
+  const r = graph.compile(pinWalkedFixture(), { rootId: "dec-new", digest: false });
+  const pinnedAt = r.text.indexOf("## PINNED");
+  const lineageAt = r.text.indexOf("## LINEAGE");
+  const specAt = r.text.indexOf("### spec-rc ");
+  assert.ok(pinnedAt >= 0 && pinnedAt < specAt && specAt < lineageAt, "spec-rc sits in the PINNED section");
+  assert.equal(r.text.split("### spec-rc ").length - 1, 1, "rendered once");
+  assert.match(r.text, /### spec-rc [^\n]*\n\*selected via: pinned by corr-pin-walked\*/);
+});
+
+test("pipeline: a pin the content arm would pick is claimed by the pin stage", () => {
+  const g = pricingFixture().load();
+  const q = "actor model concurrency pricing engine";
+  const r = graph.compile(g, { query: q, digest: true });
+  assert.equal(r.relevant, true);
+  assert.ok(!r.picks.contentPicks.some((p) => p.id === "spec-actor"), "content arm skips the pin");
+  assert.ok(!r.picks.structuralSet.has("spec-actor"), "structural arm skips the pin");
+  const lines = digestLines(r);
+  assert.match(lines[0], /^- \*\*spec-actor .*pinned by corr-global-1/);
+  assert.equal(lines.filter((l) => l.includes("**spec-actor ")).length, 1);
+});
+
+test("pipeline: a rerank verdict on a walked pin neither reorders it nor counts as applied", () => {
+  const r = graph.compile(pinWalkedFixture(), { rootId: "dec-new", digest: true, rerankScores: { "spec-rc": { score: 0, noul: 0 } } });
+  const lines = digestLines(r);
+  const at = lines.findIndex((l) => /^- \*\*spec-rc .*pinned by corr-pin-walked/.test(l));
+  assert.ok(at >= 0 && at < firstUnpinned(lines), "a pin still leads");
+  assert.equal(r.meta.rerank, undefined, "no scored candidate rendered");
+});
+
 test("correction: global correction body line is appended to the digest", () => {
   const g = pricingFixture().load();
   const r = graph.compile(g, { rootId: "dec-new", digest: true });

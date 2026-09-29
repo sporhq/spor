@@ -15,13 +15,15 @@ Quote prices from art-catalogue; never recompute price figures inline.
 The plan tier table question gates the rollout order; the old single-vendor
 decision keeps misleading sessions and is excluded.
 
-## LINEAGE (structural arm: typed-edge walk)
+## PINNED (forced into the neighborhood by corrections)
 
 ### q-tier-pricing — Does the plan tier table inherit composed bundle discounts (question, 2026-06-10)
-*selected via: content seed, score 0.90*
+*selected via: pinned by corr-pricing-rollout*
 
 If tier discounts compound with composed bundle discounts the margin model
 breaks; if they price flat the price book contradicts the spec.
+
+## LINEAGE (structural arm: typed-edge walk)
 
 ### task-pricing-rollout — Roll out vendor neutral pricing to the price book (task, 2026-06-10)
 *selected via: content seed, score 0.85*

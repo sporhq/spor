@@ -18,6 +18,14 @@ Quote prices from art-catalogue; never recompute price figures inline.
 The plan tier table question gates the rollout order; the old single-vendor
 decision keeps misleading sessions and is excluded.
 
+## PINNED (forced into the neighborhood by corrections)
+
+### q-tier-pricing — Does the plan tier table inherit composed bundle discounts (question, 2026-06-10)
+*selected via: pinned by corr-pricing-rollout*
+
+If tier discounts compound with composed bundle discounts the margin model
+breaks; if they price flat the price book contradicts the spec.
+
 ## LINEAGE (structural arm: typed-edge walk)
 
 ### spec-rc — Billing cost spec (artifact, 2026-06-01)
@@ -32,12 +40,6 @@ construction.
 
 Price book pricing is vendor neutral: composed bundles price from the
 billing cost spec envelopes, never from a single vendor quote.
-
-### q-tier-pricing — Does the plan tier table inherit composed bundle discounts (question, 2026-06-10)
-*selected via: relates-to (inbound) from task-pricing-rollout, score 0.50*
-
-If tier discounts compound with composed bundle discounts the margin model
-breaks; if they price flat the price book contradicts the spec.
 
 ### art-catalogue — Published price book (artifact, 2026-06-05)
 *selected via: relates-to (inbound) from spec-rc, score 0.50*

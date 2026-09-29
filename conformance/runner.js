@@ -32,6 +32,7 @@ const kgraph = require("../lib/kernel/graph.js");
 const kfm = require("../lib/kernel/frontmatter.js");
 const kqueue = require("../lib/kernel/queue.js");
 const ktok = require("../lib/kernel/tokenizer.js");
+const krank = require("../lib/kernel/ranker.js");
 const { sandboxFor } = require("../lib/sandbox.js");
 
 const ROOT = __dirname;
@@ -213,6 +214,35 @@ const KINDS = {
       slug: ktok.slugify(s),
       slugMax: ktok.slugify(s, c.input.slugMax),
     })));
+  },
+
+  // the content arm's tf-idf index + cosine ranker (task-spor-compile-
+  // explicit-pipeline-and-ranker-extraction) — no corpus: the docs ARE the
+  // input. Pins the index (N, per-doc norm, df) and every query's full
+  // ranking, then applies the case's incremental `updates` (create/update
+  // through indexNode) and pins the rankings again. Sims are rounded to 12
+  // significant digits so a port's last-bit log()/sqrt() noise is not drift.
+  ranker(c) {
+    const sig = (x) => Number(x.toPrecision(12));
+    const byId = new Map(c.input.docs.map((d) => [d.id, d]));
+    const index = krank.buildIndex(c.input.docs);
+    const snapshot = () => ({
+      N: index.N,
+      norms: index.docs.map((d) => ({ id: d.id, norm: sig(d.norm) })),
+      df: Object.keys(index.df).sort().map((t) => [t, index.df[t]]),
+      rankings: c.input.queries.map((q) => ({
+        query: q.text,
+        exclude: q.exclude ?? [],
+        ranked: krank.rankAgainst(index, q.text, new Set(q.exclude ?? [])).map((r) => ({ id: r.id, sim: sig(r.sim) })),
+      })),
+    });
+    const out = { built: snapshot(), updated: null };
+    for (const u of c.input.updates ?? []) {
+      krank.indexNode(index, u, byId.get(u.id) ?? null);
+      byId.set(u.id, u);
+    }
+    if ((c.input.updates ?? []).length) out.updated = snapshot();
+    return json(out);
   },
 
   // validator diagnostics — JSON of the reportable surface (the parsed nodes

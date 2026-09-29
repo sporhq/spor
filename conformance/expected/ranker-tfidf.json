@@ -1,0 +1,1262 @@
+{
+  "built": {
+    "N": 8,
+    "norms": [
+      {
+        "id": "dec-price-book",
+        "norm": 9.50395531432
+      },
+      {
+        "id": "dec-bundle-discount",
+        "norm": 9.11692773953
+      },
+      {
+        "id": "issue-proto-keys",
+        "norm": 9.97265129647
+      },
+      {
+        "id": "task-empty",
+        "norm": 0
+      },
+      {
+        "id": "art-stopwords",
+        "norm": 0
+      },
+      {
+        "id": "dec-omvarld",
+        "norm": 7.49753310286
+      },
+      {
+        "id": "dec-japanese",
+        "norm": 9.06407553918
+      },
+      {
+        "id": "task-price-dup",
+        "norm": 9.99671080381
+      }
+    ],
+    "df": [
+      [
+        "book",
+        2
+      ],
+      [
+        "bundle",
+        1
+      ],
+      [
+        "bundles",
+        1
+      ],
+      [
+        "compose",
+        1
+      ],
+      [
+        "composed",
+        2
+      ],
+      [
+        "constructor",
+        1
+      ],
+      [
+        "discount",
+        1
+      ],
+      [
+        "discounts",
+        1
+      ],
+      [
+        "fel",
+        1
+      ],
+      [
+        "fra",
+        1
+      ],
+      [
+        "hasownproperty",
+        1
+      ],
+      [
+        "inherits",
+        1
+      ],
+      [
+        "isprototypeof",
+        1
+      ],
+      [
+        "keys",
+        1
+      ],
+      [
+        "kunden",
+        1
+      ],
+      [
+        "live",
+        1
+      ],
+      [
+        "motereferat",
+        1
+      ],
+      [
+        "nar",
+        1
+      ],
+      [
+        "neutral",
+        1
+      ],
+      [
+        "node",
+        1
+      ],
+      [
+        "object",
+        1
+      ],
+      [
+        "omvarldsanalys",
+        1
+      ],
+      [
+        "ostergaard",
+        1
+      ],
+      [
+        "plan",
+        2
+      ],
+      [
+        "price",
+        2
+      ],
+      [
+        "prices",
+        1
+      ],
+      [
+        "pricing",
+        1
+      ],
+      [
+        "proto",
+        1
+      ],
+      [
+        "prototype",
+        1
+      ],
+      [
+        "stack",
+        1
+      ],
+      [
+        "svaljer",
+        1
+      ],
+      [
+        "tostring",
+        1
+      ],
+      [
+        "trycker",
+        1
+      ],
+      [
+        "vag",
+        1
+      ],
+      [
+        "valueof",
+        1
+      ],
+      [
+        "vendor",
+        1
+      ],
+      [
+        "whose",
+        1
+      ],
+      [
+        "words",
+        1
+      ],
+      [
+        "した",
+        1
+      ],
+      [
+        "しま",
+        1
+      ],
+      [
+        "予算",
+        1
+      ],
+      [
+        "会議",
+        1
+      ],
+      [
+        "日程",
+        1
+      ],
+      [
+        "東京",
+        1
+      ],
+      [
+        "確認",
+        1
+      ]
+    ],
+    "rankings": [
+      {
+        "query": "vendor neutral price book pricing",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-price-book",
+            "sim": 0.850621085445
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0.468807230938
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "composed bundle discount",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0.713211413419
+          },
+          {
+            "id": "dec-price-book",
+            "sim": 0.0621970413571
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "constructor toString",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "issue-proto-keys",
+            "sim": 0.737209780774
+          },
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "__proto__ hasOwnProperty valueOf",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "issue-proto-keys",
+            "sim": 0.361157559257
+          },
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "the and of a",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "zzqx gibberish wibble",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "omvarldsanalys svaljer",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-omvarld",
+            "sim": 0.588348405415
+          },
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "予算を確認",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-japanese",
+            "sim": 0.486664263392
+          },
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "price book",
+        "exclude": [
+          "dec-price-book",
+          "task-price-dup"
+        ],
+        "ranked": [
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          }
+        ]
+      }
+    ]
+  },
+  "updated": {
+    "N": 9,
+    "norms": [
+      {
+        "id": "dec-price-book",
+        "norm": 9.50395531432
+      },
+      {
+        "id": "dec-bundle-discount",
+        "norm": 8.4894164746
+      },
+      {
+        "id": "issue-proto-keys",
+        "norm": 9.97265129647
+      },
+      {
+        "id": "task-empty",
+        "norm": 0
+      },
+      {
+        "id": "art-stopwords",
+        "norm": 0
+      },
+      {
+        "id": "dec-omvarld",
+        "norm": 7.49753310286
+      },
+      {
+        "id": "dec-japanese",
+        "norm": 9.06407553918
+      },
+      {
+        "id": "task-price-dup",
+        "norm": 9.99671080381
+      },
+      {
+        "id": "dec-new-wibble",
+        "norm": 7.98581638789
+      }
+    ],
+    "df": [
+      [
+        "applies",
+        1
+      ],
+      [
+        "book",
+        4
+      ],
+      [
+        "bundle",
+        2
+      ],
+      [
+        "bundles",
+        1
+      ],
+      [
+        "composed",
+        1
+      ],
+      [
+        "constructor",
+        2
+      ],
+      [
+        "discount",
+        1
+      ],
+      [
+        "discounts",
+        1
+      ],
+      [
+        "fel",
+        1
+      ],
+      [
+        "flat",
+        1
+      ],
+      [
+        "fra",
+        1
+      ],
+      [
+        "hasownproperty",
+        1
+      ],
+      [
+        "isprototypeof",
+        1
+      ],
+      [
+        "keys",
+        1
+      ],
+      [
+        "kunden",
+        1
+      ],
+      [
+        "like",
+        1
+      ],
+      [
+        "live",
+        1
+      ],
+      [
+        "motereferat",
+        1
+      ],
+      [
+        "nar",
+        1
+      ],
+      [
+        "neutral",
+        1
+      ],
+      [
+        "never",
+        1
+      ],
+      [
+        "node",
+        1
+      ],
+      [
+        "object",
+        1
+      ],
+      [
+        "omvarldsanalys",
+        1
+      ],
+      [
+        "one",
+        1
+      ],
+      [
+        "ostergaard",
+        1
+      ],
+      [
+        "plan",
+        2
+      ],
+      [
+        "price",
+        4
+      ],
+      [
+        "priced",
+        1
+      ],
+      [
+        "prices",
+        1
+      ],
+      [
+        "pricing",
+        2
+      ],
+      [
+        "proto",
+        1
+      ],
+      [
+        "prototype",
+        1
+      ],
+      [
+        "stack",
+        1
+      ],
+      [
+        "svaljer",
+        1
+      ],
+      [
+        "tostring",
+        1
+      ],
+      [
+        "trycker",
+        1
+      ],
+      [
+        "vag",
+        1
+      ],
+      [
+        "valueof",
+        1
+      ],
+      [
+        "vendor",
+        1
+      ],
+      [
+        "whose",
+        1
+      ],
+      [
+        "wibble",
+        1
+      ],
+      [
+        "words",
+        1
+      ],
+      [
+        "zzqx",
+        1
+      ],
+      [
+        "した",
+        1
+      ],
+      [
+        "しま",
+        1
+      ],
+      [
+        "予算",
+        1
+      ],
+      [
+        "会議",
+        1
+      ],
+      [
+        "日程",
+        1
+      ],
+      [
+        "東京",
+        1
+      ],
+      [
+        "確認",
+        1
+      ]
+    ],
+    "rankings": [
+      {
+        "query": "vendor neutral price book pricing",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-price-book",
+            "sim": 0.814188468148
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0.309137530896
+          },
+          {
+            "id": "dec-new-wibble",
+            "sim": 0.123147593216
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0.0515108802788
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "composed bundle discount",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0.262618073056
+          },
+          {
+            "id": "dec-price-book",
+            "sim": 0.0928382049796
+          },
+          {
+            "id": "dec-new-wibble",
+            "sim": 0.0820582525797
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "constructor toString",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "issue-proto-keys",
+            "sim": 0.697473178612
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0.0922408542471
+          },
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          },
+          {
+            "id": "dec-new-wibble",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "__proto__ hasOwnProperty valueOf",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "issue-proto-keys",
+            "sim": 0.361157559257
+          },
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          },
+          {
+            "id": "dec-new-wibble",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "the and of a",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          },
+          {
+            "id": "dec-new-wibble",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "zzqx gibberish wibble",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-new-wibble",
+            "sim": 0.778215938338
+          },
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          },
+          {
+            "id": "dec-new-wibble",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "omvarldsanalys svaljer",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-omvarld",
+            "sim": 0.588348405415
+          },
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          },
+          {
+            "id": "dec-new-wibble",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "予算を確認",
+        "exclude": [],
+        "ranked": [
+          {
+            "id": "dec-japanese",
+            "sim": 0.486664263392
+          },
+          {
+            "id": "dec-price-book",
+            "sim": 0
+          },
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "task-price-dup",
+            "sim": 0
+          },
+          {
+            "id": "dec-new-wibble",
+            "sim": 0
+          }
+        ]
+      },
+      {
+        "query": "price book",
+        "exclude": [
+          "dec-price-book",
+          "task-price-dup"
+        ],
+        "ranked": [
+          {
+            "id": "dec-bundle-discount",
+            "sim": 0.163391916998
+          },
+          {
+            "id": "dec-new-wibble",
+            "sim": 0.143608174068
+          },
+          {
+            "id": "issue-proto-keys",
+            "sim": 0
+          },
+          {
+            "id": "task-empty",
+            "sim": 0
+          },
+          {
+            "id": "art-stopwords",
+            "sim": 0
+          },
+          {
+            "id": "dec-omvarld",
+            "sim": 0
+          },
+          {
+            "id": "dec-japanese",
+            "sim": 0
+          }
+        ]
+      }
+    ]
+  }
+}

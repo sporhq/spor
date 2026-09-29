@@ -48,6 +48,13 @@ artifact (REFACTOR.md §2).
     without accents, non-decomposing letters (ø æ ß) and unspaced Japanese
     all seed the right node. The tokenizer's own edge-case corpus is the
     corpus-less `tokenizer-unicode` case: its input strings ARE the fixture.
+  - The content arm's tf-idf index and cosine ranker (lib/kernel/ranker.js,
+    task-spor-compile-explicit-pipeline-and-ranker-extraction) likewise has a
+    corpus-less case, `ranker-tfidf`: inline docs + queries pin the index
+    (N, per-doc norm, df) and every query's full ranking — prototype-key
+    tokens, zero-norm docs, unknown/empty queries, excludes — then the
+    incremental `indexNode` update/create path re-ranked. Sims are rounded to
+    12 significant digits.
   - `meridian` — the self-contained example org from wf/lenses/examples
     (dec-demo-vocab-in-fixtures): graph-resident schema vocabulary, lenses,
     workspaces.
@@ -57,7 +64,7 @@ artifact (REFACTOR.md §2).
     not content).
 - `cases/<id>.json` — one pinned invocation each: `kind`
   (compile | skeleton | queue | validate | frontmatter | frontmatter-edit |
-  tokenizer | viewtree | queue-viewtree | runs),
+  tokenizer | ranker | viewtree | queue-viewtree | runs),
   `corpus`, `input`, `expected`, and a `covers` note.
 - `expected/` — the goldens. Treat diffs here like source diffs in review.
 - `runner.js` — runner one: the JS kernel. `--update` regenerates goldens,

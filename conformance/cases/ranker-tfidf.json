@@ -1,0 +1,34 @@
+{
+  "id": "ranker-tfidf",
+  "kind": "ranker",
+  "input": {
+    "docs": [
+      { "id": "dec-price-book", "title": "Vendor neutral price book", "summary": "The price book prices vendor-neutral.", "body": "Composed bundles and plan pricing live in the price book." },
+      { "id": "dec-bundle-discount", "title": "Bundle discounts compose", "summary": "Composed bundle discounts stack.", "body": "A composed bundle inherits each plan discount." },
+      { "id": "issue-proto-keys", "title": "constructor toString valueOf", "summary": "A node whose words are Object.prototype keys.", "body": "constructor constructor hasOwnProperty __proto__ isPrototypeOf toString" },
+      { "id": "task-empty", "title": "", "summary": "", "body": "" },
+      { "id": "art-stopwords", "title": "The and of", "summary": "a an the", "body": "of to in is it" },
+      { "id": "dec-omvarld", "title": "Omvärldsanalys för väg", "summary": "Sväljer fel när kunden trycker", "body": "Møtereferat fra Østergaard om omvärldsanalys." },
+      { "id": "dec-japanese", "title": "予算と日程", "summary": "東京で会議をしました。", "body": "予算と日程を確認しました。" },
+      { "id": "task-price-dup", "title": "Price book price book price book", "summary": "price price price", "body": "book" }
+    ],
+    "queries": [
+      { "text": "vendor neutral price book pricing" },
+      { "text": "composed bundle discount" },
+      { "text": "constructor toString" },
+      { "text": "__proto__ hasOwnProperty valueOf" },
+      { "text": "the and of a" },
+      { "text": "zzqx gibberish wibble" },
+      { "text": "" },
+      { "text": "omvarldsanalys svaljer" },
+      { "text": "予算を確認" },
+      { "text": "price book", "exclude": ["dec-price-book", "task-price-dup"] }
+    ],
+    "updates": [
+      { "id": "dec-bundle-discount", "title": "Bundle discounts are flat", "summary": "Plan discounts never stack.", "body": "The price book applies one flat discount per plan; constructor." },
+      { "id": "dec-new-wibble", "title": "Wibble pricing", "summary": "A wibble is priced like a bundle.", "body": "zzqx wibble price book." }
+    ]
+  },
+  "expected": "ranker-tfidf.json",
+  "covers": "the content arm's tf-idf index and cosine ranker (lib/kernel/ranker.js): per-doc norms and df over a mixed corpus, prototype-key tokens (constructor/toString/__proto__/hasOwnProperty — the NaN-norm class, issue-cc-gardener-near-dup-unnormalized-cosine) scoring as ordinary finite terms, an empty doc and a stopword-only doc (zero norm scores 0, never the raw dot product), repeated terms, Unicode-folded and segmented queries, an unknown-word and an empty query (all-zero ranking), excludeIds, and the incremental indexNode update + create path re-ranked against the patched index."
+}
