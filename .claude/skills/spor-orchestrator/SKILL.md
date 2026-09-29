@@ -627,8 +627,11 @@ resolved on the graph? branch has commits?), then hand off one branch.
 Spawn the merge-subagent with the CAS flow from **`references/merge.md`** as its
 contract: rebase the node branch onto committed main, run the fast/targeted
 tests, confirm the cross-model review (Codex, or `/code-review` as its
-fallback) is clean, merge via the `git update-ref` CAS loop
-(retrying if main moved under it), run the full suite after, then
+fallback) is clean, land via `scripts/land.sh` (ancestry guard + `git
+update-ref` CAS, retrying if main moved under it; it parks any checkout that
+has main checked out and advances it with git's own checkout, so no shared
+root is left lying about its state), run the full suite
+after in a fresh detached worktree (`--verify`), then
 `git worktree remove`. Require it to return a **tight verdict** and nothing else:
 either `MERGED <sha>` with the test pass/fail counts, or `FAILED at <step>:
 <reason>` with main left untouched/reverted, or `ESCALATE: <reason>` for a

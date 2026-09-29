@@ -72,7 +72,7 @@ const { loadConfig, DEFAULT_SERVER, describeTenantRefusal } = require(path.join(
 const remote = require(path.join(ROOT, "lib", "remote.js"));
 const auth = require(path.join(ROOT, "lib", "auth.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
-const { gitSpawn } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
+const { gitSpawn, gitOracle } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 const { writeSpoolFile } = require(path.join(ROOT, "lib", "shell", "spool.js"));
 const dispatchRuns = lazyModule(path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js"));
 const dispatchTerminal = lazyModule(path.join(ROOT, "lib", "shell", "dispatch-terminal.js"));
@@ -4782,26 +4782,35 @@ function rewriteStatus(raw, value) {
 const ANCESTRY_COMPLETION_STATUSES = new Set(["done", "resolved", "completed", "merged"]);
 const ANCESTRY_TRUNK_REFS = ["main", "master", "origin/main", "origin/master"];
 
-// `git -C <dir> <args>` -> ok (exit 0) | not-ok (any other exit, a spawn
-// failure, or the timeout firing) — never throws.
-function gitProbeOk(dir, args) {
-  const r = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", timeout: 5000 });
-  return !r.error && r.status === 0;
+// `git <args>` in <dir> -> "hit" | "miss" | "error" (lib/shell/git-exec.js
+// gitOracle): hit = exit 0, miss = exit 1 (what `rev-parse --verify --quiet`
+// and `merge-base --is-ancestor` answer "no" with), error = git could not
+// answer (a spawn failure, the timeout firing, any other exit) — never throws.
+function gitProbe(dir, args) {
+  return gitOracle(dir, args, { timeout: 5000 }).state;
 }
 
 // isLandedLocally(dir, sha) -> {known, landed} — the same third state as the
 // server's makeAncestryOracle: known:false means unverifiable (sha absent
 // from the checkout, no trunk ref resolves, or git errored) and must never
 // be read as "unlanded"; only known:true, landed:false is evidence-backed.
+// A trunk probe that ERRORED is not a trunk that does not exist — it could be
+// the one that says yes — so it makes the answer unknown rather than
+// silently narrowing the set of trunks consulted
+// (task-spor-git-shell-fail-closed-oracles).
 function isLandedLocally(dir, sha) {
-  if (!gitProbeOk(dir, ["rev-parse", "--verify", "--quiet", `${sha}^{commit}`])) return { known: false, landed: null };
-  const trunks = ANCESTRY_TRUNK_REFS.filter((ref) => gitProbeOk(dir, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]));
+  if (gitProbe(dir, ["rev-parse", "--verify", "--quiet", `${sha}^{commit}`]) !== "hit") return { known: false, landed: null };
+  const trunks = [];
+  for (const ref of ANCESTRY_TRUNK_REFS) {
+    const state = gitProbe(dir, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+    if (state === "error") return { known: false, landed: null };
+    if (state === "hit") trunks.push(ref);
+  }
   if (!trunks.length) return { known: false, landed: null };
-  const answered = [];
   for (const ref of trunks) {
-    const r = spawnSync("git", ["-C", dir, "merge-base", "--is-ancestor", sha, ref], { encoding: "utf8", timeout: 5000 });
-    if (!r.error && r.status === 0) return { known: true, landed: true };
-    if (!r.error && r.status === 1) { answered.push(ref); continue; }
+    const state = gitProbe(dir, ["merge-base", "--is-ancestor", sha, ref]);
+    if (state === "hit") return { known: true, landed: true };
+    if (state === "miss") continue;
     return { known: false, landed: null }; // an errored trunk could be the one that says yes
   }
   return { known: true, landed: false };
@@ -11621,7 +11630,7 @@ function rescueDiagnosisPath(cwd, name) {
 // written, leaves the gates' own untracked-residue tolerance as the backstop.
 function excludeRescueDiagnosisDir(cwd) {
   try {
-    const r = spawnSync("git", ["-C", cwd, "rev-parse", "--git-path", "info/exclude"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
+    const r = gitSpawn(cwd, ["rev-parse", "--git-path", "info/exclude"], { timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
     if (r.status !== 0) return false;
     const rel = String(r.stdout || "").trim();
     if (!rel) return false;

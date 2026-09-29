@@ -43,7 +43,7 @@
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
-const { envWithoutRepoLocalVars } = require("./heal-stale-root.js");
+const { envWithoutRepoLocalVars } = require("../lib/shell/git-exec.js");
 
 const ROOT = path.join(__dirname, "..");
 const PRELOADS = [

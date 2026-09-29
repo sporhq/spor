@@ -2541,8 +2541,8 @@ Second idless body.
 // (issue-spor-read-graph-files-single-file-abort). This must not abort the
 // whole load any more than an unparseable node does; it rides the same
 // graph.skipped record and stderr warning.
-// chmod 0o000 only withholds read on POSIX for a non-root uid (see
-// test/heal-stale-root.test.js's identical guard): on Windows it does not
+// chmod 0o000 only withholds read on POSIX for a non-root uid: on Windows
+// it does not
 // block readFileSync, and root ignores permission bits entirely — either
 // way the file would read fine and the test would pass green without
 // exercising the skip path it exists to pin.

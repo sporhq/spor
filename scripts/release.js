@@ -27,6 +27,7 @@ const { spawnSync } = require('child_process');
 const readline = require('readline');
 
 const ROOT = path.resolve(__dirname, '..');
+const { gitEnv } = require(path.join(ROOT, 'lib', 'shell', 'git-exec.js'));
 
 // The five version strings that MUST move together (publish.yaml enforces it).
 const MANIFESTS = [
@@ -49,9 +50,10 @@ function info(msg) { console.log(msg); }
 function ok(msg) { console.log(`\x1b[32m✓\x1b[0m ${msg}`); }
 
 // Run a command, streaming output; return trimmed stdout when captured.
-function run(cmd, args, { capture = false, allowFail = false } = {}) {
+function run(cmd, args, { capture = false, allowFail = false, env } = {}) {
   const res = spawnSync(cmd, args, {
     cwd: ROOT,
+    env,
     encoding: 'utf8',
     stdio: capture ? ['inherit', 'pipe', 'pipe'] : 'inherit',
   });
@@ -67,7 +69,9 @@ function run(cmd, args, { capture = false, allowFail = false } = {}) {
   return capture ? (res.stdout || '').trim() : '';
 }
 
-function git(args, opts) { return run('git', args, opts); }
+// Every git call gets git-exec.js's location scrub, so an ambient GIT_DIR/
+// GIT_WORK_TREE cannot retarget the release commit/tag at another repo.
+function git(args, opts) { return run('git', args, { ...opts, env: gitEnv() }); }
 function have(cmd) {
   const probe = process.platform === 'win32' ? 'where' : 'which';
   return spawnSync(probe, [cmd], { stdio: 'ignore' }).status === 0;

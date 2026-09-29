@@ -49,29 +49,36 @@ resume waiting for that command's result. A helper must not select more work.
    ```
 
    Proceed only when ancestry succeeds and the log contains the intended
-   commits. Under the serialized merge slot, verify the active target checkout
-   is on the agreed branch, still at `BASE`, with a clean index and tracked
-   files. Use `git merge --ff-only "$CANDIDATE"` there so Git updates the ref,
-   index and files together and protects obstructing untracked files. Never
-   stage unrelated untracked work. Recheck the resulting SHA.
+   commits. Land with the Spor client repo's landing script (it lives only in
+   `<spor-repo>`; invoke it by that path whichever repo you land in):
 
-   For a target branch that is not checked out, use the compare-and-swap
-   `git update-ref refs/heads/main "$CANDIDATE" "$BASE"` after the same gates.
-   CAS failure means main moved; reconcile and repeat affected checks. Never
+   ```bash
+   <spor-repo>/.claude/skills/spor-orchestrator/scripts/land.sh \
+     --repo <shared-root> --tip "$CANDIDATE" --target main
+   ```
+
+   It re-checks ancestry against the target's CURRENT tip, parks any checkout
+   that has the target branch checked out DETACHED at its own current commit
+   (HEAD only; index and files untouched), CASes `update-ref` from that tip to
+   the candidate, then advances each parked checkout (and the shared root on
+   later lands, already detached on main's line) with `git checkout
+   --detach <candidate>` (git carries unrelated local changes and refuses,
+   writing nothing, when one would be overwritten — such a checkout stays
+   detached behind, is listed `behind=`, and is retried next land). Never land INTO a checkout by
+   hand (no `reset --hard`): a ref-only move under a checked-out branch is
+   exactly what left shared roots stale and made hand-commits revert merged
+   work. `REFUSED reason=moved` means main moved; reconcile and repeat
+   affected checks. `REFUSED reason=not-descendant` means rebase again. Never
    substitute a tip you did not test. Substitute the agreed target branch if
    this repo does not use `main`.
-5. If a previous ref-only merge left a shared checkout stale, never use
-   `reset --hard`. For Spor, run `scripts/heal-stale-root.js --repo <shared-root>`
-   in dry-run mode. `IN-SYNC` needs nothing; only `STALE` permits `--apply`.
-   The helper searches first-parent history: it can conservatively report
-   `ROOT-UNSYNCED` when the old main survives as a merge's second parent.
-   Preserve the checkout on any refusal. If and only if your own just-completed
-   CAS is still the target tip and both the index and tracked files exactly
-   match captured `BASE`, you may CAS-undo that ref-only move and perform the
-   guarded fast-forward above. Otherwise use an isolated exact-SHA checkout
-   and investigate; never force healing or erase uncommitted work.
-6. Run the required post-merge suite on that exact merged tree (shared root
-   only when verified in sync). If it fails, report the regression immediately
+5. There is no root sync step and no healer (scripts/heal-stale-root.js is
+   retired). A `behind=` checkout has local changes in the way; report it and
+   preserve it — never clean it. A root already stale from a pre-`land.sh`
+   merge is handled the same way.
+6. Run the required post-merge suite on that exact merged tree in a fresh
+   detached worktree (`land.sh --verify "<cmd>"`, or `git worktree add
+   --detach <dir> "$CANDIDATE"`), never the shared root. That worktree is
+   bare: stage dependencies in the command for a repo that has them. If it fails, report the regression immediately
    and perform a reviewed revert within existing authorization, preserving
    commits that landed later. Do not force-push, blindly move main backwards,
    or claim successful completion. Keep the task unresolved pending recovery.
@@ -87,7 +94,7 @@ resume waiting for that command's result. A helper must not select more work.
    worktrees. Delete its branch only after confirming it is fully merged.
    Push only if publishing was authorized; local merging is not a push.
 
-Return `MERGED` with landed SHA, review/test evidence and root-sync status, or
+Return `MERGED` with landed SHA, review/test evidence and any `parked=`/`behind=` checkouts, or
 `FAILED`/`ESCALATE` with the precise blocker and preserved paths. A merge helper
 never resolves the graph; the supervisor does that after successful verification.
 

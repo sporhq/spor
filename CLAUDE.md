@@ -96,7 +96,7 @@ loaded box the suite's wall time is CPU starvation, not sleeps — a ~0.1
 CPU-second CLI spawn takes ~2s at load 30 — so per-spawn CPU is the lever.
 The runner also hands `node --test` an environment with git's repo-local
 variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, … — the pinned
-`GIT_LOCAL_ENV_VARS` in scripts/heal-stale-root.js) removed, so a suite
+`GIT_LOCAL_ENV_VARS` in lib/shell/git-exec.js) removed, so a suite
 launched from a git hook or `git bisect run` cannot point a scratch fixture at
 the host repo; `test/helpers/git.js` `gitEnv()` is the same scrub for a
 directly-run file and the one place to build a fixture's git env. And it always

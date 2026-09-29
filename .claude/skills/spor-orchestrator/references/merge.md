@@ -84,82 +84,95 @@ id, sanitized by dispatch).
    pass per increment, on the exact tree about to land, behind the cheap
    deterministic gate — is the token-for-quality trade.
 
-4. **CAS merge.** Fast-forward `main` to the rebased branch tip, but only if main
-   is still where you tested — AND only if the new tip actually descends from
-   it. The ancestry check is **mandatory**, never skip it:
+4. **Land — ancestry guard + CAS, never INTO a checkout.** Land with the
+   landing script, which lives only in the **spor client repo** (`<spor-repo>`
+   below — e.g. `~/repos/spor` on this machine), so invoke it by that path
+   whichever repo you are landing in:
 
    ```bash
-   OLD=$(git rev-parse main)
    NEW=$(git -C <worktree> rev-parse HEAD)     # rebased branch tip
-   git merge-base --is-ancestor "$OLD" "$NEW" || { echo "REFUSE: $NEW does not descend from $OLD — rebase first"; exit 1; }
    git log main.."$NEW"   # sanity check by eye: should list only THIS branch's own commits
-   git update-ref refs/heads/main "$NEW" "$OLD"  # fails if main moved
+   <spor-repo>/.claude/skills/spor-orchestrator/scripts/land.sh --repo <shared root> --tip "$NEW"
    ```
 
-   `update-ref <ref> <new> <old>` only asserts that `main` is **still at**
-   `$OLD` — it says nothing about whether `$NEW` is actually a *descendant* of
-   `$OLD`. If step 1's rebase was skipped or landed on the wrong base, `$NEW`
-   can be built from a stale ancestor of `$OLD`; the CAS still succeeds (main
-   really was at `$OLD`) but the swap silently **rewinds** main, dropping every
-   commit landed since `$NEW`'s base — with no error, because `update-ref`
-   never checked. This happened for real: a wave-7 merge subagent CAS'd spor
-   `main` from `68b944e` to `9cb447a` (a tip based on `8ebb3b6`, six commits
-   behind `68b944e`) without rebasing, and main silently lost those six
-   wave-6 commits until the orchestrator noticed and re-CAS'd
-   (issue-spor-orchestrator-merge-cas-lacks-ancestry-check). `git merge-base
-   --is-ancestor "$OLD" "$NEW"` exits 0 only when `$OLD` is an ancestor of
-   `$NEW`; a non-zero exit means the rebase either didn't happen or targeted
-   the wrong base — **REFUSE and go back to step 1, never swap anyway.** The
-   `git log main.."$NEW"` line is the same check by eye: it should list only
-   commits you recognize as this branch's own, never commits from someone
-   else's wave.
+   It prints one verdict line and does, in order:
 
-   If `update-ref` fails, main moved under you: go back to step 1 (re-rebase onto
-   the new main) and retry. This loop is the whole point — it's safe under
-   concurrent committers.
+   - **The ancestry guard** (mandatory, built in): `$NEW` must descend from
+     main's current tip `$OLD` (`git merge-base --is-ancestor`).
+     `update-ref <ref> <new> <old>` only asserts main is **still at** `$OLD` —
+     it says nothing about whether `$NEW` builds on it, so a skipped or
+     wrong-base rebase would CAS successfully and silently **rewind** main.
+     That happened for real: a wave-7 merge subagent CAS'd spor `main` from
+     `68b944e` to `9cb447a` (based on `8ebb3b6`, six commits behind) and main
+     lost six wave-6 commits until the orchestrator re-CAS'd
+     (issue-spor-orchestrator-merge-cas-lacks-ancestry-check). `REFUSED
+     reason=not-descendant` → go back to step 1, never swap anyway.
+   - **Parks any checkout that has main checked out** — detached at its OWN
+     current commit (`git checkout --detach`, no commit argument: HEAD stops
+     following main; index and working tree are untouched, nothing is
+     discarded). This is what retired `scripts/heal-stale-root.js`: `update-ref`
+     moves the ref and nothing else, so a checkout left ON main kept the old
+     commit's content and `git status` showed every merged file as modified —
+     indistinguishable from live WIP — and a hand-commit from it reverted merged
+     work three times (inc-spor-npm-release-stale-index-revert-4801b52,
+     inc-spor-triple-checkout-stale-revert-075adb2,
+     inc-spor-orchestrator-stale-root-revert-26c9ef9). A parked checkout's
+     `git status` is still exactly its own WIP, and a commit made there is off
+     the old base — which the next land's ancestry guard refuses instead of
+     silently reverting. The verdict line lists what it parked (`parked=…`).
+   - **The CAS**: `git update-ref refs/heads/main "$NEW" "$OLD"`. `REFUSED
+     reason=moved` → main moved under you: go back to step 1 (re-rebase onto
+     the new main) and retry. This loop is the whole point — it's safe under
+     concurrent committers. (A checkout parked before the refusal stays parked,
+     listed in `parked=` — consistent, just detached.)
+   - **Advances each parked checkout to `$NEW`** — and the shared root on
+     every later land too, since it is already detached on main's line — with
+     `git checkout --detach "$NEW"` — git's own checkout, which carries local changes to paths the
+     land didn't touch and refuses the WHOLE checkout, writing nothing, when a
+     change would be overwritten. It has to advance: `spor dispatch
+     --worktree` cuts every new agent branch from the shared root's HEAD, so a
+     root frozen at the first land would base every later dispatch on stale
+     code. A checkout git refused is left detached at its old commit
+     (consistent, only behind), listed as `behind=…`, and retried by the next
+     land. A root a human detached onto their OWN commit (not an ancestor of
+     main) is never moved.
 
-5. **Sync the shared root.** `update-ref` just moved the ref — the shared
-   checkout's index and working tree still hold the old commit's content, which
-   `git status` cannot tell apart from a parallel job's live WIP
-   (norm-spor-orchestrator-cas-merge). Never blind `git reset --hard main` here;
-   run the surgical heal instead — dry run first, `--apply` only once it
-   confirms every modified path is safely behind HEAD
-   (dec-spor-orchestrator-stale-root-heal-by-identity). The script itself lives
-   only in the **spor client repo** (`<spor-repo>` below — e.g. `~/repos/spor`
-   on this machine), not in spor-server or control-plane, so always invoke it
-   by that path regardless of which repo's shared root you're syncing:
+   Exit 0 `LANDED`/`NOOP`; exit 1 `REFUSED reason=…` means main did not move.
+   Keep the verdict line's `old=` as `$OLD` — step 6 and the reconcile use it.
+
+5. **No root sync step — and no healer.** Never `git reset --hard` a shared
+   checkout. Step 4 already left the shared root (and any checkout that
+   followed main) either at `$NEW` or, where git refused, consistently
+   detached behind it. A `behind=`
+   checkout is not a merge failure: note it in your report for a human (whose
+   local changes are in the way), and do not touch its paths. A root that was
+   ALREADY stale before this land (left on main by a pre-`land.sh` ref-only
+   merge) carries its stale blobs as local changes through the advance or is
+   left behind; report it the same way rather than trying to clean it.
+
+6. **Full `npm test` after the merge — in a fresh detached worktree, never the
+   shared root.** Fold it into the land with `--verify` (step 4's command plus
+   the flag), which checks the landed tip out into a throwaway detached
+   worktree, runs the command there, and removes the worktree on success:
 
    ```bash
-   node <spor-repo>/scripts/heal-stale-root.js --repo <shared root>            # dry run
+   <spor-repo>/.claude/skills/spor-orchestrator/scripts/land.sh --repo <shared root> --tip "$NEW" --verify "npm test"
    ```
 
-   - Exit 0, verdict `IN-SYNC` → nothing was modified; the root already matches
-     main.
-   - Exit 1, verdict `STALE` → every modified path is stale-not-novel and safe
-     to heal; re-run with `--apply` to actually check them out:
-     ```bash
-     node <spor-repo>/scripts/heal-stale-root.js --repo <shared root> --apply
-     ```
-     (exit 0 verdict `HEALED` on success).
-   - Exit 1, verdict `ROOT-UNSYNCED` or `UNVERIFIED`, or exit 2 → real WIP is
-     present, or the guard couldn't confirm the root either way. Do **not**
-     reset, heal further, or touch those paths — leave the shared root as-is.
-     This is not a merge failure (the CAS swap already succeeded); note it in
-     your report so a human can look, and verify THIS merge in a throwaway
-     detached worktree instead (`git worktree add --detach <dir> main`, per
-     norm-spor-orchestrator-cas-merge) rather than trusting the stale shared
-     root for step 6 below.
-
-6. **Full `npm test` after the merge.** This is the safety net that catches what
-   the targeted tests didn't. Run it from the shared root once step 5 confirms
-   `IN-SYNC`/`HEALED`; otherwise run it in the throwaway detached worktree from
-   step 5 instead, since the shared root can't be trusted to reflect `main` yet.
-   If it's red, you merged a regression — revert the merge and re-dispatch the
-   agent to fix, rather than leaving main broken. `git update-ref refs/heads/main
-   "$OLD" "$NEW"` is only safe if `main` is STILL at `$NEW` (re-check
-   `git rev-parse main` first — another committer may have advanced it since
-   your CAS landed); if it moved, use `git revert` instead so you don't clobber
-   their commit.
+   (Or run it yourself: `git worktree add --detach <dir> "$NEW"`, `npm test`
+   there, then `git worktree remove <dir>`.) The worktree is bare: spor is
+   zero-dep, but a repo with dependencies (spor-server) must stage them in the
+   command — `--verify "<its worktreeSetup script> && npm test"` — or a
+   missing `node_modules` reads as a regression. For a suite that may outlast the
+   Bash tool's 10-minute cap, land without `--verify`, then run the suite in
+   your own detached worktree detached-to-a-log and poll it in the foreground.
+   `VERIFY-FAILED … worktree=<dir>` (exit 3) means the swap LANDED and the
+   suite is red: you merged a regression — revert and re-dispatch the agent to
+   fix, rather than leaving main broken. `git update-ref refs/heads/main "$OLD"
+   "$NEW"` is only safe if `main` is STILL at `$NEW` (re-check `git rev-parse
+   main` first — another committer may have advanced it since your CAS landed);
+   if it moved, use `git revert` instead so you don't clobber their commit.
+   Remove the kept `<dir>` worktree once you've read the failure.
 
    Once it's green, **reconcile the landed range** — the commits you just put on
    `main` may carry `Spor:` trailers naming OTHER open items (a drive-by fix, a
@@ -167,7 +180,7 @@ id, sanitized by dispatch).
    their resolver (task-spor-landing-detect-shipped-resolver-draft):
 
    ```bash
-   spor reconcile-landed --dir <shared root or the step-5 worktree> --ref main --since "$OLD"
+   spor reconcile-landed --dir <shared root> --ref main --since "$OLD"   # $OLD = the verdict line's old=
    ```
 
    It only DRAFTS: each open task/issue a newly reachable commit names gets an

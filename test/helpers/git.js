@@ -6,7 +6,7 @@
 // It is also the ONE place a test fixture's git environment is built
 // (task-spor-acceptance-suites-on-isolated-ci-runners): `gitEnv()` strips
 // git's repo-local variables (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, … — the
-// same pinned set scripts/heal-stale-root.js scrubs) before adding the fixed
+// pinned GIT_LOCAL_ENV_VARS set in lib/shell/git-exec.js) before adding the fixed
 // identity, so a fixture run straight from a git hook or `git bisect run`
 // (`node --test test/foo.test.js`, bypassing scripts/test-run.js's own
 // scrub) still cannot reach the host repo
@@ -18,7 +18,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
 
-const { envWithoutRepoLocalVars } = require("../../scripts/heal-stale-root.js");
+const { envWithoutRepoLocalVars } = require("../../lib/shell/git-exec.js");
 
 const IDENTITY = {
   GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com",
