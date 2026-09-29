@@ -124,6 +124,7 @@ const { deriveReadiness, readinessOf } = require(path.join(ROOT, "lib", "kernel"
 // remote-cli-dispatch). Requiring the module only pulls its exports — its CLI
 // block is require.main-guarded.
 const analyticsLib = lazyModule(path.join(ROOT, "lib", "analytics.js"));
+const queueRender = lazyModule(path.join(ROOT, "lib", "queue.js"));
 
 // The CLI surface is a single declarative table (COMMANDS, defined below): it is
 // the one source of truth for dispatch, flag parsing (Node's built-in
@@ -593,30 +594,11 @@ async function cmdNext(cfg, args) {
       // a bare "queue empty" reads as "the whole backlog is empty".
       err(`no queue items for project '${scopeSlug}' (inferred from the current directory) — run 'spor next --all-projects' for the whole graph`);
     }
-    if (needAgents) {
-      const q = r.json || {};
-      const { items, hidden } = annotateInFlight(q.items || [], dispatchedAgents(cfg), hideDispatched);
-      q.items = items;
-      if (typeof q.count === "number") q.count = Math.max(0, q.count - hidden);
-      // --hide-dispatched shrinks .items below whatever fetchQueuePaged assembled,
-      // so returned_count (task-spor-next-pagination-metadata-coherence) must
-      // shrink with it too or it stops matching q.items.length in the final
-      // payload actually handed to the caller.
-      if (typeof q.returned_count === "number") q.returned_count = Math.max(0, q.returned_count - hidden);
-      if (hideDispatched) q.hidden_dispatched = hidden;
-      if (wantJson) {
-        out(JSON.stringify(q));
-        return 0;
-      }
-      renderQueue(q, hidden);
-      return 0;
-    }
-    if (wantJson) {
-      out(JSON.stringify(r.json));
-      return 0;
-    }
-    renderQueue(r.json);
-    return 0;
+    // ONE renderer and ONE JSON form for both modes
+    // (task-spor-local-remote-single-renderer-conformance): the server's body is
+    // the canonical envelope, printed pretty like local's and rendered through
+    // lib/queue.js renderReport — the same function local mode prints through.
+    return emitQueue(cfg, r.json || {}, { wantJson, hideDispatched, needAgents });
   }
   // local: byte-identical passthrough. When no --project was given but a default
   // is pinned, inject it so the local read inherits the same default scope as
@@ -653,43 +635,31 @@ function nextLocalInFlight(cfg, localArgs, { wantJson, hideDispatched }) {
     if (r.stdout) process.stdout.write(r.stdout); // forward queue.js's own output
     return status;
   }
-  const { items, hidden } = annotateInFlight(q.items || [], dispatchedAgents(cfg), hideDispatched);
-  q.items = items;
-  if (typeof q.count === "number") q.count = Math.max(0, q.count - hidden);
-  if (hideDispatched) q.hidden_dispatched = hidden;
-  if (wantJson) {
-    out(JSON.stringify(q, null, 2)); // match queue.js --json (pretty, 2-space)
-    return status;
-  }
-  renderQueueLocalText(q, hidden);
+  emitQueue(cfg, q, { wantJson, hideDispatched, needAgents: true });
   return status;
 }
 
-// Mirror lib/queue.js's HUMAN render for the local --hide-dispatched text path
-// (the --json path re-emits queue.js's own object, so only this form is
-// reconstructed). Kept byte-identical to queue.js by a conformance test — if
-// queue.js's line format moves, that test fails and both must move together
-// (norm-cc-byte-identical-refactor). count was already decremented by `hidden`,
-// so the "(N more — raise --limit)" overflow math is unaffected by hiding.
-function renderQueueLocalText(q, hidden = 0) {
-  const items = (q && q.items) || [];
-  if (!items.length) out("queue empty — nothing queueable and live");
-  for (const [i, it] of items.entries()) {
-    out(`${i + 1}. [${it.score}] ${it.id} — ${it.title} (${it.type}${it.status ? `, ${it.status}` : ""}${it.suggest === "close" ? ", suggest: close" : ""})`);
-    out(`   ${it.why}`);
+// Emit a queue envelope — either mode's — as `spor next` prints it: the
+// in-flight cross-reference when asked (task-spor-cli-in-flight-surface, a
+// client-side presentation neither the server nor lib/queue.js can compute), then
+// the envelope as pretty JSON or through lib/queue.js renderReport, the one text
+// renderer (task-spor-local-remote-single-renderer-conformance). Always 0.
+function emitQueue(cfg, q, { wantJson, hideDispatched, needAgents }) {
+  let hidden = 0;
+  if (needAgents) {
+    const kept = annotateInFlight(q.items || [], dispatchedAgents(cfg), hideDispatched);
+    hidden = kept.hidden;
+    q.items = kept.items;
+    if (typeof q.count === "number") q.count = Math.max(0, q.count - hidden);
+    // --hide-dispatched shrinks .items below the page the envelope described, so
+    // returned_count (task-spor-next-pagination-metadata-coherence) must shrink
+    // with it or it stops matching q.items.length.
+    if (typeof q.returned_count === "number") q.returned_count = Math.max(0, q.returned_count - hidden);
+    if (hideDispatched) q.hidden_dispatched = hidden;
   }
-  if (q.count > items.length) out(`(${q.count - items.length} more — raise --limit)`);
-  if (q.muted > 0) out(`(${q.muted} muted — your queue_mute)`);
-  if (q.blocked > 0) out(`(${q.blocked} blocked — gated by live work, hidden until unblocked)`);
-  // Agent-readiness breakdown (issue-spor-local-queue-render-mirror-missing-
-  // readiness-counts): the lead line lib/queue.js's human render prints
-  // (queue.js:210-213), present only when the kernel emits counts_by_readiness
-  // (the graph carries readiness signal, or a --readiness facet was asked for).
-  if (q.counts_by_readiness) {
-    const c = q.counts_by_readiness;
-    out(`readiness: ${c.agent} agent-ready, ${c.human} need human, ${c.untriaged} untriaged`);
-  }
-  if (hidden > 0) out(`(${hidden} in-flight hidden — --hide-dispatched)`);
+  if (wantJson) out(JSON.stringify(q, null, 2));
+  else out(queueRender.renderReport(q, { hidden }));
+  return 0;
 }
 
 // preflight.liveWorkspaceWriters's caller-side half. Occupancy is read off the
@@ -756,41 +726,6 @@ function annotateInFlight(items, agentMap, hide) {
     kept.push(it);
   }
   return { items: kept, hidden };
-}
-
-function renderQueue(q, hidden = 0) {
-  const items = (q && q.items) || [];
-  if (!items.length) {
-    out("queue empty — nothing queueable and live");
-  } else {
-    for (const it of items) {
-      out(`${(it.score ?? 0).toFixed ? it.score.toFixed(2) : it.score}  ${it.suggest || "do"}  ${it.id}`);
-      if (it.why) out(`        ${it.why}`);
-    }
-  }
-  // Overflow hint (task-spor-next-limit-flag): when the page shows fewer than the
-  // full ranked total, say how many more and how to get them — the remote mirror
-  // of lib/queue.js's "(N more — raise --limit)". count is the full-set total
-  // (the server ranks the whole set and slices only the page); with --limit 0
-  // every item is fetched, so count == items.length and this stays silent.
-  if (q && typeof q.count === "number" && q.count > items.length) {
-    out(`(${q.count - items.length} more — raise --limit, or --limit 0 for all)`);
-  }
-  // Counted, not silent: blocked items are gated out of the actionable queue
-  // (dec-spor-queue-hide-blocked), reported so their disappearance is never
-  // silent. Present only when the server forwards r.blocked; absent => no line.
-  if (q && q.blocked > 0) out(`(${q.blocked} blocked — gated by live work, hidden until unblocked)`);
-  // Agent-readiness breakdown (task-spor-queue-remote-readiness-ignored): the
-  // remote mirror of lib/queue.js's own readiness lead line — present only
-  // when the server sends counts_by_readiness (graph has readiness signal, or
-  // a --readiness facet was asked for).
-  if (q && q.counts_by_readiness) {
-    const c = q.counts_by_readiness;
-    out(`readiness: ${c.agent} agent-ready, ${c.human} need human, ${c.untriaged} untriaged`);
-  }
-  // Never-silent truncation (task-spor-cli-in-flight-surface): report what
-  // --hide-dispatched removed, the way queue.js surfaces the muted count.
-  if (hidden > 0) out(`(${hidden} in-flight hidden — --hide-dispatched)`);
 }
 
 // --limit parse for `spor next` (task-spor-next-limit-flag). Default is
@@ -3454,9 +3389,8 @@ function changesLocal(cfg, args) {
     let g = null;
     try { g = graphLib.loadGraph(nodesDir); } catch { /* unreadable graph -> no scoping */ }
     if (g) {
-      if (!graphLib.projectKnown(g, project)) {
-        err(`project '${project}' matched no repo or grouping — changes is empty (try a repo slug, a repo-<slug> node id, or a grouping id)`);
-      }
+      const warning = graphLib.unknownProjectWarning(g, project, "changes");
+      if (warning) err(warning);
       const scope = graphLib.scopeFor(g, project);
       keep = (fm) => fm != null && scope.has(graphLib.resolveProject(g, fm.project));
     }
@@ -9063,9 +8997,8 @@ async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}, OFFSET = 0) {
       // The local twin of the remote warning above (norm-spor-cli-mode-parity):
       // lib/queue.js prints this only from its CLI main, which rankQueue
       // bypasses, so say it here — same text, same once-per-token throttle.
-      if (slug && !graphLib.projectKnown(g, slug)) {
-        warnQueueProjectOnce(slug, `project '${slug}' matched no repo or grouping — queue is empty (try a repo slug, a repo-<slug> node id, or a grouping id)`);
-      }
+      const warning = graphLib.unknownProjectWarning(g, slug, "queue");
+      if (warning) warnQueueProjectOnce(slug, warning);
       const { rankQueue } = require(path.join(ROOT, "lib", "queue.js"));
       const opts = { limit: OFFSET + LIMIT, excludeTypes: ["question"] };
       const r = rankQueue(g, slug ? { project: slug, ...opts } : opts);

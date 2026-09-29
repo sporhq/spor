@@ -73,14 +73,14 @@ test("local next default caps at 20 and reports the overflow", () => {
   const { nodes } = fixture(25);
   const def = run(["next", "--nodes", nodes]);
   assert.strictEqual(itemLines(def.stdout).length, 20);
-  assert.match(def.stdout, /\(5 more — raise --limit\)/);
+  assert.match(def.stdout, /\(5 more — raise --limit, or --limit 0 for all\)/);
 });
 
 test("local next --limit N caps at N", () => {
   const { nodes } = fixture(25);
   const r = run(["next", "--nodes", nodes, "--limit", "3"]);
   assert.strictEqual(itemLines(r.stdout).length, 3);
-  assert.match(r.stdout, /\(22 more — raise --limit\)/);
+  assert.match(r.stdout, /\(22 more — raise --limit, or --limit 0 for all\)/);
 });
 
 // ---------------- remote mode (paged GET /v1/queue) ----------------

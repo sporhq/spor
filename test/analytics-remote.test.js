@@ -90,9 +90,7 @@ function analyticsStub(g) {
     const types = u.searchParams.getAll("type").flatMap((v) => v.split(",")).map((s) => s.trim()).filter(Boolean);
     let inScope = null, projectWarning = null;
     if (project) {
-      if (!graphLib.projectKnown(g, project)) {
-        projectWarning = `project '${project}' matched no repo or grouping — analytics is empty (try a repo slug, a repo-<slug> node id, or a grouping id)`;
-      }
+      projectWarning = graphLib.unknownProjectWarning(g, project, "analytics");
       const scope = graphLib.scopeFor(g, project);
       inScope = (node) => scope.has(graphLib.resolveProject(g, node.project));
     }
@@ -174,7 +172,7 @@ test("remote: a zero-match --project surfaces the warning on stderr (parity with
   try {
     const r = await runAsync(["analytics", "--project", "zzz-nope", "--json"], remoteEnv(freshHome(), base));
     assert.strictEqual(r.status, 0, r.stderr);
-    assert.match(r.stderr, /project 'zzz-nope' matched no repo or grouping — analytics is empty/);
+    assert.match(r.stderr, /project 'zzz-nope' matched no repo, grouping, or project stamp on any resident node — analytics is empty/);
     const j = JSON.parse(r.stdout); // valid JSON ...
     assert.ok(!("project_warning" in j), "project_warning stripped from the rendered report");
   } finally {

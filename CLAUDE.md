@@ -136,6 +136,15 @@ node lib/compile.js --query "some task text" --digest # prompt-time digest
 node lib/compile.js --query "gibberish zzz" --digest  # must emit NOTHING (gate)
 ```
 
+Dual-mode read verbs are held to norm-spor-cli-mode-parity by a TEST, not
+review (task-spor-local-remote-single-renderer-conformance):
+`test/mode-parity.test.js` runs each verb (`next`, `analytics`) in local mode
+over a fixture graph and in remote mode against `test/helpers/stub-spor-server.js`
+serving the same graph, and requires byte-identical stdout/stderr and an
+identical `--json` envelope (minus the server-only routing fields). A new
+dual-mode read verb should add its rows there, render both arms through ONE
+renderer over the server's envelope, and model its route in the stub.
+
 Hooks are tested by piping simulated payloads through the dispatcher (all
 read JSON on stdin; engines live in `scripts/engines/`, dispatched in-process
 by `bin/spor-hook.js` — `bin/spor-hook` is its POSIX shim,

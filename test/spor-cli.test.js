@@ -649,7 +649,8 @@ test('next (local) warns on stderr for an unknown --project token, still exits 0
   const { nodes } = queueScopeGraph();
   const r = run(['next', '--nodes', nodes, '--project', 'zzz-nonexistent']);
   assert.strictEqual(r.status, 0, 'fail-open: still exits 0');
-  assert.match(r.stderr, /project 'zzz-nonexistent' matched no repo or grouping/);
+  // the ONE text both modes print (task-spor-local-remote-single-renderer-conformance)
+  assert.match(r.stderr, /project 'zzz-nonexistent' matched no repo, grouping, or project stamp/);
   assert.match(r.stderr, /repo-<slug> node id/); // names the valid forms
   assert.match(r.stdout, /queue empty/);
 });
@@ -659,12 +660,12 @@ test('next (local) does NOT warn for a known repo slug / repo id (0.4.x semantic
   // a bare slug up-resolves (deliberate) and is KNOWN -> no warning, alpha only
   const bySlug = run(['next', '--nodes', nodes, '--project', 'alpha']);
   assert.strictEqual(bySlug.status, 0, bySlug.stderr);
-  assert.doesNotMatch(bySlug.stderr, /matched no repo or grouping/);
+  assert.doesNotMatch(bySlug.stderr, /matched no repo/);
   assert.match(bySlug.stdout, /task-alpha-1/);
   assert.doesNotMatch(bySlug.stdout, /task-beta-1/);
   // a repo NODE id pins the single repo -> known, no warning
   const byId = run(['next', '--nodes', nodes, '--project', 'repo-beta']);
-  assert.doesNotMatch(byId.stderr, /matched no repo or grouping/);
+  assert.doesNotMatch(byId.stderr, /matched no repo/);
   assert.match(byId.stdout, /task-beta-1/);
   assert.doesNotMatch(byId.stdout, /task-alpha-1/);
 });
