@@ -803,7 +803,7 @@ test("dispatchWorkItem under `completion.by: controller`: a fake dispatcher that
   const raw = fs.readFileSync(path.join(t.nodesDir, "task-x.md"), "utf8");
   assert.match(raw, /^execution: exec-[0-9a-f]{16}$/m);
   assert.deepEqual(
-    lines.filter((l) => /execution hold .* could not be cleared/.test(l)),
+    lines.filter((l) => /execution hold .* (could not be cleared|was not released)/.test(l)),
     [],
     "clearHold must never even be attempted for a launched run"
   );
@@ -1046,4 +1046,31 @@ test("remote completion reads authoritative organization status partitions and r
     assert.equal(item.ok, false); assert.match(item.reason, /live status policy could not be read/);
   }
   assert.ok(requests.every((r) => r.startsWith("GET ")), "policy uncertainty never mutates the hold");
+});
+
+// The outcome door on the REAL local store (task-spor-extract-work-loop-plan-
+// execute-and-outcome-door, issue-spor-unroutable-dispatch-clears-graph-
+// before-execution): a refused dispatch ends the execution in its store and
+// only then clears the graph hold, and leaves no withdrawal debt behind.
+test("dispatchWorkItem refusal under `completion.by: controller`: the execution is ENDED in its store before the graph hold is cleared, and no withdrawal debt is left owed", async () => {
+  const t = tmpGraph(Object.fromEntries([node("task-x", "task", { status: "open" })]));
+  const cfg = localCfg(t.dir);
+  const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller" } });
+  factory.id = "factory-t";
+  let heldId = null;
+  const fakeCmdDispatch = async () => {
+    heldId = (fs.readFileSync(path.join(t.nodesDir, "task-x.md"), "utf8").match(/^execution: (exec-[0-9a-f]{16})$/m) || [])[1];
+    return 1;
+  };
+  const lines = [];
+  const result = await spor.dispatchWorkItem(cfg, { id: "task-x" }, {}, { factory, home: t.dir, log: (l) => lines.push(l), cmdDispatch: fakeCmdDispatch });
+  assert.equal(result.ok, false);
+  assert.ok(heldId, "the hold was stamped before the dispatch ran");
+  assert.doesNotMatch(fs.readFileSync(path.join(t.nodesDir, "task-x.md"), "utf8"), /^execution:/m);
+  const store = require("../lib/shell/execution-store.js").openExecutionStore(cfg, { home: t.dir, mode: "local" });
+  const read = await store.get(heldId);
+  assert.equal(read.ok, true);
+  assert.equal(read.execution.terminal, true, "the execution was ended, not merely un-pointed on the graph");
+  const debts = fs.existsSync(path.join(t.dir, "journal", "work-outcome")) ? fs.readdirSync(path.join(t.dir, "journal", "work-outcome")) : [];
+  assert.deepEqual(debts, [], lines.join("\n"));
 });

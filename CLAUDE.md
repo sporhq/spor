@@ -1014,8 +1014,20 @@ dispatcher: selection is the shared `dispatchableQueuePage()` and every launch
 goes through `cmdDispatch` (so all its guards, the auto-claim, worktree
 isolation, the supervisor, the run record and the terminal-state contract apply
 unchanged and can never drift). The loop machine is `lib/shell/work-loop.js`,
-dependency-injected so it drives with a fake clock/queue/dispatcher; `cmdWork`
-in `bin/spor.js` is the wiring. Two things it owns beyond dispatch: a slot frees
+dependency-injected so it drives with a fake clock/queue/dispatcher; its wiring
+is `lib/shell/work.js` over an injected host of CLI helpers (the
+lib/shell/dispatch.js shape): `planWork` (options, factory + gh/publication
+satisfiability, scope — READS ONLY: the probe is not persisted, the bundle
+store is not created) → `previewWork` (`--print`) → `executeWork`. A run the
+loop gives up on settles through ONE outcome door, `lib/shell/work-outcome.js`:
+a refused dispatch or an unroutable implementer ENDS its execution in the store
+(confirmed by an authoritative read) BEFORE the exact-execution graph CAS
+clears the hold, owing a `journal/work-outcome/*.withdraw.json` debt across the
+two that every controller pass re-drives (a hold naming a newer execution is
+preserved); an idle-stopped run closes its record before its lease is
+released. Run identity (pid + start ticks minted at launch) is ONE check,
+`isOurProcess` in `lib/shell/process-identity.js`, shared by the run store,
+the local execution lock and the spool claims. Two things it owns beyond dispatch: a slot frees
 only when the RUN RECORD goes terminal AND its outcome is settled — never when a
 launcher returns — and any item that was refused — or whose run ended WITHOUT resolving, which hands the
 lease back and returns it to the pool — cools off for `work.retryAfterMs` so the
