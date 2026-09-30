@@ -543,7 +543,12 @@ test("effective token override cannot replay another credential's outbox despite
     const unknown = config(""); unknown.token = () => "";
     assert.equal(cli.attestationOriginMatches(unknown, pending.origin), false);
     const jwtB = `e30.${Buffer.from(JSON.stringify({ org: "org-b" })).toString("base64url")}.sig`;
-    assert.throws(() => cli.attestationGraphOrigin(config(jwtB)), /disagrees/);
+    // The selector attributes a foreign JWT bearer to ITS org claim, not the
+    // stored tenant's (issue-spor-agent-token-scope-escalation-via-refresh-and-
+    // store-default), so config no longer manufactures a disagreement here; the
+    // guard still refuses a cfg whose selected org differs from the credential's.
+    assert.equal(config(jwtB).tenant().org, "org-b");
+    assert.throws(() => cli.attestationGraphOrigin({ mode: () => "remote", token: () => jwtB, server: () => server, tenant: () => ({ org: "org-a" }) }), /disagrees/);
   } finally { global.fetch = originalFetch; auth.refreshTenant = originalRefresh; }
 });
 

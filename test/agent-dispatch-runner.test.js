@@ -348,3 +348,71 @@ test("runReportTexts reads a Codex stream's assistant messages through the read-
   );
   assert.deepStrictEqual(runReportTexts({ harness: "codex", log_path: log }), [early, "Now fixing; the long suite is still running in the background."]);
 });
+
+// issue-spor-agent-token-scope-escalation-via-refresh-and-store-default (2): the
+// agent-scoped child token is only READ by the child's config cascade on the flat
+// SPOR_SERVER path, so a launcher that resolved its own tenant from the credential
+// store (no SPOR_SERVER in its env) must name the server beside the token — else
+// the child's store default (the PERSON's credential) wins and the agent token
+// sits ignored.
+test("an agent-scoped child gets SPOR_SERVER exported beside its SPOR_TOKEN; no child token leaves the env untouched", async () => {
+  const script = `
+const fs = require("node:fs");
+fs.writeFileSync(process.env.OUTFILE, JSON.stringify({
+  server: process.env.SPOR_SERVER || null,
+  legacyServer: process.env.SUBSTRATE_SERVER || null,
+  token: process.env.SPOR_TOKEN || null,
+  legacyToken: process.env.SUBSTRATE_TOKEN || null,
+  childToken: process.env.SPOR_DISPATCH_CHILD_TOKEN || null,
+}));
+process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-thread" }) + "\\n");
+`;
+  const run = async (jobPatch, envPatch) => {
+    const fixture = jobFixture(script, "p\n");
+    const job = readJson(fixture.job);
+    atomicJson(fixture.job, { ...job, ...jobPatch });
+    const outfile = path.join(fixture.dir, "env.json");
+    const saved = {};
+    for (const [k, v] of Object.entries({ OUTFILE: outfile, ...envPatch })) {
+      saved[k] = process.env[k];
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      assert.strictEqual(await runJob(fixture.job), 0);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    return JSON.parse(fs.readFileSync(outfile, "utf8"));
+  };
+
+  // A store-only launcher: no SPOR_SERVER in the supervisor's env, a child token minted for the run.
+  const agent = await run({ server: "http://127.0.0.1:9/" }, {
+    SPOR_SERVER: undefined, SUBSTRATE_SERVER: undefined, SPOR_TOKEN: "PERSON", SUBSTRATE_TOKEN: undefined,
+    SPOR_DISPATCH_CHILD_TOKEN: "AGENT",
+  });
+  assert.deepStrictEqual(agent, {
+    server: "http://127.0.0.1:9/", legacyServer: "http://127.0.0.1:9/",
+    token: "AGENT", legacyToken: "AGENT", childToken: null,
+  });
+
+  // Local mode: a child token but no server — nothing to name.
+  const local = await run({ server: null }, {
+    SPOR_SERVER: undefined, SUBSTRATE_SERVER: undefined, SPOR_TOKEN: undefined, SUBSTRATE_TOKEN: undefined,
+    SPOR_DISPATCH_CHILD_TOKEN: "AGENT",
+  });
+  assert.strictEqual(local.server, null);
+  assert.strictEqual(local.token, "AGENT");
+
+  // No child token (a person-token run): the env passes through byte-identical, server included.
+  const passthrough = await run({ server: "http://127.0.0.1:9/" }, {
+    SPOR_SERVER: "http://env.example", SUBSTRATE_SERVER: undefined, SPOR_TOKEN: "PERSON", SUBSTRATE_TOKEN: undefined,
+    SPOR_DISPATCH_CHILD_TOKEN: undefined,
+  });
+  assert.deepStrictEqual(passthrough, {
+    server: "http://env.example", legacyServer: null, token: "PERSON", legacyToken: null, childToken: null,
+  });
+});

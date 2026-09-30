@@ -503,6 +503,114 @@ test('remote.request: refreshable tenant with no cached access token refreshes b
 });
 
 // ===========================================================================
+// Agent-scoped tokens never escalate to the person
+// (issue-spor-agent-token-scope-escalation-via-refresh-and-store-default). A
+// dispatched agent runs with the PERSON's HOME (and so their credentials.json)
+// but an agent-scoped SPOR_TOKEN; the person's refresh credential must not ride
+// beside it, or a 401/403 — or a near-expiry proactive refresh — swaps the
+// bearer for the person's.
+// ===========================================================================
+
+test('selector: env SPOR_TOKEN that is NOT the stored access_token carries no refresh credential or identity', () => {
+  const home = tmp();
+  auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'PERSON', refresh_token: 'RT', person: 'person-x', email: 'x@y', exp: 1 });
+  const c = loadAt(home, { env: { SPOR_SERVER: 'https://a', SPOR_TOKEN: 'AGENT' } });
+  const t = c.tenant();
+  assert.strictEqual(t.token, 'AGENT');
+  assert.strictEqual(t.org, 'acme', 'an opaque foreign bearer still falls back to the server\'s known org');
+  assert.strictEqual(t.key, null, 'a foreign bearer is no store entry\'s own');
+  assert.strictEqual(t.refresh_token, null, 'the person\'s refresh credential does not ride beside a foreign bearer');
+  assert.strictEqual(t.exp, null);
+  assert.strictEqual(t.person, null);
+  assert.strictEqual(t.email, null);
+  // byte-identical when the env token IS the store's own
+  const same = loadAt(home, { env: { SPOR_SERVER: 'https://a', SPOR_TOKEN: 'PERSON' } }).tenant();
+  assert.strictEqual(same.refresh_token, 'RT');
+  assert.strictEqual(same.person, 'person-x');
+  assert.strictEqual(same.exp, 1);
+});
+
+test('selector: on a multi-org server a bearer is matched to ITS tenant by token, and a foreign JWT keeps its own org claim', () => {
+  const home = tmp();
+  auth.upsertTenant(home, { server: 'https://s', org: 'acme', access_token: 'ACME', refresh_token: 'RT-acme' });
+  auth.upsertTenant(home, { server: 'https://s', org: 'beta', access_token: 'BETA', refresh_token: 'RT-beta' }, { makeDefault: true });
+  // the person's own beta token: matched by token, not by first-same-server (acme)
+  const beta = loadAt(home, { env: { SPOR_SERVER: 'https://s', SPOR_TOKEN: 'BETA' } }).tenant();
+  assert.strictEqual(beta.key, 'https://s/beta');
+  assert.strictEqual(beta.org, 'beta');
+  assert.strictEqual(beta.refresh_token, 'RT-beta');
+  // an agent JWT minted for beta: never stamped with acme, never refreshable
+  const agent = loadAt(home, { env: { SPOR_SERVER: 'https://s', SPOR_TOKEN: fakeJwt({ org: 'beta', sub: 'agent-1' }) } }).tenant();
+  assert.strictEqual(agent.org, 'beta');
+  assert.strictEqual(agent.key, null);
+  assert.strictEqual(agent.refresh_token, null);
+  // no token supplied: the first same-server entry, byte-identical to before
+  const none = loadAt(home, { env: { SPOR_SERVER: 'https://s' } }).tenant();
+  assert.strictEqual(none.key, 'https://s/acme');
+  assert.strictEqual(none.token, 'ACME');
+  assert.strictEqual(none.refresh_token, 'RT-acme');
+});
+
+test('remote.request: an agent 401 never refreshes into the person credential', async () => {
+  const { srv, base, hits } = await refreshServer();
+  try {
+    const home = tmp();
+    const key = `${base}/acme`;
+    auth.writeStore(home, { tenants: { [key]: { server: base, org: 'acme', access_token: 'PERSON', refresh_token: 'RT' } }, default: key });
+    const c = loadAt(home, { env: { SPOR_SERVER: base, SPOR_TOKEN: 'AGENT' } });
+    const r = await remote.get(c, '/v1/thing');
+    assert.strictEqual(r.status, 401, JSON.stringify(r));
+    assert.deepStrictEqual(hits.map((h) => [h.url, h.bearer]), [['/v1/thing', 'AGENT']], 'one attempt as the agent, no /oauth/token, no retry as FRESH');
+    // the CLI's own refresh door refuses the same tenant
+    assert.strictEqual(await remote.refreshAfterAuthFailure(c), null);
+    assert.strictEqual(auth.readStore(home).tenants[key].access_token, 'PERSON', 'the store was not touched');
+  } finally {
+    srv.close();
+  }
+});
+
+test('remote.request: a near-expiry store credential is not proactively refreshed under an agent bearer', async () => {
+  const { srv, base, hits } = await refreshServer();
+  try {
+    const home = tmp();
+    const key = `${base}/acme`;
+    auth.writeStore(home, {
+      tenants: { [key]: { server: base, org: 'acme', access_token: 'PERSON', refresh_token: 'RT', exp: Math.floor(Date.now() / 1000) - 1 } },
+      default: key,
+    });
+    const c = loadAt(home, { env: { SPOR_SERVER: base, SPOR_TOKEN: 'AGENT' } });
+    await remote.get(c, '/v1/thing');
+    assert.ok(!hits.some((h) => h.url === '/oauth/token'), 'no proactive refresh of the person credential');
+    assert.deepStrictEqual(hits.map((h) => h.bearer), ['AGENT']);
+  } finally {
+    srv.close();
+  }
+});
+
+test('selector: an agent child env on a store-only box (person default, SPOR_SERVER+SPOR_TOKEN exported by dispatch) sends the agent token', async () => {
+  const { srv, base, hits } = await refreshServer();
+  try {
+    const home = tmp();
+    const key = `${base}/acme`;
+    // The person logged in with `spor auth login`: no SPOR_SERVER anywhere in
+    // their env, the store default is the whole remote configuration.
+    auth.writeStore(home, { tenants: { [key]: { server: base, org: 'acme', access_token: 'PERSON', refresh_token: 'RT' } }, default: key });
+    const person = loadAt(home);
+    assert.strictEqual(person.tenant().source, 'store-default');
+    // The dispatch runner exports the server beside the child token (see
+    // agent-dispatch-runner.test.js); with both set the flat env path wins the
+    // cascade and the attribution the server sees is the agent's.
+    const agent = loadAt(home, { env: { SPOR_SERVER: base, SPOR_TOKEN: 'AGENT' } });
+    assert.strictEqual(agent.tenant().source, 'env');
+    assert.strictEqual(agent.token(), 'AGENT');
+    await remote.get(agent, '/v1/thing');
+    assert.deepStrictEqual(hits.map((h) => h.bearer), ['AGENT'], 'the stub server saw the agent, never the person');
+  } finally {
+    srv.close();
+  }
+});
+
+// ===========================================================================
 // lib/remote.js request() — jsonError on an unparseable 2xx body
 // (issue-spor-verify-run-resolution-silent-json-parse-failure): mirrors
 // dispatch-terminal.js's own httpJson so every caller reading the parsed body

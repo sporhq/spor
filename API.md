@@ -1129,6 +1129,16 @@ machine-local — never committed, always in the shared-graph `.gitignore`):
   default (which would move every other repo onto it). A repo `server` with no credential on hand at all resolves tokenless.
 - **Refresh.** A 401/403 on a tenant carrying a `refresh_token` transparently
   refreshes against its issuer (`grant_type=refresh_token`) and retries once.
+  Only the store tenant's OWN bearer carries one: an explicit `SPOR_TOKEN` /
+  `--token` that is not the stored `access_token` for that server — a
+  dispatched agent's scoped token under the person's HOME is exactly this
+  shape — resolves with no `refresh_token`, no store `key`, and its own JWT
+  `org` claim, so an agent's 401 is never retried as the person
+  (issue-spor-agent-token-scope-escalation-via-refresh-and-store-default).
+  For the same reason `spor dispatch` exports `SPOR_SERVER` beside the
+  agent-scoped `SPOR_TOKEN` to every remote-mode harness child: without the
+  server the child's cascade never reads the env token and selects the store
+  default — the person — instead.
 - **Byte-identical.** With no credential store and only a flat
   `server`+`token` or `SPOR_*` env set, every resolved value equals the prior
   single-tenant behavior (norm-cc-byte-identical-refactor).

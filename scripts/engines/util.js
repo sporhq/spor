@@ -1537,13 +1537,15 @@ function bearer() {
 // to curl(). Callers pass their headers WITHOUT Authorization; it is supplied
 // here so the retry can swap it.
 //
-// Only the store tenant's OWN token is refreshed. A flat env SPOR_TOKEN aimed at
-// a server the store knows still carries that store tenant's refresh_token
-// (Config's flat() selection), and a dispatched agent run is exactly that shape:
-// its SPOR_TOKEN is an agent-scoped child token while HOME — and so the person's
-// credentials.json — is unchanged. Refreshing there would retry the agent's
-// rejected POST as the PERSON (a 403 retried past the agent's scope) and hand
-// every later bearer() in the run the person's token. So a tenant the selector
+// Only the store tenant's OWN token is refreshed. A dispatched agent run has a
+// flat env SPOR_TOKEN that is an agent-scoped child token while HOME — and so
+// the person's credentials.json — is unchanged. Refreshing there would retry the
+// agent's rejected POST as the PERSON (a 403 retried past the agent's scope) and
+// hand every later bearer() in the run the person's token. Config's flat()
+// selection now withholds the store's refresh_token from such a tenant at
+// resolution (issue-spor-agent-token-scope-escalation-via-refresh-and-store-
+// default), so `t.refresh_token` is already null there; the check below stays
+// as the second guard, judged on the bearer actually SENT: a tenant the selector
 // took FROM the store (by key: the default, or an org selector) is always
 // eligible — its bearer is the store's own even when another process has since
 // refreshed the file under us — while a flat server+token selection is eligible
