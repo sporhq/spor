@@ -353,7 +353,7 @@ function cmdConfig(cfg, p) {
   }
   out("");
   out(`mode:     ${cfg.mode()}`);
-  if (tenant && tenant.refused === "server-mismatch") {
+  if (tenant && (tenant.refused === "server-mismatch" || tenant.refused === "agent-org")) {
     out(`tenant:   REFUSED — ${describeTenantRefusal(te)}`);
   } else if (tenant && tenant.refused) {
     out(`tenant:   REFUSED — org '${tenant.org}' (from ${tenant.origin}) has no stored credential; stored: ${tenant.stored_orgs.join(", ") || "(none)"}`);
@@ -19154,6 +19154,15 @@ function refuseUnknownOrg(cfg, canon, args = []) {
     err(`spor: --org was given an empty value — refusing to fall back to whichever tenant is active.`);
     err(`  an empty selector is malformed input (typically an unset shell variable), not "use the default".`);
     err(te.orgs.length ? `  stored orgs: ${te.orgs.join(", ")}` : "  the credential store is empty");
+    return true;
+  }
+  if (te.kind === "agent-org") {
+    // A dispatched agent run is bound to the token it was handed; an `--org`
+    // naming another org would resolve the PERSON's stored credential
+    // (issue-spor-agent-org-flag-resolves-person-store-tenant). Nothing is
+    // exempt — acquiring a credential is no more the agent's to do.
+    err(`spor: --org '${te.org}' refused — this is a dispatched agent run, bound to its own token${te.agent_org ? ` (org ${te.agent_org})` : ""}.`);
+    err(`  drop --org to act as the agent; an agent run never selects the person's stored credential.`);
     return true;
   }
   if (te.kind === "server-mismatch") {

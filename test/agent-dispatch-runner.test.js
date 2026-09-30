@@ -364,6 +364,7 @@ fs.writeFileSync(process.env.OUTFILE, JSON.stringify({
   token: process.env.SPOR_TOKEN || null,
   legacyToken: process.env.SUBSTRATE_TOKEN || null,
   childToken: process.env.SPOR_DISPATCH_CHILD_TOKEN || null,
+  agentRun: process.env.SPOR_AGENT_RUN || null,
 }));
 process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-thread" }) + "\\n");
 `;
@@ -373,7 +374,7 @@ process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-th
     atomicJson(fixture.job, { ...job, ...jobPatch });
     const outfile = path.join(fixture.dir, "env.json");
     const saved = {};
-    for (const [k, v] of Object.entries({ OUTFILE: outfile, ...envPatch })) {
+    for (const [k, v] of Object.entries({ OUTFILE: outfile, SPOR_AGENT_RUN: undefined, ...envPatch })) {
       saved[k] = process.env[k];
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
@@ -397,6 +398,9 @@ process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-th
   assert.deepStrictEqual(agent, {
     server: "http://127.0.0.1:9/", legacyServer: "http://127.0.0.1:9/",
     token: "AGENT", legacyToken: "AGENT", childToken: null,
+    // marks the run agent-scoped, so the child's `--org` is bound to this token
+    // (issue-spor-agent-org-flag-resolves-person-store-tenant)
+    agentRun: "1",
   });
 
   // Local mode: a child token but no server — nothing to name.
@@ -406,6 +410,7 @@ process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-th
   });
   assert.strictEqual(local.server, null);
   assert.strictEqual(local.token, "AGENT");
+  assert.strictEqual(local.agentRun, "1");
 
   // No child token (a person-token run): the env passes through byte-identical, server included.
   const passthrough = await run({ server: "http://127.0.0.1:9/" }, {
@@ -413,6 +418,6 @@ process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-th
     SPOR_DISPATCH_CHILD_TOKEN: undefined,
   });
   assert.deepStrictEqual(passthrough, {
-    server: "http://env.example", legacyServer: null, token: "PERSON", legacyToken: null, childToken: null,
+    server: "http://env.example", legacyServer: null, token: "PERSON", legacyToken: null, childToken: null, agentRun: null,
   });
 });

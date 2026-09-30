@@ -610,6 +610,72 @@ test('selector: an agent child env on a store-only box (person default, SPOR_SER
   }
 });
 
+// A dispatched agent run (SPOR_AGENT_RUN, set by the supervisor beside the
+// agent token) is bound to that token: `--org` must never resolve the person's
+// store tenant for the org (issue-spor-agent-org-flag-resolves-person-store-tenant).
+test('selector: an agent run --org naming another org refuses instead of resolving the person store tenant', () => {
+  const home = tmp();
+  auth.writeStore(home, {
+    tenants: {
+      'https://s/acme': { server: 'https://s', org: 'acme', access_token: 'ACME', refresh_token: 'RT-acme' },
+      'https://s/beta': { server: 'https://s', org: 'beta', access_token: 'BETA', refresh_token: 'RT-beta' },
+    },
+    default: 'https://s/acme',
+  });
+  const agentEnv = { SPOR_SERVER: 'https://s', SPOR_TOKEN: fakeJwt({ org: 'acme', sub: 'agent-1' }), SPOR_AGENT_RUN: '1' };
+  // Without the marker, --org beta picks the stored beta credential (unchanged).
+  const person = loadAt(home, { env: { SPOR_SERVER: 'https://s', SPOR_TOKEN: agentEnv.SPOR_TOKEN }, cli: { org: 'beta' } });
+  assert.strictEqual(person.token(), 'BETA');
+  // With it, the same --org refuses: no tenant, no token, a reported refusal.
+  const c = loadAt(home, { env: agentEnv, cli: { org: 'beta' } });
+  assert.strictEqual(c.tenant(), null);
+  assert.strictEqual(c.token(), '');
+  const te = c.tenantError();
+  assert.strictEqual(te.kind, 'agent-org');
+  assert.strictEqual(te.org, 'beta');
+  assert.strictEqual(te.agent_org, 'acme');
+  assert.strictEqual(te.source, 'cli-org');
+  // --org naming the agent's own org is not the person's acme tenant either:
+  // it stays on the agent bearer, as the non-store `env` source, unrefreshable.
+  const own = loadAt(home, { env: agentEnv, cli: { org: 'acme' } });
+  assert.strictEqual(own.tenantError(), null);
+  const t = own.tenant();
+  assert.strictEqual(t.token, agentEnv.SPOR_TOKEN);
+  assert.strictEqual(t.source, 'env');
+  assert.strictEqual(t.key, null);
+  assert.strictEqual(t.refresh_token, null);
+  // An agent run with no env bearer to bind to refuses rather than use the store.
+  const bare = loadAt(home, { env: { SPOR_AGENT_RUN: '1' }, cli: { org: 'acme' } });
+  assert.strictEqual(bare.tenant(), null);
+  assert.strictEqual(bare.tenantError().kind, 'agent-org');
+  // An empty --org stays the malformed-input refusal.
+  assert.strictEqual(loadAt(home, { env: agentEnv, cli: { org: '' } }).tenantError().kind, 'empty-org');
+  // No --org: the flat env path, unchanged.
+  assert.strictEqual(loadAt(home, { env: agentEnv }).token(), agentEnv.SPOR_TOKEN);
+});
+
+test('cli: an agent run `spor --org <other>` exits 1 and sends nothing', async () => {
+  const { srv, base, hits } = await refreshServer();
+  try {
+    const home = tmp();
+    auth.writeStore(home, {
+      tenants: {
+        [`${base}/acme`]: { server: base, org: 'acme', access_token: 'PERSON-ACME', refresh_token: 'RT' },
+        [`${base}/beta`]: { server: base, org: 'beta', access_token: 'PERSON-BETA', refresh_token: 'RT' },
+      },
+      default: `${base}/acme`,
+    });
+    const r = await runAsync(['--org', 'beta', 'get', 'task-x'], {
+      SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: fakeJwt({ org: 'acme' }), SPOR_AGENT_RUN: '1',
+    });
+    assert.strictEqual(r.code, 1, r.stderr);
+    assert.match(r.stderr, /dispatched agent run/);
+    assert.ok(!hits.some((h) => /PERSON/.test(h.bearer || '')), JSON.stringify(hits));
+  } finally {
+    srv.close();
+  }
+});
+
 // ===========================================================================
 // lib/remote.js request() — jsonError on an unparseable 2xx body
 // (issue-spor-verify-run-resolution-silent-json-parse-failure): mirrors
