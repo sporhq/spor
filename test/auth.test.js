@@ -17,7 +17,7 @@ const { spawn } = require('node:child_process');
 
 const auth = require('../lib/auth.js');
 const remote = require('../lib/remote.js');
-const { loadConfig } = require('../lib/config.js');
+const { loadConfig, describeTenantRefusal } = require('../lib/config.js');
 
 const CLI = path.join(__dirname, '..', 'bin', 'spor.js');
 
@@ -669,8 +669,124 @@ test('cli: an agent run `spor --org <other>` exits 1 and sends nothing', async (
       SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: fakeJwt({ org: 'acme' }), SPOR_AGENT_RUN: '1',
     });
     assert.strictEqual(r.code, 1, r.stderr);
-    assert.match(r.stderr, /dispatched agent run/);
+    assert.match(r.stderr, /--org 'beta' refused — this is a dispatched agent run/);
     assert.ok(!hits.some((h) => /PERSON/.test(h.bearer || '')), JSON.stringify(hits));
+  } finally {
+    srv.close();
+  }
+});
+
+// The widened guard (task-spor-agent-run-guard-all-org-selectors): the AMBIENT
+// selectors — an inherited SPOR_ORG, a repo `.spor` org: marker — bind to the
+// agent's own bearer or refuse exactly like --org, and an agent run never
+// acquires a credential. The hazard they close is the LOCAL-MODE job: no
+// SPOR_SERVER in the child env, so the flat path never runs and the selector
+// used to answer from the person's store.
+test('selector: an inherited SPOR_ORG in an agent run on a store-only box refuses instead of resolving the person tenant', () => {
+  const home = tmp();
+  auth.writeStore(home, {
+    tenants: { 'https://s/acme': { server: 'https://s', org: 'acme', access_token: 'PERSON', refresh_token: 'RT' } },
+    default: 'https://s/acme',
+  });
+  // Non-agent: SPOR_ORG picks the stored tenant, unchanged.
+  const person = loadAt(home, { env: { SPOR_ORG: 'acme' } });
+  assert.strictEqual(person.token(), 'PERSON');
+  assert.strictEqual(person.tenant().source, 'env-org');
+  // Agent run, no env bearer (a local-mode job): refused, store never consulted.
+  const c = loadAt(home, { env: { SPOR_ORG: 'acme', SPOR_AGENT_RUN: '1' } });
+  assert.strictEqual(c.tenant(), null);
+  assert.strictEqual(c.token(), '');
+  const te = c.tenantError();
+  assert.strictEqual(te.kind, 'agent-org');
+  assert.strictEqual(te.org, 'acme');
+  assert.strictEqual(te.agent_org, null);
+  assert.strictEqual(te.source, 'env-org');
+  assert.strictEqual(te.origin, 'SPOR_ORG');
+  // The legacy spelling is named as the origin it came from.
+  assert.strictEqual(loadAt(home, { env: { SUBSTRATE_ORG: 'acme', SPOR_AGENT_RUN: '1' } }).tenantError().origin, 'SUBSTRATE_ORG');
+  // Agent run WITH its bearer exported (the dispatch-exported shape): the flat
+  // env path wins before SPOR_ORG is read, as it does for a person — the token
+  // sent is the agent's and no refusal is recorded.
+  const jwt = fakeJwt({ org: 'acme', sub: 'agent-1' });
+  const bound = loadAt(home, { env: { SPOR_SERVER: 'https://s', SPOR_TOKEN: jwt, SPOR_ORG: 'acme', SPOR_AGENT_RUN: '1' } });
+  assert.strictEqual(bound.tenantError(), null);
+  assert.strictEqual(bound.token(), jwt);
+  assert.strictEqual(bound.tenant().source, 'env');
+  assert.strictEqual(bound.tenant().refresh_token, null);
+  // Under an explicit local mode the ambient refusal is moot, as for unknown-org.
+  assert.strictEqual(loadAt(home, { env: { SPOR_ORG: 'acme', SPOR_AGENT_RUN: '1', SPOR_MODE: 'local' } }).tenantError(), null);
+});
+
+test('selector: a repo .spor org: marker in an agent run refuses instead of resolving the person tenant', () => {
+  const home = tmp();
+  auth.writeStore(home, {
+    tenants: { 'https://s/acme': { server: 'https://s', org: 'acme', access_token: 'PERSON', refresh_token: 'RT' } },
+    default: 'https://s/acme',
+  });
+  const repo = tmp('spor-auth-repo-');
+  fs.writeFileSync(path.join(repo, '.spor'), 'repo: x\norg: acme\n');
+  // Non-agent: the marker picks the stored tenant, unchanged.
+  assert.strictEqual(loadAt(home, { cwd: repo }).token(), 'PERSON');
+  // Agent run, no env bearer: refused, naming the marker file.
+  const c = loadAt(home, { cwd: repo, env: { SPOR_AGENT_RUN: '1' } });
+  assert.strictEqual(c.tenant(), null);
+  assert.strictEqual(c.token(), '');
+  const te = c.tenantError();
+  assert.strictEqual(te.kind, 'agent-org');
+  assert.strictEqual(te.org, 'acme');
+  assert.strictEqual(te.agent_org, null);
+  assert.strictEqual(te.source, 'repo-marker');
+  assert.strictEqual(te.origin, path.join(repo, '.spor'));
+  // The hook/CLI/explain surfaces share one rendering that names the selector.
+  assert.match(describeTenantRefusal(te), /org 'acme' \(from .*\.spor\) in a dispatched agent run/);
+  // A marker naming an org that is NOT the agent's, with the agent bearer
+  // exported: the flat env path still wins (byte-identical ordering), the
+  // agent token is sent and the marker is not consulted.
+  const jwt = fakeJwt({ org: 'beta', sub: 'agent-1' });
+  const bound = loadAt(home, { cwd: repo, env: { SPOR_SERVER: 'https://s', SPOR_TOKEN: jwt, SPOR_AGENT_RUN: '1' } });
+  assert.strictEqual(bound.tenantError(), null);
+  assert.strictEqual(bound.token(), jwt);
+});
+
+test('cli: an agent run with an inherited SPOR_ORG exits 1 and sends nothing; the same env without the marker is unchanged', async () => {
+  const { srv, base, hits } = await refreshServer();
+  try {
+    const home = tmp();
+    auth.writeStore(home, {
+      tenants: { [`${base}/acme`]: { server: base, org: 'acme', access_token: 'PERSON', refresh_token: 'RT' } },
+      default: `${base}/acme`,
+    });
+    const r = await runAsync(['get', 'task-x'], { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_ORG: 'acme', SPOR_AGENT_RUN: '1' });
+    assert.strictEqual(r.code, 1, r.stderr);
+    assert.match(r.stderr, /SPOR_ORG='acme' refused — this is a dispatched agent run/);
+    assert.deepStrictEqual(hits, [], 'nothing was sent');
+    // auth list is NOT exempt here — the refusal is about who is asking.
+    const l = await runAsync(['auth', 'list'], { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_ORG: 'acme', SPOR_AGENT_RUN: '1' });
+    assert.strictEqual(l.code, 1, l.stderr);
+    // Without the marker the person's own SPOR_ORG resolves their tenant (unchanged).
+    const p = await runAsync(['get', 'task-x'], { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_ORG: 'acme' });
+    assert.ok(hits.some((h) => h.bearer === 'PERSON'), JSON.stringify({ hits, stderr: p.stderr }));
+  } finally {
+    srv.close();
+  }
+});
+
+test('cli: credential acquisition (auth login / login / join) refuses in an agent run, even with no org selector', async () => {
+  const { srv, base, hits } = await refreshServer();
+  try {
+    const home = tmp();
+    // A bound agent env with no refusal from the cascade at all.
+    const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: fakeJwt({ org: 'acme' }), SPOR_AGENT_RUN: '1' };
+    for (const args of [['auth', 'login'], ['auth', 'login', '--org', 'beta'], ['login', `${base}`, 'PASTED'], ['join', 'PASTED']]) {
+      const r = await runAsync(args, env);
+      assert.strictEqual(r.code, 1, `${args.join(' ')}: ${r.stderr}`);
+      assert.match(r.stderr, /refused — this is a dispatched agent run/, args.join(' '));
+    }
+    assert.deepStrictEqual(hits, [], 'no device-flow or paste-path request left the box');
+    assert.deepStrictEqual(auth.readStore(home).tenants, {}, 'nothing was stored');
+    // Other auth subcommands and reads are untouched by the acquisition rule.
+    const w = await runAsync(['auth', 'list'], env);
+    assert.strictEqual(w.code, 0, w.stderr);
   } finally {
     srv.close();
   }

@@ -19145,6 +19145,17 @@ function isCredentialAcquisition(canon, args) {
 // credential for the empty string any more than `spor get x --org ""` can read
 // one, so it refuses everywhere, acquisition included.
 function refuseUnknownOrg(cfg, canon, args = []) {
+  // A dispatched agent run never ACQUIRES a credential: `spor auth login` /
+  // `login` / `join` mint or store a PERSON credential in the person's store
+  // (and `auth login` would default its server from whatever the cascade
+  // names), which is not the agent's to do and is a second door to acting as
+  // the person (task-spor-agent-run-guard-all-org-selectors). Refused before
+  // the tenant refusal below so it holds with or without an org selector.
+  if (cfg.agentRun() && isCredentialAcquisition(canon, args)) {
+    err(`spor: '${canon === "auth" ? "auth login" : canon}' refused — this is a dispatched agent run, bound to its own token.`);
+    err(`  an agent run never acquires or stores a person credential; sign in from your own session instead.`);
+    return true;
+  }
   const te = cfg.tenantError();
   if (!te) return false;
   // `spor config explain` is the diagnostic that SHOWS the refusal; it reads no
@@ -19157,12 +19168,16 @@ function refuseUnknownOrg(cfg, canon, args = []) {
     return true;
   }
   if (te.kind === "agent-org") {
-    // A dispatched agent run is bound to the token it was handed; an `--org`
-    // naming another org would resolve the PERSON's stored credential
-    // (issue-spor-agent-org-flag-resolves-person-store-tenant). Nothing is
-    // exempt — acquiring a credential is no more the agent's to do.
-    err(`spor: --org '${te.org}' refused — this is a dispatched agent run, bound to its own token${te.agent_org ? ` (org ${te.agent_org})` : ""}.`);
-    err(`  drop --org to act as the agent; an agent run never selects the person's stored credential.`);
+    // A dispatched agent run is bound to the token it was handed; an org
+    // selector naming another org — `--org`, an inherited SPOR_ORG, a repo
+    // `.spor` org: marker — would resolve the PERSON's stored credential
+    // (issue-spor-agent-org-flag-resolves-person-store-tenant,
+    // task-spor-agent-run-guard-all-org-selectors). Nothing is exempt, the
+    // local-only inspection verbs included: the refusal is about WHO is
+    // asking, not which credential is missing.
+    const sel = te.source === "cli-org" ? "--org " : te.source === "env-org" ? `${te.origin}=` : `the org: marker in ${te.origin} naming `;
+    err(`spor: ${sel}'${te.org}' refused — this is a dispatched agent run, bound to its own token${te.agent_org ? ` (org ${te.agent_org})` : ""}.`);
+    err(`  ${te.source === "cli-org" ? "drop --org" : te.source === "env-org" ? `unset ${te.origin}` : "remove the marker's org: line"} to act as the agent; an agent run never selects the person's stored credential.`);
     return true;
   }
   if (te.kind === "server-mismatch") {

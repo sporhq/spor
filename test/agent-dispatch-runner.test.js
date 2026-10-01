@@ -365,6 +365,8 @@ fs.writeFileSync(process.env.OUTFILE, JSON.stringify({
   legacyToken: process.env.SUBSTRATE_TOKEN || null,
   childToken: process.env.SPOR_DISPATCH_CHILD_TOKEN || null,
   agentRun: process.env.SPOR_AGENT_RUN || null,
+  org: process.env.SPOR_ORG || null,
+  legacyOrg: process.env.SUBSTRATE_ORG || null,
 }));
 process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-thread" }) + "\\n");
 `;
@@ -374,7 +376,7 @@ process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-th
     atomicJson(fixture.job, { ...job, ...jobPatch });
     const outfile = path.join(fixture.dir, "env.json");
     const saved = {};
-    for (const [k, v] of Object.entries({ OUTFILE: outfile, SPOR_AGENT_RUN: undefined, ...envPatch })) {
+    for (const [k, v] of Object.entries({ OUTFILE: outfile, SPOR_AGENT_RUN: undefined, SPOR_ORG: undefined, SUBSTRATE_ORG: undefined, ...envPatch })) {
       saved[k] = process.env[k];
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
@@ -393,7 +395,7 @@ process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-th
   // A store-only launcher: no SPOR_SERVER in the supervisor's env, a child token minted for the run.
   const agent = await run({ server: "http://127.0.0.1:9/" }, {
     SPOR_SERVER: undefined, SUBSTRATE_SERVER: undefined, SPOR_TOKEN: "PERSON", SUBSTRATE_TOKEN: undefined,
-    SPOR_DISPATCH_CHILD_TOKEN: "AGENT",
+    SPOR_DISPATCH_CHILD_TOKEN: "AGENT", SPOR_ORG: "acme", SUBSTRATE_ORG: "acme",
   });
   assert.deepStrictEqual(agent, {
     server: "http://127.0.0.1:9/", legacyServer: "http://127.0.0.1:9/",
@@ -401,6 +403,9 @@ process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-th
     // marks the run agent-scoped, so the child's `--org` is bound to this token
     // (issue-spor-agent-org-flag-resolves-person-store-tenant)
     agentRun: "1",
+    // the launcher's org selector names the PERSON's tenant — scrubbed, both
+    // spellings (task-spor-agent-run-guard-all-org-selectors)
+    org: null, legacyOrg: null,
   });
 
   // Local mode: a child token but no server — nothing to name.
@@ -415,9 +420,10 @@ process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-th
   // No child token (a person-token run): the env passes through byte-identical, server included.
   const passthrough = await run({ server: "http://127.0.0.1:9/" }, {
     SPOR_SERVER: "http://env.example", SUBSTRATE_SERVER: undefined, SPOR_TOKEN: "PERSON", SUBSTRATE_TOKEN: undefined,
-    SPOR_DISPATCH_CHILD_TOKEN: undefined,
+    SPOR_DISPATCH_CHILD_TOKEN: undefined, SPOR_ORG: "acme",
   });
   assert.deepStrictEqual(passthrough, {
     server: "http://env.example", legacyServer: null, token: "PERSON", legacyToken: null, childToken: null, agentRun: null,
+    org: "acme", legacyOrg: null,
   });
 });
