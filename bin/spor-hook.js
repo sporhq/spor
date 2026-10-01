@@ -98,7 +98,7 @@ function tenantRefused(cfg) {
     fs.writeFileSync(stamp, "");
     const log = u.makeLogger(path.join(journal, "remote.log"), "config: ");
     if (te.kind === "server-mismatch") log(`${require("../lib/config.js").describeTenantRefusal(te)} — hook skipped; run 'spor auth login' for that server or override it`);
-    else if (te.kind === "agent-org") log(`${require("../lib/config.js").describeTenantRefusal(te)} — hook skipped; an agent run never selects the person's stored credential`);
+    else if (te.kind === "agent-org" || te.kind === "agent-no-token") log(`${require("../lib/config.js").describeTenantRefusal(te)} — hook skipped; an agent run never selects the person's stored credential`);
     else log(`org '${te.org}' (from ${te.origin}) has no stored credential — hook skipped; run 'spor auth login --org ${te.org}' or fix the selector`);
   } catch {
     /* logging must never break fail-open */

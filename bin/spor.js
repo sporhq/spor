@@ -334,7 +334,8 @@ function cmdConfig(cfg, p) {
   const t = te ? null : cfg.tenant();
   const tenant = te
     ? { refused: te.kind, org: te.org, source: te.source, origin: te.origin, stored_orgs: te.orgs,
-        ...(te.kind === "server-mismatch" ? { server: te.server, credential_server: te.credential_server } : {}) }
+        ...(te.kind === "server-mismatch" ? { server: te.server, credential_server: te.credential_server } : {}),
+        ...(te.kind === "agent-no-token" ? { server: te.server } : {}) }
     : t ? { server: t.server, org: t.org || null, source: t.source } : null;
   if (p.values.json) {
     out(JSON.stringify({
@@ -353,7 +354,7 @@ function cmdConfig(cfg, p) {
   }
   out("");
   out(`mode:     ${cfg.mode()}`);
-  if (tenant && (tenant.refused === "server-mismatch" || tenant.refused === "agent-org")) {
+  if (tenant && (tenant.refused === "server-mismatch" || tenant.refused === "agent-org" || tenant.refused === "agent-no-token")) {
     out(`tenant:   REFUSED — ${describeTenantRefusal(te)}`);
   } else if (tenant && tenant.refused) {
     out(`tenant:   REFUSED — org '${tenant.org}' (from ${tenant.origin}) has no stored credential; stored: ${tenant.stored_orgs.join(", ") || "(none)"}`);
@@ -19178,6 +19179,17 @@ function refuseUnknownOrg(cfg, canon, args = []) {
     const sel = te.source === "cli-org" ? "--org " : te.source === "env-org" ? `${te.origin}=` : `the org: marker in ${te.origin} naming `;
     err(`spor: ${sel}'${te.org}' refused — this is a dispatched agent run, bound to its own token${te.agent_org ? ` (org ${te.agent_org})` : ""}.`);
     err(`  ${te.source === "cli-org" ? "drop --org" : te.source === "env-org" ? `unset ${te.origin}` : "remove the marker's org: line"} to act as the agent; an agent run never selects the person's stored credential.`);
+    return true;
+  }
+  if (te.kind === "agent-no-token") {
+    // The same bound run named a server but carries no bearer: the person's
+    // cascade would pair it with the store's credential for that server (or
+    // the flat config `token`), which is exactly the escalation the marker
+    // exists to stop (task-spor-agent-run-no-store-token-fallback). Nothing is
+    // exempt, for the same reason as `agent-org`.
+    const sel = te.source === "cli-server" ? "--server " : te.source === "env" ? `${te.origin}=` : `the server: key in ${te.origin} naming `;
+    err(`spor: ${sel}'${te.server}' refused — this is a dispatched agent run with no agent token.`);
+    err(`  an agent run never sends the person's stored credential; it needs its own SPOR_TOKEN (the dispatch runner exports one beside SPOR_SERVER).`);
     return true;
   }
   if (te.kind === "server-mismatch") {

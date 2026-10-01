@@ -792,6 +792,117 @@ test('cli: credential acquisition (auth login / login / join) refuses in an agen
   }
 });
 
+// The last door (task-spor-agent-run-no-store-token-fallback): a server with
+// NO bearer. The person's cascade pairs `--server`/SPOR_SERVER with the store's
+// credential for that server (tokenForServer) or the flat config `token`, and
+// flat() itself borrows the store's access_token when handed an empty one —
+// so under SPOR_AGENT_RUN=1 with a server set and no token every one of those
+// sent the PERSON's credential. Under an agent run the store is never opened:
+// a bare server refuses with `agent-no-token`, and the store default / legacy
+// flat token (steps 5-6) are never reached.
+test('selector: an agent run with a server and no token refuses instead of pairing the person store or flat config token', () => {
+  const home = tmp();
+  auth.writeStore(home, {
+    tenants: { 'https://s/acme': { server: 'https://s', org: 'acme', access_token: 'PERSON', refresh_token: 'RT', person: 'person-x' } },
+    default: 'https://s/acme',
+  });
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ server: 'https://s', token: 'FLAT' }));
+  // Person (no marker): every shape pairs the server with a credential of the
+  // person's — the flat config token, the store's entry for the server, the
+  // store default — unchanged.
+  assert.strictEqual(loadAt(home, { env: { SPOR_SERVER: 'https://s' } }).token(), 'FLAT');
+  assert.strictEqual(loadAt(home, { cli: { server: 'https://s' } }).token(), 'PERSON');
+  assert.strictEqual(loadAt(home, {}).token(), 'PERSON');
+  const check = (c, source, origin) => {
+    assert.strictEqual(c.tenant(), null);
+    assert.strictEqual(c.token(), '');
+    assert.strictEqual(c.server(), '');
+    const te = c.tenantError();
+    assert.strictEqual(te.kind, 'agent-no-token');
+    assert.strictEqual(te.server, 'https://s');
+    assert.strictEqual(te.source, source);
+    assert.strictEqual(te.origin, origin);
+    assert.deepStrictEqual(te.orgs, [], 'the person\'s orgs are not listed to the agent');
+    assert.match(describeTenantRefusal(te), /in a dispatched agent run with no agent token/);
+  };
+  // SPOR_SERVER and the legacy spelling.
+  check(loadAt(home, { env: { SPOR_SERVER: 'https://s', SPOR_AGENT_RUN: '1' } }), 'env', 'SPOR_SERVER');
+  check(loadAt(home, { env: { SUBSTRATE_SERVER: 'https://s', SPOR_AGENT_RUN: '1' } }), 'env', 'SUBSTRATE_SERVER');
+  // --server, with and without an --org that names the stored org.
+  check(loadAt(home, { env: { SPOR_AGENT_RUN: '1' }, cli: { server: 'https://s' } }), 'cli-server', '--server');
+  check(loadAt(home, { env: { SPOR_AGENT_RUN: '1' }, cli: { server: 'https://s', org: 'acme' } }), 'cli-server', '--server');
+  // The config-file server with no bearer: refused too, never paired with FLAT.
+  check(loadAt(home, { env: { SPOR_AGENT_RUN: '1' } }), 'flat-config', path.join(home, 'config.json'));
+  // No server named anywhere: local, no refusal (the store default is never read).
+  const bare = tmp();
+  auth.writeStore(bare, { tenants: { 'https://s/acme': { server: 'https://s', org: 'acme', access_token: 'PERSON' } }, default: 'https://s/acme' });
+  assert.strictEqual(loadAt(bare, { env: { SPOR_AGENT_RUN: '1' } }).tenant(), null);
+  assert.strictEqual(loadAt(bare, { env: { SPOR_AGENT_RUN: '1' } }).tenantError(), null);
+  // An ambient refusal is moot under an explicit local mode, as for the others.
+  assert.strictEqual(loadAt(home, { env: { SPOR_SERVER: 'https://s', SPOR_AGENT_RUN: '1', SPOR_MODE: 'local' } }).tenantError(), null);
+  // With the agent's bearer the tenant is built WITHOUT the store: no key, no
+  // refresh credential, no person identity — even when the store holds an entry
+  // for the same server (and the --token spelling, and a config-file server).
+  const jwt = fakeJwt({ org: 'acme', sub: 'agent-1' });
+  for (const c of [
+    loadAt(home, { env: { SPOR_SERVER: 'https://s', SPOR_TOKEN: jwt, SPOR_AGENT_RUN: '1' } }),
+    loadAt(home, { env: { SUBSTRATE_SERVER: 'https://s', SUBSTRATE_TOKEN: jwt, SPOR_AGENT_RUN: '1' } }),
+    loadAt(home, { env: { SPOR_AGENT_RUN: '1' }, cli: { server: 'https://s', token: jwt } }),
+    loadAt(home, { env: { SPOR_TOKEN: jwt, SPOR_AGENT_RUN: '1' } }),
+  ]) {
+    assert.strictEqual(c.tenantError(), null);
+    const t = c.tenant();
+    assert.strictEqual(t.token, jwt);
+    assert.strictEqual(t.server, 'https://s');
+    assert.strictEqual(t.org, 'acme');
+    assert.strictEqual(t.key, null);
+    assert.strictEqual(t.refresh_token, null);
+    assert.strictEqual(t.person, null);
+  }
+});
+
+test('cli: an agent run with SPOR_SERVER / --server --org and no token exits 1 and the server never sees the person token', async () => {
+  const { srv, base, hits } = await refreshServer();
+  try {
+    const home = tmp();
+    auth.writeStore(home, {
+      tenants: { [`${base}/acme`]: { server: base, org: 'acme', access_token: 'PERSON', refresh_token: 'RT' } },
+      default: `${base}/acme`,
+    });
+    const H = { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_AGENT_RUN: '1' };
+    const shapes = [
+      [['get', 'task-x'], { ...H, SPOR_SERVER: base }, /SPOR_SERVER=.* refused — this is a dispatched agent run with no agent token/],
+      [['get', 'task-x'], { ...H, SUBSTRATE_SERVER: base }, /SUBSTRATE_SERVER=.* refused — this is a dispatched agent run with no agent token/],
+      // --server is not a global CLI flag (only --org is lifted), so the
+      // "--server + --org" shape is the lib-level test above; here --org rides
+      // beside the env server under both spellings. --org is read before the
+      // env server, and with no bearer to confirm it refuses as `agent-org`.
+      [['--org', 'acme', 'get', 'task-x'], { ...H, SPOR_SERVER: base }, /--org 'acme' refused — this is a dispatched agent run/],
+      [['--org', 'acme', 'get', 'task-x'], { ...H, SUBSTRATE_SERVER: base }, /--org 'acme' refused — this is a dispatched agent run/],
+      // Not exempt: the inspection verbs run as the agent too.
+      [['auth', 'list'], { ...H, SPOR_SERVER: base }, /refused — this is a dispatched agent run/],
+    ];
+    for (const [args, env, re] of shapes) {
+      const r = await runAsync(args, env);
+      assert.strictEqual(r.code, 1, `${args.join(' ')}: ${r.stderr}`);
+      assert.match(r.stderr, re, args.join(' '));
+    }
+    assert.deepStrictEqual(hits, [], 'nothing was sent');
+    // The explain surface shows the refusal and lists no stored orgs.
+    const x = await runAsync(['config', 'explain', '--json'], { ...H, SPOR_SERVER: base });
+    assert.strictEqual(x.code, 0, x.stderr);
+    const j = JSON.parse(x.stdout);
+    assert.strictEqual(j.tenant.refused, 'agent-no-token');
+    assert.strictEqual(j.tenant.server, base);
+    assert.deepStrictEqual(j.tenant.stored_orgs, []);
+    // The same env without the marker is the person's own flat path, unchanged.
+    await runAsync(['get', 'task-x'], { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base });
+    assert.ok(hits.some((h) => h.bearer === 'PERSON'), JSON.stringify(hits));
+  } finally {
+    srv.close();
+  }
+});
+
 // ===========================================================================
 // lib/remote.js request() — jsonError on an unparseable 2xx body
 // (issue-spor-verify-run-resolution-silent-json-parse-failure): mirrors
