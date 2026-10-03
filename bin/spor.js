@@ -333,7 +333,12 @@ function cmdConfig(cfg, p) {
   const te = cfg.tenantError();
   const t = te ? null : cfg.tenant();
   const tenant = te
-    ? { refused: te.kind, org: te.org, source: te.source, origin: te.origin, stored_orgs: te.orgs,
+    ? { refused: te.kind, org: te.org, source: te.source, origin: te.origin,
+        // An agent run's refusal never consulted the person's store, so it carries
+        // no stored-org inventory to report — and must not appear to (an empty
+        // list reads as "the store is empty"); it names the agent's own org instead
+        // (issue-spor-agent-run-can-mutate-person-credential-store).
+        ...(te.kind === "agent-org" ? { agent_org: te.agent_org } : cfg.agentRun() ? {} : { stored_orgs: te.orgs }),
         ...(te.kind === "server-mismatch" ? { server: te.server, credential_server: te.credential_server } : {}),
         ...(te.kind === "agent-no-token" ? { server: te.server } : {}) }
     : t ? { server: t.server, org: t.org || null, source: t.source } : null;
@@ -357,7 +362,7 @@ function cmdConfig(cfg, p) {
   if (tenant && (tenant.refused === "server-mismatch" || tenant.refused === "agent-org" || tenant.refused === "agent-no-token")) {
     out(`tenant:   REFUSED — ${describeTenantRefusal(te)}`);
   } else if (tenant && tenant.refused) {
-    out(`tenant:   REFUSED — org '${tenant.org}' (from ${tenant.origin}) has no stored credential; stored: ${tenant.stored_orgs.join(", ") || "(none)"}`);
+    out(`tenant:   REFUSED — org '${tenant.org}' (from ${tenant.origin}) has no stored credential${tenant.stored_orgs ? `; stored: ${tenant.stored_orgs.join(", ") || "(none)"}` : ""}`);
   } else if (tenant) {
     out(`tenant:   ${tenant.server}${tenant.org ? ` (org ${tenant.org})` : ""}  <- ${tenant.source}`);
   } else {
@@ -19131,6 +19136,24 @@ function isCredentialAcquisition(canon, args) {
   return canon === "auth" && args[0] === "login";
 }
 
+// The `auth` subcommands that read or rewrite the PERSON's credential store
+// rather than the resolved tenant: `logout` (one tenant, the active default, or
+// `--all`), `switch` (re-points the default), and the store listings (`auth` /
+// `auth list`, `auth whoami --all`, which name every stored org, server and
+// person). A dispatched agent run is bound to its own token and the store is
+// not its to read or change (issue-spor-agent-run-can-mutate-person-credential-store);
+// bare `auth whoami` / `whoami` reports the RESOLVED tenant (the agent's) and
+// stays open.
+// Read off `args[0]`, the same expression `cmdAuth` dispatches on.
+function isCredentialStoreAccess(canon, args) {
+  // The flat `whoami` alias calls cmdAuthWhoami directly, `--all` included.
+  if (canon === "whoami") return args.includes("--all");
+  if (canon !== "auth") return false;
+  const sub = args[0];
+  if (sub === undefined || sub === "list" || sub === "switch" || sub === "logout") return true;
+  return sub === "whoami" && args.slice(1).includes("--all");
+}
+
 // A global `--org` the cascade REFUSED to resolve must refuse the COMMAND, not
 // quietly run it against the active tenant: a read then answers from the wrong
 // graph, and a write LANDS in it while the operator believes they are scoped
@@ -19157,6 +19180,17 @@ function refuseUnknownOrg(cfg, canon, args = []) {
     err(`  an agent run never acquires or stores a person credential; sign in from your own session instead.`);
     return true;
   }
+  // Nor does it read or rewrite the person's store: `auth logout` would delete
+  // the person's default (or every) credential, `auth switch` would re-point
+  // the tenant every later person session resolves, and the listings would hand
+  // the agent the person's org/server/identity inventory
+  // (issue-spor-agent-run-can-mutate-person-credential-store).
+  if (cfg.agentRun() && isCredentialStoreAccess(canon, args)) {
+    const sub = canon === "whoami" ? "whoami --all" : args[0] === undefined ? "auth" : `auth ${args[0]}${args[0] === "whoami" ? " --all" : ""}`;
+    err(`spor: '${sub}' refused — this is a dispatched agent run, bound to its own token.`);
+    err(`  an agent run never reads or changes the person's credential store; run it from your own session instead ('spor auth whoami' shows the agent's tenant).`);
+    return true;
+  }
   const te = cfg.tenantError();
   if (!te) return false;
   // `spor config explain` is the diagnostic that SHOWS the refusal; it reads no
@@ -19165,7 +19199,8 @@ function refuseUnknownOrg(cfg, canon, args = []) {
   if (te.kind === "empty-org") {
     err(`spor: --org was given an empty value — refusing to fall back to whichever tenant is active.`);
     err(`  an empty selector is malformed input (typically an unset shell variable), not "use the default".`);
-    err(te.orgs.length ? `  stored orgs: ${te.orgs.join(", ")}` : "  the credential store is empty");
+    // An agent run never read the store, so it has no inventory to report.
+    if (!cfg.agentRun()) err(te.orgs.length ? `  stored orgs: ${te.orgs.join(", ")}` : "  the credential store is empty");
     return true;
   }
   if (te.kind === "agent-org") {
@@ -19268,7 +19303,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
+module.exports = { withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
 
 if (require.main === module) {
   main()

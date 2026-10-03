@@ -784,9 +784,62 @@ test('cli: credential acquisition (auth login / login / join) refuses in an agen
     }
     assert.deepStrictEqual(hits, [], 'no device-flow or paste-path request left the box');
     assert.deepStrictEqual(auth.readStore(home).tenants, {}, 'nothing was stored');
-    // Other auth subcommands and reads are untouched by the acquisition rule.
-    const w = await runAsync(['auth', 'list'], env);
-    assert.strictEqual(w.code, 0, w.stderr);
+    // Bare `auth whoami` reports the resolved (agent) tenant and stays open.
+    const w = await runAsync(['auth', 'whoami'], env);
+    assert.doesNotMatch(w.stderr, /refused — this is a dispatched agent run/);
+  } finally {
+    srv.close();
+  }
+});
+
+// The store-mutating and store-listing auth subcommands
+// (issue-spor-agent-run-can-mutate-person-credential-store): a dispatched agent
+// run may not delete the person's credentials, re-point their default tenant,
+// or enumerate the store — with or without an org selector.
+test('cli: auth logout / logout --all / switch / list / whoami --all refuse in an agent run and leave the store untouched', async () => {
+  const { srv, base, hits } = await refreshServer();
+  try {
+    const home = tmp();
+    const store = {
+      tenants: {
+        [`${base}/acme`]: { server: base, org: 'acme', access_token: 'PERSON-ACME', refresh_token: 'RT' },
+        [`${base}/beta`]: { server: base, org: 'beta', access_token: 'PERSON-BETA', refresh_token: 'RT' },
+      },
+      default: `${base}/acme`,
+    };
+    auth.writeStore(home, store);
+    const before = fs.readFileSync(path.join(home, 'auth', 'credentials.json'), 'utf8');
+    const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: fakeJwt({ org: 'acme' }), SPOR_AGENT_RUN: '1' };
+    const shapes = [
+      ['auth', 'logout'], ['auth', 'logout', '--all'], ['auth', 'logout', 'beta'], ['--org', 'acme', 'auth', 'logout'],
+      ['auth', 'switch', 'beta'], ['--org', 'acme', 'auth', 'switch'], ['auth'], ['auth', 'list'], ['auth', 'whoami', '--all'], ['whoami', '--all'],
+    ];
+    for (const args of shapes) {
+      const r = await runAsync(args, env);
+      assert.strictEqual(r.code, 1, `${args.join(' ')}: ${r.stderr}`);
+      assert.match(r.stderr, /refused — this is a dispatched agent run/, args.join(' '));
+      assert.doesNotMatch(r.stdout + r.stderr, /beta/.test(args.join(' ')) ? /PERSON/ : /beta|PERSON/, args.join(' '));
+    }
+    assert.strictEqual(fs.readFileSync(path.join(home, 'auth', 'credentials.json'), 'utf8'), before, 'the store was not rewritten');
+    // The agent-org refusal's explain surface names the agent's org, never the person's stored orgs.
+    const x = await runAsync(['--org', 'beta', 'config', 'explain', '--json'], env);
+    assert.strictEqual(x.code, 0, x.stderr);
+    const j = JSON.parse(x.stdout);
+    assert.strictEqual(j.tenant.refused, 'agent-org');
+    assert.strictEqual(j.tenant.agent_org, 'acme');
+    assert.ok(!('stored_orgs' in j.tenant), JSON.stringify(j.tenant));
+    const e = JSON.parse((await runAsync(['--org', '', 'config', 'explain', '--json'], env)).stdout);
+    assert.strictEqual(e.tenant.refused, 'empty-org');
+    assert.ok(!('stored_orgs' in e.tenant), JSON.stringify(e.tenant));
+    const et = await runAsync(['--org', '', 'config', 'explain'], env);
+    assert.strictEqual(et.code, 0, et.stderr);
+    assert.match(et.stdout, /tenant: +REFUSED/);
+    assert.doesNotMatch(et.stdout, /stored:/);
+    assert.ok(!hits.some((h) => /PERSON/.test(h.bearer || '')), JSON.stringify(hits));
+    // Without the marker the person's own logout still works (unchanged).
+    const p = await runAsync(['auth', 'switch', 'beta'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(p.code, 0, p.stderr);
+    assert.strictEqual(auth.readStore(home).default, `${base}/beta`);
   } finally {
     srv.close();
   }
@@ -894,7 +947,7 @@ test('cli: an agent run with SPOR_SERVER / --server --org and no token exits 1 a
     const j = JSON.parse(x.stdout);
     assert.strictEqual(j.tenant.refused, 'agent-no-token');
     assert.strictEqual(j.tenant.server, base);
-    assert.deepStrictEqual(j.tenant.stored_orgs, []);
+    assert.ok(!('stored_orgs' in j.tenant), 'an agent refusal carries no stored-org inventory');
     // The same env without the marker is the person's own flat path, unchanged.
     await runAsync(['get', 'task-x'], { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base });
     assert.ok(hits.some((h) => h.bearer === 'PERSON'), JSON.stringify(hits));
