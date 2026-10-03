@@ -362,6 +362,65 @@ test("a worker that dies while a fix cycle runs: the resumed execution awaits th
   assert.equal(world2.main, "cand-head-v3");
 });
 
+// An UNFOLLOWABLE fix cycle (issue-spor-integration-runfix-ignores-unfollowable):
+// a fixer this worker stopped following — an idle stop that did not take, the
+// age watchdog — may still hold the checkout, so the stage SETTLES the refusal
+// (escalated, demoted, a fact) and never rebuilds the candidate or dispatches
+// again; the reading rides the signal form and the one-shot form alike.
+test("an UNFOLLOWABLE fix cycle (signal form) settles as failed saying the fixer may still hold the checkout — no rebuild, no second dispatch, the result tagged", async () => {
+  const clock = fakeClock(1000);
+  const world = makeWorld({ clock });
+  const origDispatch = world.deps.dispatchFix;
+  world.deps.dispatchFix = async (args) => {
+    const r = await origDispatch(args);
+    // The run-terminal signal, as laneAwaitRun delivers a watchdog verdict.
+    world.signals[world.signals.length - 1] = { name: `run:${r.runId}`, payload: { ok: false, reason: "idle for 45m; the stop did not take", unfollowable: true } };
+    return r;
+  };
+  world.activities = wf.bindIntegrationActivities(world.deps).activities;
+  const r = await drive(exec(world, clock), { clock, signals: world.signals });
+  assert.equal(r.status, "completed", JSON.stringify(r));
+  assert.equal(r.result.state, "failed");
+  assert.equal(r.result.unfollowable, true, "the result carries the reading");
+  assert.match(r.result.reason, /could not follow it to its end \(idle for 45m; the stop did not take\)/);
+  assert.match(r.result.reason, /the fixer may still hold the checkout, so the candidate is not rebuilt/);
+  assert.equal(world.dispatches, 1, "no second fixer");
+  assert.equal(world.builds, 0, "the conflicting build was never rebuilt");
+  assert.equal(world.main, null, "nothing landed");
+  assert.deepEqual(world.escalations.length, 1);
+  assert.match(world.escalations[0], /fixer may still hold the checkout/, "the escalation a person reads names the live fixer");
+  assert.deepEqual(world.demotions, ["task-integration-escalate-x"]);
+});
+
+test("an UNFOLLOWABLE fix cycle (one-shot form) is read the same way, while a fix that merely could not run keeps the plain reading and no tag", async () => {
+  const clock = fakeClock(1_700_000_000_000);
+  for (const [label, fix, expectTag, pattern] of [
+    ["unfollowable", { ok: false, reason: "the run did not reach a terminal state within 1440m", unfollowable: true, runId: "fix-1" }, true, /the fix cycle \(run fix-1\) was launched but this worker could not follow it to its end/],
+    ["could not run", { ok: false, reason: "no response" }, false, /the fix cycle could not run \(no response\)/],
+  ]) {
+    const home = scratchHome(`unfollowable-${label.replace(/\s+/g, "-")}`);
+    const { deps, seen } = stageFakes({
+      home, clock,
+      suite: () => ({ ok: false, reason: "npm test exited 1", output: "1 failing" }),
+    });
+    deps.fix = async () => {
+      seen.fixes += 1;
+      return fix;
+    };
+    const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps, gatedHead: "head-v1" });
+    assert.equal(res.state, "failed", `${label}: ${JSON.stringify(res)}`);
+    assert.equal(res.unfollowable, expectTag ? true : undefined, label);
+    assert.match(res.reason, pattern, label);
+    assert.equal(seen.fixes, 1, `${label}: one fix cycle`);
+    assert.equal(seen.builds, 1, `${label}: the candidate is not rebuilt`);
+    assert.equal(seen.lands, 0, label);
+    assert.equal(seen.escalations, 1, label);
+    assert.equal(seen.demotions, 1, label);
+    assert.equal(seen.facts.length, 1, label);
+    assert.equal(seen.cleanups, 1, `${label}: the candidate built before the fix is torn down`);
+  }
+});
+
 // ---------------------------------------------------- the file journal + yields --
 
 function scratchHome(label) {

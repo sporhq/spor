@@ -14645,7 +14645,16 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     let lastRegateFacts = [];
     const regate = async ({ head }) => {
       regateRan = true;
-      const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
+      // The re-gate's OWN durable journal (issue-spor-gate-workflow-
+      // unjournaled-regate-and-provenance): a child gate journal beside the
+      // stage journals, keyed on the head it judges, so a worker that dies
+      // mid-re-gate resumes the nested pipeline from where it stopped — the
+      // integration workflow re-calls `regate` for the same head (its own
+      // `regate` activity never journaled) and the child journal replays what
+      // already landed instead of re-judging it from scratch. A later re-gate
+      // of a DIFFERENT head (a further fix cycle moved it) opens its own.
+      const regateJournal = stageWorkflowJournal(home, record, item, regateStageName(head));
+      const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: { ...makeGateDeps(cfg, dctx), ...(regateJournal ? { workflowJournal: regateJournal } : {}) } });
       for (const f of lastRegateFacts) {
         if (originalFacts.includes(f)) continue;
         const i = gateFacts.indexOf(f);
@@ -14749,6 +14758,15 @@ function stageWorkflowJournal(home, record, item, stageName) {
   if (!runId || !executionStore.validSegment(String(runId))) return null;
   const abs = path.join(dispatchRuns.runPaths(home, String(runId)).workflows, `${stage}.workflow.jsonl`);
   return () => executionStore.openWorkflowJournalAt(abs, { stage, label: `${stageName} workflow journal for run ${runId}` });
+}
+
+// The stage name of the integration stage's re-gate of a moved head: the gate
+// stage's own name plus the judged head (a hex sha; anything else is reduced to
+// the segment alphabet), so each re-gated head has one child journal
+// (`gates-regate-<head12>-a<attempt>.workflow.jsonl`) beside the stage's.
+function regateStageName(head) {
+  const h = String(head || "unknown").toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 12) || "unknown";
+  return `gates-regate-${h}`;
 }
 
 // The run record as it reads NOW — the pipeline's captured copy predates every
@@ -19485,7 +19503,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchThrough, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
+module.exports = { dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
 
 if (require.main === module) {
   main()

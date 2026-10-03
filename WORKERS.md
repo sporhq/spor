@@ -2597,8 +2597,19 @@ rescue block the attempt opened under and every pass iterates that copy, so a
 completed journal replays to its verdicts under any later edit of the factory,
 and a journal parked mid-attempt refuses at its next live step when the
 binding (the gate list, rescue, implementation, completion, trusted ref,
-protected paths, test lane and risk classes — never a revision stamp or the
-factory id) has moved. A journal this worker cannot continue — that
+protected paths, test lane, risk classes AND the factory's `definition`
+provenance — never the rename chain, the repo scope or the factory id) has
+moved. Provenance is bound because the pass branches on it: every fact and
+every evidence-reuse comparison reads `factory.definition`, so a
+provenance-only edit (a re-stamped node revision) under a parked journal would
+change what a replay reuses — the gate stage is a pure function of its journal
+with no exceptions, so it is refused like any other binding change
+(issue-spor-gate-workflow-unjournaled-regate-and-provenance, `WORKFLOW_VERSION`
+3). The integration stage's RE-GATE of a moved head (§10.9) is a nested gate
+pipeline and drives its OWN durable child journal, keyed on the judged head
+(`gates-regate-<head12>-a<attempt>.workflow.jsonl` beside the stage's), so a
+worker that dies mid-re-gate resumes the nested pipeline from where it stopped
+instead of re-judging the moved head from scratch. A journal this worker cannot continue — that
 mismatch, or another workflow version — is REFUSED through the same
 tombstone-then-settle door as the other two stages (§10.9, §10.16): the
 attempt's journal is tombstoned first, then settled `failed` outside it with

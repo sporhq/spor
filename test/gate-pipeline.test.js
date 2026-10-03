@@ -11203,3 +11203,161 @@ test("real doors: a gate journal this worker cannot continue is REFUSED through 
   assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-gate-")).length, 1);
   assert.strictEqual(executionStoreLib.readWorkflowJournal(home, claim.tenant, claim.execution_id, { stage: "gates-a0" }).length, j.length, "a tombstoned journal is never appended to");
 });
+
+// The integration stage's RE-GATE of a moved head drives its OWN durable child
+// gate journal (issue-spor-gate-workflow-unjournaled-regate-and-provenance):
+// the `regate` closure in runGateAndIntegration used to run the nested gate
+// pipeline over an in-memory journal, so a worker that died mid-re-gate
+// re-judged the moved head from scratch on resume. Now each re-gated head has a
+// `gates-regate-<head12>-a<attempt>` journal beside the stage's, and the
+// integration workflow's re-call of `regate` (its own activity never
+// journaled) resumes the nested pipeline from where it stopped.
+test("real doors: the integration stage's re-gate drives a durable CHILD gate journal keyed on the judged head — a worker that dies mid-re-gate resumes it from the journal, and the suite is not re-run", async () => {
+  const executionStoreLib = require("../lib/shell/execution-store.js");
+  const dispatchRunsLib = require("../lib/shell/agent-dispatch-runner.js");
+  const integrationRunner = require("../lib/shell/integration-runner.js");
+  const wf = require("../lib/shell/gate-workflow.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-journal-regate-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_MODE: "local" } });
+  fs.writeFileSync(path.join(nodes, "task-demo.md"), "---\nid: task-demo\ntype: task\nproject: demo\ntitle: Benign work\nsummary: Benign work whose gate passes and is re-gated after a fix cycle.\nstatus: done\ndate: 2026-09-06\n---\n\nBody.\n");
+  const repo = repoWithBranch({ weakenTest: false, regress: false });
+  // Every suite run leaves a mark, so a re-run is countable.
+  const counter = path.join(home, "suite-runs");
+  const factory = factoryOf({
+    ...BASE,
+    gates: [{ id: "acceptance", kind: "command", command: `"${process.execPath}" test/acceptance.js && "${process.execPath}" -e "require('fs').appendFileSync(process.argv[1], 'x')" "${counter}"` }],
+    integration: { target_ref: "main", mode: "local", command: "npm test", strategy: "merge", cycles: 1 },
+  });
+  factory.id = "factory-test";
+  const runId = "run-journal-regate-1";
+  const record = { run_id: runId, node_id: "task-demo", name: "task-demo", harness: "fake", cwd: repo, state: "done", termination_class: "completed", terminal_state: "resolved", terminal_enforced: true, started_at: "2026-09-06T00:00:00.000Z", finished_at: "2026-09-06T00:10:00.000Z" };
+  dispatchRunsLib.atomicJson(dispatchRunsLib.runPaths(home, runId).record, record);
+  const lines = [];
+  const entry = { run_id: runId, node_id: "task-demo", project: "demo" };
+  const ctx = { factory, slug: "demo", passthrough: {}, warn: () => {}, runMaxMs: 1000, home, log: (l) => lines.push(l), stopping: () => false, sleep: async () => {}, workerId: "w-1" };
+  const suiteRuns = () => (fs.existsSync(counter) ? fs.readFileSync(counter, "utf8").length : 0);
+
+  // The integration stage, standing in: a fix cycle moved the head, so the
+  // stage asks the caller's `regate` for the moved head — twice, as a resumed
+  // integration workflow does when the worker died inside the first call.
+  const regates = [];
+  let childJournal = null;
+  let movedHead = null;
+  const orig = integrationRunner.runIntegrationStage;
+  integrationRunner.runIntegrationStage = async ({ deps }) => {
+    // "The fix cycle" commits on the implementer's branch.
+    fs.writeFileSync(path.join(repo, "lib", "mul.js"), "module.exports = (a, b) => a * b;\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "fix cycle");
+    movedHead = git(repo, "rev-parse", "HEAD").trim();
+    const before = suiteRuns();
+    const first = await deps.regate({ head: movedHead });
+    regates.push({ ...first, suiteRuns: suiteRuns() - before });
+    childJournal = path.join(dispatchRunsLib.runPaths(home, runId).workflows, `${sporCli.regateStageName(movedHead)}-a0.workflow.jsonl`);
+    assert.ok(fs.existsSync(childJournal), `the re-gate's child journal exists beside the stage journals: ${fs.existsSync(dispatchRunsLib.runPaths(home, runId).workflows) ? fs.readdirSync(dispatchRunsLib.runPaths(home, runId).workflows).join(", ") : "(none)"}`);
+    // The worker dies mid-re-gate: AFTER the judgement was journaled, BEFORE
+    // the pipeline settled — the journal is cut back to the judge entry.
+    const full = executionStoreLib.openWorkflowJournalAt(childJournal).journal;
+    const judgeAt = full.findIndex((x) => x.kind === "effect" && /\/judge#\d+$/.test(x.key));
+    assert.ok(judgeAt > 0, `the child journal holds the judgement: ${full.map((x) => x.key || x.kind).join(", ")}`);
+    assert.ok(full.some((x) => x.kind === "effect" && /\/settled#1$/.test(x.key)), "the first re-gate settled");
+    fs.writeFileSync(childJournal, full.slice(0, judgeAt + 1).map((x) => JSON.stringify(x)).join("\n") + "\n");
+    // A successor's integration workflow re-calls `regate` for the same head.
+    const mid = suiteRuns();
+    const second = await deps.regate({ head: movedHead });
+    regates.push({ ...second, suiteRuns: suiteRuns() - mid });
+    return { state: "failed", facts: [], attempts: [], reason: "stopped by the test after the re-gate", escalation_failed: true };
+  };
+  let res;
+  try {
+    res = await sporCli.runGateAndIntegration(cfg, entry, record, ctx);
+  } finally {
+    integrationRunner.runIntegrationStage = orig;
+  }
+  assert.ok(res && typeof res.state === "string", lines.join("\n"));
+  assert.strictEqual(regates.length, 2, lines.join("\n"));
+  assert.strictEqual(regates[0].state, "passed", `the live re-gate: ${JSON.stringify(regates[0])}\n${lines.join("\n")}`);
+  assert.strictEqual(regates[0].head, movedHead, "the re-gate judged the moved head");
+  assert.strictEqual(regates[0].suiteRuns, 1, "the live re-gate ran the suite once");
+  assert.strictEqual(regates[1].state, "passed", `the resumed re-gate: ${JSON.stringify(regates[1])}`);
+  assert.strictEqual(regates[1].head, movedHead);
+  assert.strictEqual(regates[1].suiteRuns, 0, "the resumed re-gate replayed the judgement — the suite did not run again");
+  assert.deepStrictEqual(regates[1].facts, regates[0].facts, "the same fact, not a second one");
+  assert.strictEqual(suiteRuns(), 2, "one suite run for the gate list, one for the re-gate, none for the resume");
+  // The child journal: its own file, bound to the same factory, closed again.
+  const j = executionStoreLib.openWorkflowJournalAt(childJournal).journal;
+  assert.deepStrictEqual(j[0], { kind: "version", spec: require("../lib/kernel/workflow.js").JOURNAL_SPEC_VERSION, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+  const opened = j.find((x) => x.kind === "effect" && /\/open#1$/.test(x.key));
+  assert.strictEqual(opened.result.digest, wf.definitionBindingDigest(factory));
+  assert.ok(j.some((x) => x.kind === "effect" && /\/settled#1$/.test(x.key) && x.result.state === "passed"), "the resumed re-gate closed the child journal");
+  assert.notStrictEqual(childJournal, path.join(dispatchRunsLib.runPaths(home, runId).workflows, "gates-a0.workflow.jsonl"));
+  assert.ok(fs.existsSync(path.join(dispatchRunsLib.runPaths(home, runId).workflows, "gates-a0.workflow.jsonl")), "the gate list's own journal is untouched beside it");
+  assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-gate-")).length, 2, `one fact per judged head: ${fs.readdirSync(nodes).join(", ")}`);
+});
+
+test("regateStageName: one child journal per judged head, in the segment alphabet", () => {
+  assert.strictEqual(sporCli.regateStageName("ABCDEF0123456789abcdef"), "gates-regate-abcdef012345");
+  assert.strictEqual(sporCli.regateStageName("a/b c"), "gates-regate-abc");
+  assert.strictEqual(sporCli.regateStageName(null), "gates-regate-unknown");
+  assert.strictEqual(sporCli.regateStageName("///"), "gates-regate-unknown");
+  // A valid stage segment for the journal opener.
+  require("../lib/shell/execution-store.js").openWorkflowJournalAt(path.join(os.tmpdir(), "spor-regate-name-probe.jsonl"), { stage: `${sporCli.regateStageName("deadbeef")}-a0` });
+});
+
+// A PROVENANCE-ONLY edit under a parked journal (issue-spor-gate-workflow-
+// unjournaled-regate-and-provenance): the factory's `definition` block — node
+// revisions and digests — joined the gate stage's binding (WORKFLOW_VERSION 3),
+// so a journal parked under one provenance and re-driven under another is
+// refused through runGateAndIntegration like any other binding change, with
+// `gate_refusal` on the record — never continued with the live provenance in
+// place of the journaled one.
+test("real doors: a provenance-only edit under a PARKED gate journal is REFUSED through runGateAndIntegration — gate_refusal on the record, nothing judged", async () => {
+  const executionStoreLib = require("../lib/shell/execution-store.js");
+  const dispatchRunsLib = require("../lib/shell/agent-dispatch-runner.js");
+  const kernel = require("../lib/kernel/workflow.js");
+  const wf = require("../lib/shell/gate-workflow.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-journal-provenance-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_MODE: "local" } });
+  fs.writeFileSync(path.join(nodes, "task-demo.md"), "---\nid: task-demo\ntype: task\nproject: demo\ntitle: Benign work\nsummary: Benign work whose gate journal was parked under another definition provenance.\nstatus: done\ndate: 2026-09-06\n---\n\nBody.\n");
+  const repo = repoWithBranch({ weakenTest: false, regress: false });
+  const counter = path.join(home, "suite-runs");
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: `"${process.execPath}" test/acceptance.js && "${process.execPath}" -e "require('fs').appendFileSync(process.argv[1], 'x')" "${counter}"` }] });
+  factory.id = "factory-test";
+  // The SAME factory as a previous worker read it, with its node revision
+  // stamped differently — a provenance-only difference.
+  const parkedUnder = { ...factory, definition: { ...factory.definition, factory: { ...factory.definition.factory, revision: "0123456789abcdef0123456789abcdef01234567" } } };
+  assert.notStrictEqual(wf.definitionBindingDigest(parkedUnder), wf.definitionBindingDigest(factory));
+  const runId = "run-journal-provenance-1";
+  // The parked journal: opened under the other provenance, nothing judged yet
+  // (the previous worker died between `open` and the pass's first step).
+  const journalPath = path.join(dispatchRunsLib.runPaths(home, runId).workflows, "gates-a0.workflow.jsonl");
+  fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+  const h = executionStoreLib.openWorkflowJournalAt(journalPath, { stage: "gates-a0" });
+  h.persist({ kind: "version", spec: kernel.JOURNAL_SPEC_VERSION, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+  h.persist({ kind: "effect", key: `${runId}/gates/a0/e0/open#1`, result: { has: {}, attempt: 0, digest: wf.definitionBindingDigest(parkedUnder), factoryId: "factory-test", gates: parkedUnder.gates, rescue: null, implementation: null, completion: parkedUnder.completion || null, trustedRef: parkedUnder.trustedRef, protectedPaths: parkedUnder.protectedPaths, testLaneProfile: parkedUnder.testLaneProfile, riskClasses: parkedUnder.riskClasses, definition: parkedUnder.definition } });
+  const record = { run_id: runId, node_id: "task-demo", name: "task-demo", harness: "fake", cwd: repo, state: "done", termination_class: "completed", terminal_state: "resolved", terminal_enforced: true, started_at: "2026-09-06T00:00:00.000Z", finished_at: "2026-09-06T00:10:00.000Z" };
+  dispatchRunsLib.atomicJson(dispatchRunsLib.runPaths(home, runId).record, record);
+  const lines = [];
+  const entry = { run_id: runId, node_id: "task-demo", project: "demo", resumed: true };
+  const ctx = { factory, slug: "demo", passthrough: {}, warn: () => {}, runMaxMs: 1000, home, log: (l) => lines.push(l), stopping: () => false, sleep: async () => {}, workerId: "w-1" };
+  const res = await sporCli.runGateAndIntegration(cfg, entry, record, ctx);
+  assert.strictEqual(res.state, "failed", lines.join("\n"));
+  assert.strictEqual(res.definition_mismatch && res.definition_mismatch.live, wf.definitionBindingDigest(factory), JSON.stringify(res.definition_mismatch));
+  assert.strictEqual(res.definition_mismatch.journaled, wf.definitionBindingDigest(parkedUnder));
+  assert.strictEqual(res.refusal_tombstoned, true);
+  assert.deepStrictEqual(res.gates, [], "nothing was judged");
+  assert.ok(!fs.existsSync(counter), "the suite never ran");
+  const after = JSON.parse(fs.readFileSync(dispatchRunsLib.runPaths(home, runId).record, "utf8"));
+  assert.strictEqual(after.gate_state, "failed");
+  assert.deepStrictEqual(after.gate_refusal, { reason: "definition_mismatch", journaled: wf.definitionBindingDigest(parkedUnder), live: wf.definitionBindingDigest(factory), tombstoned: true, replayed: false });
+  assert.ok(after.gate_escalated_to && after.gate_escalated_to.startsWith("task-gate-acceptance-"), after.gate_escalated_to);
+  assert.match(fs.readFileSync(path.join(nodes, `${after.gate_escalated_to}.md`), "utf8"), /- \{type: blocks, to: task-demo\}/);
+  const j = executionStoreLib.openWorkflowJournalAt(journalPath).journal;
+  assert.strictEqual(j[j.length - 1].kind, "tombstone");
+  assert.strictEqual(j[j.length - 1].reason, "definition_mismatch");
+  assert.ok(!lines.some((l) => /fresh in-memory journal|REPLAY FAULT/.test(l)), lines.join("\n"));
+});

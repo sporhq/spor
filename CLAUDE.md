@@ -1823,7 +1823,14 @@ stands until slice 4, so the driver logs it and judges over a fresh
 in-memory journal, exactly today's resume; a key-sequence fault takes the
 same door under its own "REPLAY FAULT" line (it is a workflow bug, never an
 operator's situation), and so does a step that THREW on an earlier drive
-(the record-based resume re-ran it live). One resume stays record-based BY
+(the record-based resume re-ran it live). The binding INCLUDES the factory's
+`definition` provenance (`WORKFLOW_VERSION` 3,
+issue-spor-gate-workflow-unjournaled-regate-and-provenance): the pass compares
+saved evidence against `factory.definition`, so a provenance-only edit under a
+parked journal is refused like any other binding change, and the integration
+stage's re-gate of a moved head drives its own child gate journal
+(`gates-regate-<head12>-a<n>`, `regateStageName` in bin/spor.js) so a worker
+that dies mid-re-gate resumes it rather than re-judging. One resume stays record-based BY
 DESIGN: an orphan adopted MID-AWAIT — a resumed drive whose pure replay ends
 on a run another worker dispatched — re-runs the pass through the record
 (the supersession check a resumed pipeline owes runs, adopt-by-name

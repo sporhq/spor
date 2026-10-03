@@ -458,7 +458,7 @@ test("a journal recorded by another workflow version is REFUSED: tombstoned firs
   assert.equal(store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" }).length, 3, "a tombstoned journal is never appended to");
 });
 
-test("an EDITED definition between two drives of a parked journal is REFUSED at the next live step (the gate list, rescue, implementation, completion, trusted ref, protected paths, test lane and risk classes are the binding — never the revision stamps or the factory id); a revert after the refusal re-settles the refusal, never lands", async () => {
+test("an EDITED definition between two drives of a parked journal is REFUSED at the next live step (the gate list, rescue, implementation, completion, trusted ref, protected paths, test lane, risk classes AND the definition provenance are the binding — never the rename chain, the repo scope or the factory id); a revert after the refusal re-settles the refusal, never lands", async () => {
   const home = scratchHome("definition");
   const clock = fakeClock(1_700_000_000_000);
   const w = makeWorld({ clock, home });
@@ -467,10 +467,17 @@ test("an EDITED definition between two drives of a parked journal is REFUSED at 
   assert.equal(first.state, "interrupted");
   w.preflight = { ok: true };
   clock.advanceBy(wf.YIELD_MS + 1);
-  // Provenance is not binding: a re-stamped revision, a rename chain, a repo
-  // scope, a different factory id — none refuses.
-  const restamped = { ...SCRIPTS.passed.factory, id: "factory-renamed", revision: "deadbeef", renamedFrom: ["factory-test"], repos: ["demo"], definition: { ...SCRIPTS.passed.factory.definition, factory: { ...SCRIPTS.passed.factory.definition.factory, revision: "deadbeef" } } };
-  assert.equal(wf.definitionBindingDigest(restamped), wf.definitionBindingDigest(SCRIPTS.passed.factory));
+  // Identity is not binding: a rename chain, a repo scope, a different
+  // factory id, a top-level revision stamp — none refuses.
+  const renamed = { ...SCRIPTS.passed.factory, id: "factory-renamed", revision: "deadbeef", renamedFrom: ["factory-test"], repos: ["demo"] };
+  assert.equal(wf.definitionBindingDigest(renamed), wf.definitionBindingDigest(SCRIPTS.passed.factory));
+  // The definition PROVENANCE is (issue-spor-gate-workflow-unjournaled-regate-
+  // and-provenance): the pass compares saved evidence against
+  // `factory.definition`, so a re-stamped node revision in it changes what a
+  // replay reuses — it is bound, and a provenance-only edit under a parked
+  // journal refuses like any other binding change (driven below).
+  const restamped = { ...SCRIPTS.passed.factory, definition: { ...SCRIPTS.passed.factory.definition, factory: { ...SCRIPTS.passed.factory.definition.factory, revision: "deadbeef" } } };
+  assert.notEqual(wf.definitionBindingDigest(restamped), wf.definitionBindingDigest(SCRIPTS.passed.factory), "definition provenance is a gate-stage input");
   // The integration block is the integration stage's binding, not the gate
   // list's (declaring one re-parses the completion DEFAULT to `after:
   // integration`, which IS a gate-stage input — so the block is swapped on the
@@ -491,6 +498,7 @@ test("an EDITED definition between two drives of a parked journal is REFUSED at 
     ["completion", { ...SCRIPTS.passed.factory, completion: { ...SCRIPTS.passed.factory.completion, after: "integration" } }],
     ["trusted ref", { ...SCRIPTS.passed.factory, trustedRef: "release" }],
     ["rescue", factoryOf({ ...BASE, gates: GATES, rescue: { profile: "profile-rescue", attempts: 1 } })],
+    ["definition provenance", restamped],
   ]) {
     const homeN = scratchHome(`definition-${label.replace(/\s+/g, "-")}`);
     const wN = makeWorld({ clock, home: homeN });
@@ -541,6 +549,7 @@ test("a COMPLETED gate journal is a pure function of the journal: under an EDITE
   const opened = j1.find((x) => x.kind === "effect" && /\/open#1$/.test(x.key));
   assert.deepEqual(opened.result.gates.map((g) => g.id), ["acceptance", "review"], "the gate list rides the open entry");
   assert.equal(opened.result.rescue, null);
+  assert.deepEqual(opened.result.definition, SCRIPTS.passed.factory.definition, "the definition provenance rides the open entry");
   const suites = w.suites;
   const reviews = w.reviews.length;
 
@@ -548,6 +557,7 @@ test("a COMPLETED gate journal is a pure function of the journal: under an EDITE
     ["the suite command edited", factoryOf({ ...BASE, gates: [{ ...GATES[0], command: "npm run test:all" }, GATES[1]] })],
     ["the gate list moved", factoryOf({ ...BASE, gates: [GATES[0]] })],
     ["a gate added", factoryOf({ ...BASE, gates: [...GATES, { id: "lint", kind: "command", command: "npm run lint" }] })],
+    ["the definition provenance re-stamped", { ...SCRIPTS.passed.factory, definition: { ...SCRIPTS.passed.factory.definition, factory: { ...SCRIPTS.passed.factory.definition.factory, revision: "deadbeef" } } }],
   ]) {
     assert.notEqual(wf.definitionBindingDigest(factory), wf.definitionBindingDigest(SCRIPTS.passed.factory), label);
     const logs = [];
