@@ -181,19 +181,27 @@ test("the ledger reads log-first, then a legacy record stamp (read-only), then t
     runs.atomicJson(runs.runPaths(home, RUN).record, { ...record, gate_state: "running", gate_settle_id: "o", gate_regate_count: 0 });
     assert.equal(sp.latestProgress(home, record).source, "record");
     assert.equal(sp.owesEvidence(home, record), true);
-    // A gate journal holding a save result does NOT outrank a legacy record
-    // copy: before the log, the saves made inside another activity (a flake
-    // filing intent, a fix's launch) rewrote the record and were never
-    // journaled as their own step, so the record is the superset — a journal
-    // that says "complete" here is a STALE reading of a later record stamp.
+    // A gate journal holding a save result OUTRANKS a legacy record copy
+    // (log, then journals, then the record as the read-only last resort).
     const g = store.openWorkflowJournalAt(path.join(runs.runPaths(home, RUN).workflows, "gates-a0.workflow.jsonl"), { stage: "gates-a0" });
     g.persist({ kind: "effect", key: `${RUN}/gates/a0/e0/progress/acceptance/saveGateProgress#1`, result: { key: RUN, seq: 0, at: "2026-10-03T00:00:01.000Z", gates: { acceptance: { evidence: { complete: true } } } } });
+    // …unless the record's stamp is strictly later (seq 1 > 0): a pre-log save
+    // rewrote it unjournaled, so the journal is stale and the owed row stands.
     assert.equal(sp.latestProgress(home, record).source, "record");
-    assert.equal(sp.owesEvidence(home, record), true, "the record's owed row stands over the stale journal save");
+    assert.equal(sp.owesEvidence(home, record), true);
+    const later = { ...record, gate_progress: { ...record.gate_progress, seq: 0, at: "2026-10-03T00:00:00.000Z" } };
+    assert.equal(sp.latestProgress(home, later).source, "journal", "an older record stamp yields to the journal");
+    assert.equal(sp.owesEvidence(home, later), false);
     // A post-log run whose log is lost (no record stamp) falls back to the journal…
     const lost = { run_id: RUN };
     assert.equal(sp.latestProgress(home, lost).source, "journal");
     assert.equal(sp.owesEvidence(home, lost), false);
+    // …and with no journal at all the record's legacy stamp is the last resort.
+    const bare = scratch();
+    try {
+      assert.equal(sp.latestProgress(bare, record).source, "record");
+      assert.equal(sp.owesEvidence(bare, record), true);
+    } finally { fs.rmSync(bare, { recursive: true, force: true }); }
     // …and the WRITER continues from that same reading: its first append keeps
     // the journal's rows rather than starting from an empty ledger.
     runs.atomicJson(runs.runPaths(home, RUN).record, { run_id: RUN, gate_state: "running", gate_settle_id: "o", gate_regate_count: 0 });
@@ -206,7 +214,7 @@ test("the ledger reads log-first, then a legacy record stamp (read-only), then t
     // The log outranks both.
     const w = sp.writeGateProgress(home, RUN, { gates: { acceptance: { evidence: { complete: false, gate: { id: "acceptance" } } } } }, { key: RUN, attempt: 1, own: "o" });
     assert.equal(w.ok, true, w.reason);
-    assert.equal(w.progress.seq, 2, "continued from the legacy record stamp (seq 1), not the journal (seq 0)");
+    assert.equal(w.progress.seq, 2, "continued from the later legacy record stamp (seq 1), not the journal (seq 0)");
     assert.equal(sp.latestProgress(home, record).source, "log");
     assert.equal(sp.owesEvidence(home, record), true);
     assert.deepEqual(sp.projectRun(home, record).owed, [{ row: "acceptance", carryKey: null, rescue: 0, attempt: null }]);
@@ -269,6 +277,35 @@ test("`spor runs <id>` prints the projection after the record's gate lines; a ru
     const json = JSON.parse(await capture({ json: true }));
     assert.equal(json.runs[0].run_id, RUN);
     assert.equal(json.runs[0].stages, undefined, "the JSON surface is the record as before");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("projectRun.gates reflects only the latest attempt's gate set; a gate a later attempt dropped is not a current verdict", () => {
+  const home = scratch();
+  try {
+    const record = { run_id: RUN };
+    const dir = runs.runPaths(home, RUN).workflows;
+    fs.mkdirSync(dir, { recursive: true });
+    const judge = (a, gate, verdict) => JSON.stringify({ kind: "effect", key: `${RUN}/gates/a${a}/e0/judge/r0/${gate}/c0/judge#1`, result: { outcome: { verdict, head: "abc" } } }) + "\n";
+    fs.writeFileSync(path.join(dir, "gates-a0.workflow.jsonl"), judge(0, "acceptance", "passed") + judge(0, "review", "failed"));
+    fs.writeFileSync(path.join(dir, "gates-a1.workflow.jsonl"), judge(1, "acceptance", "passed"));
+    assert.deepEqual(sp.projectRun(home, record).gates.map((g) => [g.gate, g.attempt]), [["acceptance", 1]]);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("claimGateRecord refuses a new attempt over owed flake evidence WITHOUT an owesEvidence override (the callee reads the projection)", () => {
+  const home = scratch();
+  try {
+    const file = runs.runPaths(home, RUN).record;
+    runs.atomicJson(file, { run_id: RUN, node_id: "task-demo", gate_state: "running", gate_settle_id: "o", gate_worker: "w1", gate_regate_count: 0 });
+    sp.writeGateProgress(home, RUN, { gates: { acceptance: { evidence: { complete: false, gate: { id: "acceptance" } } } } }, { key: RUN, attempt: 1, own: "o" });
+    const claim = runs.claimGateRecord(home, RUN, { workerId: "w2", reopen: { settleId: "o", regateCount: 0, state: "running" } });
+    assert.equal(claim.ok, false);
+    assert.match(claim.refused, /flake occurrence publication is still owed/);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
