@@ -307,10 +307,12 @@ function scan() {
         }
       }
     }
+    // The ledger left the record (task-spor-run-surfaces-read-stage-journal:
+    // agent-dispatch-runner.js appendGateProgress writes the gate-progress log
+    // beside the stage journals), so NOTHING assigns it any more — a legacy
+    // stamp is read, never rewritten.
     for (const m of code.matchAll(/\.gate_progress\s*=[^=]/g)) {
-      const fn = enclosingFunction(code, m.index);
-      if (inRunner && fn === "updateGateProgress") continue; // the merging writer building its patch
-      flag(rel, code, m.index, `direct assignment to .gate_progress (in ${fn || "module scope"})`);
+      flag(rel, code, m.index, `direct assignment to .gate_progress (in ${enclosingFunction(code, m.index) || "module scope"})`);
     }
 
     // R6 — the doors past a settled verdict are used only by listed callers.
@@ -320,7 +322,7 @@ function scan() {
         const allowed = SETTLED_PATCH_CALLERS[rel];
         if (!allowed || !allowed.has(fn)) flag(rel, code, m.index, `allowSettledPatch used from ${fn || "module scope"}, not a listed settled-patch caller`);
       }
-      for (const m of code.matchAll(/\.(stampGateState|stampImplState|updateGateProgress)\s*\(/g)) {
+      for (const m of code.matchAll(/\.(stampGateState|stampImplState)\s*\(/g)) {
         const text = callText(code, m.index + m[0].length - 1);
         if (!/\bforce\s*:\s*true\b/.test(text)) continue;
         const fn = enclosingFunction(code, m.index);

@@ -831,3 +831,170 @@ test("the activities table and the binding name the same set", () => {
   const listed = wf.INTEGRATION_ACTIVITIES.map(([name]) => name).filter((n) => !/^(signal|timer) /.test(n)).sort();
   assert.deepEqual(bound, listed);
 });
+
+// ---------------------------------------------------------------------------
+// THE NESTED RE-GATE inside a real integration workflow
+// (task-spor-run-surfaces-read-stage-journal, orchestrator addition 2;
+// dec-spor-gate-binding-includes-provenance-and-regate-child-journal): the
+// stage's `regate` dep drives a REAL child gate workflow over its own journal,
+// keyed on the head it judges (bin/spor.js regateStageName). A worker that
+// dies INSIDE the re-gate — at any child activity boundary — leaves the
+// parent's `regate` step unjournaled (a dead process writes nothing), so the
+// resumed parent re-calls `regate` for the same head and the child CONTINUES
+// from its journal: the gates it already judged are replayed, never re-run.
+// The sweep crashes the child at every boundary of both re-gates and checks
+// the parent lands the same result with the same side effects, that exactly
+// one child journal per head exists and was continued (one version header,
+// one `open`), and that no gate is judged twice — the at-least-once window
+// aside, where exactly one child activity (whichever it was) re-executes.
+const gwf = require("../lib/shell/gate-workflow.js");
+const gatesKernel = require("../lib/kernel/gates.js");
+const { Crash } = kernel;
+const CHILD_PASS = '```json\n{"verdict":"pass"}\n```';
+
+function childFactory() {
+  const body = ["```json", JSON.stringify({ factory: "test", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "npm test" }, { id: "review", kind: "agent-review", profile: "profile-review", cycles: 0 }] }), "```"].join("\n");
+  const { factory, errors } = gatesKernel.parseFactory(body, { id: "factory-test", gateNodes: new Map() });
+  assert.deepEqual(errors, [], errors.join("; "));
+  return factory;
+}
+
+// The landed world (two fix cycles, so two re-gates: head-v2 and head-v3),
+// with `regate` driving a real child gate Execution per head. `crashOnce`
+// ({head, at, nth}) arms the kernel's crash seam on the FIRST child Execution
+// for that head; the crash surfaces as a kernel Crash out of the dep — the
+// process dying inside the activity — which `driveNested` turns into the
+// resumed-worker shape.
+function nestedWorld({ clock, crashOnce = null }) {
+  const w = makeWorld({ clock });
+  const child = { journals: new Map(), calls: new Map(), effects: [], facts: new Map(), regateCalls: [], crashOnce, suites: 0, reviews: 0 };
+  const factory = childFactory();
+  const childDeps = (head) => ({
+    now: () => clock.now(),
+    sleep: async (ms) => clock.advanceBy(ms),
+    stopping: () => false,
+    changedPaths: async () => ({ ok: true, paths: ["lib/x.js"], head, base: "base0000", trustedRef: "main", trustedSha: "trust000", branch: "task-demo", cwd: "/repo/wt" }),
+    runSuite: async () => { child.suites += 1; return { ok: true }; },
+    review: async () => { child.reviews += 1; return { ok: true, text: CHILD_PASS }; },
+    recordFact: async ({ id, markdown }) => { child.facts.set(id, markdown); return { ok: true, id }; },
+  });
+  w.deps.regate = async ({ head }) => {
+    child.regateCalls.push(head);
+    const journal = child.journals.get(head) || [];
+    const deps = childDeps(head);
+    const { activities } = gwf.bindGateActivities(deps, { item: ITEM, factory, log: () => {} });
+    let crashPlan = null;
+    if (child.crashOnce && child.crashOnce.head === head) {
+      crashPlan = { at: child.crashOnce.at, nth: child.crashOnce.nth };
+      child.crashOnce = null;
+    }
+    const e = new Execution(gwf.gateWorkflow, { item: ITEM, factory, deps, log: () => {}, driver: { parked: null }, pinHead: head }, {
+      journal, clock, activities, crashPlan,
+      // Counted per HEAD: the two child journals share a run and attempt, so
+      // their keys spell the same.
+      onActivity: ({ key, name }) => { child.calls.set(`${head} ${key}`, (child.calls.get(`${head} ${key}`) || 0) + 1); child.effects.push({ key, name, head }); },
+      workflow: gwf.WORKFLOW_NAME, version: gwf.WORKFLOW_VERSION,
+    });
+    child.journals.set(head, e.journal);
+    const r = await e.run();
+    if (r.status === "crashed") throw new Crash(`inside the re-gate of ${head}: ${r.where}`);
+    if (r.status !== "completed") throw new Error(`the child gate workflow did not complete: ${r.status} ${r.error ? r.error.message : ""}`);
+    return r.result;
+  };
+  w.child = child;
+  return w;
+}
+
+// The kernel's test driver, with one difference: a parent that CRASHED inside
+// an activity is resumed as a NEW process over the journal as a dead process
+// left it — the kernel's own append for the throw (`threw: true` on the
+// `regate` key) is an entry no dead process ever wrote, so it is dropped.
+async function driveNested(world, clock, { onCrash = () => {} } = {}) {
+  let e = exec(world, clock, { journal: [] });
+  const q = world.signals;
+  for (let runs = 0; runs < 200; runs++) {
+    for (let i = q.length - 1; i >= 0; i--) {
+      if (q[i].atOrAfter == null || clock.now() >= q[i].atOrAfter) {
+        e.signal(q[i].name, q[i].payload);
+        q.splice(i, 1);
+      }
+    }
+    const r = await e.run();
+    if (r.status === "completed" || r.status === "failed") return r;
+    if (r.status === "crashed") {
+      onCrash(r);
+      const j = e.journal.slice();
+      const last = j[j.length - 1];
+      assert.ok(last && last.kind === "effect" && last.threw && /\/regate$/.test(last.key), `the crash surfaced through the regate step: ${JSON.stringify(last)}`);
+      j.pop();
+      e = exec(world, clock, { journal: j });
+      continue;
+    }
+    if (r.kind === "timer") { clock.advanceTo(r.detail.fireAt); continue; }
+    if (r.kind === "signal") {
+      const next = q.find((s) => s.name === r.detail.name);
+      if (next) { clock.advanceTo(Math.max(clock.now(), next.atOrAfter || clock.now())); continue; }
+      if (r.detail.deadlineAt != null) { clock.advanceTo(r.detail.deadlineAt); continue; }
+      return { ...r, stuck: true };
+    }
+  }
+  throw new Error("driveNested: did not settle");
+}
+
+test("nested re-gate crash sweep: a crash at EVERY child activity boundary of both re-gates resumes the parent, which re-calls `regate` for the same head; the child journal is CONTINUED and no gate is re-judged (only the before-journal window re-executes exactly one child activity)", async () => {
+  const refClock = fakeClock(1000);
+  const ref = nestedWorld({ clock: refClock });
+  const reference = await driveNested(ref, refClock);
+  assert.equal(reference.status, "completed", JSON.stringify(reference));
+  assert.equal(reference.result.state, "passed");
+  assert.equal(reference.result.gated_head, "head-v3");
+  assert.deepEqual(ref.child.regateCalls, ["head-v2", "head-v3"], "two re-gates, one per moved head");
+  assert.equal(reference.result.regate_facts.length, 2, "the landed head's re-gate facts (one per gate) ride the result");
+  assert.ok(reference.result.regate_facts.every((id) => ref.child.facts.has(id)), "…and they are facts the child wrote");
+  const refEffects = sideEffects(ref);
+  const refChildFacts = [...ref.child.facts.keys()].sort();
+  const childEffects = (head) => ref.child.effects.filter((x) => x.head === head).length;
+  assert.ok(childEffects("head-v2") > 6 && childEffects("head-v3") > 6, `a non-trivial child effect count, got ${childEffects("head-v2")}/${childEffects("head-v3")}`);
+  for (const [, n] of ref.child.calls) assert.equal(n, 1);
+  assert.equal(ref.child.suites, 2);
+  assert.equal(ref.child.reviews, 2);
+
+  let swept = 0;
+  for (const head of ["head-v2", "head-v3"]) {
+    for (const at of ["before-execute", "before-journal", "after-journal"]) {
+      for (let nth = 1; nth <= childEffects(head); nth++) {
+        const label = `${head} ${at}#${nth}`;
+        const clock = fakeClock(1000);
+        const world = nestedWorld({ clock, crashOnce: { head, at, nth } });
+        let crashed = 0;
+        const r = await driveNested(world, clock, { onCrash: () => crashed++ });
+        swept += 1;
+        assert.equal(crashed, 1, `${label}: crashed ${crashed} times`);
+        assert.equal(r.status, "completed", `${label}: ${r.status} ${r.error ? r.error.message : ""}`);
+        assert.deepEqual(r.result, reference.result, `${label}: result differs`);
+        assert.deepEqual(sideEffects(world), refEffects, `${label}: parent side effects differ`);
+        assert.deepEqual([...world.child.facts.keys()].sort(), refChildFacts, `${label}: child facts differ`);
+        // The resumed parent re-called `regate` for the crashed head, once.
+        assert.deepEqual(world.child.regateCalls, head === "head-v2" ? ["head-v2", "head-v2", "head-v3"] : ["head-v2", "head-v3", "head-v3"], `${label}: re-gate calls`);
+        // ONE continued child journal per head: one version header, one `open`.
+        const j = world.child.journals.get(head);
+        assert.equal(j.filter((x) => x.kind === "version").length, 1, `${label}: one version header`);
+        assert.equal(j.filter((x) => x.kind === "effect" && /\/open#1$/.test(x.key)).length, 1, `${label}: one open entry`);
+        assert.ok(j.some((x) => x.kind === "effect" && /\/settled\/settled#1$/.test(x.key)), `${label}: the child journal settled`);
+        // Never re-judged: every child activity ran once — except the
+        // before-journal window, where exactly one re-executes.
+        const twice = [...world.child.calls].filter(([, n]) => n > 1);
+        if (at === "before-journal") {
+          assert.equal(twice.length, 1, `${label}: exactly one child effect re-executes, got ${twice.map(([k]) => k)}`);
+          assert.equal(twice[0][1], 2, label);
+        } else {
+          assert.equal(twice.length, 0, `${label}: nothing re-executes, got ${twice.map(([k]) => k)}`);
+          assert.equal(world.child.suites, 2, `${label}: the suite ran once per re-gated head`);
+          assert.equal(world.child.reviews, 2, `${label}: the review ran once per re-gated head`);
+        }
+        for (const [key, n] of world.child.calls) if (/\/judge#\d+$/.test(key) && at !== "before-journal") assert.equal(n, 1, `${label}: ${key} judged ${n} times`);
+      }
+    }
+  }
+  assert.equal(swept, 3 * (childEffects("head-v2") + childEffects("head-v3")));
+});

@@ -1271,10 +1271,15 @@ required, `introduced_by_fix` on a fix cycle — everything else is advisory), a
 verdict that ignores a prior finding is unreadable and counts as changes_requested
 for the prior set only (so is a `changes_requested` with no readable findings — a
 malformed entry or a missing/empty list is never filtered down to a pass), and the
-per-gate finding ledger rides on the `art-gate-*` fact AND on the run record
-(`gate_progress`: ledger + fix count + attempts + last fix, saved BEFORE each fix
-dispatch, so a resumed pipeline keeps its prior findings and its cap holds across
-the interruption). `--read-only` REFUSES on a harness with no posture (the built-ins
+per-gate finding ledger rides on the `art-gate-*` fact AND in the run's
+GATE-PROGRESS LOG beside its stage journals (ledger + fix count + attempts +
+last fix, saved BEFORE each fix dispatch, so a resumed pipeline keeps its prior
+findings and its cap holds across the interruption — `gate-progress.jsonl`,
+one appended line per save, written only by `appendGateProgress` in
+agent-dispatch-runner.js under the record lock and read through
+`lib/shell/stage-projection.js`; it used to be the record's `gate_progress`
+stamp, which a pre-4b record still carries read-only,
+task-spor-run-surfaces-read-stage-journal). `--read-only` REFUSES on a harness with no posture (the built-ins
 all have one: codex sandbox, claude plan mode, opencode `--agent plan` plus a
 `bash: deny` for that agent via `OPENCODE_CONFIG_CONTENT` from the adapter's
 `prepareRun` — plan mode alone leaves the shell write-capable — and copilot
@@ -1494,7 +1499,7 @@ id a rescue pass mints is keyed one segment deeper (`shortRunAttempt`/
 `gateRunKey`'s third arg → `-x<n>`/`#x<n>`; progress under `<gate>#x<n>`).
 Only a refusal of the LAST rescue pass escalates, and the escalation body
 OPENS with the diagnosis. The rescue state (refusal handed, per-gate seed,
-run id, diagnosis) rides `gate_progress.rescue` on the run record
+run id, diagnosis) rides the same gate-progress log as `rescue`
 (`loadRescueState`/`saveRescueState`, `gate_rescue_run_id` stamped at launch),
 so a killed worker resumes INSIDE the rescue and adopts its run by name
 (`rescue-<short>-<n>`), never re-running the original pass. See
@@ -1607,7 +1612,7 @@ beside `fix`/`rescue`: named `impl-<short>-<n>`, adopted by name on resume,
 `--no-worktree --force --no-auto-route`, the worker's posture, the original
 `resolved_profile`) while `budget.attempts` (code outcomes: failed /
 cancelled / no-candidate / dirty-under-`require_clean`) or the SHARED
-`gate_progress.pools.retry` counter (outages, after `retry.backoff_ms`)
+`pools.retry` counter in the gate-progress log (outages, after `retry.backoff_ms`)
 allow; a spent pool settles `exhausted` (I11) / `escalated` (I8) and files a
 deterministic `task-impl-<state>-…` `requires: [human]` item that `blocks`
 the work item, the hold KEPT (T1); a re-dispatch refused pre-record is
@@ -1818,7 +1823,7 @@ gate-runner.js is the DRIVER with the same signature and result shape (the
 stage's. Unlike the integration stage, a journal this worker cannot continue
 — another version, an edited factory (the `open` digest), a tombstone — is
 NOT refused: the gate list's own rules already re-judge a moved definition
-and the record-based resume (`gate_progress`, the rescue state) still
+and the ledger-based resume (the gate-progress log, the rescue state) still
 stands until slice 4, so the driver logs it and judges over a fresh
 in-memory journal, exactly today's resume; a key-sequence fault takes the
 same door under its own "REPLAY FAULT" line (it is a workflow bug, never an
@@ -1893,11 +1898,37 @@ unfollowable run that LAUNCHED — never as the pre-record refusal that would
 withdraw the reservation and clear the hold over a run in flight. See
 test/stage-workflow.test.js, the awaitRun pins in test/gate-deps.test.js, and
 the two folded-in cases in test/gate-pipeline.test.js.
+**Slice 4b — the run surfaces read the stage journals
+(task-spor-run-surfaces-read-stage-journal):** `lib/shell/stage-projection.js`
+is the ONE read model over a run's stage journals — `projectRun` enumerates
+both journal homes (run-keyed `runPaths().workflows`, execution-keyed beside
+the execution record), reads each journal's version header, `open` binding,
+status (settled / parked on a yield / tombstoned / running), the last verdict
+per gate with the head it judged, and the ledger — and `spor runs <id>`,
+`spor work --status` (the active slot's current stage), `spor work --regate`
+(whether evidence is owed) and the claim's flake-debt refusal all read through
+it. The gate ledger left the run record: `gate_progress` is no longer written
+anywhere (the lint bans its assignment outright); the ledger is the append-only
+gate-progress log beside the stage journals, written by the runner's
+`appendGateProgress` under the record lock with the same three refusals, and
+a pre-4b record's stamp is read as the prior once and never rewritten. The
+record keeps only what the journals cannot derive — identity, the ownership
+nonce `gate_settle_id`, the timestamps and the final verdict fields — so
+`gate_state` and the settle CAS stay (they ARE the final outcome and the
+lease). `regateStageName` THROWS on a missing or non-hex head (a gated re-gate
+always judges a real sha; the shared `gates-regate-unknown` journal is gone),
+and a gate-stage definition-mismatch refusal records BOTH the provenance the
+journal opened under and the live one (`definition_mismatch.provenance`,
+`definition_journaled` on the refusal record). The nested re-gate is
+crash-swept inside a real integration workflow in
+test/integration-workflow.test.js: a crash at every CHILD activity boundary
+resumes the parent, which re-calls `regate` for the same head, and the child
+journal continues — never re-judged.
 What is NOT yet done, and
 still open on the parent task: the fold of `runGateAndIntegration` into one
-workflow, and the deletion of `gate_state`, the `gate_progress`
-save/reload, `orphanedGateRuns`, `resumableSlots`, parked re-offers and
-`claimGateRecord` that the rewrite makes possible (slice 4; both stages'
+workflow, and the deletion of `gate_state`'s transitional writes
+(`running`/`interrupted`), `orphanedGateRuns`, `resumableSlots`, parked
+re-offers and `claimGateRecord` that the rewrite makes possible (slice 4; both stages'
 re-offers still ride the loop's door — the journals only make the
 re-offered pipeline continue rather than restart). See
 test/workflow-kernel.test.js, test/workflow-journal.test.js,

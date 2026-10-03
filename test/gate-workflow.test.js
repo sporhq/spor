@@ -518,7 +518,7 @@ test("an EDITED definition between two drives of a parked journal is REFUSED at 
   const logs = [];
   const second = await gateRunner.runGatePipeline({ item: ITEM, factory: edited, deps: w.deps, log: (l) => logs.push(l) });
   assert.equal(second.state, "failed", JSON.stringify(second));
-  assert.deepEqual(second.definition_mismatch, { runId: ITEM.run_id, journaled: wf.definitionBindingDigest(SCRIPTS.passed.factory), live: wf.definitionBindingDigest(edited) });
+  assert.deepEqual(second.definition_mismatch, { runId: ITEM.run_id, journaled: wf.definitionBindingDigest(SCRIPTS.passed.factory), live: wf.definitionBindingDigest(edited), provenance: { journaled: SCRIPTS.passed.factory.definition || null, live: edited.definition || null } }, "the refusal records BOTH the provenance the journal opened under and the live one");
   assert.equal(second.refusal_tombstoned, true);
   assert.match(second.reason, /definition .* was edited while this attempt was in flight/);
   assert.equal(w.suites + w.reviews.length, 0, "nothing was judged under a mixed definition");
@@ -590,7 +590,7 @@ test("a journal whose key sequence diverges DURING replay under a binding that h
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory: SCRIPTS.passed.factory, deps: w.deps, log: (l) => logs.push(l) });
   assert.equal(res.state, "failed", JSON.stringify(res));
   assert.equal(res.refusal_tombstoned, true);
-  assert.deepEqual(res.definition_mismatch, { runId: ITEM.run_id, journaled: "sha256:old", live: wf.definitionBindingDigest(SCRIPTS.passed.factory) });
+  assert.deepEqual(res.definition_mismatch, { runId: ITEM.run_id, journaled: "sha256:old", live: wf.definitionBindingDigest(SCRIPTS.passed.factory), provenance: { journaled: null, live: SCRIPTS.passed.factory.definition || null } });
   assert.ok(!logs.some((l) => /REPLAY FAULT/.test(l)), logs.join("\n"));
   assert.equal(w.suites + w.reviews.length, 0, "nothing judged");
   assert.deepEqual(w.escalations, ["task-gate-review"], "filed against the first gate of the list the journal OPENED under");

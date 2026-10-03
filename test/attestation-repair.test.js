@@ -262,7 +262,7 @@ test("an interrupted --regate on pending flake evidence is resumed by the next -
   const gate = { id: "acceptance", kind: "command", command: "true", timeoutMs: 60000, cycles: 0, source: "inline", risk: [] };
   const factory = { ...f.factory, gates: [gate] };
   runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "failed", gate_worker: "old", gate_regate_count: 0, gate_failing_tests: ["test/old.test.js"] });
-  const owed = () => Object.values((runner.readJson(f.file).gate_progress || {}).gates || {}).some((p) => p && (p.filingIntent || (p.evidence && p.evidence.complete !== true)));
+  const owed = () => Object.values((require("../lib/shell/stage-projection.js").latestProgress(f.home, runner.readJson(f.file)).stamp || {}).gates || {}).some((p) => p && (p.filingIntent || (p.evidence && p.evidence.complete !== true)));
   const regate = () => cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory, factoryId: factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home });
   const evidence = (complete) => ({ complete, gate, origin: cli.attestationGraphOrigin(f.cfg), outcome: { state: "passed", flake: { issues: ["issue-flake-one"] } } });
   const PENDING = { state: "interrupted", gates: [], facts: [], reason: "flake occurrence evidence is pending graph publication; resume this attempt to retry it" };
@@ -300,7 +300,10 @@ test("an interrupted --regate on pending flake evidence is resumed by the next -
     // The trap: opening a NEW attempt over the owed evidence is refused, and
     // the --regate left no gating slot for a worker to resume from.
     const reopen = { settleId: rec.gate_settle_id, regateCount: 1, state: "interrupted" };
-    assert.match(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "probe", reopen }).refused, /flake occurrence publication is still owed/);
+    // The claim's owed-evidence reading is the caller's, off the gate-progress
+    // log (stage-projection.js owesEvidence) — the ledger is not a record field.
+    const projection = require("../lib/shell/stage-projection.js");
+    assert.match(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "probe", owesEvidence: (fresh) => projection.owesEvidence(f.home, fresh), reopen }).refused, /flake occurrence publication is still owed/);
     assert.equal(runner.readJson(f.file).gate_settle_id, rec.gate_settle_id, "the refused probe changed nothing");
     assert.ok(!loop.readWorkerStatuses(f.home, { alive: cli.workerAlive }).some((w) => w.live), "no live worker holds it");
 
@@ -368,7 +371,7 @@ test("a --regate resumes a work loop's interrupted pipeline under the loop's own
   const rec = runner.readJson(f.file);
   assert.equal(rec.gate_state, "passed");
   assert.equal(rec.gate_regate_count || 0, 0, "no new attempt was opened");
-  assert.equal(Object.values(rec.gate_progress.gates).some((p) => p.evidence && !p.evidence.complete), false, "nothing is left owed");
+  assert.equal(Object.values(require("../lib/shell/stage-projection.js").latestProgress(f.home, rec).stamp.gates).some((p) => p.evidence && !p.evidence.complete), false, "nothing is left owed");
 });
 
 test("proposal push and trusted-ref merge never execute repository hooks with judge credentials", () => {
@@ -461,23 +464,27 @@ test("re-gating a settled refusal never clears incomplete flake evidence — it 
   let after = runner.readJson(f.file);
   assert.equal(after.gate_regate_count, 1);
   assert.deepEqual(after.gate_progress.gates.acceptance, owedRow, "the claim leaves the obligation exactly as it was");
-  // The new attempt's first write rolls the key over and CARRIES the debt.
+  // The new attempt's first write rolls the key over and CARRIES the debt —
+  // into the gate-progress log (the legacy record stamp is the read-only
+  // prior, task-spor-run-surfaces-read-stage-journal).
+  const projection = require("../lib/shell/stage-projection.js");
   const newKey = `${f.item.run_id}#r2`;
-  const put = runner.updateGateProgress(f.home, f.item.run_id, { gates: { acceptance: { ledger: [] } } }, { key: newKey, attempt: 2, own: claim.token });
+  const put = runner.appendGateProgress(f.home, f.item.run_id, { gates: { acceptance: { ledger: [] } } }, { key: newKey, attempt: 2, own: claim.token });
   assert.equal(put.ok, true, put.reason);
-  after = runner.readJson(f.file);
-  assert.equal(after.gate_progress.key, newKey);
-  assert.deepEqual(Object.keys(after.gate_progress.gates), ["acceptance"], "the prior attempt's own state is replaced");
-  const carried = after.gate_progress.carried[`${f.item.run_id}|acceptance`];
+  assert.deepEqual(runner.readJson(f.file).gate_progress, record.gate_progress, "the record's legacy stamp is never rewritten");
+  after = projection.latestProgress(f.home, runner.readJson(f.file)).stamp;
+  assert.equal(after.key, newKey);
+  assert.deepEqual(Object.keys(after.gates), ["acceptance"], "the prior attempt's own state is replaced");
+  const carried = after.carried[`${f.item.run_id}|acceptance`];
   assert.deepEqual({ ...carried, carried_from: undefined }, { ...owedRow, carried_from: undefined }, "the owed row rides over intact");
   assert.deepEqual(carried.carried_from, { key: f.item.run_id, row: "acceptance", attempt: 0, rescue: 0 });
-  assert.equal(Object.keys(after.gate_progress.carried).length, 1, "a paid/unowed row is not carried");
+  assert.equal(Object.keys(after.carried).length, 1, "a paid/unowed row is not carried");
   // A later rollover carries it again while it is still owed.
   runner.stampGateState(f.home, f.item.run_id, { gate_state: "failed" }, { own: claim.token });
-  const again = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "third", reopen: { settleId: claim.token, regateCount: 1, state: "failed" } });
+  const again = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "third", owesEvidence: (fresh) => projection.owesEvidence(f.home, fresh), reopen: { settleId: claim.token, regateCount: 1, state: "failed" } });
   assert.equal(again.ok, true, again.refused);
-  runner.updateGateProgress(f.home, f.item.run_id, { gates: {} }, { key: `${f.item.run_id}#r3`, attempt: 3, own: again.token });
-  assert.deepEqual(Object.keys(runner.readJson(f.file).gate_progress.carried), [`${f.item.run_id}|acceptance`], "still owed, still carried, same row");
+  runner.appendGateProgress(f.home, f.item.run_id, { gates: {} }, { key: `${f.item.run_id}#r3`, attempt: 3, own: again.token });
+  assert.deepEqual(Object.keys(projection.latestProgress(f.home, runner.readJson(f.file)).stamp.carried), [`${f.item.run_id}|acceptance`], "still owed, still carried, same row");
 });
 
 // The re-attached obligation is PAID by the new attempt's preflight — under its
@@ -508,8 +515,10 @@ test("a --regate of a settled refusal owing flake evidence pays it first, then j
   const rec = runner.readJson(f.file);
   assert.equal(rec.gate_state, "passed");
   assert.equal(rec.gate_regate_count, 1);
-  assert.equal(gatesKernel.owedGateObligations(rec.gate_progress, rec.gate_progress.key).length, 0, "nothing is left owed");
-  assert.equal(rec.gate_progress.carried[`${f.item.run_id}|acceptance`].evidence.complete, true, "the receipt landed on the carried row");
+  const ledger = require("../lib/shell/stage-projection.js").latestProgress(f.home, rec);
+  assert.equal(ledger.source, "log");
+  assert.equal(gatesKernel.owedGateObligations(ledger.stamp, ledger.stamp.key).length, 0, "nothing is left owed");
+  assert.equal(ledger.stamp.carried[`${f.item.run_id}|acceptance`].evidence.complete, true, "the receipt landed on the carried row");
 });
 
 test("effective token override cannot replay another credential's outbox despite matching stored tenant metadata", async () => {

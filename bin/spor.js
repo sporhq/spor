@@ -98,6 +98,7 @@ const gateDepsLib = lazyModule(path.join(ROOT, "lib", "shell", "gate-deps.js"));
 const ciGate = lazyModule(path.join(ROOT, "lib", "shell", "ci-gate.js"));
 const implementationStage = lazyModule(path.join(ROOT, "lib", "shell", "implementation-stage.js"));
 const stageWorkflow = lazyModule(path.join(ROOT, "lib", "shell", "stage-workflow.js"));
+const stageProjection = lazyModule(path.join(ROOT, "lib", "shell", "stage-projection.js"));
 const workerContractLib = lazyModule(path.join(ROOT, "lib", "shell", "worker-contract.js"));
 // workerContractLib is lazy, so this can't be a destructure (that would force
 // the require right here, at every startup) — a thin wrapper defers it like
@@ -10479,6 +10480,17 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
     if (r.gate_fix_run_id) {
       out(`  fix cycle:  run ${String(r.gate_fix_run_id).slice(0, 8)} — 'spor runs ${r.gate_fix_run_id}' follows it${r.gate_state === "interrupted" ? " (left running by a stopped worker)" : ""}`);
     }
+    // What the run's STAGE JOURNALS say (task-spor-run-surfaces-read-stage-
+    // journal): each stage's status per attempt, the last verdict per gate,
+    // and the gate ledger — read through the one projection
+    // (stage-projection.js), never off record fields. A run with no journal
+    // prints nothing here; a record carrying a legacy `gate_progress` stamp
+    // is read, never rewritten.
+    try {
+      for (const line of stageProjection.describeRun(stageProjection.projectRun(home, r))) out(line);
+    } catch (e) {
+      out(`  journal:    unreadable — ${(e && e.message) || e}`);
+    }
     // The implementation stage's own dimension (task-spor-factory-candidate-
     // record, WORKERS.md §8) — absent on every legacy run and on every factory
     // that declares no `implementation:` block. `impl_state` is printed with
@@ -11291,6 +11303,19 @@ function cmdWorkStatus(cfg, { json }) {
       // stage. Absent unless the factory declares an `implementation:` block.
       if (gateRecord && gateRecord.impl_candidate) {
         out(`            candidate: ${candidateKernel.candidateSummary(gateRecord.impl_candidate)}`);
+      }
+      // WHERE the pipeline stands, from the run's stage journals
+      // (stage-projection.js): the current stage and its status, and the
+      // last verdict per gate — the reading the record no longer carries.
+      if (gateRecord) {
+        try {
+          const p = stageProjection.projectRun(home, gateRecord);
+          if (p.current) out(`            stage: ${p.current.kind === "gates-regate" ? `re-gate of ${String(p.current.head || "").slice(0, 12)}` : p.current.kind} a${p.current.attempt} — ${p.current.status}${p.current.state && p.current.state !== p.current.status ? ` (${p.current.state})` : ""}`);
+          if (p.gates.length) out(`            gates: ${p.gates.map((g) => `${g.gate} ${g.verdict || "pending"}${g.cycle ? ` (fix ${g.cycle})` : ""}`).join(", ")}`);
+          if (p.owed.length) out(`            ledger: ${p.owed.length} flake obligation(s) still owed to the graph`);
+        } catch (e) {
+          out(`            stage: journals unreadable — ${(e && e.message) || e}`);
+        }
       }
     }
     const recent = w.recent || [];
@@ -14761,11 +14786,14 @@ function stageWorkflowJournal(home, record, item, stageName) {
 }
 
 // The stage name of the integration stage's re-gate of a moved head: the gate
-// stage's own name plus the judged head (a hex sha; anything else is reduced to
-// the segment alphabet), so each re-gated head has one child journal
-// (`gates-regate-<head40>-a<attempt>.workflow.jsonl`) beside the stage's.
+// stage's own name plus the judged head (the full hex sha), so each re-gated
+// head has one child journal (`gates-regate-<head40>-a<attempt>.workflow.jsonl`)
+// beside the stage's. A gated re-gate always has a real sha, so a missing or
+// non-hex head THROWS rather than keying a shared, unpinned journal that a
+// later head could replay from (task-spor-run-surfaces-read-stage-journal).
 function regateStageName(head) {
-  const h = String(head || "unknown").toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 40) || "unknown";
+  const h = typeof head === "string" ? head.trim().toLowerCase() : "";
+  if (!/^[0-9a-f]{7,64}$/.test(h)) throw new Error(`the integration re-gate has no commit to key its journal on (head: ${head == null ? "none" : JSON.stringify(String(head)).slice(0, 60)}); a gated re-gate always judges a real sha`);
   return `gates-regate-${h}`;
 }
 
@@ -15679,7 +15707,9 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // continues the CURRENT attempt: same attempt number, same ids, the owed
   // evidence replayed first, no branch refresh or stage re-open (the attempt
   // already did both when it started).
-  const owesEvidence = gatesKernel.owedGateObligations(record.gate_progress, null).length > 0;
+  // Read off the run's gate-progress log (stage-projection.js), never the
+  // record: the ledger is no longer a record field.
+  const owesEvidence = stageProjection.owesEvidence(home, record);
   const resume = record.gate_state === "interrupted" || (owesEvidence && !gatesKernel.SETTLED_GATE_STATES.has(record.gate_state));
   // Attempt 1 was the pipeline that refused; each re-gate counts up from
   // there. A resume keeps the attempt it continues — and a pipeline no
@@ -15706,7 +15736,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   const status = { worker_id: workerId, pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), started_at: new Date().toISOString(), updated_at: new Date().toISOString(), kind: "regate" };
   if (!workLoop.writeWorkerStatus(home, status)) { err("spor work --regate: could not publish worker liveness; no judgement started"); return 1; }
   try {
-  const gateClaim = dispatchRuns.claimGateRecord(home, record.run_id, { workerId, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), reopen: { settleId: record.gate_settle_id || null, regateCount: Number(record.gate_regate_count) || 0, state: record.gate_state, ...(resume ? { resume: true } : {}) } });
+  const gateClaim = dispatchRuns.claimGateRecord(home, record.run_id, { workerId, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), owesEvidence: (fresh) => stageProjection.owesEvidence(home, fresh), reopen: { settleId: record.gate_settle_id || null, regateCount: Number(record.gate_regate_count) || 0, state: record.gate_state, ...(resume ? { resume: true } : {}) } });
   if (!gateClaim.ok) { err(`spor work --regate: ${gateClaim.refused || gateClaim.reason}`); return 1; }
   if (report) report.claimed = true;
   const owns = () => freshRecord(home, record).gate_settle_id === gateClaim.token;

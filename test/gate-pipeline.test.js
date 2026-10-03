@@ -3071,9 +3071,11 @@ test("issue-spor-gate-node-refile-date-collision: re-filing the same gate fact a
 });
 
 // The durable half of the resumption above: makeGateDeps keeps the per-gate
-// progress on the pipeline's own RUN RECORD (`gate_progress`, keyed by the
-// attempt's run key), which is what a later worker's makeGateDeps reads back.
-test("makeGateDeps saves gate progress on the run record and reads it back — keyed to the attempt, so a re-gate starts clean", async () => {
+// progress in the run's GATE-PROGRESS LOG beside its stage journals
+// (lib/shell/stage-projection.js; keyed by the attempt's run key), which is
+// what a later worker's makeGateDeps reads back — never on the run record
+// (task-spor-run-surfaces-read-stage-journal).
+test("makeGateDeps saves gate progress in the run's gate-progress log and reads it back — keyed to the attempt, so a re-gate starts clean; the record carries no ledger", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-progress-"));
   fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
   const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
@@ -3097,8 +3099,14 @@ test("makeGateDeps saves gate progress on the run record and reads it back — k
   const progress = { fixes: 2, attempts: [{ verdict: "failed", detail: "a" }, { verdict: "failed", detail: "b" }], ledger: [{ id: "F1", severity: "blocking", status: "open", blocking: true, summary: "x", opened: 0 }], lastFix: { cycle: 1, runId: null, fromHead: "abc", toHead: null } };
   await first.saveGateProgress({ gate, progress });
   await first.saveGateProgress({ gate: { id: "acceptance" }, progress: { fixes: 0, attempts: [], ledger: [], lastFix: null } });
+  const stageProjection = require("../lib/shell/stage-projection.js");
   const onDisk = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
-  assert.deepStrictEqual(Object.keys(onDisk.gate_progress.gates).sort(), ["acceptance", "review"], "one entry per gate, both kept");
+  assert.strictEqual(onDisk.gate_progress, undefined, "the record carries no ledger");
+  const ledger = stageProjection.latestProgress(home, onDisk);
+  assert.strictEqual(ledger.source, "log");
+  assert.deepStrictEqual(Object.keys(ledger.stamp.gates).sort(), ["acceptance", "review"], "one entry per gate, both kept");
+  assert.strictEqual(ledger.stamp.seq, 2, "one log line per save");
+  assert.strictEqual(stageProjection.readProgressLog(home, runId).length, 2);
   assert.strictEqual(onDisk.gate_state, "running", "the verdict fields are untouched");
 
   // A later worker's deps (same run, same attempt) read it back — and recover
@@ -10783,9 +10791,11 @@ test("a re-gate carries the refused attempt's owed evidence from every rescue pa
     assert.deepEqual(calls.slice(0, 2), ["debt:0", "debt:1"], "the debt is paid before anything else");
     assert.ok(calls.indexOf("tree") > 1);
     const rec = dispatchRuns.readJson(file);
-    assert.equal(rec.gate_progress.key, `${entry.run_id}#r2`);
-    for (const k of [`${entry.run_id}|acceptance`, `${entry.run_id}|acceptance#x1`]) assert.equal(rec.gate_progress.carried[k].evidence.complete, true, `${k} receipt`);
-    assert.equal(rec.gate_progress.gates.acceptance && rec.gate_progress.gates.acceptance.evidence, undefined, "the new attempt's own row never took the carried receipt");
+    const ledger = require("../lib/shell/stage-projection.js").latestProgress(home, rec);
+    assert.equal(ledger.source, "log", "the new attempt's ledger is in the gate-progress log");
+    assert.equal(ledger.stamp.key, `${entry.run_id}#r2`);
+    for (const k of [`${entry.run_id}|acceptance`, `${entry.run_id}|acceptance#x1`]) assert.equal(ledger.stamp.carried[k].evidence.complete, true, `${k} receipt`);
+    assert.equal(ledger.stamp.gates.acceptance && ledger.stamp.gates.acceptance.evidence, undefined, "the new attempt's own row never took the carried receipt");
     assert.deepEqual(real.checkEvidenceOrigins(), { ok: true }, "nothing is left owed");
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
@@ -11298,11 +11308,15 @@ test("real doors: the integration stage's re-gate drives a durable CHILD gate jo
   assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-gate-")).length, 2, `one fact per judged head: ${fs.readdirSync(nodes).join(", ")}`);
 });
 
-test("regateStageName: one child journal per judged head, in the segment alphabet", () => {
+test("regateStageName: one child journal per judged head, keyed on the full sha — a missing or non-hex head THROWS, never a shared unpinned journal", () => {
   assert.strictEqual(sporCli.regateStageName("ABCDEF0123456789abcdef"), "gates-regate-abcdef0123456789abcdef");
-  assert.strictEqual(sporCli.regateStageName("a/b c"), "gates-regate-abc");
-  assert.strictEqual(sporCli.regateStageName(null), "gates-regate-unknown");
-  assert.strictEqual(sporCli.regateStageName("///"), "gates-regate-unknown");
+  assert.strictEqual(sporCli.regateStageName(" 3b2edc0a9f1e4c7d2b8e6f0a1c3d5e7f9a0b2c4d \n"), "gates-regate-3b2edc0a9f1e4c7d2b8e6f0a1c3d5e7f9a0b2c4d");
+  // task-spor-run-surfaces-read-stage-journal (orchestrator addition 4): a
+  // gated re-gate always judges a real sha, so anything else is refused rather
+  // than keyed to `gates-regate-unknown`, a journal a later head could replay.
+  for (const bad of [null, undefined, "", "unknown", "///", "a/b c", "head-v2", "xyz", 42]) {
+    assert.throws(() => sporCli.regateStageName(bad), /no commit to key its journal on/, `head ${JSON.stringify(bad)}`);
+  }
   // A valid stage segment for the journal opener.
   require("../lib/shell/execution-store.js").openWorkflowJournalAt(path.join(os.tmpdir(), "spor-regate-name-probe.jsonl"), { stage: `${sporCli.regateStageName("deadbeef")}-a0` });
 });

@@ -130,23 +130,9 @@ test("stampImplState, stampCompletionState and stampRun refuse a stale expectedR
   assert.strictEqual(runner.readJson(file).rev, 5);
 });
 
-test("updateGateProgress with expectedRev refuses a moved record and says so, without running the mutator", () => {
-  const home = scratch();
-  seed(home, "r-cas-progress");
-  const claim = runner.claimGateRecord(home, "r-cas-progress", { workerId: "w1" });
-  assert.ok(claim.ok);
-  const read = runner.readRecord(home, "r-cas-progress");
-  let ran = 0;
-  const first = runner.updateGateProgress(home, "r-cas-progress", () => { ran += 1; return { gates: { g1: { passed: true } } }; }, { key: "k", attempt: 1, own: claim.token, expectedRev: read.rev });
-  assert.ok(first.ok);
-  assert.strictEqual(ran, 1);
-  const second = runner.updateGateProgress(home, "r-cas-progress", () => { ran += 1; return { gates: { g2: { passed: true } } }; }, { key: "k", attempt: 1, own: claim.token, expectedRev: read.rev });
-  assert.strictEqual(second.ok, false);
-  assert.strictEqual(second.stale, true);
-  assert.match(second.reason, /moved since it was read/);
-  assert.strictEqual(ran, 1, "a refused put never runs the mutator");
-  assert.deepStrictEqual(Object.keys(runner.readRecord(home, "r-cas-progress").gate_progress.gates), ["g1"]);
-});
+// The gate ledger is no longer a record field (task-spor-run-surfaces-read-
+// stage-journal): its writer is agent-dispatch-runner.js appendGateProgress
+// over the gate-progress log, pinned in test/gate-progress-writer.test.js.
 
 // ------------------------------------- the bin/spor.js callers made CAS --
 
