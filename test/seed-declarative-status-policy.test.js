@@ -205,6 +205,20 @@ test("status.resolver_types is declared by, and matches, every resolver-required
   }
 });
 
+test("a host-supplied view.resolver_types replaces the seed resolver types in the gate", () => {
+  for (const s of nodeSchemas()) {
+    const st = statusOf(s);
+    if (st.resolver_required !== true) continue;
+    const h = hooks(s);
+    const proposed = { id: `${s.key}-probe`, status: st.completion };
+    const gate = (type, resolver_types) =>
+      h.transitions({ status: "active" }, proposed, { resolvers: [{ id: `${type}-x`, type, status: "" }], non_resolving_statuses: [], resolver_types }).allow;
+    assert.equal(gate("finding", ["finding"]), true, `${s.id}: a declared override type must open the gate`);
+    assert.equal(gate("decision", ["finding"]), false, `${s.id}: an override must close the seed types it omits`);
+    assert.equal(gate("decision", undefined), true, `${s.id}: an absent view.resolver_types keeps the seed types`);
+  }
+});
+
 // ---- the declaration reaches readers through the registry, not hook source ----
 
 test("the registry accessors expose the seed completion policy the gardener derives from", () => {

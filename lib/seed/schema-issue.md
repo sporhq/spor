@@ -130,7 +130,8 @@ below tests for before allowing `resolved`. Readers (the gardener's
 terminal-without-resolver check, a remedy naming what to write) read it off the
 registry (`resolverTypes(type)`) instead of mirroring the hook's type test;
 `test/seed-declarative-status-policy.test.js` drives the hook with each declared
-type and with an undeclared one, so the two cannot drift. Declaration only —
+type and with an undeclared one, so the two cannot drift. The host passes the declared list to the hook as `view.resolver_types`
+(absent → the seed pair), so a resident override of it moves the write door with the readers. Declaration only —
 enforcement stays in the hook — backward-readable, no upgrade chain.
 
 ```json
@@ -234,16 +235,20 @@ export function transitions(current, proposed, view) {
     }
     const rs = (view && view.resolvers) || [];
     const nonResolving = (view && view.non_resolving_statuses) || [];
+    // view.resolver_types = this type's status.resolver_types, supplied by the
+    // host; a host that omits it gets the seed declaration (backward-readable).
+    const types = ((view && view.resolver_types) || []).map(function (t) { return String(t).toLowerCase(); });
+    const accepted = types.length ? types : ["decision", "artifact"];
     let ok = false;
     for (let i = 0; i < rs.length; i++) {
-      const isChange = rs[i].type === "decision" || rs[i].type === "artifact";
+      const isChange = accepted.indexOf(String(rs[i].type).toLowerCase()) !== -1;
       const st = ((rs[i] && rs[i].status) || "").toLowerCase();
       if (isChange && nonResolving.indexOf(st) === -1) { ok = true; break; }
     }
     if (!ok) {
       return {
         allow: false,
-        reason: "resolved requires a decision or artifact node in a RESOLVING " +
+        reason: "resolved requires a " + accepted.join(" or ") + " node in a RESOLVING " +
           "state that resolves this issue (an inbound resolves edge) — record " +
           "how it was fixed on the graph, even a few lines, so it surfaces in " +
           "the neighborhood; a change still in review keeps the issue open " +
