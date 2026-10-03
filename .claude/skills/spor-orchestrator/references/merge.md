@@ -193,6 +193,19 @@ id, sanitized by dispatch).
    if it moved, use `git revert` instead so you don't clobber their commit.
    Remove the kept `<dir>` worktree once you've read the failure.
 
+   **Under fleet load, one rule decides "flake" — not your judgment**
+   (task-split-spor-bf14e0e45235, issue-spor-full-suite-crashes-under-fleet-load).
+   `scripts/test-run.js` prints every file that died outside a test with its
+   exit code/signal and stderr tail, and when the run was lost ONLY to such
+   file-level crashes it re-runs exactly those files together once. Read the
+   closing line: `test-run: passed` is green; `test-run: FLAKY … passed only
+   after re-running …` is accepted — name the files in your report (a
+   `::warning` under CI); anything else is red. A file-level crash with no
+   failing test is accepted only because those files re-ran together green. Any
+   failing test, a red or crashed-again re-run, or a signal-killed/timed-out
+   runner is a REAL failure — fix or revert, never call it a flake.
+   `SPOR_TEST_RERUN_CRASHED=0` turns the re-run off (strict).
+
    Once it's green, **reconcile the landed range** — the commits you just put on
    `main` may carry `Spor:` trailers naming OTHER open items (a drive-by fix, a
    follow-up folded in), which otherwise stay open forever because nothing writes

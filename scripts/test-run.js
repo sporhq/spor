@@ -37,9 +37,19 @@
 //     code or signal, wall time, shard — and under GitHub Actions a failure is
 //     also an `::error` annotation, so a red run can never be silent
 //     (issue-spor-server-ci-run-tiers-silent-failure).
+//   - A NAMED crash. A file whose process dies outside any test (OOM kill,
+//     signal, uncaught exit) reads as a bare "test failed". The crash reporter
+//     (test/helpers/crash-reporter.js) records each such file's exit code/signal
+//     and stderr tail, the closing summary prints them, and a run lost ONLY to
+//     such crashes (runner exited 1 normally, no failing test, <= MAX_RERUN
+//     files) re-runs exactly those files together ONCE and passes only if that
+//     is green — FLAKY + `::warning`, never silent. SPOR_TEST_RERUN_CRASHED=0
+//     is strict (task-split-spor-bf14e0e45235,
+//     dec-spor-server-run-tiers-crash-only-rerun is the server twin).
 
 "use strict";
 
+const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
@@ -108,7 +118,11 @@ function defaultConcurrency() {
   return Math.max(2, width);
 }
 
-function buildArgs(argv) {
+const MAX_RERUN = 12;
+
+// `extra.files` replaces the file list and drops the shard (a re-run names its
+// files explicitly).
+function buildArgs(argv, extra = {}) {
   const pass = [];
   const files = [];
   let shard = null;
@@ -132,10 +146,45 @@ function buildArgs(argv) {
   for (const p of PRELOADS) args.push("--require", p);
   args.push("--test");
   if (!concurrency) args.push(`--test-concurrency=${defaultConcurrency()}`);
-  if (shard) args.push(`--test-shard=${shard}`);
+  if (shard && !extra.files) args.push(`--test-shard=${shard}`);
   args.push(...pass);
-  args.push(...(files.length ? files : ["test/*.test.js"]));
+  args.push(...(extra.files || (files.length ? files : ["test/*.test.js"])));
   return args;
+}
+
+// Add the crash reporter beside the human one, unless the caller chose its own
+// reporter. Node's default is spec on a TTY (and from 23 on); tap before that.
+function withCrashReporter(args, reportFile) {
+  if (args.some((a) => a === "--test-reporter" || a.startsWith("--test-reporter="))) return args;
+  const major = Number(process.versions.node.split(".")[0]);
+  const human = process.stdout.isTTY || major >= 23 ? "spec" : "tap";
+  const reporters = [
+    `--test-reporter=${human}`, "--test-reporter-destination=stdout",
+    "--test-reporter=./test/helpers/crash-reporter.js", "--test-reporter-destination=stdout",
+  ];
+  const at = args.indexOf("--test") + 1;
+  return [...args.slice(0, at), ...reporters, ...args.slice(at)];
+}
+
+function readCrashReport(file) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
+}
+
+// Whether a failed run is eligible for the one re-run: the runner exited 1
+// normally, no test failed, and a small bounded set of files crashed.
+function crashOnly({ code, signal }, rep) {
+  return !signal && code === 1 && !!rep && rep.failedTests === 0
+    && rep.crashed.length > 0 && rep.crashed.length <= MAX_RERUN;
+}
+
+function describeCrashes(crashed) {
+  const out = [];
+  for (const c of crashed) {
+    const how = c.signal ? `killed by ${c.signal}` : `exited ${c.exitCode}`;
+    out.push(`  crashed outside a test: ${path.relative(ROOT, c.file) || c.file} — ${how}`);
+    for (const l of c.stderr || []) out.push(`    | ${l}`);
+  }
+  return out.join("\n");
 }
 
 // The environment every test process runs under: the caller's, minus git's
@@ -161,30 +210,67 @@ function report(result, env = process.env) {
   }
 }
 
-function main() {
+function runOnce(args, forward) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const child = spawn(process.execPath, args, { cwd: ROOT, stdio: "inherit", env: suiteEnv() });
+    forward.child = child;
+    child.on("error", (err) => {
+      process.stderr.write(`test-run: could not start node --test: ${err.message}\n`);
+      process.exit(1);
+    });
+    child.on("exit", (code, signal) => resolve({ code, signal, ms: Date.now() - started }));
+  });
+}
+
+async function main() {
   const argv = process.argv.slice(2);
   const args = buildArgs(argv);
   const shardArg = args.find((a) => a.startsWith("--test-shard="));
   const shard = shardArg ? shardArg.slice("--test-shard=".length) : null;
-  const started = Date.now();
-  const child = spawn(process.execPath, args, { cwd: ROOT, stdio: "inherit", env: suiteEnv() });
-  const forward = (sig) => { try { child.kill(sig); } catch { /* already gone */ } };
-  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => forward(sig));
-  child.on("error", (err) => {
-    process.stderr.write(`test-run: could not start node --test: ${err.message}\n`);
-    process.exit(1);
-  });
-  child.on("exit", (code, signal) => {
-    report({ code, signal, ms: Date.now() - started, shard });
-    if (signal) {
-      process.removeAllListeners(signal);
-      process.kill(process.pid, signal);
-      return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-test-run-"));
+  const reportFile = path.join(dir, "crashes.json");
+  process.env.SPOR_TEST_CRASH_REPORT = reportFile;
+  const forward = { child: null };
+  let stopping = false; // a stop between the two runs must not start the re-run
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.on(sig, () => { stopping = true; try { forward.child.kill(sig); } catch { /* already gone */ } });
+  }
+  const cleanup = () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } };
+  process.on("exit", cleanup);
+
+  let result = await runOnce(withCrashReporter(args, reportFile), forward);
+  const rep = readCrashReport(reportFile);
+  let flaky = null;
+  if (rep && rep.crashed.length) process.stderr.write(`\ntest-run: ${rep.crashed.length} file(s) died outside a test\n${describeCrashes(rep.crashed)}\n`);
+  if (!stopping && crashOnly(result, rep) && process.env.SPOR_TEST_RERUN_CRASHED !== "0") {
+    const files = rep.crashed.map((c) => path.relative(ROOT, c.file) || c.file);
+    process.stderr.write(`test-run: only file-level crashes — re-running ${files.join(" ")} together once\n`);
+    try { fs.rmSync(reportFile, { force: true }); } catch { /* best-effort */ }
+    const again = await runOnce(withCrashReporter(buildArgs(argv, { files }), reportFile), forward);
+    const rep2 = readCrashReport(reportFile);
+    if (rep2 && rep2.crashed.length) process.stderr.write(`\ntest-run: re-run crashed again\n${describeCrashes(rep2.crashed)}\n`);
+    if (!again.signal && again.code === 0) flaky = { files, ms: result.ms + again.ms };
+    result = { ...again, ms: result.ms + again.ms };
+  }
+  cleanup();
+  if (flaky) {
+    const line = `test-run: FLAKY${shard ? ` (shard ${shard})` : ""} — passed only after re-running ${flaky.files.length} crashed file(s) together: ${flaky.files.join(", ")} (${Math.round(flaky.ms / 1000)}s total)`;
+    process.stderr.write(`\n${line}\n`);
+    if (process.env.GITHUB_ACTIONS === "true") {
+      process.stderr.write(`::warning title=test suite flaky::${line.replace(/^test-run: /, "")}\n`);
     }
-    process.exit(code == null ? 1 : code);
-  });
+  } else {
+    report({ ...result, shard });
+  }
+  if (result.signal) {
+    process.removeAllListeners(result.signal);
+    process.kill(process.pid, result.signal);
+    return;
+  }
+  process.exit(result.code == null ? 1 : result.code);
 }
 
 if (require.main === module) main();
 
-module.exports = { buildArgs, parseShard, suiteEnv, verdictLine };
+module.exports = { buildArgs, crashOnly, describeCrashes, withCrashReporter, parseShard, suiteEnv, verdictLine };

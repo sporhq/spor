@@ -11,7 +11,7 @@ const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 
 const RUNNER = path.join(__dirname, "..", "scripts", "test-run.js");
-const { buildArgs, suiteEnv, verdictLine } = require(RUNNER);
+const { buildArgs, crashOnly, withCrashReporter, suiteEnv, verdictLine } = require(RUNNER);
 const { gitEnv, gitInit } = require("./helpers/git");
 
 // This file runs as a runner CHILD; a nested runner that inherited the marker
@@ -223,4 +223,52 @@ test("a failing run ends on a FAILED verdict, and under GitHub Actions also on a
   const local = spawnSync(process.execPath, [RUNNER, bad], { encoding: "utf8", env: runnerEnv({ GITHUB_ACTIONS: "" }) });
   assert.strictEqual(local.status, 1);
   assert.doesNotMatch(local.stderr, /::error/, "outside Actions the annotation would be noise");
+});
+
+test("crashOnly: only a normal exit 1 with crashed files and no failing test earns the one re-run", () => {
+  const rep = { crashed: [{ file: "a.test.js" }], failedTests: 0 };
+  assert.strictEqual(crashOnly({ code: 1, signal: null }, rep), true);
+  assert.strictEqual(crashOnly({ code: 1, signal: null }, { ...rep, failedTests: 1 }), false);
+  assert.strictEqual(crashOnly({ code: 1, signal: "SIGTERM" }, rep), false);
+  assert.strictEqual(crashOnly({ code: 2, signal: null }, rep), false);
+  assert.strictEqual(crashOnly({ code: 1, signal: null }, null), false);
+  assert.strictEqual(crashOnly({ code: 1, signal: null }, { crashed: [], failedTests: 0 }), false);
+  const many = { crashed: Array.from({ length: 13 }, () => ({ file: "x" })), failedTests: 0 };
+  assert.strictEqual(crashOnly({ code: 1, signal: null }, many), false);
+});
+
+test("withCrashReporter adds the reporter pair unless the caller chose a reporter", () => {
+  const args = withCrashReporter(buildArgs([]), "/tmp/x");
+  assert.ok(args.includes("--test-reporter=./test/helpers/crash-reporter.js"));
+  const own = buildArgs(["--test-reporter", "tap"]);
+  assert.deepStrictEqual(withCrashReporter(own, "/tmp/x"), own);
+});
+
+function runCrashFixture(env) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "test-run-crash-"));
+  const file = path.join(dir, "crash.test.js");
+  fs.writeFileSync(file, [
+    "const t = require('node:test'), fs = require('node:fs');",
+    "t.test('a', () => {});",
+    `const flag = ${JSON.stringify(path.join(dir, "flag"))};`,
+    "if (!fs.existsSync(flag)) { fs.writeFileSync(flag, '1'); console.error('boom line'); setTimeout(() => process.kill(process.pid, 'SIGKILL'), 100); }",
+  ].join("\n"));
+  const r = spawnSync(process.execPath, [RUNNER, file], { env: runnerEnv(env), encoding: "utf8", timeout: 120000 });
+  fs.rmSync(dir, { recursive: true, force: true });
+  return r;
+}
+
+test("a file killed outside a test is named, re-run once together, and passes as FLAKY", () => {
+  const r = runCrashFixture({});
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /crashed outside a test: .*crash\.test\.js — killed by SIGKILL/);
+  assert.match(r.stderr, /\| boom line/);
+  assert.match(r.stderr, /test-run: FLAKY/);
+});
+
+test("SPOR_TEST_RERUN_CRASHED=0 is strict: the crash stays red and is still named", () => {
+  const r = runCrashFixture({ SPOR_TEST_RERUN_CRASHED: "0" });
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /killed by SIGKILL/);
+  assert.match(r.stderr, /test-run: FAILED/);
 });
