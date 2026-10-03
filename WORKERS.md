@@ -4038,9 +4038,13 @@ fallback; the legacy no-op).
 
 §10.14 declares the stage; this is what `spor work` DOES with it
 (task-spor-factory-implementation-stage-runner, FACTORY-IMPLEMENTATION-STAGE.md
-§4.2 rows I2-I11, §5.3, §6.5; `lib/shell/implementation-stage.js`, its
-launcher and stamps in `bin/spor.js` `makeGateDeps` beside the fix cycle's and
-the rescue's). Under `completion.by: controller` every terminal implementer run
+§4.2 rows I2-I11, §5.3, §6.5; `lib/shell/implementation-stage.js` is the
+door, `lib/shell/implementation-workflow.js` the control flow — one
+deterministic workflow function over `lib/kernel/workflow.js`
+(task-spor-implementation-stage-as-workflow-function, the third per-stage
+slice of the gate-pipeline rewrite; see "Durability" at the end of this
+section) — its launcher and stamps in `lib/shell/gate-deps.js` `makeGateDeps`
+beside the fix cycle's and the rescue's). Under `completion.by: controller` every terminal implementer run
 is gated (§10.2), and the stage runs FIRST — between the loop's harvest and the
 first gate — inside the same pipeline promise, so the slot-holding, cooldown
 and resume machinery of §10.8 need no changes: only a CANDIDATE reaches the
@@ -4180,6 +4184,35 @@ See test/gate-pipeline.test.js ("the implementation stage": every row with a
 fake dispatcher, plus the real doors end to end), test/completion-boundary.
 test.js (the claim-time reservation and budget stamp) and
 test/work-loop.test.js (the per-record ceiling).
+
+**Durability (task-spor-implementation-stage-as-workflow-function).** The
+loop above is `implementationWorkflow(ctx, input)` in
+`lib/shell/implementation-workflow.js`, a deterministic function of (input,
+journal) over the replay kernel, exactly as the integration stage is (§10.9):
+every deps call is a `ctx.run` keyed on the ledger's own ids (the segment's
+attempt key and the entry's index), so a resumed worker replays the recorded
+RESULT and never re-executes a step that landed. The re-dispatch is the
+launch half (`dispatchImplement`, adopt-by-name) journaled with the run it
+started, the run id stamped on the ledger's reservation, then the run's
+terminal state awaited as a SIGNAL (`run:<id>`) — a worker that dies while a
+re-dispatched implementer runs resumes awaiting the SAME run. The retry
+backoff is a durable timer the driver waits out in-process (sliced, answered
+by a stop as before); a stop is a journaled read plus a durable yield, so the
+re-driven workflow asks again and goes on from where it stopped rather than
+replaying the stop. The run record rides the journal as a VIEW (the fields
+the classifier and the no-code claim read), never whole. The `open` entry
+binds the `implementation` block and the trusted ref; a resume under an
+edited definition fails CLOSED — the journal is tombstoned and the attempt
+settled `escalated` outside it, under the same escalation id, and a revert
+re-settles the same refusal — so the door back is a fresh attempt (`spor
+work --regate <run>`), which opens its own journal
+(`journal/executions/<tenant>/exec/<id>.implementation-a<attempt>.workflow.jsonl`,
+beside the integration stage's). A legacy run or a pre-adapter claim runs
+over an in-memory journal, byte-identical to the runner it replaced.
+test/implementation-workflow.test.js is the durability oracle (a crash at
+every activity boundary resumes to the same result and side effects); the
+stage rows in test/gate-pipeline.test.js are the behavioural one, unchanged.
+
 ### 10.10 The attestation — a commit-bound, config-checksummed record per run
 
 A gate fact that says only "gate `acceptance` passed" cannot be validated by

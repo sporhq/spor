@@ -1749,9 +1749,43 @@ attestation) carries only the facts of the re-gate that judged the head
 being landed; the LIVE `regate` closure in `runGateAndIntegration` keeps
 the same rule (a later re-gate's facts REPLACE the previous re-gate's on
 `gateFacts`), so the live and resumed arms attest the same fact list.
+**The implementation stage IS a workflow function too
+(task-spor-implementation-stage-as-workflow-function, the third slice):**
+`lib/shell/implementation-workflow.js` holds the stage's control flow as
+`implementationWorkflow(ctx, input)` over the same kernel, and
+`runImplementationStage` in implementation-stage.js is its driver's door
+with the same signature and result shape (the stage rows in
+test/gate-pipeline.test.js drive it unchanged). Every deps call is a
+`ctx.run` keyed on the segment's attempt key and the entry's index
+(`<run>/implementation/a<attempt>/i<index>/<site>`); the re-dispatch is
+`dispatchImplement` + an `awaitSignal(run:<id>)` when gate-deps wires the
+two halves (it does; the one-shot `implement` is their tagged composition,
+and the signal payload carries the run record's VIEW — `recordView`, the
+fields the classifier and the no-code claim read, never the whole record);
+the run id is stamped on the ledger's reservation BEFORE the await, so a
+worker that dies mid-attempt resumes awaiting the SAME run. The retry
+backoff is a durable `sleepUntil` the driver waits out in-process, sliced on
+`deps.sleep` and answered by `deps.stopping` exactly as the runner's
+waitBackoff was — a stop hands up the journaled `interrupted` result and the
+re-drive continues from the timer (the reserved attempt launched, the pool
+never charged twice). A STOP is a journaled `stopping` read plus a durable
+yield (the interrupted result journaled, a `YIELD_MS` timer), and the
+re-driven workflow asks again under the next key, so a stop is never
+replayed as a verdict. The `open` entry binds the `implementation` block +
+`trustedRef` (`definitionBindingDigest`); a resume under an edited
+definition fails closed the same way the integration stage does — tombstone
+first, then settled `escalated` outside the journal (`settleRefusal`: the
+ledger stamped, the `task-impl-escalated-…` item filed), and a revert
+re-settles the same refusal. bin/spor.js opens the journal through the same
+`stageWorkflowJournal(home, record, item, "implementation")` the integration
+stage uses (`implementation-a<attempt>` beside the execution record; a
+legacy run runs over an in-memory journal, byte-identical). See
+test/implementation-workflow.test.js (the crash sweep over the retry,
+outage and exhausted scripts; the worker-dies-mid-run proof; the stop and
+backoff yields over the file journal; the definition-mismatch refusal).
 What is NOT yet done, and
 still open on the parent task: the rewrite of `runGateAndIntegration`/
-`runGatePipeline`/the implementation stage as one workflow function over
+`runGatePipeline` as one workflow function over
 this kernel, and the deletion of `gate_state`, the `gate_progress`
 save/reload, `orphanedGateRuns`, `resumableSlots`, parked re-offers and
 `claimGateRecord` that the rewrite makes possible (the integration stage's

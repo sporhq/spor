@@ -14452,7 +14452,13 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // Gated on a DECLARED stage under controller completion, so a factory
   // without an `implementation:` block is byte-identical.
   if (controller && ctx.factory.implementation) {
-    const stage = await implementationStage.runImplementationStage({ item, factory: ctx.factory, record, log: ctx.log, deps: gateDeps });
+    // The stage's durable journal (task-spor-implementation-stage-as-
+    // workflow-function): beside the execution record, keyed on the execution
+    // the claim opened and this gate ATTEMPT, exactly as the integration
+    // stage's is — a legacy run or a pre-adapter claim runs over an in-memory
+    // journal, byte-identical.
+    const implJournal = stageWorkflowJournal(home, record, item, "implementation");
+    const stage = await implementationStage.runImplementationStage({ item, factory: ctx.factory, record, log: ctx.log, deps: { ...gateDeps, ...(implJournal ? { workflowJournal: implJournal } : {}) } });
     if (stage.state !== "candidate") {
       if (stage.state === "unroutable") {
         // Through the same outcome door as a refused first dispatch: end the
@@ -14645,7 +14651,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // the attempt and continue from the journal). A legacy run or a pre-adapter
   // claim has no execution to key on and runs over an in-memory journal,
   // byte-identical to before.
-  const integrationJournal = integrationWorkflowJournal(home, record, item);
+  const integrationJournal = stageWorkflowJournal(home, record, item, "integration");
   intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null, deps: { ...makeIntegrationDeps(cfg, { ...intCtx, gateResult: () => gateResult, regate }), ...(integrationJournal ? { workflowJournal: integrationJournal } : {}) } });
   // A passing re-gate the stage REPLAYED (a resumed worker: the journal holds
   // the re-gate's result, so the `regate` closure above — whose merge into
@@ -14702,10 +14708,10 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
 // has no execution to key it on. A function (re-openable): the driver opens
 // a fresh handle after a poisoned persist, so what it replays is what is on
 // disk.
-function integrationWorkflowJournal(home, record, item) {
+function stageWorkflowJournal(home, record, item, stageName) {
   const claim = record && record.impl_claim;
   if (!claim || !claim.store || !claim.execution_id || !claim.tenant) return null;
-  const stage = `integration-a${Math.max(0, Number(item && item.attempt) || 0)}`;
+  const stage = `${stageName}-a${Math.max(0, Number(item && item.attempt) || 0)}`;
   if (!executionStore.validSegment(String(claim.tenant)) || !executionStore.validSegment(String(claim.execution_id))) return null;
   return () => executionStore.openWorkflowJournal(home, String(claim.tenant), String(claim.execution_id), { stage });
 }
