@@ -1715,17 +1715,34 @@ the candidate sha as landed (the at-least-once window), and
 `definitionBindingDigest` — a digest over the factory's `integration` block,
 `trustedRef` and `protectedPaths`, the three inputs makeIntegrationDeps'
 activities read LIVE — and a resume whose live digest differs throws a `NonDeterminism` tagged
-`definitionMismatch` before the lease or the tree read (the journal gains
-nothing, so a re-drive under the ORIGINAL definition continues where it
-stopped). The driver settles that attempt as REFUSED outside the journal
-(`refuseUnresumable`: the escalation, the §10.7 demotion and the
+`definitionMismatch` before the lease or the tree read (the WORKFLOW
+appends nothing). The driver settles that attempt as REFUSED outside the
+journal (`refuseUnresumable`: the escalation, the §10.7 demotion and the
 `art-merge-*` fact under the ids the attempt would have minted, result
 tagged `definition_mismatch`), never a land under a mixed definition and
 never a rebuild of the activities from the snapshot (that would run an old
 suite command against a changed factory); a journal recorded by another
-WORKFLOW_VERSION is settled the same way (`journal_version_mismatch`). The
-door back is a fresh attempt (`spor work --regate <run>`), which opens its
-own journal under the current definition. And the result's `regate_facts`
+WORKFLOW_VERSION is settled the same way (`journal_version_mismatch`).
+**A refusal is TERMINAL for its journal**
+(task-spor-integration-refusal-tombstones-journal): those settle writes are
+durable and nothing reverses them, so before it makes any of them the driver
+writes the kernel's `tombstone` entry (`Execution.tombstone`, persisted like
+every append; `journalTombstone` reads it back, and `run()` fails with
+`WorkflowTombstoned` BEFORE the version header is read, so a journal of any
+version stays refused). The tombstone carries the refusal RECORD
+(`refusalRecord`: the detail, the journaled clock, and the live-factory
+fields the ids and fact body are built from), and a resume of a tombstoned
+journal re-settles from that record (`settleRefusal`, result tagged
+`refusal_replayed`) — same ids, same bytes — so a crash between the
+tombstone and the settle is made whole on the next attempt, and a factory
+REVERTED after the refusal can never continue the attempt and land it. "A
+re-drive under the ORIGINAL definition continues where it stopped" therefore
+holds ONLY for a journal that never refused through the driver (a bare
+Execution that threw the mismatch is still resumable; a driven one is closed
+for good). A tombstone the persist cannot land poisons the Execution and
+THROWS, so a refusal that could not be made durable settles nothing and the
+next pass refuses again. The door back is a fresh attempt (`spor work
+--regate <run>`), which opens its own journal under the current definition. And the result's `regate_facts`
 are the CARRIED re-gate's facts only — reset whenever a later re-gate
 supersedes `regate_result` — so bin/spor.js's adoption (and the
 attestation) carries only the facts of the re-gate that judged the head

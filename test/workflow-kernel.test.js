@@ -366,6 +366,57 @@ test("a replayed failure keeps the name and code a workflow branches on; a falsy
   }
 });
 
+test("a TOMBSTONE closes a journal for good: persisted like every append, read before the version header, idempotent, and a poisoned persist never leaves one in memory alone", async () => {
+  const clock = fakeClock(0);
+  const w = world(clock);
+  const persisted = [];
+  const e = new Execution(oneGate, { id: "g1" }, { journal: [], clock, activities: w.activities, persist: (x) => persisted.push(x), workflow: "gate-pipeline", version: "3" });
+  assert.equal((await e.run()).status, "suspended");
+  const before = e.journal.length;
+  assert.equal(wf.journalTombstone(e.journal), null);
+
+  const t = e.tombstone("definition_mismatch", { detail: "edited", at: 7 });
+  assert.deepEqual(t, { kind: "tombstone", reason: "definition_mismatch", detail: { detail: "edited", at: 7 } });
+  assert.equal(e.journal.length, before + 1);
+  assert.deepEqual(persisted[persisted.length - 1], t, "persisted like every append");
+  assert.deepEqual(wf.journalTombstone(e.journal), t);
+  assert.equal(e.tombstone("again", { x: 1 }), t, "idempotent: the FIRST tombstone stands");
+  assert.equal(e.journal.length, before + 1);
+
+  // Every later run fails with the recorded tombstone — and a signal is refused.
+  const r = await e.run();
+  assert.equal(r.status, "failed");
+  assert.equal(r.error.name, "WorkflowTombstoned");
+  assert.ok(r.error instanceof wf.WorkflowTombstoned);
+  assert.deepEqual(r.error.tombstone, t);
+  assert.ok(wf.isControlFlow(r.error));
+  assert.throws(() => e.signal("run:x", {}), { name: "WorkflowTombstoned" });
+  assert.equal(w.dispatches, 1, "nothing re-executed");
+
+  // Read BEFORE the version header: a different version — even an
+  // unversioned execution — is refused by the tombstone, not continued.
+  for (const opts of [{ workflow: "gate-pipeline", version: "4" }, {}]) {
+    const other = new Execution(oneGate, { id: "g1" }, { journal: e.journal.slice(), clock, activities: w.activities, ...opts });
+    const ro = await other.run();
+    assert.equal(ro.status, "failed", JSON.stringify(opts));
+    assert.equal(ro.error.name, "WorkflowTombstoned", JSON.stringify(opts));
+  }
+
+  // A tombstone on an EMPTY versioned journal opens it with the header first.
+  const fresh = new Execution(oneGate, { id: "g2" }, { journal: [], clock, activities: w.activities, workflow: "gate-pipeline", version: "3" });
+  fresh.tombstone("refused");
+  assert.equal(fresh.journal[0].kind, "version");
+  assert.equal(fresh.journal[1].kind, "tombstone");
+  assert.equal(fresh.journal[1].detail, undefined, "no detail, no key");
+
+  // A persist that throws poisons the execution and THROWS: memory never
+  // holds a tombstone the disk does not.
+  const bad = new Execution(oneGate, { id: "g3" }, { journal: [], clock, activities: w.activities, persist: () => { throw new Error("disk full"); }, workflow: "gate-pipeline", version: "3" });
+  assert.throws(() => bad.tombstone("refused", { a: 1 }), { message: "disk full", poisoned: true });
+  assert.ok(bad.poisoned);
+  assert.equal((await bad.run()).status, "failed");
+});
+
 test("the constructor refuses what the model cannot run without", () => {
   assert.throws(() => new Execution(null, {}, { clock: fakeClock() }), /function of \(ctx, input\)/);
   assert.throws(() => new Execution(() => 1, {}, {}), /injected clock/);

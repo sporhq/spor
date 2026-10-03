@@ -29,7 +29,8 @@ const path = require("node:path");
 const integrationRunner = require("../lib/shell/integration-runner.js");
 const wf = require("../lib/shell/integration-workflow.js");
 const store = require("../lib/shell/execution-store.js");
-const { Execution, drive, fakeClock } = require("../lib/kernel/workflow.js");
+const kernel = require("../lib/kernel/workflow.js");
+const { Execution, drive, fakeClock } = kernel;
 
 const ITEM = { node_id: "task-demo", run_id: "run-abcdef12", project: "demo" };
 const FACTORY = { id: "factory-demo", integration: { targetRef: "main", mode: "local", command: "npm test", strategy: "merge", serialize: "repo", cycles: 2, timeoutMs: 900000, reruns: 0 } };
@@ -264,8 +265,11 @@ test("a factory edited between attempts FAILS CLOSED: the resumed execution refu
     assert.equal(second.journal.length, before, `${label}: the refusal appends nothing to the journal`);
   }
 
-  // The ORIGINAL definition still continues from where it stopped: the
-  // refusal left the journal intact.
+  // The ORIGINAL definition still continues from where it stopped: a bare
+  // Execution's refusal left the journal intact. This holds ONLY for a
+  // journal that never refused through the DRIVER — driveIntegrationStage
+  // tombstones the journal before settling, and a tombstoned journal is
+  // re-settled, never continued (the driver tests below).
   const { r2, world2 } = await resumeWith(FACTORY);
   assert.equal(r2.status, "completed", JSON.stringify(r2));
   assert.equal(r2.result.state, "passed");
@@ -537,7 +541,7 @@ test("a resumed worker tears down its predecessor's candidate by path: the clean
   assert.deepEqual(b.seen.discarded, ["/tmp/candidate-1"]);
 });
 
-test("the DRIVER settles a definition edited between attempts as a refusal of the attempt over the file journal: escalated, demoted, a fact — no build, no land, nothing appended; the original definition still continues", async () => {
+test("the DRIVER settles a definition edited between attempts as a refusal of the attempt over the file journal: escalated, demoted, a fact — no build, no land — and TOMBSTONES the journal first, so the original definition can never continue it", async () => {
   const home = scratchHome("edited");
   const clock = fakeClock(1_700_000_000_000);
   let ciUp = false;
@@ -558,46 +562,141 @@ test("the DRIVER settles a definition edited between attempts as a refusal of th
   ciUp = true;
   clock.advanceBy(wf.YIELD_MS + 1);
 
-  for (const [label, edited] of [
-    ["the integration block edited", { ...factory, integration: { ...factory.integration, command: "npm run test:all" } }],
-    ["the trusted ref edited", { ...factory, trustedRef: "release" }],
-  ]) {
-    const escalations = seen.escalations;
-    const facts = seen.facts.length;
-    const r = await integrationRunner.runIntegrationStage({ item: ITEM, factory: edited, deps, log, gatedHead: "head-v1" });
-    assert.equal(r.state, "failed", `${label}: ${JSON.stringify(r)}`);
-    assert.ok(r.definition_mismatch, `${label}: tagged`);
-    assert.equal(r.definition_mismatch.journaled, wf.definitionBindingDigest(factory));
-    assert.equal(r.definition_mismatch.live, wf.definitionBindingDigest(edited));
-    assert.match(r.reason, /edited while this attempt was in flight/);
-    assert.match(r.reason, /nothing is judged or landed under a mixed definition/);
-    assert.equal(r.escalated_to, "task-integration-escalate-x", `${label}: escalated`);
-    assert.equal(r.demoted, true, `${label}: demoted`);
-    assert.equal(seen.escalations, escalations + 1);
-    assert.equal(seen.demotions, seen.escalations);
-    assert.equal(seen.facts.length, facts + 1, `${label}: the refusal is recorded as a fact`);
-    assert.deepEqual(r.facts, [seen.facts[seen.facts.length - 1].id]);
-    assert.match(seen.facts[seen.facts.length - 1].markdown, /mixed definition/);
-    assert.equal(r.landed_sha, null);
-    assert.equal(r.gated_head, "head-v1");
-    assert.deepEqual(r.attempts.map((a) => a.verdict), ["failed"]);
-    assert.equal(seen.builds, 1, `${label}: no rebuild`);
-    assert.equal(seen.suites, 1, `${label}: the suite did not run`);
-    assert.equal(seen.lands, 0, `${label}: nothing landed`);
-    assert.equal(seen.leaseAcquired, 1, `${label}: the lease was not re-taken`);
-    assert.equal(onDisk().length, j1.length, `${label}: the refusal appends nothing to the journal`);
-    assert.ok(logs.some((l) => /integration failed on task-demo — the factory's integration definition/.test(l)), logs.join("\n"));
-  }
+  const edited = { ...factory, integration: { ...factory.integration, command: "npm run test:all" } };
+  const r = await integrationRunner.runIntegrationStage({ item: ITEM, factory: edited, deps, log, gatedHead: "head-v1" });
+  assert.equal(r.state, "failed", JSON.stringify(r));
+  assert.ok(r.definition_mismatch, "tagged");
+  assert.equal(r.definition_mismatch.journaled, wf.definitionBindingDigest(factory));
+  assert.equal(r.definition_mismatch.live, wf.definitionBindingDigest(edited));
+  assert.match(r.reason, /edited while this attempt was in flight/);
+  assert.match(r.reason, /nothing is judged or landed under a mixed definition/);
+  assert.equal(r.escalated_to, "task-integration-escalate-x", "escalated");
+  assert.equal(r.demoted, true, "demoted");
+  assert.equal(r.refusal_tombstoned, true);
+  assert.equal(r.refusal_replayed, undefined, "a fresh refusal, not a re-settle");
+  assert.equal(seen.escalations, 1);
+  assert.equal(seen.demotions, 1);
+  assert.equal(seen.facts.length, 1, "the refusal is recorded as a fact");
+  assert.deepEqual(r.facts, [seen.facts[0].id]);
+  assert.match(seen.facts[0].markdown, /mixed definition/);
+  assert.equal(r.landed_sha, null);
+  assert.equal(r.gated_head, "head-v1");
+  assert.deepEqual(r.attempts.map((a) => a.verdict), ["failed"]);
+  assert.equal(seen.builds, 1, "no rebuild");
+  assert.equal(seen.suites, 1, "the suite did not run");
+  assert.equal(seen.lands, 0, "nothing landed");
+  assert.equal(seen.leaseAcquired, 1, "the lease was not re-taken");
+  assert.ok(logs.some((l) => /integration failed on task-demo — the factory's integration definition/.test(l)), logs.join("\n"));
 
-  // The ORIGINAL definition re-driven: the journal continues from the yield
-  // and lands — the refusals above did not poison it.
-  const late = await integrationRunner.runIntegrationStage({ item: ITEM, factory, deps, log, gatedHead: "head-v1" });
-  assert.equal(late.state, "passed", JSON.stringify(late));
-  assert.equal(seen.lands, 1);
-  assert.equal(seen.builds, 2);
+  // The refusal is TERMINAL for the journal: exactly one entry was appended,
+  // the kernel's tombstone, carrying the refusal the settle was made from.
+  const j2 = onDisk();
+  assert.equal(j2.length, j1.length + 1, "the refusal appends exactly the tombstone");
+  const tomb = j2[j2.length - 1];
+  assert.equal(tomb.kind, "tombstone");
+  assert.equal(tomb.reason, "definition_mismatch");
+  assert.equal(tomb.detail.detail, r.attempts[0].detail);
+  assert.deepEqual(tomb.detail.definition_mismatch, r.definition_mismatch);
+  assert.deepEqual(kernel.journalTombstone(j2), tomb);
+
+  // Factory REVERTED to the original definition and the journal re-driven:
+  // the attempt is NOT continued — no build, no suite, no land — and no
+  // second fact or escalation is minted; the same refusal is re-settled
+  // idempotently under the same ids (if_exists: skip on the graph side).
+  clock.advanceBy(60_000);
+  const reverted = await integrationRunner.runIntegrationStage({ item: ITEM, factory, deps, log, gatedHead: "head-v1" });
+  assert.equal(reverted.state, "failed", JSON.stringify(reverted));
+  assert.equal(reverted.refusal_replayed, true, "re-settled from the tombstone");
+  assert.equal(reverted.refusal_tombstoned, true);
+  assert.deepEqual(reverted.definition_mismatch, r.definition_mismatch);
+  assert.equal(reverted.escalated_to, r.escalated_to);
+  assert.deepEqual(reverted.facts, r.facts, "the same fact id");
+  assert.equal(reverted.finished_at, r.finished_at, "the journaled clock, not the live one");
+  assert.equal(seen.facts.length, 2, "the fact write is re-made under the same id (idempotent on the graph side)");
+  assert.equal(seen.facts[1].id, seen.facts[0].id);
+  assert.equal(seen.facts[1].markdown, seen.facts[0].markdown, "byte-identical: the record, not the live factory, is what the settle reads");
+  assert.equal(seen.escalations, 2, "re-filed under its own deterministic id");
+  assert.equal(seen.demotions, 2);
+  assert.equal(seen.builds, 1, "reverted: no rebuild");
+  assert.equal(seen.suites, 1, "reverted: the suite did not run");
+  assert.equal(seen.lands, 0, "reverted: NOTHING LANDED");
+  assert.equal(seen.leaseAcquired, 1, "reverted: the lease was not re-taken");
+  assert.equal(onDisk().length, j2.length, "a re-settle appends nothing more");
+  assert.ok(logs.some((l) => /re-settled from the attempt's refusal tombstone/.test(l)), logs.join("\n"));
+
+  // ...and under the EDITED definition too: tombstone wins, nothing is judged.
+  const again = await integrationRunner.runIntegrationStage({ item: ITEM, factory: edited, deps, log, gatedHead: "head-v1" });
+  assert.equal(again.state, "failed");
+  assert.equal(again.refusal_replayed, true);
+  assert.deepEqual(again.facts, r.facts);
+  assert.equal(seen.lands, 0);
+  assert.equal(onDisk().length, j2.length);
 });
 
-test("the DRIVER settles a journal recorded by another workflow version the same way: refused, escalated, never continued", async () => {
+test("a crash between the tombstone and the settle: the next attempt re-settles the refusal from the tombstone under the same ids, even with the factory reverted", async () => {
+  const home = scratchHome("tomb-crash");
+  const clock = fakeClock(1_700_000_000_000);
+  let ciUp = false;
+  const { deps, seen } = stageFakes({ home, clock, suite: () => (ciUp ? { ok: true } : { ok: false, reason: "CI run cancelled", outage: { outcome: "infrastructure", reason: "cancelled" } }) });
+  const factory = { ...FACTORY, trustedRef: "main", integration: { ...FACTORY.integration, ci: { workflow: "test.yaml" } } };
+  const first = await integrationRunner.runIntegrationStage({ item: ITEM, factory, deps, gatedHead: "head-v1" });
+  assert.equal(first.state, "interrupted");
+  ciUp = true;
+  clock.advanceBy(wf.YIELD_MS + 1);
+  const onDisk = () => store.readWorkflowJournal(home, "local", EXEC, { stage: "integration-a0" });
+  const before = onDisk().length;
+
+  // What the refusing worker would have on disk had it died right after the
+  // tombstone landed and before a single settle write: the refusal record,
+  // as the driver builds it, tombstoned through the kernel over the file
+  // journal — and no escalation, demotion or fact anywhere.
+  const edited = { ...factory, trustedRef: "release" };
+  const error = (() => {
+    const e = new Error("mismatch");
+    e.definitionMismatch = { runId: ITEM.run_id, journaled: wf.definitionBindingDigest(factory), live: wf.definitionBindingDigest(edited) };
+    return e;
+  })();
+  const refusal = wf.refusalRecord({ item: ITEM, factory: edited, gatedHead: "head-v1", error, clock });
+  const h = deps.workflowJournal();
+  const dying = new Execution(wf.integrationWorkflow, {}, { journal: h.journal, persist: h.persist, clock, activities: {}, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+  dying.tombstone(refusal.reason, refusal);
+  assert.equal(onDisk().length, before + 1, "the tombstone is on disk");
+  assert.equal(seen.escalations, 0);
+  assert.equal(seen.facts.length, 0);
+
+  // What the refusal WOULD have settled to, had it not crashed — computed over
+  // an identical world so the ids and bytes can be compared.
+  const twin = stageFakes({ home: scratchHome("tomb-twin"), clock, suite: () => ({ ok: true }) });
+  const expected = await wf.settleRefusal({ item: ITEM, deps: twin.deps, log: () => {}, refusal });
+
+  // The next attempt — the factory already reverted — re-settles from the
+  // tombstone: the same escalation, the same fact under the same id with
+  // the same bytes, nothing built or landed, nothing appended.
+  clock.advanceBy(3_600_000);
+  const logs = [];
+  const r = await integrationRunner.runIntegrationStage({ item: ITEM, factory, deps, log: (l) => logs.push(l), gatedHead: "head-v1" });
+  assert.equal(r.state, "failed", JSON.stringify(r));
+  assert.equal(r.refusal_replayed, true);
+  assert.deepEqual(r.definition_mismatch, error.definitionMismatch);
+  assert.equal(r.escalated_to, expected.escalated_to);
+  assert.equal(r.demoted, true);
+  assert.deepEqual(r.facts, expected.facts);
+  assert.equal(r.finished_at, expected.finished_at, "the tombstone's clock, not the live one");
+  assert.equal(seen.escalations, 1);
+  assert.equal(seen.demotions, 1);
+  assert.equal(seen.facts.length, 1);
+  assert.equal(seen.facts[0].id, twin.seen.facts[0].id);
+  assert.equal(seen.facts[0].markdown, twin.seen.facts[0].markdown, "byte-identical to the settle that never happened");
+  assert.match(seen.facts[0].markdown, /mixed definition/);
+  assert.equal(seen.builds, 1, "no rebuild");
+  assert.equal(seen.suites, 1, "the suite did not run");
+  assert.equal(seen.lands, 0, "NOTHING LANDED");
+  assert.equal(seen.leaseAcquired, 1);
+  assert.equal(onDisk().length, before + 1, "a re-settle appends nothing");
+  assert.ok(logs.some((l) => /re-settled from the attempt's refusal tombstone/.test(l)), logs.join("\n"));
+});
+
+test("the DRIVER settles a journal recorded by another workflow version the same way: refused, escalated, never continued — and tombstoned, so a downgrade cannot continue it either", async () => {
   const home = scratchHome("version");
   const clock = fakeClock(1_700_000_000_000);
   const { deps, seen } = stageFakes({ home, clock, suite: () => ({ ok: true }) });
@@ -610,13 +709,35 @@ test("the DRIVER settles a journal recorded by another workflow version the same
   assert.equal(r.journal_version_mismatch, true);
   assert.match(r.reason, /recorded by another version of the workflow/);
   assert.equal(r.escalated_to, "task-integration-escalate-x");
+  assert.equal(r.refusal_tombstoned, true);
   assert.equal(seen.escalations, 1);
   assert.equal(seen.demotions, 1);
   assert.equal(seen.facts.length, 1);
   assert.equal(seen.builds, 0);
   assert.equal(seen.lands, 0);
   assert.equal(seen.leaseAcquired, 0);
-  assert.equal(store.readWorkflowJournal(home, "local", EXEC, { stage: "integration-a0" }).length, 2, "nothing appended");
+  const onDisk = store.readWorkflowJournal(home, "local", EXEC, { stage: "integration-a0" });
+  assert.equal(onDisk.length, 3, "exactly the tombstone appended");
+  assert.equal(onDisk[2].kind, "tombstone");
+  assert.equal(onDisk[2].reason, "journal_version_mismatch");
+
+  // Even version "0" itself — the recording version — refuses it now: the
+  // tombstone is read before the version header.
+  const back = new Execution(wf.integrationWorkflow, { item: ITEM, factory: FACTORY, gatedHead: "head-v1", deps, log: () => {}, driver: { parked: null } }, { journal: onDisk, clock, activities: {}, workflow: wf.WORKFLOW_NAME, version: "0" });
+  const rb = await back.run();
+  assert.equal(rb.status, "failed");
+  assert.equal(rb.error.name, "WorkflowTombstoned");
+
+  // And the current version re-settles rather than re-refusing: one more
+  // escalation under its own id, no second journal entry.
+  const r2 = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps, gatedHead: "head-v1" });
+  assert.equal(r2.state, "failed");
+  assert.equal(r2.refusal_replayed, true);
+  assert.equal(r2.journal_version_mismatch, true);
+  assert.deepEqual(r2.facts, r.facts);
+  assert.equal(seen.facts[1].markdown, seen.facts[0].markdown);
+  assert.equal(store.readWorkflowJournal(home, "local", EXEC, { stage: "integration-a0" }).length, 3);
+  assert.equal(seen.lands, 0);
 });
 
 test("the activities table and the binding name the same set", () => {
