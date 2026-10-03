@@ -265,3 +265,77 @@ test("pinCandidate returns the host's require_clean refusal before reading anyth
   assert.deepStrictEqual(seen, [{ factory: "factory-test", cwd: "/nonexistent-checkout" }]);
   assert.strictEqual(readRecord(file).impl_candidate, undefined, "nothing was stamped");
 });
+
+// The review door's run NAME is a launch identity (dec-spor-adopt-by-name-
+// returns-existing): the dispatch door adopts a run already launched under a
+// name, so every legitimate re-dispatch of a review at the same cycle — a
+// gate-0 restart at a moved head, a fallback lane, a re-ask after an outage —
+// must spell a different name, and only a true re-execution (same head, lane
+// and retry count) spells the same one.
+test("the review dispatch name folds in the judged head, the routed lane and the retry count, and is stable for a true re-execution", async (t) => {
+  const home = scratchHome(t);
+  const runId = "66666666-6666-6666-6666-666666666666";
+  writeRecord(home, runId);
+  const names = [];
+  const logs = [];
+  let head = "aaaa1111bbbb";
+  const { makeGateDeps } = gateDeps.createGateDeps(
+    fakeHost({
+      gateStem: (id) => id,
+      gateChangeSet: () => ({ ok: true, head, base: "base0001", cwd: "/tmp/x", paths: ["lib/x.js"], dirty: false }),
+      gateWorkItemText: async () => "the item",
+      gateDiffText: () => "diff",
+      reviewPassthrough: (p) => p,
+    })
+  );
+  const deps = makeGateDeps(cfgFor(home), {
+    record: { cwd: "/tmp/x", run_id: runId }, entry: { run_id: runId, node_id: "task-x" }, factory: { id: "f", trustedRef: "main" },
+    passthrough: {}, warn: () => {}, sleep: async () => {}, log: (l) => logs.push(l), home,
+    dispatch: async (_cfg, values) => { names.push(values.name); return { ok: false, reason: "stop here" }; },
+  });
+  const gate = { id: "review", kind: "agent-review", profile: "profile-codex", cycles: 2 };
+  await deps.changedPaths({ trustedRef: "main" });
+  const ask = (g, extra = {}) => deps.review({ gate: g, cycle: 0, prior: [], ...extra });
+  await ask(gate);
+  await ask(gate);
+  assert.equal(names[0], "gate-review-66666666-0-aaaa1111-codex");
+  assert.equal(names[1], names[0], "the same head, lane and retry count is the same launch");
+  await ask(gate, { retry: 1 });
+  assert.equal(names[2], "gate-review-66666666-0-aaaa1111-codex-t1", "a re-ask after an outage is a new launch");
+  await ask({ ...gate, profile: "profile-claude-fallback" });
+  assert.equal(names[3], "gate-review-66666666-0-aaaa1111-claude-fallback", "a fallback lane is a new launch");
+  head = "cccc2222dddd";
+  await deps.changedPaths({ trustedRef: "main" });
+  await ask(gate);
+  assert.equal(names[4], "gate-review-66666666-0-cccc2222-codex", "a moved head is a new launch");
+  await deps.review({ gate, cycle: 1, prior: [], rescue: 1, base: 1 });
+  assert.equal(names[5], "gate-review-66666666-x1-1-cccc2222-codex", "a rescue pass keys one segment deeper");
+  assert.equal(new Set(names).size, 5);
+});
+
+test("a review the door reports as ADOPTED is logged as adopted and its run awaited, never dispatched again", async (t) => {
+  const home = scratchHome(t);
+  const runId = "77777777-7777-7777-7777-777777777777";
+  writeRecord(home, runId);
+  const logs = [];
+  let awaited = null;
+  const { makeGateDeps } = gateDeps.createGateDeps(
+    fakeHost({
+      gateStem: (id) => id,
+      gateChangeSet: () => ({ ok: true, head: "aaaa1111", base: "base0001", cwd: "/tmp/x", paths: ["lib/x.js"], dirty: false }),
+      gateWorkItemText: async () => "the item",
+      gateDiffText: () => "diff",
+      reviewPassthrough: (p) => p,
+      awaitGateRun: async (_cfg, id) => { awaited = id; return { ok: false, reason: "stop here" }; },
+    })
+  );
+  const deps = makeGateDeps(cfgFor(home), {
+    record: { cwd: "/tmp/x", run_id: runId }, entry: { run_id: runId, node_id: "task-x" }, factory: { id: "f", trustedRef: "main" },
+    passthrough: {}, warn: () => {}, sleep: async () => {}, log: (l) => logs.push(l), home,
+    dispatch: async () => ({ ok: true, run: { run_id: "already-reviewing" }, adopted: true }),
+  });
+  await deps.changedPaths({ trustedRef: "main" });
+  await deps.review({ gate: { id: "review", kind: "agent-review", profile: "profile-codex", cycles: 2 }, cycle: 0, prior: [] });
+  assert.equal(awaited, "already-reviewing");
+  assert.ok(logs.some((l) => /review \(cycle 0\) on task-x was already launched as run already- — adopting it/.test(l)), logs.join("\n"));
+});

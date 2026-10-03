@@ -284,18 +284,63 @@ test("persist runs after every append and before the result reaches the workflow
   await e.run();
   assert.deepEqual(disk, e.journal);
   assert.deepEqual(order, ["workflow saw a=7 with 2 on disk"]);
-  let fail = true;
-  const flaky = new Execution(fn, {}, { journal: [], clock, activities: { a: () => 7 }, persist: () => { if (fail) throw new Error("disk full"); } });
+  // A persist that throws leaves the durable state UNKNOWN (an fsync can fail
+  // after the bytes landed), so the Execution is poisoned: every later run()
+  // and signal() refuses, and only a fresh Execution over the journal re-read
+  // from disk may continue — never this one, which could append a duplicate
+  // of an entry that did land.
+  const flaky = new Execution(fn, {}, { journal: [], clock, activities: { a: () => 7 }, persist: () => { throw new Error("disk full"); } });
   const r = await flaky.run();
   assert.equal(r.status, "failed");
   assert.equal(r.error.message, "disk full");
-  assert.deepEqual(flaky.journal, [], "memory never runs ahead of disk");
-  fail = false;
-  assert.deepEqual(await flaky.run(), { status: "completed", result: 7 });
+  assert.equal(r.error.poisoned, true);
+  assert.equal((await flaky.run()).error, r.error, "poisoned: the same refusal, no second attempt");
+  assert.throws(() => flaky.signal("approval:x", 1), /disk full/);
+  const reopened = new Execution(fn, {}, { journal: [], clock, activities: { a: () => 7 }, persist: () => {} });
+  assert.deepEqual(await reopened.run(), { status: "completed", result: 7 });
   // a signal delivery persists too
   const s = new Execution(fn, {}, { journal: [], clock, activities: { a: () => 7 }, persist: (x) => disk.push(x) });
   s.signal("approval:x", 1);
   assert.deepEqual(disk[disk.length - 1], { kind: "signal", key: "signal:approval:x", payload: 1 });
+});
+
+test("a signal delivered to a versioned execution BEFORE its first run opens the journal with the header, never as an unversioned journal", async () => {
+  const clock = fakeClock(0);
+  const fn = (ctx) => ctx.awaitSignal("k", "run:1").payload;
+  const e = new Execution(fn, {}, { journal: [], clock, activities: {}, workflow: "w", version: "1" });
+  e.signal("run:1", "done");
+  assert.deepEqual(e.journal.map((x) => x.kind), ["version", "signal"]);
+  assert.deepEqual(await e.run(), { status: "completed", result: "done" });
+  // and through drive(), which delivers an undated signal before the first run
+  const d = new Execution(fn, {}, { journal: [], clock, activities: {}, workflow: "w", version: "1" });
+  const r = await drive(d, { clock, signals: [{ name: "run:1", payload: "driven" }] });
+  assert.equal(r.status, "completed");
+  assert.equal(r.result, "driven");
+});
+
+test("a replayed failure keeps the name and code a workflow branches on; a falsy throw is still a failure", async () => {
+  const clock = fakeClock(0);
+  const fn = async (ctx) => {
+    try {
+      await ctx.run("k", "bad", {});
+      return "no";
+    } catch (e) {
+      return { name: e.name, code: e.code, message: e.message, replayed: !!e.replayed };
+    }
+  };
+  const bad = () => { throw Object.assign(new TypeError("typed"), { code: "E_TYPED" }); };
+  const e = new Execution(fn, {}, { journal: [], clock, activities: { bad } });
+  assert.deepEqual((await e.run()).result, { name: "TypeError", code: "E_TYPED", message: "typed", replayed: false });
+  assert.deepEqual(e.journal, [{ kind: "effect", key: "k", threw: true, error: "typed", name: "TypeError", code: "E_TYPED" }]);
+  const again = new Execution(fn, {}, { journal: e.journal.slice(), clock, activities: {} });
+  assert.deepEqual((await again.run()).result, { name: "TypeError", code: "E_TYPED", message: "typed", replayed: true });
+  for (const act of [() => { throw null; }, async () => { throw undefined; }]) {
+    const f = new Execution(fn, {}, { journal: [], clock, activities: { bad: act } });
+    const out = (await f.run()).result;
+    assert.equal(out.replayed, false);
+    assert.match(out.message, /activity (threw|rejected)/);
+    assert.equal(f.journal[0].threw, true);
+  }
 });
 
 test("the constructor refuses what the model cannot run without", () => {
