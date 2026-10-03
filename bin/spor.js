@@ -14654,7 +14654,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       // already landed instead of re-judging it from scratch. A later re-gate
       // of a DIFFERENT head (a further fix cycle moved it) opens its own.
       const regateJournal = stageWorkflowJournal(home, record, item, regateStageName(head));
-      const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: { ...makeGateDeps(cfg, dctx), ...(regateJournal ? { workflowJournal: regateJournal } : {}) } });
+      const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, pinHead: head || null, deps: { ...makeGateDeps(cfg, dctx), ...(regateJournal ? { workflowJournal: regateJournal } : {}) } });
       for (const f of lastRegateFacts) {
         if (originalFacts.includes(f)) continue;
         const i = gateFacts.indexOf(f);
@@ -14763,9 +14763,9 @@ function stageWorkflowJournal(home, record, item, stageName) {
 // The stage name of the integration stage's re-gate of a moved head: the gate
 // stage's own name plus the judged head (a hex sha; anything else is reduced to
 // the segment alphabet), so each re-gated head has one child journal
-// (`gates-regate-<head12>-a<attempt>.workflow.jsonl`) beside the stage's.
+// (`gates-regate-<head40>-a<attempt>.workflow.jsonl`) beside the stage's.
 function regateStageName(head) {
-  const h = String(head || "unknown").toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 12) || "unknown";
+  const h = String(head || "unknown").toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 40) || "unknown";
   return `gates-regate-${h}`;
 }
 

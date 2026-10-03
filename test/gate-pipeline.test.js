@@ -11290,7 +11290,8 @@ test("real doors: the integration stage's re-gate drives a durable CHILD gate jo
   const j = executionStoreLib.openWorkflowJournalAt(childJournal).journal;
   assert.deepStrictEqual(j[0], { kind: "version", spec: require("../lib/kernel/workflow.js").JOURNAL_SPEC_VERSION, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
   const opened = j.find((x) => x.kind === "effect" && /\/open#1$/.test(x.key));
-  assert.strictEqual(opened.result.digest, wf.definitionBindingDigest(factory));
+  assert.strictEqual(opened.result.digest, wf.definitionBindingDigest(factory, movedHead));
+  assert.strictEqual(opened.result.pinHead, movedHead);
   assert.ok(j.some((x) => x.kind === "effect" && /\/settled#1$/.test(x.key) && x.result.state === "passed"), "the resumed re-gate closed the child journal");
   assert.notStrictEqual(childJournal, path.join(dispatchRunsLib.runPaths(home, runId).workflows, "gates-a0.workflow.jsonl"));
   assert.ok(fs.existsSync(path.join(dispatchRunsLib.runPaths(home, runId).workflows, "gates-a0.workflow.jsonl")), "the gate list's own journal is untouched beside it");
@@ -11298,7 +11299,7 @@ test("real doors: the integration stage's re-gate drives a durable CHILD gate jo
 });
 
 test("regateStageName: one child journal per judged head, in the segment alphabet", () => {
-  assert.strictEqual(sporCli.regateStageName("ABCDEF0123456789abcdef"), "gates-regate-abcdef012345");
+  assert.strictEqual(sporCli.regateStageName("ABCDEF0123456789abcdef"), "gates-regate-abcdef0123456789abcdef");
   assert.strictEqual(sporCli.regateStageName("a/b c"), "gates-regate-abc");
   assert.strictEqual(sporCli.regateStageName(null), "gates-regate-unknown");
   assert.strictEqual(sporCli.regateStageName("///"), "gates-regate-unknown");
@@ -11360,4 +11361,27 @@ test("real doors: a provenance-only edit under a PARKED gate journal is REFUSED 
   assert.strictEqual(j[j.length - 1].kind, "tombstone");
   assert.strictEqual(j[j.length - 1].reason, "definition_mismatch");
   assert.ok(!lines.some((l) => /fresh in-memory journal|REPLAY FAULT/.test(l)), lines.join("\n"));
+});
+
+test("regateStageName: two heads sharing a 12-hex prefix get distinct journals", () => {
+  const a = "abcdef012345" + "0".repeat(28);
+  const b = "abcdef012345" + "1".repeat(28);
+  assert.notStrictEqual(sporCli.regateStageName(a), sporCli.regateStageName(b));
+  require("../lib/shell/execution-store.js").openWorkflowJournalAt(path.join(os.tmpdir(), "spor-regate-name-probe.jsonl"), { stage: `${sporCli.regateStageName(a)}-a0` });
+});
+
+test("a forged same-key child journal written under a different head is refused, never replayed", async () => {
+  const wf = require("../lib/shell/gate-workflow.js");
+  const f = { id: "factory-x", gates: [], trustedRef: "main" };
+  assert.notStrictEqual(wf.definitionBindingDigest(f, "a".repeat(40)), wf.definitionBindingDigest(f, "b".repeat(40)));
+  assert.strictEqual(wf.definitionBindingDigest(f, null), wf.definitionBindingDigest(f));
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "spor-pin-")), "j.workflow.jsonl");
+  const store = require("../lib/shell/execution-store.js");
+  const mk = (pinHead) => wf.driveGatePipeline({ item: { node_id: "task-x", run_id: "run-x", attempt: 0 }, factory: f, pinHead, log: () => {}, deps: { workflowJournal: () => store.openWorkflowJournalAt(file, { stage: "gates-regate-x-a0" }), readChange: async () => { throw new Error("stop"); } } });
+  await mk("a".repeat(40)).catch(() => {});
+  assert.ok(fs.existsSync(file), "journal recorded");
+  const r = await mk("b".repeat(40)).catch((e) => e);
+  const text = JSON.stringify(r && r.message ? r.message : r);
+  assert.strictEqual(r.state, "failed", text);
+  assert.ok(/gate definition/.test(r.reason), text);
 });
