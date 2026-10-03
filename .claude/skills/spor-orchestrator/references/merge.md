@@ -62,6 +62,15 @@ id, sanitized by dispatch).
    merge behind). For this repo that's the relevant `node --test test/<x>.test.js`
    files; for a change touching the kernel or schema, include the conformance
    goldens.
+   Before running them, read any test the change adds or edits that invokes an
+   ops script (`scripts/*.sh`, prune/ack/erase, anything taking `--apply`): it
+   must point every root it touches at a `mkdtemp` through an override the
+   script honours, put stubs for every external binary it calls (`docker`,
+   `fly`, `systemctl`, `sudo`, …) first on `PATH`, and pass `--no-restart` where
+   offered. A test that would reach this box's real `/tmp`, Docker daemon, graph
+   home or running server — including through a root the script hardcodes — is
+   `FAILED` back to the implementer UNRUN: running it to find out is the damage
+   (issue-spor-implementer-ran-destructive-host-script-during-test).
 
 3. **The rigorous review lives HERE — run it ONCE on Codex (cross-model), gated
    behind step 2.** The implementer did only a *right-sized* `medium` self-review

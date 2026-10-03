@@ -17,6 +17,15 @@ concurrently on this box and a pattern kills theirs too.
 2. Run relevant tests/typecheck against the rebased tree. Include kernel/schema
    conformance goldens when affected. Run required repo checks. A red tree is
    not eligible for model review or merge.
+   Before running them, read any test the change adds or edits that invokes an
+   ops script (`scripts/*.sh`, prune/ack/erase, anything taking `--apply`): it
+   must point every root it touches at a `mkdtemp` through an override the
+   script honours, put stubs for every external binary it calls (`docker`,
+   `fly`, `systemctl`, `sudo`, …) first on `PATH`, and pass `--no-restart` where
+   offered. A test that would reach this box's real `/tmp`, Docker daemon, graph
+   home or running server — including through a root the script hardcodes — is
+   sent back to the implementer UNRUN: running it to find out is the damage
+   (issue-spor-implementer-ran-destructive-host-script-during-test).
 3. Run an independent Astra review of the exact change. Write a temporary
    review input containing the acceptance criteria, `BASE`, candidate SHA,
    diff stat and complete diff. Add this instruction:

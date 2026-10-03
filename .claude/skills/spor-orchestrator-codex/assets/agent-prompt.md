@@ -20,6 +20,16 @@ Remain on the branch selected by dispatch; do not switch branches.
 - Pin acceptance and implement only this item's scope. You are not alone in the
   repository: preserve others' edits. Never modify a shared checkout, create a
   second worktree, merge, push, deploy, or discard work you did not author.
+- Never run a host-mutating ops script (`scripts/*.sh` such as
+  `enospc-recover.sh`, prune/ack/erase scripts, anything that deletes, prunes,
+  gc's, restarts or takes `--apply`) against this box's real paths, by hand or
+  from a test. A test of one points every root it touches at a mkdtemp through
+  an override the script honours, stubs every external binary it calls
+  (`docker`, `fly`, `systemctl`, `sudo`, …) first on `PATH`, passes
+  `--no-restart` where offered, and opts in to `--apply` only inside that
+  sandbox; a root the script hardcodes gets an override or stays untested,
+  stated in your report. The box is shared with other agents
+  (issue-spor-implementer-ran-destructive-host-script-during-test).
 - Run the relevant deterministic tests and required checks; include conformance
   goldens for kernel/schema/store changes. Inspect actual dependency paths for
   server tests. Never hardcode another machine's SPOR_LIB. Prepare dependencies

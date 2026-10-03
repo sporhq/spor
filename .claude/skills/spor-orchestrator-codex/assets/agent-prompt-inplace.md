@@ -33,6 +33,17 @@ report discoveries/decisions for the supervisor to capture. The supervisor will
 perform an independent Astra review and verify your commits; there is no
 isolated branch for it to merge.
 
+Never run a host-mutating ops script (`scripts/*.sh` such as
+`enospc-recover.sh`, prune/ack/erase scripts, anything that deletes, prunes,
+gc's, restarts or takes `--apply`) against this box's real paths, by hand or
+from a test. A test of one points every root it touches at a mkdtemp through an
+override the script honours, stubs every external binary it calls (`docker`,
+`fly`, `systemctl`, `sudo`, …) first on `PATH`, passes `--no-restart` where
+offered, and opts in to `--apply` only inside that sandbox; a root the script
+hardcodes gets an override or stays untested, stated in your report. The box is
+shared with other agents
+(issue-spor-implementer-ran-destructive-host-script-during-test).
+
 Return READY-FOR-VERIFICATION or BLOCKED with before/after SHAs per affected
 repo, exact changed files, check results and limitations. Include a
 `## FINDINGS FOR THE ORCHESTRATOR` block (or FINDINGS: none). If acceptance has

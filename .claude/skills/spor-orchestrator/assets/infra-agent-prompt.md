@@ -26,6 +26,17 @@ you work directly on the real checkout at `{{dir}}`.
   fan-out methods over loops (per-model lock contention).
 - Stay in spor-infra. Do **not** edit spor / spor-server. If the item turns out
   to need a change in another repo, stop and `/spor:defer` it (see below).
+- Your authorized swamp change (deploy, or rollback within scope) is the only
+  infrastructure mutation you make. A box-local ops script (`scripts/*.sh` such
+  as `enospc-recover.sh`, prune/ack/erase scripts, anything taking `--apply`)
+  runs against this box's real paths only when the item explicitly authorizes
+  that run — never from a test. A test of one points every root it touches at a
+  mkdtemp through an override the script honours, stubs every external binary it
+  calls (`docker`, `fly`, `systemctl`, `sudo`, …) first on `PATH`, passes
+  `--no-restart` where offered, and opts in to `--apply` only inside that
+  sandbox; a root the script hardcodes gets an override or stays untested. The
+  box hosts other agents' worktrees, scratch and Docker images
+  (issue-spor-implementer-ran-destructive-host-script-during-test).
 
 ## The loop
 

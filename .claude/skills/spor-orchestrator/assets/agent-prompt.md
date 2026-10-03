@@ -36,6 +36,22 @@ from that, and breaking either tangles other agents' work:
    around it. Keep the change scoped to this item — if you trip over unrelated
    problems, don't fold them in; file them (step 5) and move on.
 
+   **Never run a host-mutating ops script against real paths — by hand or from a
+   test.** A script that deletes, prunes, gc's, acks, erases or restarts
+   (`scripts/*.sh` like `enospc-recover.sh`, `prune-*`, `ack-*`, anything taking
+   `--apply`) acts on the whole shared box: its `/tmp`, its Docker daemon, its
+   live `SPOR_HOME`, its running server. A test of one must point EVERY root it
+   touches at a `mkdtemp` through an override the script honours, put stubs for
+   every external binary it calls (`docker`, `fly`, `systemctl`, `sudo`, …)
+   first on `PATH`, pass `--no-restart` where offered, and opt in to `--apply`
+   explicitly, only inside that sandbox — including the first red draft of the
+   test. A root the script hardcodes (`enospc-recover.sh` sweeps the real `/tmp`
+   today) has no sandbox: add an override, or leave that path untested and say
+   so in your report. This box also holds other agents' worktrees and scratch
+   (`/tmp/claude-*`): one implementer's early test ran `enospc-recover.sh
+   --apply` for real and pruned every Docker image plus other sessions' scratch
+   (issue-spor-implementer-ran-destructive-host-script-during-test).
+
 3. **Verify first — the cheap, deterministic gate.** Before spending any review
    budget, get the deterministic checks green: the typecheck and the tests that
    exercise your change (plus the full suite and conformance goldens if you

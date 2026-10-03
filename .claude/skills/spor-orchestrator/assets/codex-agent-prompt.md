@@ -23,6 +23,16 @@ Branch: {{node}} — commit here; do not switch or merge branches.
   check doesn't mistake your finished work for a stalled agent.
 - Read the repo's CLAUDE.md (and any spec it points to) for hard rules before coding,
   and honor them. Write code that reads like the code around it.
+- Never run a host-mutating ops script (`scripts/*.sh` such as
+  `enospc-recover.sh`, prune/ack/erase scripts, anything that deletes, prunes,
+  gc's, restarts or takes `--apply`) against this box's real paths, by hand or
+  from a test. A test of one points every root it touches at a mkdtemp through
+  an override the script honours, stubs every external binary it calls
+  (`docker`, `fly`, `systemctl`, `sudo`, …) first on `PATH`, passes
+  `--no-restart` where offered, and opts in to `--apply` only inside that
+  sandbox; a root the script hardcodes gets an override or stays untested,
+  stated in your report. The box is shared with other agents
+  (issue-spor-implementer-ran-destructive-host-script-during-test).
 
 ## Do the work
 1. **Orient — brief yourself from the graph FIRST.** Before pinning scope, compile

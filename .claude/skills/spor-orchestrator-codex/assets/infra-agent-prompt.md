@@ -15,6 +15,18 @@ environment and authorized apply/deploy. Never assume a retired repo is the
 current infrastructure home. If authorization or target is missing, prepare
 reviewable changes and return BLOCKED with the exact action needing approval.
 
+Your authorized swamp change (deploy, or rollback within scope) is the only
+infrastructure mutation you make. A box-local ops script (`scripts/*.sh` such as
+`enospc-recover.sh`, prune/ack/erase scripts, anything taking `--apply`) runs
+against this box's real paths only when the item explicitly authorizes that run
+— never from a test. A test of one points every root it touches at a mkdtemp
+through an override the script honours, stubs every external binary it calls
+(`docker`, `fly`, `systemctl`, `sudo`, …) first on `PATH`, passes `--no-restart`
+where offered, and opts in to `--apply` only inside that sandbox; a root the
+script hardcodes gets an override or stays untested. The box hosts other agents'
+worktrees, scratch and Docker images
+(issue-spor-implementer-ran-destructive-host-script-during-test).
+
 Inspect existing git status. Preserve others' edits; do not create worktrees,
 switch branches, stash, reset --hard, or commit unrelated files. Prepare and
 validate the swamp change, then perform only the specified authorized deploy
