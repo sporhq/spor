@@ -359,10 +359,11 @@ function cmdConfig(cfg, p) {
   }
   out("");
   out(`mode:     ${cfg.mode()}`);
-  if (tenant && (tenant.refused === "server-mismatch" || tenant.refused === "agent-org" || tenant.refused === "agent-no-token")) {
-    out(`tenant:   REFUSED — ${describeTenantRefusal(te)}`);
-  } else if (tenant && tenant.refused) {
-    out(`tenant:   REFUSED — org '${tenant.org}' (from ${tenant.origin}) has no stored credential${tenant.stored_orgs ? `; stored: ${tenant.stored_orgs.join(", ") || "(none)"}` : ""}`);
+  if (tenant && tenant.refused) {
+    // Every refusal kind renders through the one shared line; only the two
+    // org-naming refusals of a PERSON run carry the stored-org inventory.
+    const stored = tenant.stored_orgs && (te.kind === "unknown-org" || te.kind === "empty-org") ? `; stored: ${tenant.stored_orgs.join(", ") || "(none)"}` : "";
+    out(`tenant:   REFUSED — ${describeTenantRefusal(te)}${stored}`);
   } else if (tenant) {
     out(`tenant:   ${tenant.server}${tenant.org ? ` (org ${tenant.org})` : ""}  <- ${tenant.source}`);
   } else {
@@ -6036,26 +6037,57 @@ function cmdAuthLogout(cfg, args) {
   return 0;
 }
 
+// --- command access classes ----------------------------------------------
+// What a command does to CREDENTIALS, declared beside the command rather than
+// re-derived from its spelling in a guard (task-spor-cli-command-access-classes-for-agent-runs).
+// A dispatched agent run is bound to its own token, so every invocation that
+// touches the PERSON's credentials refuses there (refuseUnknownOrg):
+//   acquire      mints or stores a person credential (`auth login`, `login`, `join`)
+//   store-read   reads the person's store inventory — orgs, servers, identities
+//                (`auth` / `auth list`, `auth whoami --all`)
+//   store-write  rewrites the person's store or flat config credential
+//                (`auth switch`, `auth logout`, `install --server/--token`)
+// Anything else — the resolved tenant's own reads and writes — declares no
+// class (`access: null`, or the key omitted on a COMMANDS entry that reaches
+// none of the store primitives). A class is a string or a function of the raw
+// argv after the verb, for a command whose class depends on a flag. The guard
+// refuses by CLASS, so a new alias inherits the class of what it runs instead
+// of slipping past a hand-kept list of spellings (the flat `whoami --all` alias
+// did exactly that); test/command-access.test.js fails any COMMANDS entry that
+// reaches a credential-store primitive without declaring one.
+const ACCESS_CLASSES = Object.freeze(["acquire", "store-read", "store-write"]);
+
+// The `spor auth <sub>` table: cmdAuth dispatches through it and the guard
+// classifies through it, so the two cannot drift. A missing subcommand is
+// `list`.
+const AUTH_SUBCOMMANDS = {
+  login: { access: "acquire", run: (cfg, rest) => cmdAuthLogin(cfg, rest) },
+  list: { access: "store-read", run: (cfg) => cmdAuthList(cfg) },
+  switch: { access: "store-write", run: (cfg, rest) => cmdAuthSwitch(cfg, rest) },
+  // Bare `whoami` reports the RESOLVED tenant (an agent's own); `--all`
+  // enumerates every stored tenant.
+  whoami: { access: (rest) => (rest.includes("--all") ? "store-read" : null), run: (cfg, rest) => cmdAuthWhoami(cfg, rest) },
+  logout: { access: "store-write", run: (cfg, rest) => cmdAuthLogout(cfg, rest) },
+};
+
+function authSubcommand(args) {
+  const sub = args[0] === undefined ? "list" : args[0];
+  return Object.prototype.hasOwnProperty.call(AUTH_SUBCOMMANDS, sub) ? AUTH_SUBCOMMANDS[sub] : null;
+}
+
+function accessOf(spec, args) {
+  if (!spec) return null;
+  return (typeof spec.access === "function" ? spec.access(args) : spec.access) || null;
+}
+
 // `spor auth <sub>` dispatcher (raw-parsed, like `agent`/`token`).
 async function cmdAuth(cfg, args) {
-  const sub = args[0];
-  const rest = args.slice(1);
-  switch (sub) {
-    case "login":
-      return await cmdAuthLogin(cfg, rest);
-    case undefined:
-    case "list":
-      return await cmdAuthList(cfg);
-    case "switch":
-      return cmdAuthSwitch(cfg, rest);
-    case "whoami":
-      return await cmdAuthWhoami(cfg, rest);
-    case "logout":
-      return cmdAuthLogout(cfg, rest);
-    default:
-      err("usage: spor auth login [--web] [--org <slug>] [--all] | list | switch <org> | whoami [--all] | logout [<org>|--all]");
-      return 1;
+  const sub = authSubcommand(args);
+  if (!sub) {
+    err("usage: spor auth login [--web] [--org <slug>] [--all] | list | switch <org> | whoami [--all] | logout [<org>|--all]");
+    return 1;
   }
+  return await sub.run(cfg, args.slice(1));
 }
 
 // --- spor join ----------------------------------------------------------
@@ -17373,6 +17405,8 @@ const COMMANDS = {
       mcp: { type: "boolean", desc: "also auto-write per-host MCP config + AGENTS.md (codex/gemini/opencode/copilot)" },
     },
     examples: ["spor install claude", "spor install codex gemini --scope repo", "spor install --all --print", "spor install codex --mcp"],
+    // --server/--token persist a credential into the person's flat user config.
+    access: (args) => (args.some((a) => /^--(server|token)(=|$)/.test(a)) ? "store-write" : null),
     run: (cfg, p) => cmdInstall(cfg, p),
   },
   upgrade: {
@@ -17434,6 +17468,7 @@ const COMMANDS = {
       token: { type: "string", value: "tok", desc: "auth token (else the trailing positional)" },
     },
     examples: ["spor join spor_pat_abc123", "spor join https://graph.example.com spor_pat_abc123 --org acme"],
+    access: "acquire",
     run: (cfg, p) => cmdJoin(cfg, p),
   },
   auth: {
@@ -17468,6 +17503,7 @@ const COMMANDS = {
       "spor auth whoami --all",
       "spor auth logout acme",
     ],
+    access: (args) => accessOf(authSubcommand(args), args.slice(1)),
     run: (cfg, args) => cmdAuth(cfg, args),
   },
   login: {
@@ -17478,6 +17514,7 @@ const COMMANDS = {
       "an alias of 'spor auth login' (see that for flags). 'spor login <url> <token>'\n" +
       "still works as the paste path. The non-interactive path stays SPOR_TOKEN.",
     examples: ["spor login --server https://graph.example.com", "spor login https://graph.example.com tok_abc123"],
+    access: AUTH_SUBCOMMANDS.login.access,
     run: (cfg, args) => cmdAuthLogin(cfg, args),
   },
   migrate: {
@@ -17496,6 +17533,7 @@ const COMMANDS = {
       "mode). In local mode it explains there is no server identity. --all enumerates\n" +
       "the identity of every stored tenant. Alias of 'spor auth whoami'.",
     examples: ["spor whoami", "spor whoami --all"],
+    access: AUTH_SUBCOMMANDS.whoami.access,
     run: (cfg, args) => cmdAuthWhoami(cfg, args),
   },
   person: {
@@ -19138,6 +19176,25 @@ function extractOrgFlag(argv) {
   return { org, rest };
 }
 
+// The access class of one invocation (see ACCESS_CLASSES): what the canonical
+// verb's COMMANDS entry declares for this argv. The ONE place the agent-run
+// guard and the org-refusal exemptions learn what a command does to
+// credentials.
+function commandAccess(canon, args) {
+  return accessOf(COMMANDS[canon], args);
+}
+
+// How a refusal names the invocation: the verb, the auth subcommand it ran, and
+// the `--all` that made a `whoami` a store read.
+function invocationLabel(canon, args) {
+  const words = [canon];
+  if (canon === "auth" && args[0] !== undefined) words.push(args[0]);
+  if (canon === "install" && commandAccess(canon, args) === "store-write") words.push("--server/--token");
+  const flags = canon === "auth" ? args.slice(1) : args;
+  if ((canon === "whoami" || words[1] === "whoami") && flags.includes("--all")) words.push("--all");
+  return words.join(" ");
+}
+
 // The ONE exemption from the unknown-`--org` refusal below: an invocation whose
 // whole job is to ACQUIRE a credential for an org you do not have one for yet —
 // `spor login`, `spor join`, `spor auth login`. Naming an unstored org is what
@@ -19149,30 +19206,32 @@ function extractOrgFlag(argv) {
 // dartlane` had the flag lifted out of argv, skipped the refusal because the
 // canonical verb was `auth`, and then cleared the ACTIVE tenant, destroying a
 // credential for an org the operator never named. `auth whoami`/`list`/`switch`
-// answered about (or re-pointed) the active tenant just as silently. The
-// subcommand is read as `args[0]` — the same expression `cmdAuth` dispatches on,
-// so the two cannot drift.
+// answered about (or re-pointed) the active tenant just as silently. The class
+// is read through AUTH_SUBCOMMANDS — the same table `cmdAuth` dispatches on, so
+// the two cannot drift.
 function isCredentialAcquisition(canon, args) {
-  if (canon === "join" || canon === "login") return true;
-  return canon === "auth" && args[0] === "login";
+  return commandAccess(canon, args) === "acquire";
 }
 
-// The `auth` subcommands that read or rewrite the PERSON's credential store
-// rather than the resolved tenant: `logout` (one tenant, the active default, or
-// `--all`), `switch` (re-points the default), and the store listings (`auth` /
-// `auth list`, `auth whoami --all`, which name every stored org, server and
-// person). A dispatched agent run is bound to its own token and the store is
-// not its to read or change (issue-spor-agent-run-can-mutate-person-credential-store);
-// bare `auth whoami` / `whoami` reports the RESOLVED tenant (the agent's) and
-// stays open.
-// Read off `args[0]`, the same expression `cmdAuth` dispatches on.
+// The invocations that read or rewrite the PERSON's credential store rather
+// than the resolved tenant: `auth logout` (one tenant, the active default, or
+// `--all`), `auth switch` (re-points the default), the store listings (`auth` /
+// `auth list`, `auth whoami --all` / flat `whoami --all`, which name every
+// stored org, server and person), and `install --server/--token` (writes the
+// flat config credential). A dispatched agent run is bound to its own token and
+// the store is not its to read or change
+// (issue-spor-agent-run-can-mutate-person-credential-store); bare `auth whoami`
+// / `whoami` reports the RESOLVED tenant (the agent's) and stays open.
 function isCredentialStoreAccess(canon, args) {
-  // The flat `whoami` alias calls cmdAuthWhoami directly, `--all` included.
-  if (canon === "whoami") return args.includes("--all");
-  if (canon !== "auth") return false;
-  const sub = args[0];
-  if (sub === undefined || sub === "list" || sub === "switch" || sub === "logout") return true;
-  return sub === "whoami" && args.slice(1).includes("--all");
+  const a = commandAccess(canon, args);
+  return a === "store-read" || a === "store-write";
+}
+
+// The local-only inspection an AMBIENT org refusal (and a server-mismatch)
+// still lets through: a store READ (what the refusal tells you to check) and
+// turning Spor off for the repo. Neither reads or writes a graph.
+function isLocalInspection(canon, args) {
+  return commandAccess(canon, args) === "store-read" || canon === "disable";
 }
 
 // A global `--org` the cascade REFUSED to resolve must refuse the COMMAND, not
@@ -19197,7 +19256,7 @@ function refuseUnknownOrg(cfg, canon, args = []) {
   // the person (task-spor-agent-run-guard-all-org-selectors). Refused before
   // the tenant refusal below so it holds with or without an org selector.
   if (cfg.agentRun() && isCredentialAcquisition(canon, args)) {
-    err(`spor: '${canon === "auth" ? "auth login" : canon}' refused — this is a dispatched agent run, bound to its own token.`);
+    err(`spor: '${invocationLabel(canon, args)}' refused — this is a dispatched agent run, bound to its own token.`);
     err(`  an agent run never acquires or stores a person credential; sign in from your own session instead.`);
     return true;
   }
@@ -19207,8 +19266,7 @@ function refuseUnknownOrg(cfg, canon, args = []) {
   // the agent the person's org/server/identity inventory
   // (issue-spor-agent-run-can-mutate-person-credential-store).
   if (cfg.agentRun() && isCredentialStoreAccess(canon, args)) {
-    const sub = canon === "whoami" ? "whoami --all" : args[0] === undefined ? "auth" : `auth ${args[0]}${args[0] === "whoami" ? " --all" : ""}`;
-    err(`spor: '${sub}' refused — this is a dispatched agent run, bound to its own token.`);
+    err(`spor: '${invocationLabel(canon, args)}' refused — this is a dispatched agent run, bound to its own token.`);
     err(`  an agent run never reads or changes the person's credential store; run it from your own session instead ('spor auth whoami' shows the agent's tenant).`);
     return true;
   }
@@ -19251,7 +19309,7 @@ function refuseUnknownOrg(cfg, canon, args = []) {
   if (te.kind === "server-mismatch") {
     // Signing in to the repo's server records a credential FOR it, which is the
     // cure; the local-only inspection verbs run as for an ambient org refusal.
-    if (isCredentialAcquisition(canon, args) || (canon === "auth" && (args[0] === undefined || args[0] === "list")) || canon === "disable") return false;
+    if (isCredentialAcquisition(canon, args) || isLocalInspection(canon, args)) return false;
     err(`spor: ${te.origin} sets server ${te.server}, but your stored credential is for ${te.credential_server || "(no recorded server)"} — refusing to send it to a server the repo chose.`);
     err(`  run 'spor auth login' to sign in to ${te.server} (stored for that server only), or set SPOR_SERVER / --server to override the repo's server ('spor config explain server' shows the layers).`);
     return true;
@@ -19261,7 +19319,7 @@ function refuseUnknownOrg(cfg, canon, args = []) {
   // verbs that only inspect or repair local state still run: listing the stored
   // credentials (what the refusal tells you to check) and turning Spor off for
   // the repo. Neither reads or writes a graph.
-  if (te.source !== "cli-org" && ((canon === "auth" && (args[0] === undefined || args[0] === "list")) || canon === "disable")) return false;
+  if (te.source !== "cli-org" && isLocalInspection(canon, args)) return false;
   // An AMBIENT selector (SPOR_ORG, a repo `.spor` org: marker) refuses exactly
   // like --org (issue-spor-ambient-org-selector-silent-fallback); name it, since
   // the operator did not type it on this command line.
@@ -19324,7 +19382,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchThrough, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
+module.exports = { dispatchThrough, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
 
 if (require.main === module) {
   main()

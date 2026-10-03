@@ -428,6 +428,59 @@ test('post-tool: journals the touched file under the session id', () => {
   assert.strictEqual(line.tool, 'Write');
 });
 
+// --- agent-run org refusal (task-spor-cli-command-access-classes-for-agent-runs,
+// dec-spor-agent-run-binds-every-org-selector-and-refuses-acquisition): an
+// AMBIENT org selector — an inherited SPOR_ORG or a repo .spor org: marker — in a
+// dispatched agent run (SPOR_AGENT_RUN, no agent bearer exported) refuses with
+// agent-org. The person's store tenant for that org must never be selected, and
+// the hook surface must inject nothing and write nothing to EITHER graph: no
+// briefing, no digest, no journal line, no distilled node — only the one
+// throttled remote.log line saying why.
+for (const via of ['SPOR_ORG', 'repo marker']) {
+  test(`agent run: an agent-org refusal from ${via} injects nothing and writes nothing`, () => {
+    const { root, home, cwd } = scratch();
+    fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+    // The PERSON's stored credential for acme — what the selector would pick
+    // outside an agent run. A dead port, so a request that did go out fails.
+    fs.mkdirSync(path.join(home, 'auth'), { recursive: true });
+    const credFile = path.join(home, 'auth', 'credentials.json');
+    fs.writeFileSync(credFile, JSON.stringify({
+      tenants: { 'http://127.0.0.1:9/acme': { server: 'http://127.0.0.1:9', org: 'acme', access_token: 'PERSON', refresh_token: 'RT' } },
+      default: 'http://127.0.0.1:9/acme',
+    }, null, 2));
+    const credBefore = fs.readFileSync(credFile, 'utf8');
+    const marker = path.join(root, 'distill-ran');
+    const env = {
+      ...freshEnv(home), SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_AGENT_RUN: '1', SPOR_DEBOUNCE: '0',
+      SPOR_DISTILL_CMD: nodeCommand(writeNodeScript(path.join(root, 'distill-stub.js'), `require('fs').readFileSync(0); require('fs').writeFileSync(${JSON.stringify(marker)}, '');`)),
+      SPOR_NUDGE_CMD: nodeCommand(writeNodeScript(path.join(root, 'nudge-stub.js'), `require('fs').readFileSync(0); require('fs').writeFileSync(${JSON.stringify(marker)}, '');`)),
+    };
+    if (via === 'SPOR_ORG') env.SPOR_ORG = 'acme';
+    else fs.writeFileSync(path.join(cwd, '.spor'), 'project: projx\norg: acme\n');
+    const transcript = path.join(root, 't.jsonl');
+    const words = Array.from({ length: 120 }, (_, i) => `word${i}`).join(' ');
+    fs.writeFileSync(transcript, JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: words }] } }) + '\n');
+    const nodesBefore = fs.readdirSync(path.join(home, 'nodes')).sort();
+    const calls = [
+      ['session-start', { cwd, session_id: 's1', hook_event_name: 'SessionStart' }],
+      ['prompt-context', { cwd, session_id: 's1', prompt: 'tell me about the projx standing briefing body please', hook_event_name: 'UserPromptSubmit' }],
+      ['post-tool', { cwd, session_id: 's1', tool_name: 'Write', tool_input: { file_path: path.join(cwd, 'notes.md'), content: words }, hook_event_name: 'PostToolUse' }],
+      ['distill', { cwd, session_id: 's1', transcript_path: transcript, hook_event_name: 'SessionEnd' }],
+    ];
+    for (const [event, payload] of calls) {
+      assert.strictEqual(run([event, '--host', 'claude-code'], JSON.stringify(payload), env), '', `${event} injected nothing`);
+    }
+    assert.deepStrictEqual(fs.readdirSync(path.join(home, 'nodes')).sort(), nodesBefore, 'no node written to the local graph');
+    assert.ok(!fs.existsSync(marker), 'neither the distiller nor the nudge classifier ran');
+    assert.strictEqual(fs.readFileSync(credFile, 'utf8'), credBefore, "the person's store was not touched");
+    assert.deepStrictEqual(fs.readdirSync(path.join(home, 'journal')).sort(), ['remote.log', 'tenant-refused.stamp'], 'no session journal, cache or outbox write');
+    const log = fs.readFileSync(path.join(home, 'journal', 'remote.log'), 'utf8');
+    assert.match(log, via === 'SPOR_ORG' ? /org 'acme' \(from SPOR_ORG\) in a dispatched agent run/ : /org 'acme' \(from .*\.spor\) in a dispatched agent run/);
+    assert.match(log, /hook skipped; an agent run never selects the person's stored credential/);
+    assert.ok(!fs.existsSync(path.join(home, 'cache')) && !fs.existsSync(path.join(home, 'outbox')), 'no remote cache or outbox');
+  });
+}
+
 // --- opt-in gate (task-spor-plugin-opt-in-default): the dispatcher no-ops every
 // hook in a repo that hasn't opted in (no .spor/.spor.json marker, no enable
 // flag), so running an agent in an unrelated repo injects nothing and writes

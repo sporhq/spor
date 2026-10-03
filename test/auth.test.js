@@ -845,6 +845,31 @@ test('cli: auth logout / logout --all / switch / list / whoami --all refuse in a
   }
 });
 
+// Access classes (task-spor-cli-command-access-classes-for-agent-runs): the
+// guard refuses by what a command does to credentials, so `install
+// --server/--token` — which writes the person's flat config credential — refuses
+// in an agent run like the auth store writers, while a plain install is not a
+// credential write at all.
+test('cli: install --server/--token refuses in an agent run and leaves the flat config untouched', async () => {
+  const home = tmp();
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: fakeJwt({ org: 'acme' }), SPOR_AGENT_RUN: '1' };
+  for (const args of [['install', 'claude', '--token', 'PASTED', '--print'], ['install', '--server=https://evil.example', '--print']]) {
+    const r = await runAsync(args, env);
+    assert.strictEqual(r.code, 1, `${args.join(' ')}: ${r.stderr}`);
+    assert.match(r.stderr, /'install --server\/--token' refused — this is a dispatched agent run/, args.join(' '));
+  }
+  assert.ok(!fs.existsSync(path.join(home, 'config.json')), 'no flat credential was written');
+});
+
+test('cli: config explain renders an empty --org through the shared refusal line', async () => {
+  const home = tmp();
+  auth.writeStore(home, { tenants: { 'https://s/acme': { server: 'https://s', org: 'acme', access_token: 'T' } }, default: 'https://s/acme' });
+  const r = await runAsync(['--org', '', 'config', 'explain'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.match(r.stdout, /tenant: +REFUSED — --org given an empty value; stored: acme/);
+  assert.doesNotMatch(r.stdout, /org '' \(from/);
+});
+
 // The last door (task-spor-agent-run-no-store-token-fallback): a server with
 // NO bearer. The person's cascade pairs `--server`/SPOR_SERVER with the store's
 // credential for that server (tokenForServer) or the flat config `token`, and

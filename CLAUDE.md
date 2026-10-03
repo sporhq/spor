@@ -1713,9 +1713,16 @@ INVOCATIONS — `spor login`, `spor join`, `spor auth login` — whose job is to
 acquire a credential for an org you do not have one for yet; they read
 `Config.serverForNewTenant()` (the cascade re-resolved with the flag ignored) so
 `spor auth login --org <new>` still defaults to the server the rest of the
-cascade names. The exemption is per-INVOCATION, not per-verb
-(`isCredentialAcquisition` reads `auth`'s subcommand off `args[0]`, the same
-expression `cmdAuth` dispatches on): exempting the whole `auth` namespace left every
+cascade names. The exemption is per-INVOCATION, not per-verb: every COMMANDS
+entry (and every `AUTH_SUBCOMMANDS` row, the table `cmdAuth` dispatches through)
+declares an ACCESS CLASS — `acquire`, `store-read`, `store-write`, or none,
+optionally a function of argv (`whoami --all` reads the store, bare `whoami`
+does not) — and the exemption and the agent-run refusals (a dispatched agent
+run refuses every `acquire`/`store-*` invocation) read the class via
+`commandAccess`, never a list of spellings, so a new alias inherits its class
+(task-spor-cli-command-access-classes-for-agent-runs; test/command-access.test.js
+fails any entry that reaches a credential-store primitive undeclared). Exempting
+the whole `auth` namespace had left every
 non-acquiring subcommand with the exact hazard the refusal exists to stop —
 `spor auth logout --org <unknown>` cleared the ACTIVE tenant, and `auth
 whoami`/`list`/`switch` answered about (or re-pointed) it. An `--org` given an

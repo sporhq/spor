@@ -408,6 +408,27 @@ test("describeTenant reports the selector that chose the tenant, and never the c
   assert.doesNotMatch(line, /secret-token/, "a diagnostic reports a credential present/missing, never its value");
 });
 
+test("describeTenant shows a refusal under mode auto instead of 'local mode, no tenant'", () => {
+  // A refused tenant resolves no server, so mode() reads local under auto —
+  // the refusal is still the answer (task-spor-cli-command-access-classes-for-agent-runs).
+  const refusals = [
+    [{ kind: "agent-org", org: "acme", agent_org: null, source: "env-org", origin: "SPOR_ORG" }, /org 'acme' \(from SPOR_ORG\) in a dispatched agent run/],
+    [{ kind: "unknown-org", org: "dartlane", source: "repo-marker", origin: "/r/.spor" }, /the \.spor org: marker 'dartlane' names no stored credential/],
+    [{ kind: "server-mismatch", org: "", server: "https://team.example", credential_server: "https://mine.example", source: "repo", origin: "/r/.spor.json" }, /sets server https:\/\/team\.example/],
+  ];
+  for (const [te, want] of refusals) {
+    const t = preflight.describeTenant({ mode: () => "local", tenant: () => null, tenantError: () => te, nodesDir: () => "/g/nodes" });
+    assert.strictEqual(t.error, te.kind);
+    assert.match(t.provenance, want);
+    const line = preflight.tenantLine(t);
+    assert.match(line, /^REFUSED — /, line);
+    assert.doesNotMatch(line, /local mode/, line);
+  }
+  // No refusal (or one an explicit mode: local made moot — tenantError() is null): unchanged.
+  const quiet = preflight.describeTenant({ mode: () => "local", tenant: () => null, tenantError: () => null, nodesDir: () => "/g/nodes" });
+  assert.strictEqual(preflight.tenantLine(quiet), "local mode (graph /g/nodes) — no tenant selector in play");
+});
+
 // -------------------------------------------------------------- CLI layer --
 
 function bare(extra = {}) {
