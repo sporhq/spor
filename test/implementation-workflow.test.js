@@ -338,6 +338,18 @@ test("a stop YIELDS over the file journal: reported interrupted as before, and a
   assert.deepEqual(settled, late);
   assert.equal(seen.implements, 1);
   assert.equal(seen.reads, 2);
+
+  // The stage sits at the FRONT of the pipeline and is re-entered on every
+  // orphan resume: a settled journal replays to its settled result WHATEVER
+  // the live definition now reads — the binding is enforced only at a live
+  // step, never over work that was never in flight (a prompt-text tweak after
+  // the candidate was produced must not refuse the attempt).
+  const edited = factoryOf({ budget: { attempts: 3 }, instructions: "be VERY careful" });
+  const replayed = await implementationStage.runImplementationStage({ item: ITEM, factory: edited, record: implRecord("completed"), deps });
+  assert.deepEqual(replayed, late, "the settled result, byte-identical");
+  assert.equal(seen.escalations.length, 0, "no refusal of a settled attempt");
+  assert.equal(seen.implements, 1);
+  assert.equal(onDisk(home).length, j2.length, "nothing appended, nothing tombstoned");
 });
 
 test("the retry backoff is a durable timer: a stop during the wait hands up the reserved attempt, and the re-drive launches it without charging the pool or reading the ledger again", async () => {
