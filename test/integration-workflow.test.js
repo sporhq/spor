@@ -211,11 +211,14 @@ for (const [name, script] of Object.entries(SCRIPTS)) {
   });
 }
 
-test("a factory edited mid-attempt does not fault the journal: the resumed execution keeps judging under the integration block it opened with", async () => {
+test("a factory edited between attempts FAILS CLOSED: the resumed execution refuses before any step, launches nothing and lands nothing", async () => {
   // Journal a run under cycles: 2 up to the first fix's await, then resume it
-  // with the factory node edited to cycles: 0 — the live block would take the
-  // escalate branch where the journal holds a fix dispatch (a replay fault);
-  // the journaled block takes the recorded path and lands.
+  // with the factory node edited to cycles: 0. The journaled block would take
+  // the recorded path; the ACTIVITIES behind it close over the live factory
+  // (gate-deps.js), so continuing would judge under a mixed definition. The
+  // workflow's binding digest refuses instead — a NonDeterminism tagged
+  // `definitionMismatch`, thrown before the lease or the tree read, so the
+  // journal gains nothing and the world sees no dispatch, build or land.
   const clock = fakeClock(1000);
   const world = makeWorld({ clock });
   const held = [];
@@ -227,18 +230,77 @@ test("a factory edited mid-attempt does not fault the journal: the resumed execu
   };
   const first = exec(world, clock);
   assert.equal((await drive(first, { clock, signals: world.signals })).status, "suspended");
+  const before = first.journal.length;
 
-  const edited = { ...FACTORY, integration: { ...FACTORY.integration, cycles: 0 } };
-  const world2 = makeWorld({ clock });
-  world2.launched.set("integration-fix-0", "fix-1");
-  const logs = [];
-  const second = new Execution(wf.integrationWorkflow, { item: ITEM, factory: edited, gatedHead: "head-v1", deps: world2.deps, log: (l) => logs.push(l), driver: { parked: null } }, { journal: first.journal.slice(), clock, activities: world2.activities, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
-  world2.signals.push(held[0]);
-  const r2 = await drive(second, { clock, signals: world2.signals });
+  // `deliver`: whether the harness hands the held fix signal to the resumed
+  // execution (a delivery is itself a journal entry, so the refusal cases
+  // run without one to show the refusal appends nothing of its own).
+  const resumeWith = async (factory, { deliver } = { deliver: true }) => {
+    const world2 = makeWorld({ clock });
+    world2.launched.set("integration-fix-0", "fix-1");
+    const logs = [];
+    const second = new Execution(wf.integrationWorkflow, { item: ITEM, factory, gatedHead: "head-v1", deps: world2.deps, log: (l) => logs.push(l), driver: { parked: null } }, { journal: first.journal.slice(), clock, activities: world2.activities, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+    if (deliver) world2.signals.push(held[0]);
+    const r2 = await drive(second, { clock, signals: world2.signals });
+    return { r2, world2, second, logs };
+  };
+
+  for (const [label, edited] of [
+    ["integration block edited", { ...FACTORY, integration: { ...FACTORY.integration, cycles: 0 } }],
+    ["trusted ref edited", { ...FACTORY, trustedRef: "release" }],
+  ]) {
+    const { r2, world2, second } = await resumeWith(edited, { deliver: false });
+    assert.equal(r2.status, "failed", `${label}: ${JSON.stringify(r2)}`);
+    assert.equal(r2.error.name, "NonDeterminism", label);
+    assert.ok(r2.error.definitionMismatch, `${label}: tagged as a definition mismatch`);
+    assert.equal(r2.error.definitionMismatch.journaled, wf.definitionBindingDigest(FACTORY));
+    assert.equal(r2.error.definitionMismatch.live, wf.definitionBindingDigest(edited));
+    assert.match(r2.error.message, /changed while task-demo's integration attempt was in flight/);
+    assert.equal(world2.dispatches, 0, `${label}: no fix cycle was launched`);
+    assert.equal(world2.builds, 0, `${label}: no candidate was built`);
+    assert.equal(world2.main, null, `${label}: nothing landed`);
+    assert.equal(world2.leases, 0, `${label}: the lease was never taken`);
+    assert.equal(world2.escalations.length, 0, "the workflow itself writes nothing — the driver settles the refusal outside the journal");
+    assert.equal(second.journal.length, before, `${label}: the refusal appends nothing to the journal`);
+  }
+
+  // The ORIGINAL definition still continues from where it stopped: the
+  // refusal left the journal intact.
+  const { r2, world2 } = await resumeWith(FACTORY);
   assert.equal(r2.status, "completed", JSON.stringify(r2));
   assert.equal(r2.result.state, "passed");
-  assert.equal(world2.dispatches, 1, "the second fix cycle ran under the journaled cycles: 2, not the edited cycles: 0");
-  assert.ok(logs.some((l) => /integration block changed while task-demo's integration was in flight/.test(l)), logs.join("\n"));
+  assert.equal(world2.main, "cand-head-v3");
+});
+
+test("two passing re-gates across moving heads: the result carries only the FINAL head's re-gate and its facts, never a superseded re-gate's", async () => {
+  // The landed script re-gates twice (head-v2 after fix 1, head-v3 after
+  // fix 2) and lands head-v3. Each re-gate mints its own fact; the driver
+  // adopts `regate_facts` as the landed head's gate evidence, so the facts
+  // of the head-v2 re-gate — which judged a head that is not landing — must
+  // not ride the result.
+  const clock = fakeClock(1000);
+  const world = makeWorld({ clock });
+  const regates = [];
+  world.deps.regate = async ({ head }) => {
+    regates.push(head);
+    return { state: "passed", head, gates: [{ id: "gate-suite", verdict: "passed", head }], facts: [`art-gate-suite-${head}`] };
+  };
+  const e = exec(world, clock);
+  const r = await drive(e, { clock, signals: world.signals });
+  assert.equal(r.status, "completed", JSON.stringify(r));
+  assert.equal(r.result.state, "passed");
+  assert.deepEqual(regates, ["head-v2", "head-v3"]);
+  assert.equal(world.main, "cand-head-v3");
+  assert.equal(r.result.gated_head, "head-v3");
+  assert.equal(r.result.regate_result.head, "head-v3");
+  assert.deepEqual(r.result.regate_facts, ["art-gate-suite-head-v3"]);
+  // ...and the same from a pure replay with no activity available: what a
+  // resumed driver adopts is exactly the final head's facts.
+  const replay = new Execution(wf.integrationWorkflow, { item: ITEM, factory: FACTORY, gatedHead: "head-v1", deps: world.deps, log: () => {}, driver: { parked: null } }, { journal: e.journal.slice(), clock, activities: {}, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+  const rr = await replay.run();
+  assert.equal(rr.status, "completed", JSON.stringify(rr));
+  assert.deepEqual(rr.result.regate_facts, ["art-gate-suite-head-v3"]);
+  assert.equal(rr.result.regate_result.head, "head-v3");
 });
 
 test("WITHOUT adopt-by-name in the fix dispatch, a before-journal crash on it launches a second fixer — the window the activity's own idempotency closes", async () => {
@@ -384,7 +446,7 @@ test("a ci outage YIELDS over the file journal: reported interrupted as before, 
   assert.ok(j1.some((j) => j.kind === "timer"), "the yield is a durable timer on disk");
   assert.ok(j1.some((j) => j.kind === "effect" && /\/yield\/0\/parked$/.test(j.key)), "the interrupted result is journaled");
   assert.equal(j1[0].kind, "version");
-  assert.deepEqual({ workflow: j1[0].workflow, version: j1[0].version }, { workflow: "integration", version: "1" });
+  assert.deepEqual({ workflow: j1[0].workflow, version: j1[0].version }, { workflow: "integration", version: wf.WORKFLOW_VERSION });
 
   // Re-driven BEFORE the timer: nothing runs, the same journaled result.
   ciUp = true;
@@ -473,6 +535,88 @@ test("a resumed worker tears down its predecessor's candidate by path: the clean
   assert.equal(b.seen.builds, 0, "the build is replayed, never re-executed");
   assert.equal(b.seen.cleanups, 0);
   assert.deepEqual(b.seen.discarded, ["/tmp/candidate-1"]);
+});
+
+test("the DRIVER settles a definition edited between attempts as a refusal of the attempt over the file journal: escalated, demoted, a fact — no build, no land, nothing appended; the original definition still continues", async () => {
+  const home = scratchHome("edited");
+  const clock = fakeClock(1_700_000_000_000);
+  let ciUp = false;
+  const { deps, seen } = stageFakes({ home, clock, suite: () => (ciUp ? { ok: true } : { ok: false, reason: "CI run cancelled", outage: { outcome: "infrastructure", reason: "cancelled" } }) });
+  const factory = { ...FACTORY, trustedRef: "main", integration: { ...FACTORY.integration, ci: { workflow: "test.yaml" } } };
+  const logs = [];
+  const log = (l) => logs.push(l);
+
+  // Attempt yields on the ci outage: a resumable journal on disk.
+  const first = await integrationRunner.runIntegrationStage({ item: ITEM, factory, deps, log, gatedHead: "head-v1" });
+  assert.equal(first.state, "interrupted");
+  const onDisk = () => store.readWorkflowJournal(home, "local", EXEC, { stage: "integration-a0" });
+  const j1 = onDisk();
+  assert.equal(j1[0].version, wf.WORKFLOW_VERSION);
+  const open = j1.find((j) => j.kind === "effect" && /\/open$/.test(j.key));
+  assert.equal(open.result.digest, wf.definitionBindingDigest(factory), "the open entry journals the binding digest");
+  assert.equal(open.result.trustedRef, "main");
+  ciUp = true;
+  clock.advanceBy(wf.YIELD_MS + 1);
+
+  for (const [label, edited] of [
+    ["the integration block edited", { ...factory, integration: { ...factory.integration, command: "npm run test:all" } }],
+    ["the trusted ref edited", { ...factory, trustedRef: "release" }],
+  ]) {
+    const escalations = seen.escalations;
+    const facts = seen.facts.length;
+    const r = await integrationRunner.runIntegrationStage({ item: ITEM, factory: edited, deps, log, gatedHead: "head-v1" });
+    assert.equal(r.state, "failed", `${label}: ${JSON.stringify(r)}`);
+    assert.ok(r.definition_mismatch, `${label}: tagged`);
+    assert.equal(r.definition_mismatch.journaled, wf.definitionBindingDigest(factory));
+    assert.equal(r.definition_mismatch.live, wf.definitionBindingDigest(edited));
+    assert.match(r.reason, /edited while this attempt was in flight/);
+    assert.match(r.reason, /nothing is judged or landed under a mixed definition/);
+    assert.equal(r.escalated_to, "task-integration-escalate-x", `${label}: escalated`);
+    assert.equal(r.demoted, true, `${label}: demoted`);
+    assert.equal(seen.escalations, escalations + 1);
+    assert.equal(seen.demotions, seen.escalations);
+    assert.equal(seen.facts.length, facts + 1, `${label}: the refusal is recorded as a fact`);
+    assert.deepEqual(r.facts, [seen.facts[seen.facts.length - 1].id]);
+    assert.match(seen.facts[seen.facts.length - 1].markdown, /mixed definition/);
+    assert.equal(r.landed_sha, null);
+    assert.equal(r.gated_head, "head-v1");
+    assert.deepEqual(r.attempts.map((a) => a.verdict), ["failed"]);
+    assert.equal(seen.builds, 1, `${label}: no rebuild`);
+    assert.equal(seen.suites, 1, `${label}: the suite did not run`);
+    assert.equal(seen.lands, 0, `${label}: nothing landed`);
+    assert.equal(seen.leaseAcquired, 1, `${label}: the lease was not re-taken`);
+    assert.equal(onDisk().length, j1.length, `${label}: the refusal appends nothing to the journal`);
+    assert.ok(logs.some((l) => /integration failed on task-demo — the factory's integration definition/.test(l)), logs.join("\n"));
+  }
+
+  // The ORIGINAL definition re-driven: the journal continues from the yield
+  // and lands — the refusals above did not poison it.
+  const late = await integrationRunner.runIntegrationStage({ item: ITEM, factory, deps, log, gatedHead: "head-v1" });
+  assert.equal(late.state, "passed", JSON.stringify(late));
+  assert.equal(seen.lands, 1);
+  assert.equal(seen.builds, 2);
+});
+
+test("the DRIVER settles a journal recorded by another workflow version the same way: refused, escalated, never continued", async () => {
+  const home = scratchHome("version");
+  const clock = fakeClock(1_700_000_000_000);
+  const { deps, seen } = stageFakes({ home, clock, suite: () => ({ ok: true }) });
+  // A journal left by the previous version of this workflow.
+  const h = store.openWorkflowJournal(home, "local", EXEC, { stage: "integration-a0" });
+  h.persist({ kind: "version", spec: 1, workflow: wf.WORKFLOW_NAME, version: "0" });
+  h.persist({ kind: "effect", key: `${ITEM.run_id}/integration/open`, result: { gatedHead: "head-v1" } });
+  const r = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps, gatedHead: "head-v1" });
+  assert.equal(r.state, "failed", JSON.stringify(r));
+  assert.equal(r.journal_version_mismatch, true);
+  assert.match(r.reason, /recorded by another version of the workflow/);
+  assert.equal(r.escalated_to, "task-integration-escalate-x");
+  assert.equal(seen.escalations, 1);
+  assert.equal(seen.demotions, 1);
+  assert.equal(seen.facts.length, 1);
+  assert.equal(seen.builds, 0);
+  assert.equal(seen.lands, 0);
+  assert.equal(seen.leaseAcquired, 0);
+  assert.equal(store.readWorkflowJournal(home, "local", EXEC, { stage: "integration-a0" }).length, 2, "nothing appended");
 });
 
 test("the activities table and the binding name the same set", () => {

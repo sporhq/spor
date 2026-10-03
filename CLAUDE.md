@@ -1710,6 +1710,28 @@ try/finally untouched (`isControlFlow`) — a journaled step taken on the way
 out of a suspend lands out of order. `landCandidate` reads a ref already at
 the candidate sha as landed (the at-least-once window), and
 `discardCandidateTree` tears down by path a worktree a dead worker built.
+**The definition is bound and an edit fails CLOSED**
+(task-spor-integration-workflow-merge-gate-fixes): the `open` entry journals
+`definitionBindingDigest` — a digest over the factory's `integration` block,
+`trustedRef` and `protectedPaths`, the three inputs makeIntegrationDeps'
+activities read LIVE — and a resume whose live digest differs throws a `NonDeterminism` tagged
+`definitionMismatch` before the lease or the tree read (the journal gains
+nothing, so a re-drive under the ORIGINAL definition continues where it
+stopped). The driver settles that attempt as REFUSED outside the journal
+(`refuseUnresumable`: the escalation, the §10.7 demotion and the
+`art-merge-*` fact under the ids the attempt would have minted, result
+tagged `definition_mismatch`), never a land under a mixed definition and
+never a rebuild of the activities from the snapshot (that would run an old
+suite command against a changed factory); a journal recorded by another
+WORKFLOW_VERSION is settled the same way (`journal_version_mismatch`). The
+door back is a fresh attempt (`spor work --regate <run>`), which opens its
+own journal under the current definition. And the result's `regate_facts`
+are the CARRIED re-gate's facts only — reset whenever a later re-gate
+supersedes `regate_result` — so bin/spor.js's adoption (and the
+attestation) carries only the facts of the re-gate that judged the head
+being landed; the LIVE `regate` closure in `runGateAndIntegration` keeps
+the same rule (a later re-gate's facts REPLACE the previous re-gate's on
+`gateFacts`), so the live and resumed arms attest the same fact list.
 What is NOT yet done, and
 still open on the parent task: the rewrite of `runGateAndIntegration`/
 `runGatePipeline`/the implementation stage as one workflow function over

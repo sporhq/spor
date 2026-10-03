@@ -14607,10 +14607,24 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     // Whether a re-gate RAN in this process this pass — the one case the
     // adoption below must not touch (the closure's own merge is the truth).
     let regateRan = false;
+    // The facts of the LAST re-gate run here, and the gate list's own facts
+    // before any re-gate: a later re-gate's facts REPLACE the previous
+    // re-gate's on gateFacts (a superseded re-gate judged a head that is not
+    // the one being landed), the mirror of the stage's own `regate_facts`
+    // reset, so the live arm and the resumed adoption below attest the same
+    // list (task-spor-integration-workflow-merge-gate-fixes).
+    const originalFacts = gateFacts.slice();
+    let lastRegateFacts = [];
     const regate = async ({ head }) => {
       regateRan = true;
       const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
-      for (const f of again.facts || []) if (!gateFacts.includes(f)) gateFacts.push(f);
+      for (const f of lastRegateFacts) {
+        if (originalFacts.includes(f)) continue;
+        const i = gateFacts.indexOf(f);
+        if (i >= 0) gateFacts.splice(i, 1);
+      }
+      lastRegateFacts = (again.facts || []).filter((f) => !originalFacts.includes(f));
+      for (const f of lastRegateFacts) if (!gateFacts.includes(f)) gateFacts.push(f);
       gateResult = again;
       if (again.state === "passed" && again.head !== head) ctx.log(`work: the re-gate of ${item.node_id} judged ${String(again.head || "an unknown head").slice(0, 12)}, not the moved head ${String(head).slice(0, 12)}`);
       return again;
@@ -14638,6 +14652,10 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // gateResult/gateFacts is a side effect of running it — never ran here):
   // adopt what the result carries, so the settle, the attestation and the
   // fact list describe the re-gated head exactly as the live pass did.
+  // `regate_facts` is the CARRIED re-gate's facts only — the stage resets it
+  // whenever a later re-gate supersedes the carried one — so what is adopted
+  // here is the evidence of the re-gate that judged the head being landed,
+  // never a superseded re-gate's (task-spor-integration-workflow-merge-gate-fixes).
   // Only when NO re-gate ran here: a live pass merged its own result (and a
   // live re-gate that FAILED after an earlier pass must not be clobbered by
   // the earlier pass the result still carries).
