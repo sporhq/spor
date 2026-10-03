@@ -1,6 +1,7 @@
 // spikes/durable-workflow/spike.test.js — crash/replay proofs over the gate
-// pipeline written as a workflow function. NOT part of `npm test` (a spike is
-// not a shipped surface); run it with:
+// pipeline written as a workflow function, run against the SHIPPED kernel
+// (lib/kernel/workflow.js, promoted from this spike's harness.js). NOT part of
+// `npm test` (a spike is not a shipped surface); run it with:
 //
 //   node --test spikes/durable-workflow/spike.test.js
 //
@@ -11,7 +12,7 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert");
-const { Execution, drive, fakeClock } = require("./harness.js");
+const { Execution, drive, fakeClock } = require("../../lib/kernel/workflow.js");
 const { gatePipeline, ACTIVITIES } = require("./pipeline.workflow.js");
 
 // A fake world: a repo whose head moves when a fix commits, a graph that
@@ -25,7 +26,7 @@ function makeWorld({ script = {}, clock, adopt = true } = {}) {
   const calls = new Map(); // key -> count of EXECUTIONS (not replays)
   const effects = []; // ordered executions
   const graph = new Map(); // id -> node
-  const signals = []; // pending signals drive() delivers
+  const signals = []; // pending signals await drive() delivers
   const repo = { head: "aaaa0001", tip: "base0001", commits: 0 };
   const launched = new Map(); // dispatch key -> run_id (the "run named after its key" the adapters adopt)
   let dispatches = 0;
@@ -109,17 +110,17 @@ const ITEM = { node_id: "task-x", run_id: "run-0001" };
 function exec(world, clock, { factory = FACTORY, journal = [], crashPlan = null } = {}) {
   return new Execution(gatePipeline, { item: ITEM, factory }, { journal, clock, activities: world.activities, crashPlan, onActivity: world.onActivity });
 }
-function runPipeline(world, clock, opts = {}) {
+async function runPipeline(world, clock, opts = {}) {
   const e = exec(world, clock, opts);
-  const r = drive(e, { clock, signals: world.signals });
+  const r = await drive(e, { clock, signals: world.signals });
   return { exec: e, r };
 }
 const keysMatching = (world, re) => [...world.calls.keys()].filter((k) => re.test(k));
 
-test("happy path: every activity executes exactly once and the journal replays to the same result with no activity available", () => {
+test("happy path: every activity executes exactly once and the journal replays to the same result with no activity available", async () => {
   const clock = fakeClock(1000);
   const world = makeWorld({ clock });
-  const { exec: e, r } = runPipeline(world, clock);
+  const { exec: e, r } = await runPipeline(world, clock);
   assert.equal(r.status, "completed");
   assert.equal(r.result.state, "passed");
   for (const [key, n] of world.calls) assert.equal(n, 1, `${key} executed ${n} times`);
@@ -130,16 +131,16 @@ test("happy path: every activity executes exactly once and the journal replays t
   // that would fail loudly if called, reproduces the result byte-for-byte.
   const poison = Object.fromEntries(Object.keys(world.activities).map((k) => [k, () => { throw new Error(`activity ${k} called during pure replay`); }]));
   const replay = new Execution(gatePipeline, { item: ITEM, factory: FACTORY }, { journal: e.journal.slice(), clock, activities: poison });
-  const rr = replay.run();
+  const rr = await replay.run();
   assert.equal(rr.status, "completed");
   assert.deepStrictEqual(rr.result, r.result);
 });
 
-test("crash sweep: a crash at EVERY activity boundary resumes to the same result AND the same side effects; only the before-journal window re-executes, exactly one activity, absorbed by the activity's own idempotency", () => {
+test("crash sweep: a crash at EVERY activity boundary resumes to the same result AND the same side effects; only the before-journal window re-executes, exactly one activity, absorbed by the activity's own idempotency", async () => {
   // Reference run: the effects, the graph, and the runs the happy path produces.
   const refClock = fakeClock(1000);
   const ref = makeWorld({ clock: refClock });
-  const reference = runPipeline(ref, refClock);
+  const reference = await runPipeline(ref, refClock);
   const effectCount = ref.effects.length;
   assert.ok(effectCount > 10, `expected a non-trivial effect count, got ${effectCount}`);
   const refGraph = [...ref.graph.keys()].sort();
@@ -151,7 +152,7 @@ test("crash sweep: a crash at EVERY activity boundary resumes to the same result
       const world = makeWorld({ clock });
       let crashed = 0;
       const e = exec(world, clock, { crashPlan: { at, nth } });
-      const r = drive(e, { clock, signals: world.signals, onCrash: () => crashed++ });
+      const r = await drive(e, { clock, signals: world.signals, onCrash: () => crashed++ });
       assert.equal(crashed, 1, `${at}#${nth}: crashed ${crashed} times`);
       assert.equal(r.status, "completed", `${at}#${nth}: ${r.status}`);
       assert.deepStrictEqual(r.result, reference.r.result, `${at}#${nth}: result differs`);
@@ -170,16 +171,16 @@ test("crash sweep: a crash at EVERY activity boundary resumes to the same result
   }
 });
 
-test("WITHOUT adopt-by-name in the dispatch activity, a before-journal crash on a dispatch launches a second agent — the model narrows duplicate dispatch to that window; closing it is the activity's job", () => {
+test("WITHOUT adopt-by-name in the dispatch activity, a before-journal crash on a dispatch launches a second agent — the model narrows duplicate dispatch to that window; closing it is the activity's job", async () => {
   const refClock = fakeClock(1000);
   const ref = makeWorld({ clock: refClock });
-  runPipeline(ref, refClock);
+  await runPipeline(ref, refClock);
   const nth = ref.effects.findIndex((e) => e.name === "dispatchReview") + 1;
   assert.ok(nth > 0);
   const clock = fakeClock(1000);
   const world = makeWorld({ clock, adopt: false });
   const e = exec(world, clock, { crashPlan: { at: "before-journal", nth } });
-  const r = drive(e, { clock, signals: world.signals });
+  const r = await drive(e, { clock, signals: world.signals });
   assert.equal(r.status, "completed");
   assert.equal(world.dispatches, ref.dispatches + 1, "one extra reviewer was launched");
   const delivered = e.journal.filter((j) => j.kind === "signal").length;
@@ -187,7 +188,7 @@ test("WITHOUT adopt-by-name in the dispatch activity, a before-journal crash on 
   assert.equal(delivered - consumed, 1, "and its terminal signal is orphaned in the journal, never awaited");
 });
 
-test("a worker that dies while a review is running: the resumed execution awaits the same run instead of dispatching a second reviewer (issue-spor-gate-pipeline-durability-concurrency §duplicate dispatches)", () => {
+test("a worker that dies while a review is running: the resumed execution awaits the same run instead of dispatching a second reviewer (issue-spor-gate-pipeline-durability-concurrency §duplicate dispatches)", async () => {
   const clock = fakeClock(1000);
   const world = makeWorld({ clock, script: { review: [{ state: "report", findings: [] }] } });
   // Hold the review's terminal signal back so the first worker parks on it.
@@ -195,7 +196,7 @@ test("a worker that dies while a review is running: the resumed execution awaits
   const origDispatch = world.activities.dispatchReview;
   world.activities.dispatchReview = (args, meta) => { const r = origDispatch(args, meta); if (!r.adopted) held.push(world.signals.pop()); return r; };
   const exec1 = exec(world, clock);
-  const r1 = drive(exec1, { clock, signals: world.signals });
+  const r1 = await drive(exec1, { clock, signals: world.signals });
   assert.equal(r1.status, "suspended");
   assert.equal(r1.kind, "signal");
   assert.match(r1.detail.name, /^run:review-1$/);
@@ -204,13 +205,13 @@ test("a worker that dies while a review is running: the resumed execution awaits
   // review is out, so the workflow waits for it.
   const exec2 = exec(world, clock, { journal: exec1.journal });
   world.signals.push(...held);
-  const r2 = drive(exec2, { clock, signals: world.signals });
+  const r2 = await drive(exec2, { clock, signals: world.signals });
   assert.equal(r2.status, "completed");
   assert.equal(r2.result.state, "passed");
   assert.equal(world.calls.get("run-0001/gate/gate-review/pass/1/review/1/dispatch"), 1, "the reviewer was dispatched once");
 });
 
-test("a fix cycle that moves the head restarts from gate 0 with each gate's memory intact; cycles spent, the rescue lane runs; superseded facts keep their ids", () => {
+test("a fix cycle that moves the head restarts from gate 0 with each gate's memory intact; cycles spent, the rescue lane runs; superseded facts keep their ids", async () => {
   const clock = fakeClock(1000);
   const blocking = { id: "f1", file: "lib/x.js", severity: "blocking", evidence: "node -e ... throws" };
   const world = makeWorld({
@@ -224,7 +225,7 @@ test("a fix cycle that moves the head restarts from gate 0 with each gate's memo
       ],
     },
   });
-  const { r } = runPipeline(world, clock);
+  const { r } = await runPipeline(world, clock);
   assert.equal(r.status, "completed");
   assert.equal(r.result.state, "passed");
   assert.equal(r.result.rescues, 1);
@@ -237,7 +238,7 @@ test("a fix cycle that moves the head restarts from gate 0 with each gate's memo
   assert.equal(r.result.escalations.length, 0);
 });
 
-test("after the rescue each gate gets a FRESH fix-cycle budget with the ledger carried; a second refusal after the last rescue escalates", () => {
+test("after the rescue each gate gets a FRESH fix-cycle budget with the ledger carried; a second refusal after the last rescue escalates", async () => {
   const clock = fakeClock(1000);
   const blocking = { id: "f1", file: "lib/x.js", severity: "blocking", evidence: "throws" };
   const world = makeWorld({
@@ -253,7 +254,7 @@ test("after the rescue each gate gets a FRESH fix-cycle budget with the ledger c
       ],
     },
   });
-  const { r } = runPipeline(world, clock);
+  const { r } = await runPipeline(world, clock);
   assert.equal(r.result.state, "failed");
   assert.equal(r.result.rescues, 1);
   assert.equal(keysMatching(world, /gate\/gate-review\/pass\/\d+\/fix\/\d+\/dispatch$/).length, 4, "2 fixes before the rescue, 2 after");
@@ -263,21 +264,21 @@ test("after the rescue each gate gets a FRESH fix-cycle budget with the ledger c
   assert.ok(postRescueReview);
 });
 
-test("a reviewer outage with a stated reset is a durable PAUSE: the workflow suspends until the reset, spends the retry pool not a fix cycle, and re-dispatches once (issue-spor-codex-usage-limit-outage-read-as-a-code-failure, issue-spor-integration-regate-misreads-reviewer-pause)", () => {
+test("a reviewer outage with a stated reset is a durable PAUSE: the workflow suspends until the reset, spends the retry pool not a fix cycle, and re-dispatches once (issue-spor-codex-usage-limit-outage-read-as-a-code-failure, issue-spor-integration-regate-misreads-reviewer-pause)", async () => {
   const clock = fakeClock(1000);
   const resetAt = 1000 + 2 * 3600e3;
   const world = makeWorld({ clock, script: { review: [{ state: "infrastructure", reset_at: resetAt }, { state: "report", findings: [] }] } });
   const e = exec(world, clock);
-  let r = e.run();
+  let r = await e.run();
   assert.equal(r.status, "suspended"); // awaiting the review run's signal
   for (const s of world.signals.splice(0)) e.signal(s.name, s.payload); // the supervisor reports the run's end
-  r = e.run();
+  r = await e.run();
   assert.equal(r.status, "suspended");
   assert.equal(r.kind, "timer");
   assert.equal(r.detail.fireAt, resetAt, "the timer is the reviewer's own stated reset");
   // nothing happens while parked: no slot, no poll, no fix
   assert.equal(keysMatching(world, /\/fix\//).length, 0);
-  const done = drive(e, { clock, signals: world.signals });
+  const done = await drive(e, { clock, signals: world.signals });
   assert.equal(done.status, "completed");
   assert.equal(done.result.state, "passed");
   assert.equal(done.result.retries, 1, "the pause spent the shared retry pool");
@@ -286,12 +287,12 @@ test("a reviewer outage with a stated reset is a durable PAUSE: the workflow sus
   assert.equal([...world.graph.values()].filter((n) => n.verdict === "infrastructure").length, 0, "a pause is not a verdict");
 });
 
-test("a reset beyond pause_max_ms goes to a person (fact + escalation, no rescue); a spent retry pool does the same; the implementer's outages draw on the SAME pool", () => {
+test("a reset beyond pause_max_ms goes to a person (fact + escalation, no rescue); a spent retry pool does the same; the implementer's outages draw on the SAME pool", async () => {
   // beyond pause_max
   {
     const clock = fakeClock(1000);
     const world = makeWorld({ clock, script: { review: [{ state: "infrastructure", reset_at: 1000 + 72 * 3600e3 }] } });
-    const { r } = runPipeline(world, clock);
+    const { r } = await runPipeline(world, clock);
     assert.equal(r.result.state, "failed");
     assert.equal(r.result.rescues, 0);
     assert.equal([...world.graph.values()].filter((n) => n.verdict === "infrastructure").length, 1, "the refusal is a gate fact");
@@ -302,7 +303,7 @@ test("a reset beyond pause_max_ms goes to a person (fact + escalation, no rescue
     const clock = fakeClock(1000);
     const factory = { ...FACTORY, implementation: { attempts: 2, retry_backoff_ms: 1000 }, retry: { attempts: 2 } };
     const world = makeWorld({ clock, script: { impl: [{ state: "infrastructure" }, { state: "candidate" }], review: [{ state: "infrastructure", reset_at: 5000 }, { state: "infrastructure", reset_at: 9000 }] } });
-    const { r } = runPipeline(world, clock, { factory });
+    const { r } = await runPipeline(world, clock, { factory });
     assert.equal(r.result.state, "failed");
     assert.equal(r.result.retries, 2, "one implementer outage + one reviewer outage spent the pool of 2");
     assert.equal(keysMatching(world, /^run-0001\/impl\/\d+\/dispatch$/).length, 2);
@@ -314,7 +315,7 @@ test("a reset beyond pause_max_ms goes to a person (fact + escalation, no rescue
     const clock = fakeClock(1000);
     const factory = { ...FACTORY, implementation: { attempts: 2, retry_backoff_ms: 1000 } };
     const world = makeWorld({ clock, script: { impl: [{ state: "infrastructure" }, { state: "failed" }, { state: "candidate" }] } });
-    const { r } = runPipeline(world, clock, { factory });
+    const { r } = await runPipeline(world, clock, { factory });
     assert.equal(r.result.state, "passed");
     assert.equal(keysMatching(world, /impl\/\d+\/dispatch$/).length, 3);
   }
@@ -323,20 +324,20 @@ test("a reset beyond pause_max_ms goes to a person (fact + escalation, no rescue
     const clock = fakeClock(1000);
     const factory = { ...FACTORY, implementation: { attempts: 1, retry_backoff_ms: 1000 } };
     const world = makeWorld({ clock, script: { impl: Array.from({ length: 50 }, () => ({ state: "infrastructure" })) } });
-    const { r } = runPipeline(world, clock, { factory });
+    const { r } = await runPipeline(world, clock, { factory });
     assert.equal(r.result.state, "escalated");
     assert.equal(keysMatching(world, /^run-0001\/impl\/\d+\/dispatch$/).length, 4, "3 retries + the refused 4th");
   }
 });
 
-test("a human gate blocks on an approval signal with a durable deadline: approved passes; timeout settles blocked, demotes, files no escalation; refusal escalates", () => {
+test("a human gate blocks on an approval signal with a durable deadline: approved passes; timeout settles blocked, demotes, files no escalation; refusal escalates", async () => {
   for (const answer of ["approve", "timeout", "refuse"]) {
     const clock = fakeClock(1000);
     const world = makeWorld({ clock, script: { paths: ["lib/auth.js"] } });
     const approvalId = "task-approval-task-x-run0001-gate-auth";
     if (answer === "approve") world.signals.push({ name: `approval:${approvalId}`, payload: { approved: true }, atOrAfter: 1000 + 600e3 });
     if (answer === "refuse") world.signals.push({ name: `approval:${approvalId}`, payload: { approved: false }, atOrAfter: 1000 + 600e3 });
-    const { r } = runPipeline(world, clock);
+    const { r } = await runPipeline(world, clock);
     assert.equal(r.status, "completed", answer);
     assert.ok(world.graph.has(approvalId), "the approval item was filed under its deterministic id");
     if (answer === "approve") { assert.equal(r.result.state, "passed"); assert.equal(world.calls.get("run-0001/demote"), undefined); }
@@ -349,7 +350,7 @@ test("a human gate blocks on an approval signal with a durable deadline: approve
   }
 });
 
-test("integration: a lost CAS race is retried on its own bound and never charged; a conflict is a fix cycle that re-gates the moved head over the SAME state (cumulative caps, no implementer re-run, one attestation)", () => {
+test("integration: a lost CAS race is retried on its own bound and never charged; a conflict is a fix cycle that re-gates the moved head over the SAME state (cumulative caps, no implementer re-run, one attestation)", async () => {
   const clock = fakeClock(1000);
   const blocking = { id: "f1", file: "lib/x.js", severity: "blocking", evidence: "throws" };
   const resolved = { ...blocking, status: "resolved" };
@@ -365,7 +366,7 @@ test("integration: a lost CAS race is retried on its own bound and never charged
       review: [{ state: "report", findings: [blocking] }, { state: "report", findings: [resolved] }, { state: "report", findings: [{ ...blocking, introduced_by_fix: true }] }, { state: "report", findings: [resolved] }],
     },
   });
-  const { r } = runPipeline(world, clock, { factory });
+  const { r } = await runPipeline(world, clock, { factory });
   assert.equal(r.status, "completed");
   assert.equal(r.result.state, "passed");
   assert.equal(keysMatching(world, /integration\/\d+\/land$/).length, 3, "two lost races + one landing");
@@ -383,10 +384,10 @@ test("integration: a lost CAS race is retried on its own bound and never charged
   assert.ok(attest.facts.length >= 6);
 });
 
-test("a protected-path touch (glob-matched) fails closed before the suite, unrun and unrescued; an escalation and demotion land under deterministic ids", () => {
+test("a protected-path touch (glob-matched) fails closed before the suite, unrun and unrescued; an escalation and demotion land under deterministic ids", async () => {
   const clock = fakeClock(1000);
   const world = makeWorld({ clock, script: { paths: ["test/foo.test.js"] } });
-  const { r } = runPipeline(world, clock);
+  const { r } = await runPipeline(world, clock);
   assert.equal(r.result.state, "failed");
   assert.equal(r.result.rescues, 0);
   assert.equal(keysMatching(world, /\/run\//).length, 0, "the suite never ran");
@@ -394,7 +395,7 @@ test("a protected-path touch (glob-matched) fails closed before the suite, unrun
   assert.equal(world.calls.get("run-0001/demote"), 1);
 });
 
-test("harness: a signal consumed by a replayed await does not resurface to a later await for the same name (replay is a function of the journal)", () => {
+test("harness: a signal consumed by a replayed await does not resurface to a later await for the same name (replay is a function of the journal)", async () => {
   const wf = (ctx) => {
     const a = ctx.awaitSignal("k1", "approval:x");
     const b = ctx.awaitSignal("k2", "approval:x");
@@ -403,11 +404,11 @@ test("harness: a signal consumed by a replayed await does not resurface to a lat
   const clock = fakeClock(0);
   const e = new Execution(wf, {}, { journal: [], clock });
   e.signal("approval:x", { approved: true });
-  assert.equal(e.run().status, "suspended", "live: k1 consumes the one signal, k2 suspends");
-  assert.equal(e.run().status, "suspended", "replay: k1 is replayed, k2 must still suspend");
+  assert.equal((await e.run()).status, "suspended", "live: k1 consumes the one signal, k2 suspends");
+  assert.equal((await e.run()).status, "suspended", "replay: k1 is replayed, k2 must still suspend");
 });
 
-test("the activities table is the bespoke remainder: every ctx.run in the workflow names one of them", () => {
+test("the activities table is the bespoke remainder: every ctx.run in the workflow names one of them", async () => {
   const src = require("node:fs").readFileSync(require.resolve("./pipeline.workflow.js"), "utf8");
   const named = new Set([...src.matchAll(/,\s*"([a-zA-Z]+)",\s*\{/g)].map((m) => m[1]));
   const table = new Set(ACTIVITIES.map(([n]) => n).filter((n) => !n.startsWith("signal ")));

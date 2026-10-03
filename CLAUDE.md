@@ -1639,6 +1639,41 @@ a per-execution outbox and replays them in order) and `spor executions`. A legac
 record or a pre-adapter claim (no `impl_claim.store`) touches no store. Knobs:
 `execution.leaseTtlMs` (`SPOR_EXECUTION_TTL`), `execution.timeoutMs`
 (`SPOR_EXECUTION_TIMEOUT`). See test/execution-store.test.js.
+**The durable-workflow replay kernel (task-spor-gate-pipeline-as-workflow-kernel,
+dec-spor-gate-pipeline-durable-workflow-model-zero-dep-kernel-first):**
+`lib/kernel/workflow.js` is the programming model Temporal, Restate and js-wf
+share, as a pure zero-dep module: a workflow is a deterministic function of
+(input, journal), re-executed from the top on every resume; `ctx.run(key,
+activity, args)` journals an activity's RESULT once under a stable key (the
+activity itself is at-least-once — a crash between executing and journaling
+re-runs it, so every activity must be idempotent under its key: deterministic
+node ids + `if_exists: skip`, git CAS, adopt-by-name for a dispatch);
+`ctx.now`/`sleepUntil`/`awaitSignal` are the journaled clock, durable timers
+and signal waits that SUSPEND instead of holding a slot; an out-of-order or
+repeated key is `NonDeterminism`, never a silent re-execution; and a journal is
+bound to the `version` that recorded it (`WorkflowVersionMismatch` — open a
+new pipeline attempt, never a patch branch). Persistence is injected
+(`persist`, called after every append and before the workflow sees the
+result): `openWorkflowJournal` in `lib/shell/execution-store.js` binds it to
+`journal/executions/<tenant>/exec/<id>.workflow.jsonl` beside the execution
+record in BOTH modes (the kernel's entry kinds are not in the hosted store's
+§7.3 event vocabulary, and the box that drives a workflow is the box that
+resumes it). The spike's thirteen proofs (`spikes/durable-workflow/`) run over
+this kernel. **Adopt-by-name is the dispatch DOOR's contract**
+(dec-spor-adopt-by-name-returns-existing): `dispatchThrough` in bin/spor.js —
+the one door every review, fix, rescue, implementer and integration-fix launch
+goes through — returns the run this box already launched under
+`values.name` (for `values.node` when one is named; a review names none and is
+matched on the name alone) and launches nothing, so a re-executed dispatch is
+idempotent at the door, not by each caller remembering `launchedFixRun` first
+(the callers' own checks are now a redundant belt). What is NOT yet done, and
+still open on the task: the rewrite of `runGateAndIntegration`/
+`runGatePipeline`/`runIntegrationStage`/the implementation stage as one
+workflow function over this kernel, and the deletion of `gate_state`, the
+`gate_progress` save/reload, `orphanedGateRuns`, `resumableSlots`, parked
+re-offers and `claimGateRecord` that the rewrite makes possible. See
+test/workflow-kernel.test.js, test/workflow-journal.test.js,
+test/dispatch-adopt-by-name.test.js.
 Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard

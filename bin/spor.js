@@ -11043,6 +11043,19 @@ function dispatchThrough(cfg, values, positionals = [], opts = {}) {
 }
 
 async function dispatchThroughLocked(cfg, values, positionals = [], opts = {}) {
+  // ADOPT-BY-NAME IS THE DOOR'S CONTRACT (dec-spor-adopt-by-name-returns-
+  // existing): a dispatch re-executed under a run name this box already
+  // launched RETURNS that run and launches nothing. Under the durable-workflow
+  // model (lib/kernel/workflow.js) a dispatch is an activity whose result is
+  // journaled once but whose effect is at-least-once — a crash between the
+  // launch and the journal append re-executes it — and this window is the one
+  // the kernel cannot close, so every pipeline door (review, fix, rescue,
+  // implementer, integration fix) must be idempotent HERE, not by each caller
+  // remembering to look first. A pipeline names every run it launches
+  // (`gate-…`, `fix-…`, `rescue-…`, `impl-…`); a nameless dispatch takes no
+  // part in this and is launched as before.
+  const named = values && values.name != null && String(values.name) !== "" ? launchedRunNamed(cfg.userConfigHome(), { node: values.node || null, name: String(values.name) }) : null;
+  if (named) return { ok: true, run: named, adopted: true };
   const launches = [];
   const lines = [];
   const previousTee = ERR_TEE;
@@ -12405,13 +12418,21 @@ async function rescueHarnessAdapter(cfg, profileId) {
 // for `nodeId`, if one exists — the launcher writes a run's record before
 // `dispatch` returns, so a launch the pipeline's own bookkeeping never got to
 // record is still findable by its name. Newest first; null when none.
-function launchedFixRun(home, nodeId, name) {
+// The run this box already launched under `name` (and, when the dispatch
+// names a node, for that node — a review dispatch names none and is matched
+// on the name alone). Any state qualifies: a terminal run is adopted and its
+// record read, exactly as a live one is awaited. Fail-open on an unreadable
+// run journal: no adoption, the dispatch proceeds.
+function launchedRunNamed(home, { node = null, name }) {
   try {
-    const hit = dispatchRuns.listRuns(home, { node: nodeId }).find((r) => r && r.name === name && r.run_id);
+    const hit = dispatchRuns.listRuns(home, { node: node || null }).find((r) => r && r.name === name && r.run_id && (!node || r.node_id === node));
     return hit ? { run_id: hit.run_id, harness: hit.harness || null, adopted: true } : null;
   } catch {
     return null;
   }
+}
+function launchedFixRun(home, nodeId, name) {
+  return launchedRunNamed(home, { node: nodeId, name });
 }
 
 // implementation.candidate.require_clean (§2.1,
@@ -19303,7 +19324,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
+module.exports = { dispatchThrough, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
 
 if (require.main === module) {
   main()
