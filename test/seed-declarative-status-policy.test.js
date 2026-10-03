@@ -216,6 +216,8 @@ test("a host-supplied view.resolver_types replaces the seed resolver types in th
     assert.equal(gate("finding", ["finding"]), true, `${s.id}: a declared override type must open the gate`);
     assert.equal(gate("decision", ["finding"]), false, `${s.id}: an override must close the seed types it omits`);
     assert.equal(gate("decision", undefined), true, `${s.id}: an absent view.resolver_types keeps the seed types`);
+    assert.equal(gate("Decision", undefined), false, `${s.id}: resolver types match exactly — "Decision" is not "decision"`);
+    assert.equal(gate("Decision", ["decision"]), false, `${s.id}: a declared type matches exactly too`);
   }
 });
 

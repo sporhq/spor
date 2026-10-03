@@ -272,11 +272,11 @@ export function transitions(current, proposed, view) {
     const nonResolving = (view && view.non_resolving_statuses) || [];
     // view.resolver_types = this type's status.resolver_types, supplied by the
     // host; a host that omits it gets the seed declaration (backward-readable).
-    const types = ((view && view.resolver_types) || []).map(function (t) { return String(t).toLowerCase(); });
+    const types = ((view && view.resolver_types) || []).map(function (t) { return String(t); });
     const accepted = types.length ? types : ["decision", "artifact"];
     let ok = false;
     for (let i = 0; i < rs.length; i++) {
-      const isChange = accepted.indexOf(String(rs[i].type).toLowerCase()) !== -1;
+      const isChange = accepted.indexOf(String(rs[i].type)) !== -1;
       const st = ((rs[i] && rs[i].status) || "").toLowerCase();
       if (isChange && nonResolving.indexOf(st) === -1) { ok = true; break; }
     }
