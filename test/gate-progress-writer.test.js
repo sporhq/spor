@@ -234,12 +234,13 @@ test('a fix launch stamp from UNOWNED deps lands only on a record nobody has cla
   assert.equal(runs.readJson(file).gate_fix_run_id, 'fix-run-standalone');
   // A worker claims the record; the standalone's next launch stamp is refused
   // (and the fix cycle with it), exactly as its ledger write is.
-  const claim = runs.claimGateRecord(home, runId, { workerId: 'worker-1' });
+  const claim = runs.claimPipeline(home, runId, { workerId: 'worker-1' });
   assert.equal(claim.ok, true, claim.refused);
   runs.stampGateState(home, runId, { gate_fix_run_id: null, gate_fix_gate: null, gate_fix_cycle: null }, { own: claim.token });
   await assert.rejects(() => unowned.dispatchFix({ gate: { id: 'acceptance' }, cycle: 1, findings: [], detail: 'still failing', evidence: '' }), /could not be updated: the gate pipeline is settled or its owner changed/);
   await assert.rejects(() => unowned.saveGateProgress({ gate: { id: 'acceptance' }, progress: { fixes: 1 } }), /owner changed/);
   const after = runs.readJson(file);
   assert.equal(after.gate_fix_run_id, null, "the worker's record gained no fix id it did not launch");
-  assert.equal(after.gate_settle_id, claim.token);
+  assert.equal(after.gate_settle_id, undefined, 'the claim is a lease entry, never a record stamp');
+  assert.equal(projection.pipelineLease(home, after).token, claim.token);
 });

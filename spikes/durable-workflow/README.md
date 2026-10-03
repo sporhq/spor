@@ -223,11 +223,15 @@ reducer stays the projection the write gate reads.
    `deps.*` call in `ctx.run(key, …)` with the deterministic id it already
    mints as the key; turn every `await run terminal` poll into a signal the
    supervisor delivers; turn every backoff/pause/approval wait into a timer or
-   a deadline; then DELETE the resume machinery — `gate_state`,
-   `gate_progress` save/reload, `orphanedGateRuns`, `resumableSlots`, parked
-   re-offers, `claimGateRecord`, the interrupted-result plumbing — because the
-   engine's re-execution does all of it. The work loop shrinks to "drive every
-   open journal; deliver signals; advance timers".
+   a deadline; then DELETE the resume machinery — `gate_state`'s transitional
+   writes, `gate_progress` save/reload, `orphanedGateRuns`, `resumableSlots`,
+   parked re-offers, `claimGateRecord`, the interrupted-result plumbing —
+   because the engine's re-execution does all of it. The work loop shrinks to
+   "drive every open journal; deliver signals; advance timers". (Done as of
+   task-spor-delete-loop-resume-machinery-after-workflow-stages: the three
+   stages are workflow functions, the loop's resume is `openPipelines` over
+   the stage journals and the pipeline lease log, and the record keeps only
+   the final verdict — WORKERS.md §10.8.)
 2. **Do not adopt Temporal or js-wf now.** Temporal for footprint against
    turnkey self-hosting; js-wf for the three reasons above.
 3. **Keep Restate as the preferred external engine for a server-hosted fleet

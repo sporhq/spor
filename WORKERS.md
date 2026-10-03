@@ -1001,10 +1001,10 @@ written only after the outcome dimension exists):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `gate_state` | string | `"running"` \| `"interrupted"` \| `"passed"` \| `"failed"` \| `"blocked"` \| `"superseded"` \| `"scoped"` \| `"mismatch"` — the last thing a gate pipeline said about this run. The three verdicts, `superseded` (an adopted pipeline whose item was already landed by hand, §10.8 — no gate ran), `scoped` (a verified no-code outcome, §10.11 — no gate ran) and `mismatch` (the branch stopped carrying the pinned candidate its gates judged, §10.9 — nothing was built) are SETTLED; `running`/`interrupted` mean a pipeline started and never reported, which is what a later worker resumes from (§10.8). Propose-mode integration adds `parked` (§10.9) |
-| `gate_worker` | string | the worker id that last touched it |
-| `gate_at` | ISO 8601 | when that stamp was written |
-| `gate_settle_id` | string | the settler's random ownership nonce, minted with a settled verdict (§10.10); every evidence field stamped after the verdict lands only through it |
+| `gate_state` | string | `"passed"` \| `"failed"` \| `"blocked"` \| `"superseded"` \| `"scoped"` \| `"mismatch"` — the FINAL verdict of a gate pipeline on this run, and the only state the record carries. The three verdicts, `superseded` (an adopted pipeline whose item was already landed by hand, §10.8 — no gate ran), `scoped` (a verified no-code outcome, §10.11 — no gate ran) and `mismatch` (the branch stopped carrying the pinned candidate its gates judged, §10.9 — nothing was built) are SETTLED. Propose-mode integration adds `parked` (§10.9). A pipeline that is RUNNING or has YIELDED is not a record state (task-spor-delete-loop-resume-machinery-after-workflow-stages): it is a held or released LEASE in the run's pipeline lease log and an open stage journal beside it (§10.8), and a `--regate` that opens a new attempt CLEARS this field (`null`) until the attempt settles. A record written before the lease log may still carry a legacy `running`/`interrupted`; both read as "unsettled" |
+| `gate_worker` | string | the worker id that settled it |
+| `gate_at` | ISO 8601 | when the settled stamp was written |
+| `gate_settle_id` | string | the settler's ownership nonce (§10.10) — the token of the pipeline LEASE it settled under (`pipeline.jsonl` beside the stage journals, `claim`/`renew`/`release` lines; stage-projection.js `pipelineLease`), copied onto the record with the verdict. Every evidence field stamped after the verdict lands only through the lease's current token; a reopen replaces it |
 | `gate_reason` | string | optional — the settled verdict's one-line reason |
 | `gate_fix_run_id` | string | optional — the run id of the most recent fix cycle this pipeline dispatched at the same node, stamped the moment it was dispatched (not when it finishes). If a stop lands while that fix cycle is still going, this field is what turns "the pipeline was abandoned" into "here is the run to go check" — a fix cycle's own dispatched run is detached and keeps going regardless (§10.7), and this is the only durable pointer to it. `spor runs`/`spor work --status` surface it. |
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
@@ -2209,9 +2209,10 @@ A worker asked to STOP while a gate is waiting out an outage is not one of
 those refusals: nothing judged the change, so the pipeline reports
 `interrupted` and settles nothing — no fact, no escalation, no demotion, no
 attestation. The retry it was about to take is CHARGED first, with its due time
-(`gate_progress.pools.retry.due_at`), and the run's gating slot stays in the
-stopped worker's status, so the next gate-armed worker resumes it (§10.8),
-waits out whatever is left of that backoff before dispatching anything, and
+(`gate_progress.pools.retry.due_at`), the gate workflow YIELDS (its journal
+parks on the backoff as a durable timer, its lease is released) and the slot is
+freed, so the resume scan re-offers it to the next gate-armed worker (§10.8),
+which waits out whatever is left of that backoff before dispatching anything, and
 takes the retry already paid for rather than a fresh, uncharged one. A pool
 already spent, or a charge that will not land, still refuses as above — a stop
 does not turn an exhausted budget into a pause.
@@ -2242,10 +2243,12 @@ dec-spor-reviewer-reset-pause-budget-and-provenance). So:
   to `implementation.retry` now, owe-before-clear, so a pool of zero refuses
   (naming the reset) rather than pausing for a review it may not make. A reset
   further out than the gate's `pause_max_ms` (default 48h) refuses too. The wake
-  rides `gate_progress.pools.retry.paused_until` and `gate_paused_until` on the
-  run record: a resumed worker honors a pause it did not create (parks it again
-  at once, dispatching nothing), the resume scan ages a paused run from its
-  wake rather than its end, and `spor work --status` / `spor runs` show it.
+  rides `gate_progress.pools.retry.paused_until` in the ledger and the parked
+  stage journal's yield (its `paused_until` IS the durable timer the resume
+  scan reads, §10.8): a resumed worker honors a pause it did not create (parks
+  it again at once, dispatching nothing), the resume scan ages a paused run
+  from its wake rather than its end, and `spor work --status` / `spor runs`
+  show it off the journal.
 - **The cooldown.** The same outage stamps the review LANE (profile) cooling
   until its reset in machine-local `journal/reviewer-cooldowns.json`. Any other
   item this box judges under that lane then pauses without dispatching (free —
@@ -2437,11 +2440,11 @@ that the demotion was `not attempted` and why, and the run record carries
 refusal exists nowhere but on this box.
 
 The verdict is still **settled**, deliberately. The obvious-looking alternative
-— stamp something un-settled so the resume scan (§10.8) re-attempts the
-escalation on a later pass — does not work: resumption re-runs the WHOLE
-pipeline (the suite, a fresh review dispatch, a fix cycle forced into the run's
-own checkout), it re-offers a run on every pass with no cooldown behind it, and
-it can only ever see a run its worker's status file still lists. So it would
+— leave the verdict un-settled so the resume scan (§10.8) re-attempts the
+escalation on a later pass — does not work: resumption re-drives the WHOLE
+pipeline's journal (a fresh pass, with whatever a re-run of its live steps
+costs), it re-offers a run on every pass with no cooldown behind it, and the
+escalation is one write, not a judgement. So it would
 loop that pipeline for as long as the graph stayed unwritable in exactly the
 case it could reach, and would not reach the ordinary case at all. `spor
 work --status` says so on the run's line, because until someone (or the
@@ -2558,214 +2561,123 @@ terminal and (for a `resolved` one) already out of every queue, so no candidate
 poll would ever come back to it. Left there, the claim stands permanently
 un-judged, which is the single outcome a factory exists to prevent.
 
-Two durable records make it recoverable by any later worker on the box:
+**The journals are the record** (task-spor-delete-loop-resume-machinery-after-
+workflow-stages, the last slice of task-spor-gate-pipeline-as-workflow-kernel).
+Every stage of a gated run is a deterministic workflow function over the replay
+kernel (`lib/kernel/workflow.js`): the implementation stage, the gate list and
+the integration stage each keep a durable stage journal
+(`journal/executions/<tenant>/exec/<id>.<stage>-a<attempt>.workflow.jsonl`
+beside the execution record, or `journal/dispatch/<run>.workflows/<stage>-a<attempt>.workflow.jsonl`
+beside the run record for a run with no execution to key on — pruned with the
+record), where every dep call is journaled under a stable key, a fix cycle's or
+a rescue's run is awaited as a signal, the outage backoff and a reviewer pause
+are durable timers, a reported `interrupted` is a durable YIELD, and the stage
+closes with a `settled` entry. Beside them sits the **pipeline lease log**
+(`pipeline.jsonl` / `<execution>.pipeline.jsonl`): one `claim` line per pipeline
+a worker starts on the run — the ownership nonce `gate_settle_id` used to be
+minted onto the record as `gate_state: running`; it is now this journaled entry
+— `renew` lines once a pass while the worker drives it, and a `release` line
+when the pipeline yields. The run RECORD carries only the FINAL outcome
+(`gate_state` and the settled verdict's fields, §8); nothing transitional is
+ever written to it, and a worker that dies mid-pipeline leaves nothing there.
 
-- each pipeline stamps **`gate_state`** on its run record — `running` when it
-  starts, `interrupted` when a stop abandons it, and the settled verdict
-  (`passed`/`failed`/`blocked`, or `superseded` — see below) when it reports. A settled verdict is FINAL for
-  that run: nothing may overwrite it, so a duplicate pipeline (see below) can
-  never launder a `failed` into a `passed`, and a stop cannot reopen one. On the
-  way out of the loop the worker makes one last pass over its pipelines, so a
-  verdict that landed while it was stopping is recorded rather than thrown away
-  for the next worker to re-derive;
-- the per-worker status file already records which slots that worker held, and
-  `spor work --status` already reads a worker whose pid is gone as STALE.
+**The resume scan** (work-loop.js `openPipelines` over stage-projection.js
+`openPipelineCandidates`) runs at each pass, **before** a gate-armed worker
+takes new work. A run is a candidate when something says a pipeline was owed —
+a lease was claimed, a stage journal exists, or the record was dispatched by a
+gate-armed worker (`gate_factory`, stamped at launch, so a worker killed with
+the run still in flight is covered too; a hand-run `spor dispatch` has none and
+is never a candidate). It is OPEN, and adopted, when its record carries a claim
+worth gating (§10.2) and no settled `gate_state`; it was started by this
+factory or one it was renamed from (an orphan of another factory is reported,
+never adopted); its node has no non-terminal run (a fix cycle may still be in
+the checkout — deferred, not dropped); its lease is not HELD (released by a
+yield, expired past its 30-minute TTL, or held by a worker whose status file is
+not live); and, for a journal parked on a yield, the yield's own timer is DUE —
+a reviewer pause wakes at its stated reset, an ordinary yield after the
+workflow's short timer; the journal is the schedule, the loop keeps none. An
+adopted pipeline takes a slot exactly like one the worker started, is handed
+the attempt its open journal belongs to (a `--regate`'s attempt continues ITS
+journal), and CONTINUES from where the journal stopped: what already landed
+replays — the same facts, the same run awaited, never a second fixer — and the
+pass picks up from the yield. Adoption claims the lease under the record lock,
+so two workers can never drive one journal: a worker that loses the claim runs
+nothing for it (no fact, no escalation, no demotion, no attestation; its
+result carries `not_run` and `superseded`).
 
-A gate-armed worker joins the two at each pass, **before** taking new work: a
-slot held by a worker that is not live, whose run record is terminal, carries a
-claim worth gating (§10.2), and has no settled `gate_state`, is adopted and
-re-gated.
+A pipeline a stop abandons mid-wait is answered inside the wait: the workflow
+YIELDS (its journal parks, its lease is released) and the loop frees the slot;
+a hard kill leaves the journal running and the lease to lapse with the dead
+worker's status file. Either way the next scan adopts it. On the way out of
+the loop the worker folds in every verdict that DID land, so one that arrived
+while it was stopping is recorded rather than re-derived by the next worker.
+`spor work --status` and `spor runs <id>` read the same projection (the
+current stage and its status, a parked stage's due time and yield count, the
+lease and its holder), so an operator and the scan can never disagree about
+whether a pipeline is being driven.
 
-**The journal is the third record** (task-spor-gate-list-as-workflow-function,
-following the integration stage's task-spor-integration-stage-as-workflow-
-function). The gate list runs as one deterministic workflow function over the
-replay kernel (`lib/shell/gate-workflow.js` over `lib/kernel/workflow.js`): every
-dep call is journaled under a stable key beside the execution record
-(`journal/executions/<tenant>/exec/<id>.gates-a<attempt>.workflow.jsonl`), a
-gate attempt is one journaled activity, a fix cycle's or a rescue's run is
-awaited as a signal, the outage backoff and a reviewer pause are durable
-timers, and a reported `interrupted` is a durable yield — so a re-gated orphan
-or a re-offered pipeline REPLAYS what already landed (the same facts, the same
-run awaited, never a second fixer) and continues with a fresh pass from the
-yield. **Every gated run has a journal** (task-spor-delete-loop-resume-
-machinery-after-workflow-stages): a run with no execution to key it on keeps its
-stage journals beside its run record (`journal/dispatch/<run>.workflows/
-<stage>.workflow.jsonl`, pruned with the record), so no gated run ever runs over
-an in-memory journal a killed worker could not continue. The gate stage is a
-PURE FUNCTION of that journal: its `open` entry carries the gate list and the
-rescue block the attempt opened under and every pass iterates that copy, so a
-completed journal replays to its verdicts under any later edit of the factory,
-and a journal parked mid-attempt refuses at its next live step when the
-binding (the gate list, rescue, implementation, completion, trusted ref,
-protected paths, test lane, risk classes AND the factory's `definition`
-provenance — never the rename chain, the repo scope or the factory id) has
-moved. Provenance is bound because the pass branches on it: every fact and
-every evidence-reuse comparison reads `factory.definition`, so a
-provenance-only edit (a re-stamped node revision) under a parked journal would
-change what a replay reuses — the gate stage is a pure function of its journal
-with no exceptions, so it is refused like any other binding change
-(issue-spor-gate-workflow-unjournaled-regate-and-provenance, `WORKFLOW_VERSION`
-3). The integration stage's RE-GATE of a moved head (§10.9) is a nested gate
-pipeline and drives its OWN durable child journal, keyed on the judged head
-(`gates-regate-<head12>-a<attempt>.workflow.jsonl` beside the stage's), so a
-worker that dies mid-re-gate resumes the nested pipeline from where it stopped
-instead of re-judging the moved head from scratch. A journal this worker cannot continue — that
-mismatch, or another workflow version — is REFUSED through the same
-tombstone-then-settle door as the other two stages (§10.9, §10.16): the
+**A journal this worker cannot continue** — a definition edited between two
+drives (the `open` binding digest), another workflow version, a tombstone — is
+REFUSED through the shared tombstone-then-settle door (§10.9, §10.16): the
 attempt's journal is tombstoned first, then settled `failed` outside it with
-the §10.7 escalation, the demotion and an `art-gate-*` fact filed against the
-first gate of the list it opened under, and the result's refusal tags land on
-the run record as `gate_refusal` (read by `spor work --status`); a re-drive
-re-settles from the tombstone under the same ids, so a factory reverted after
-the refusal can never continue the attempt. It is never judged afresh. A
-REPLAY FAULT (a key sequence this code no longer produces) is a determinism bug
-and a hard failure the pipeline is settled on, never a fallback. An orphan
-adopted mid-await is continued through the journal — the delivered run signal
-is tagged `adopted`, and the pass runs the supersession check it owes before
-judging on. The two records above still drive the resume SCAN (which orphans a
-later worker adopts) and the `--status` surface; the `gate_progress` and
-rescue-state stamps are still written for `spor runs`, `--regate` and the
-flake-evidence debt, but no resume rebuilds a pipeline from them — the journal
-is the progress. Deleting the scan and those stamps outright is what remains of
-the parent task.
+the §10.7 escalation, the demotion and the stage's own fact filed under
+deterministic ids, and the result's refusal tags land on the run record as
+`gate_refusal` (read by `spor work --status`); a re-drive re-settles from the
+tombstone under the same ids, so a factory reverted after the refusal can never
+continue the attempt. It is never judged afresh. A REPLAY FAULT (a key sequence
+this code no longer produces) is a determinism bug and a hard failure the
+pipeline is settled on, never a fallback. An orphan adopted mid-await is
+continued through the journal — the delivered run signal is tagged `adopted`,
+and the pass runs the supersession check it owes before judging on.
 
 **A pipeline can also REPORT `interrupted` — and that is not a verdict
 either.** Besides a stop inside an outage backoff (§10.4), a pass whose gate
 evidence could not yet be published (flake occurrence evidence pending, pending
 evidence it could not inspect or replay) returns `interrupted` with its debt
-retained on the record. Such a result is stamped unsettled and **settles
+retained in the ledger. Such a result is a YIELD — its journal parked, its
+lease released, nothing stamped on the record — and **settles
 nothing**: no fact beyond what the pass already recorded, no escalation, no
 demotion, no cooldown, and **no attestation** — the attestation id is one per
 (node, run, attempt), so one minted for the interruption would occupy the id the
 real verdict needs (issue-spor-gate-evidence-pending-interrupted-drops-slot-and-attests).
-Its gating slot stays in the worker's status, because a slot is the half of the
-pair the resume join reads. A worker that is stopping leaves it for the next
-one; a worker that is still running PARKS it and re-offers the pipeline to
-itself, as a resume, once `work.retryAfterMs` has passed and a slot is free —
-nobody else will while it is alive. While parked it takes no capacity (an
-interruption only a person can clear, such as a renamed gate that still owes
-evidence, would otherwise pin a `--concurrency 1` worker), though its node stays
-out of selection; nor does it hold a winding-down worker (`--max`, `--once`,
-`--restart-on-land`) open, and the exit never re-offers it: that exit leaves it
-standing for the next worker, exactly as a stop does.
+Its slot is FREED: the journal is parked on the yield's own durable timer and
+the lease is released, so the resume scan above re-offers it — to this worker
+or the next — once the timer is due, and never a cadence of the loop's own. A
+yielded pipeline therefore takes no capacity (an interruption only a person can
+clear, such as a renamed gate that still owes evidence, cannot pin a
+`--concurrency 1` worker), though its node stays out of selection while its
+journal is open; nor does it hold a winding-down worker (`--max`, `--once`,
+`--restart-on-land`) open, and a winding-down worker adopts nothing from the
+scan.
 
 **Re-offers are bounded** (task-spor-work-loop-parked-reoffer-cap). An
 interruption that cannot clear on its own — evidence owed to a gate the factory
 no longer declares, a graph this box cannot read, a stored outcome it cannot
-recover — would otherwise be re-offered every `work.retryAfterMs` for the
-worker's whole lifetime. Each park stamps the run record with
-`gate_interrupt_reason`, `gate_interrupt_attempt` (the pipeline attempt, i.e.
-`gate_regate_count`) and `gate_interrupt_count`, the number of CONSECUTIVE
-interruptions with that same reason under that same attempt; a different reason,
-or a `--regate` that opens a new attempt, starts the count again at 1, and a
-stop's hand-off to the next worker is not counted. When the count reaches
-`work.parkedReofferMax` (config-only, default 10; 0 re-offers without bound) the
-worker stops re-offering and files a deterministic `task-gate-parked-…`
-`requires: [human]` item that names the reason and `blocks` the work item, then
-applies the §10.7 demotion; the run settles `blocked` (so the resume join never
-adopts it again, the node cools, and `spor work --regate` is the door back). An
-escalation that could not be filed leaves the run parked and unsettled, and the
-next identical interruption tries it again.
+recover — would otherwise be re-offered for the box's whole lifetime. The count
+is read off the JOURNAL: the number of CONSECUTIVE yields, counting back from
+the last, that carry the same reason (stage-projection.js `reoffers`); a pause
+still inside its bound at the time it was journaled is a known, time-boxed
+outage and is neither counted nor a break, a fallback hand-off (a fresh attempt
+under another lane) starts the count again, a different reason starts it again
+at 1, and a `--regate` opens a new attempt with its own journal. When the count
+reaches `work.parkedReofferMax` (config-only, default 10; 0 re-offers without
+bound) the scan marks the entry `escalate` and the worker, instead of
+re-offering, files a deterministic `task-gate-parked-…` `requires: [human]`
+item that names the reason and `blocks` the work item, then applies the §10.7
+demotion; the run settles `blocked` (so the scan never re-offers it again, the
+node cools, and `spor work --regate` is the door back). An escalation that
+could not be filed settles nothing — the journal stays parked, the count stands
+— and the next re-offer tries it again.
 
-Which slots count is a question of **provenance**, and the two lists differ. A
-`gating` slot only ever exists on a gate-armed worker, so it is owed a verdict
-by construction. An `active` slot exists on **every** worker, bare ones
-included — and a bare worker (no factory: the shipped default, and the whole
-"adoption has no cliff" guarantee) was never owed a gate at all. So an `active`
-slot counts only when that dead worker's own status record says it ran
-gate-armed, which its `gates` tally records iff a factory resolved. Without that
-scoping a gate-armed worker would retroactively judge a bare worker's runs — and
-on a refusal file a `blocks` edge and roll back the status of an item a person
-may have deliberately closed.
-
-**A resumed pipeline re-runs its gates from the first one — with each gate's
-memory intact.** `gate_state` is one word about the whole pipeline, so the suite
-runs again and the review is dispatched again; but every gate's own progress —
-its finding ledger, how many fix cycles it has dispatched, its attempt history
-and the fix that was in flight — is saved on the run record as
-`gate_progress` (keyed by the attempt's run key, so a `--regate` starts clean)
-and read back, so a review gate resumes at the review AFTER the last fix it
-dispatched, with the prior findings it had raised, and its `cycles` cap holds
-across the interruption instead of being granted afresh by it
-(task-spor-review-gate-stateful-bounded). The fact *nodes* are idempotent (deterministic ids), so the graph
-record does not double — but the side effects are not, and one of them matters:
-a fix cycle dispatches an implementer at the node with `--force` and
-`--no-worktree`, into the run's own checkout, and the abandoned pipeline may
-have left exactly such an agent running (it is a detached process that outlived
-its worker). So an orphan whose **node still has a non-terminal run record is
-deferred**, not adopted — the next pass takes it once that agent's run is
-terminal. A record aged past the worker's own watchdog ceiling is not evidence
-of a live agent, so it cannot defer an orphan forever.
-
-**An adopted pipeline first asks whether the work was already landed by hand.**
-An orphan can sit un-judged for hours, and in that window a person may have
-merged its branch onto the trusted ref and removed its worktree (an
-orchestrator's ordinary close-out). Re-gating that is worse than wasted spend:
-the acceptance gate refuses on the missing directory, the rescue cannot dispatch
-into it, and the pipeline escalates and DEMOTES an item that is done and on the
-trusted ref (issue-spor-work-adopts-orphaned-pipeline-of-hand-landed-run). So
-before any gate runs on a resumed pipeline — or on any pipeline whose run
-checkout is gone — the runner reads two facts, and BOTH must hold: the graph
-says the item is resolved (the same verify leg the harvest uses), and git says
-the run's head is contained in `trusted_ref` (read from the checkout, or, when
-it is gone, from the branch the dispatch worktree was cut on — `git worktree
-remove` leaves it standing). Then the pipeline settles **`superseded`**: a
-settled `gate_state` (never re-offered, `--regate` has nothing to re-judge),
-no gate fact, no escalation, no demotion, no cooldown. Every doubt falls
-CLOSED to the ordinary judgement — an unreachable graph, a deleted branch, a
-head not yet on the ref — and a run whose checkout is gone but whose item is
-NOT landed refuses its first gate as before, except that the rescue lane is
-skipped (a rescue works in the run's own tree, and there is none) and the
-escalation says so. The accepted residual: a resumed run that resolved its
-item without committing anything has a head trivially contained in the
-trusted ref and reads as superseded; a pipeline the worker starts off its own
-harvest is never checked, so that reading never hides a fresh no-work claim.
-
-Scoping the candidate set to slots a work loop actually held is what keeps this
-from becoming "gate every run ever dispatched on this box": a hand-run `spor
-dispatch`, or a run from a worker that had no factory, was never owed a gate and
-is never resumed. Resumption is bounded by the free slots, so a backlog is
-worked down over passes rather than spawning a pipeline per orphan at once, and
-it sits under the same wind-down guards as a dispatch — a worker past its
-`--max`, or draining a `--once` run, leaves the orphans for the next worker,
-which is exactly what they are for.
-
-**The run record has no lock**, and one race is worth stating outright rather
-than implying it away. The gate stamp is written out of band by the worker,
-while the two in-process writers (a supervisor finishing its terminal-state
-contract, a native launcher binding a session) write the *whole* record from an
-in-memory copy. `carryGateFields` re-reads the `gate_*` namespace before those
-writes, which closes the ordinary ordering — but a supervisor that READ before a
-settle and RENAMED after it reverts a settled `failed`/`blocked` back to
-`running`. Two things bound that, and neither is "it cannot happen":
-
-- **the consequence is duplicated work, not a laundered verdict.** Every gate
-  fact is written to the graph *before* the pipeline settles, and fact ids are
-  deterministic; the refusal's durable half — the `blocks` edge and the status
-  rollback (§10.7) — is on the graph and no run-record write touches it. A
-  reverted record makes a later worker re-run the pipeline and re-record the
-  same nodes: a wasted suite run or review dispatch, and no wrong answer;
-- **a verify-and-reapply pass closes it in practice.** After writing a
-  `gate_state` the worker reads the record back, and a value that is not the one
-  it just wrote means something clobbered it — so it writes again, boundedly (an
-  unbounded retry against a contended file is a spin, and giving up simply
-  re-offers the run to the resume scan). The settled-verdict guard runs on every
-  attempt, so a clobber that turns out to be *another worker legitimately
-  settling first* is yielded to rather than fought.
-
-**Two workers on one box** are kept off a single orphan by two independent
-exclusions, because they see each other through two files that both lag: run ids
-in a live worker's own published slots, and run records already claimed
-`running` by a live `gate_worker` (stamped *before* the slot is published, so it
-is the earlier signal). The residual is a genuine read-read race — both scanning
-before either writes — which cannot be closed without a cross-process lock, so
-its *damage* is bounded instead: the gate facts are idempotent, and a settled
-`gate_state` is final, so a duplicate pipeline can never overwrite the winner's
-`failed` with its own `passed`. A live worker's gating nodes are also subtracted
-from every worker's candidate poll, so a second worker does not *dispatch* the
-node a first is gating (a gated run is terminal, so the in-flight agent guard
-cannot see it, and an unenforced `reported` one has already handed its lease
-back).
+**Two workers on one box** are kept off a single pipeline by the lease: the
+claim is taken under the record lock before the first gate runs, so whichever
+worker claims second runs nothing. A live worker's gating nodes — and every node
+whose journal the scan sees open — are also subtracted from every worker's
+candidate poll, so a second worker does not *dispatch* the node a first is
+gating (a gated run is terminal, so the in-flight agent guard cannot see it, and
+an unenforced `reported` one has already handed its lease back). A settled
+`gate_state` is final regardless, so a stale pipeline can never overwrite the
+winner's `failed` with its own `passed`.
 
 ### 10.9 The integration step — a code-enforced merge queue after every gate passes
 
@@ -4370,12 +4282,13 @@ same evidence chain (task-spor-factory-gate-attestation), in four pieces:
    could not be built or recorded is stamped on the run record
    (`gate_attestation_missing`, `gate_attestation_error`) through the
    settler's own door, never lost behind a log line. OWNERSHIP comes before
-   the first gate: `claimGateRecord` mints the run's ownership nonce
-   (`gate_settle_id`) under the record lock BEFORE the pipeline runs — a
-   record another pipeline already settled, or one a still-live worker is
-   gating, refuses the claim and the worker runs NOTHING for it (no fact, no
+   the first gate: `claimPipeline` mints the run's ownership nonce
+   (`gate_settle_id`) under the record lock BEFORE the pipeline runs, as a
+   `claim` line in the run's pipeline lease log (§10.8) — a record another
+   pipeline already settled, or whose lease a still-live worker holds,
+   refuses the claim and the worker runs NOTHING for it (no fact, no
    escalation, no demotion, no attestation; its result carries `not_run` and
-   `superseded` with the record's own verdict), while a dead owner's record is
+   `superseded` with the record's own verdict), while a dead owner's lease is
    taken over, which is what orphan resumption is — so two adopters of one
    orphan can never both mutate the graph and leave the loser's escalation or
    demotion standing against the winner's verdict. ORDER: the run record is settled FIRST

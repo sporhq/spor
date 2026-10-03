@@ -72,16 +72,21 @@ test("publication failure retains settlement debt and later replay preserves sig
   assert.equal(fs.readFileSync(path.join(f.home, "nodes", `${f.pending.built.id}.md`), "utf8"), f.pending.built.markdown);
 });
 
-test("losing observer cannot rewrite live owner before claiming or install its own settlement debt", () => {
+test("losing observer cannot take a live owner's lease or install its own settlement debt", () => {
   const f = fixture();
+  // The owner's lease: the journaled claim beside the stage journals.
+  const owner = runner.claimPipeline(f.home, f.item.run_id, { workerId: "w" });
+  assert.equal(owner.ok, true, owner.refused);
   const bytes = fs.readFileSync(f.file, "utf8");
-  runner.stampGateState(f.home, f.item.run_id, { gate_state: "running", gate_worker: "loser" });
-  const claim = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "loser", ownerLive: () => true });
+  const claim = runner.claimPipeline(f.home, f.item.run_id, { workerId: "loser", ownerLive: () => true });
   assert.equal(claim.ok, false);
+  assert.match(claim.refused, /being gated right now by worker w/);
   assert.equal(fs.readFileSync(f.file, "utf8"), bytes);
   const settle = cli.settleRunRecord(f.home, f.item.run_id, { state: "failed" }, "loser", { token: "losing-token", pending: f.pending });
   assert.equal(settle.landed, false);
   assert.equal(fs.readFileSync(f.file, "utf8"), bytes);
+  // The owner's own settle lands under its lease token.
+  assert.equal(cli.settleRunRecord(f.home, f.item.run_id, f.gateResult, "w", { token: owner.token, pending: f.pending }).landed, true);
 });
 
 test("stale breaker observation cannot unlink a successor; the waiter fails closed", () => {
@@ -219,18 +224,28 @@ test("outbox replay refuses other servers, organizations, local graphs, and lega
 test("re-gate publishes liveness before claiming and cannot overwrite a successor at final settlement", async () => {
   const gates = require("../lib/shell/gate-runner.js");
   const loop = require("../lib/shell/work-loop.js");
+  const projection = require("../lib/shell/stage-projection.js");
   for (const steal of [false, true]) {
     const f = fixture();
     runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "failed", gate_worker: "old" });
     const original = gates.runGatePipeline;
     let workerId;
+    let successor = null;
     gates.runGatePipeline = async () => {
-      const rec = runner.readJson(f.file);
-      workerId = rec.gate_worker;
+      // The re-gate holds the pipeline's LEASE under a worker it published live.
+      const lease = projection.pipelineLease(f.home, runner.readJson(f.file));
+      workerId = lease.worker;
       assert.ok(loop.readWorkerStatuses(f.home, { alive: cli.workerAlive }).some((w) => w.worker_id === workerId && w.live));
-      const rival = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "rival", ownerLive: (id) => loop.readWorkerStatuses(f.home, { alive: cli.workerAlive }).some((w) => w.live && w.worker_id === id) });
+      assert.equal(runner.readJson(f.file).gate_state, null, "a reopened attempt clears the prior verdict off the record");
+      const rival = runner.claimPipeline(f.home, f.item.run_id, { workerId: "rival", ownerLive: (id) => loop.readWorkerStatuses(f.home, { alive: cli.workerAlive }).some((w) => w.live && w.worker_id === id) });
       assert.equal(rival.ok, false, "orphan scan cannot adopt live re-gate");
-      if (steal) runner.stampGateState(f.home, f.item.run_id, { gate_state: "passed", gate_settle_id: "successor", gate_worker: "successor", gate_reason: "successor verdict" }, { force: true });
+      if (steal) {
+        // A successor that read the re-gate's worker as DEAD takes the lease
+        // and settles under its own token.
+        successor = runner.claimPipeline(f.home, f.item.run_id, { workerId: "successor", ownerLive: () => false });
+        assert.equal(successor.ok, true, successor.refused);
+        assert.equal(cli.settleRunRecord(f.home, f.item.run_id, { state: "passed", reason: "successor verdict" }, "successor", { token: successor.token }).landed, true);
+      }
       return f.gateResult;
     };
     try {
@@ -240,7 +255,7 @@ test("re-gate publishes liveness before claiming and cannot overwrite a successo
     const final = runner.readJson(f.file);
     assert.equal(final.gate_worker, steal ? "successor" : workerId);
     if (steal) {
-      assert.equal(final.gate_settle_id, "successor");
+      assert.equal(final.gate_settle_id, successor.token);
       assert.equal(final.gate_reason, "successor verdict");
       assert.equal(fs.existsSync(path.join(f.home, "nodes", `${f.pending.built.id}.md`)), false);
     }
@@ -290,26 +305,27 @@ test("an interrupted --regate on pending flake evidence is resumed by the next -
   const original = gatesLib.runGatePipeline;
   gatesLib.runGatePipeline = (args) => passes.shift()(args);
   try {
+    const projection = require("../lib/shell/stage-projection.js");
     assert.equal(await regate(), 1);
     let rec = runner.readJson(f.file);
-    assert.equal(rec.gate_state, "interrupted");
+    assert.equal(rec.gate_state, null, "nothing settled: the reopened attempt carries no verdict (and no transitional one either)");
     assert.equal(rec.gate_regate_count, 1);
     assert.ok(owed(), "the interrupted attempt owes its evidence");
     assert.ok(!rec.gate_attestation && !rec.gate_attestation_pending, "an interruption attests nothing");
     assert.equal(rec.gate_failing_tests, null, "the refused attempt's failing tests do not stand for an attempt that judged nothing");
-    // The trap: opening a NEW attempt over the owed evidence is refused, and
-    // the --regate left no gating slot for a worker to resume from.
-    const reopen = { settleId: rec.gate_settle_id, regateCount: 1, state: "interrupted" };
+    const lease = projection.pipelineLease(f.home, rec);
+    assert.ok(lease.released_at, "the yielded attempt released its lease");
+    // The trap: opening a NEW attempt over the owed evidence is refused.
+    const reopen = { settleId: lease.token, regateCount: 1, state: null };
     // The claim's owed-evidence reading is the caller's, off the gate-progress
     // log (stage-projection.js owesEvidence) — the ledger is not a record field.
-    const projection = require("../lib/shell/stage-projection.js");
-    assert.match(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "probe", owesEvidence: (fresh) => projection.owesEvidence(f.home, fresh), reopen }).refused, /flake occurrence publication is still owed/);
-    assert.equal(runner.readJson(f.file).gate_settle_id, rec.gate_settle_id, "the refused probe changed nothing");
+    assert.match(runner.claimPipeline(f.home, f.item.run_id, { workerId: "probe", owesEvidence: (fresh) => projection.owesEvidence(f.home, fresh), reopen }).refused, /flake occurrence publication is still owed/);
+    assert.equal(projection.pipelineLease(f.home, rec).token, lease.token, "the refused probe changed nothing");
     assert.ok(!loop.readWorkerStatuses(f.home, { alive: cli.workerAlive }).some((w) => w.live), "no live worker holds it");
 
     assert.equal(await regate(), 1, "interrupted again");
     rec = runner.readJson(f.file);
-    assert.equal(rec.gate_state, "interrupted");
+    assert.equal(rec.gate_state, null);
     assert.equal(rec.gate_regate_count, 1, "a resume does not open another attempt");
     assert.ok(owed(), "still owed, still journaled under the attempt that owes it");
 
@@ -324,21 +340,43 @@ test("an interrupted --regate on pending flake evidence is resumed by the next -
   assert.equal(rec.gate_attestation_pending || null, null);
 });
 
-test("a --regate does not resume an interrupted pipeline a live worker has parked", async () => {
+test("a --regate does not take a pipeline a live worker is DRIVING (its lease held), but it RESUMES one that worker parked (its lease released)", async () => {
   const f = fixture();
   const loop = require("../lib/shell/work-loop.js");
-  const workerId = "parking-worker";
+  const gatesLib = require("../lib/shell/gate-runner.js");
+  const workerId = "driving-worker";
   loop.writeWorkerStatus(f.home, { worker_id: workerId, pid: process.pid, started_ticks: runner.processStartTicks(process.pid), started_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-  runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "interrupted", gate_settle_id: "parked", gate_worker: workerId });
+  // A record with no legacy stamps: the pipeline's state is its lease and journals.
+  const { gate_state: _gs, gate_settle_id: _id, gate_worker: _gw, ...plainRecord } = runner.readJson(f.file);
+  runner.atomicJson(f.file, { ...plainRecord, terminal_state: "resolved", terminal_enforced: true });
+  const held = runner.claimPipeline(f.home, f.item.run_id, { workerId });
+  assert.equal(held.ok, true, held.refused);
   const before = fs.readFileSync(f.file, "utf8");
-  const code = await cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory: f.factory, factoryId: f.factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home });
-  assert.equal(code, 1);
-  assert.equal(fs.readFileSync(f.file, "utf8"), before, "the parked record is untouched");
+  const regate = () => cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory: f.factory, factoryId: f.factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home });
+  assert.equal(await regate(), 1);
+  assert.equal(fs.readFileSync(f.file, "utf8"), before, "the held record is untouched");
   // ...and the claim itself refuses a resume past a live owner, not only the pre-check.
   const ownerLive = (id) => loop.readWorkerStatuses(f.home, { alive: cli.workerAlive }).some((w) => w.live && w.worker_id === id);
-  const claim = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "resumer", ownerLive, reopen: { settleId: "parked", regateCount: 0, state: "interrupted", resume: true } });
-  assert.match(claim.refused, /being gated right now by worker parking-worker/);
+  const claim = runner.claimPipeline(f.home, f.item.run_id, { workerId: "resumer", ownerLive, reopen: { settleId: held.token, regateCount: 0, state: null, resume: true } });
+  assert.match(claim.refused, /being gated right now by worker driving-worker/);
   assert.equal(fs.readFileSync(f.file, "utf8"), before);
+  // The worker's pipeline YIELDS (its journal parked on a yield, its lease
+  // released): a person's --regate takes it over and continues the attempt —
+  // the claim is the arbiter between the two, never a "wait for the worker"
+  // refusal.
+  const store = require("../lib/shell/execution-store.js");
+  const journal = path.join(runner.runPaths(f.home, f.item.run_id).workflows, "gates-a0.workflow.jsonl");
+  const h = store.openWorkflowJournalAt(journal, { stage: "gates-a0" });
+  h.persist({ kind: "version", spec: 1, workflow: "gates", version: 3 });
+  h.persist({ kind: "effect", key: `${f.item.run_id}/gates/a0/e0/open#1`, result: { digest: "d", opened_at: new Date().toISOString() } });
+  h.persist({ kind: "effect", key: `${f.item.run_id}/gates/a0/e0/yield/yield#1`, result: { state: "interrupted", reason: "the worker was asked to stop" } });
+  assert.equal(runner.releasePipeline(f.home, f.item.run_id, held.token).ok, true);
+  const original = gatesLib.runGatePipeline;
+  const seen = [];
+  gatesLib.runGatePipeline = async ({ item }) => (seen.push(item.attempt), f.gateResult);
+  try { assert.equal(await regate(), 0); } finally { gatesLib.runGatePipeline = original; }
+  assert.deepEqual(seen, [0], "resumed under the worker's own attempt, not re-opened");
+  assert.equal(runner.readJson(f.file).gate_state, "passed");
 });
 
 // Review finding: a pipeline no --regate ever re-opened (a work loop's own,
@@ -407,18 +445,22 @@ test("proposal push and trusted-ref merge never execute repository hooks with ju
 
 test("atomic reopen rejects a stale snapshot and a live settler, while mismatch remains re-gateable", () => {
   const f = fixture();
-  const before = { ...runner.readJson(f.file), gate_state: "mismatch", gate_regate_count: 0 };
-  runner.atomicJson(f.file, before);
-  const reopen = { settleId: "winner", regateCount: 0, state: "mismatch" };
-  assert.equal(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen, ownerLive: () => true }).ok, false);
+  // The settler's lease, still live: a reopen under it is refused.
+  const settler = runner.claimPipeline(f.home, f.item.run_id, { workerId: "w" });
+  runner.stampGateState(f.home, f.item.run_id, { gate_state: "mismatch", gate_settle_id: settler.token, gate_regate_count: 0 }, { own: settler.token });
+  const before = runner.readJson(f.file);
+  const reopen = { settleId: settler.token, regateCount: 0, state: "mismatch" };
+  assert.equal(runner.claimPipeline(f.home, f.item.run_id, { workerId: "new", reopen, ownerLive: () => true }).ok, false);
   assert.deepEqual(runner.readJson(f.file), before);
-  assert.equal(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen: { ...reopen, settleId: "older" } }).ok, false);
+  assert.equal(runner.claimPipeline(f.home, f.item.run_id, { workerId: "new", reopen: { ...reopen, settleId: "older" } }).ok, false);
   assert.deepEqual(runner.readJson(f.file), before);
-  const winner = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen });
-  assert.equal(winner.ok, true);
+  const winner = runner.claimPipeline(f.home, f.item.run_id, { workerId: "new", reopen });
+  assert.equal(winner.ok, true, winner.refused);
   assert.equal(winner.record.gate_regate_count, 1);
-  assert.equal(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "racer", reopen }).ok, false);
-  assert.equal(runner.readJson(f.file).gate_settle_id, winner.token);
+  assert.equal(winner.record.gate_state, null, "the reopened attempt carries no verdict yet");
+  assert.equal(runner.claimPipeline(f.home, f.item.run_id, { workerId: "racer", reopen }).ok, false, "the snapshot is stale: the token moved");
+  const projection = require("../lib/shell/stage-projection.js");
+  assert.equal(projection.pipelineLease(f.home, runner.readJson(f.file)).token, winner.token);
 });
 
 test("re-gating cannot overwrite an unpaid signed outbox; matching-origin replay must finish first", async () => {
@@ -429,7 +471,7 @@ test("re-gating cannot overwrite an unpaid signed outbox; matching-origin replay
   cli.settleRunRecord(f.home, f.item.run_id, verdict, "w", { token: "winner", pending });
   const before = fs.readFileSync(f.file, "utf8");
   const reopen = { settleId: "winner", regateCount: 0, state: "failed" };
-  const tryReopen = () => runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new-attempt", reopen });
+  const tryReopen = () => runner.claimPipeline(f.home, f.item.run_id, { workerId: "new-attempt", reopen });
   assert.match(tryReopen().refused, /publication is still owed.*original graph/);
   assert.equal(fs.readFileSync(f.file, "utf8"), before, "neither nonce nor signed bytes nor attempt changed");
   await cli.replayAttestationDebts({ mode: () => "local", nodesDir: () => path.join(f.home, "foreign") }, { home: f.home });
@@ -455,11 +497,11 @@ test("re-gating a settled refusal never clears incomplete flake evidence — it 
   // Unsettled: resumable, so a NEW attempt over it is still refused.
   runner.atomicJson(f.file, { ...record, gate_state: "interrupted" });
   const interrupted = fs.readFileSync(f.file, "utf8");
-  assert.match(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen: { settleId: "prior", regateCount: 0, state: "interrupted" } }).refused, /flake occurrence publication is still owed/);
+  assert.match(runner.claimPipeline(f.home, f.item.run_id, { workerId: "new", reopen: { settleId: "prior", regateCount: 0, state: "interrupted" } }).refused, /flake occurrence publication is still owed/);
   assert.equal(fs.readFileSync(f.file, "utf8"), interrupted, "claim refusal preserves attempt, nonce and exact obligation bytes");
   // Settled: the re-gate claims, and the owed row is untouched by the claim.
   runner.atomicJson(f.file, record);
-  const claim = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen: { settleId: "prior", regateCount: 0, state: "failed" } });
+  const claim = runner.claimPipeline(f.home, f.item.run_id, { workerId: "new", reopen: { settleId: "prior", regateCount: 0, state: "failed" } });
   assert.equal(claim.ok, true, claim.refused);
   let after = runner.readJson(f.file);
   assert.equal(after.gate_regate_count, 1);
@@ -481,7 +523,7 @@ test("re-gating a settled refusal never clears incomplete flake evidence — it 
   assert.equal(Object.keys(after.carried).length, 1, "a paid/unowed row is not carried");
   // A later rollover carries it again while it is still owed.
   runner.stampGateState(f.home, f.item.run_id, { gate_state: "failed" }, { own: claim.token });
-  const again = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "third", owesEvidence: (fresh) => projection.owesEvidence(f.home, fresh), reopen: { settleId: claim.token, regateCount: 1, state: "failed" } });
+  const again = runner.claimPipeline(f.home, f.item.run_id, { workerId: "third", owesEvidence: (fresh) => projection.owesEvidence(f.home, fresh), reopen: { settleId: claim.token, regateCount: 1, state: "failed" } });
   assert.equal(again.ok, true, again.refused);
   runner.appendGateProgress(f.home, f.item.run_id, { gates: {} }, { key: `${f.item.run_id}#r3`, attempt: 3, own: again.token });
   assert.deepEqual(Object.keys(projection.latestProgress(f.home, runner.readJson(f.file)).stamp.carried), [`${f.item.run_id}|acceptance`], "still owed, still carried, same row");
@@ -596,7 +638,7 @@ test("delayed launcher PID bookkeeping cannot replace a supervisor's terminal re
     assert.ok(launched);
     recordFile = runner.runPaths(f.home, launched.run_id).record;
     runner.stampRun(f.home, launched.run_id, { state: "done", terminal_state: "resolved", terminal_enforced: true });
-    const claim = runner.claimGateRecord(f.home, launched.run_id, { workerId: "regate-owner" });
+    const claim = runner.claimPipeline(f.home, launched.run_id, { workerId: "regate-owner" });
     const item = { ...f.item, run_id: launched.run_id };
     const pending = cli.prepareRunAttestation(f.cfg, { item, factory: f.factory, gateResult: f.gateResult, intResult: null });
     assert.equal(cli.settleRunRecord(f.home, launched.run_id, f.gateResult, "regate-owner", { token: claim.token, pending }).landed, true);

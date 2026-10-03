@@ -1338,12 +1338,13 @@ test("the LIVE loop enforces the factory's repo scope — an out-of-scope item i
   const gatingSlot = state.published.flatMap((p) => p.gating || []).find((g) => g.node_id === "task-mine");
   assert.ok(gatingSlot, "the item was published as gating");
   assert.strictEqual(gatingSlot.project, "spor-server");
-  // The orphan scan reads it straight back off that slot.
+  // The resume scan reads the item's repo off the RECORD (`item_repo`, stamped
+  // at dispatch) — the same repo the slot carried.
   assert.deepStrictEqual(
     workLoop
-      .orphanedGateRuns([{ worker_id: "dead", live: false, factory: "factory-spor-server", gating: [gatingSlot] }], {
-        records: new Map([[gatingSlot.run_id, { ...ORPHAN_RECORD, run_id: gatingSlot.run_id, node_id: "task-mine" }]]),
+      .openPipelines([{ record: { ...ORPHAN_RECORD, run_id: gatingSlot.run_id, node_id: "task-mine", item_repo: "spor-server", gate_factory: "factory-spor-server" }, lease: null, projection: { stages: [], current: null, open: null }, factory: "factory-spor-server" }], {
         factory: "factory-spor-server",
+        now: () => Date.parse(ORPHAN_RECORD.finished_at) + 1,
       })
       .map((o) => o.project),
     ["spor-server"]
@@ -1519,69 +1520,71 @@ test("a GATING item is not a candidate: a free slot never re-dispatches what thi
 // back to it. "Re-gates on the next run" has to be something a worker does.
 
 const ORPHAN_RECORD = { run_id: "run-orphan", node_id: "task-orphan", state: "done", terminal_state: "resolved", terminal_enforced: true, finished_at: "2026-08-26T00:00:00.000Z" };
+const ORPHAN_AT = Date.parse(ORPHAN_RECORD.finished_at);
 
-test("orphanedGateRuns joins the dead workers' slots to the run journal, and no live worker's", () => {
-  const records = new Map([["run-orphan", ORPHAN_RECORD]]);
-  const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
-  // `gates` is the gate-armed marker: the worker status file carries that tally
-  // if and only if the worker ran with a factory.
-  const dead = (extra = {}) => ({ worker_id: "w1", live: false, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [slot], active: [], ...extra });
+// The resume scan's INPUT, as stage-projection.js openPipelineCandidates hands
+// it to openPipelines: a record, its lease, its projection, and the factory
+// something said started it (task-spor-delete-loop-resume-machinery-after-
+// workflow-stages). The projection shapes below are projectRun's.
+const FAR = "2099-01-01T00:00:00.000Z";
+const leaseOf = ({ worker = "w1", released = false, expires = FAR, factory = null } = {}) => ({ token: `tok-${worker}`, worker, factory, attempt: 0, at: ORPHAN_RECORD.finished_at, expires_at: expires, renewed_at: null, released_at: released ? ORPHAN_RECORD.finished_at : null });
+const RUNNING = { stages: [{ stage: "gates-a0", status: "running" }], current: { stage: "gates-a0", kind: "gates", attempt: 0, status: "running", state: null, due: null, reoffers: 0, parked: null }, open: "gates-a0" };
+const parkedOn = ({ due = 0, reoffers = 1, reason = "flake occurrence evidence is pending graph publication", paused_until = null, paused_profile = null } = {}) => ({
+  stages: [{ stage: "gates-a0", status: "parked" }],
+  current: { stage: "gates-a0", kind: "gates", attempt: 0, status: "parked", state: "interrupted", due, reoffers, parked: { state: "interrupted", reason, ...(paused_until != null ? { paused_until, paused_profile } : {}) } },
+  open: "gates-a0",
+});
+const NOTHING = { stages: [], current: null, open: null };
+const cand = (record = ORPHAN_RECORD, { lease = null, projection = NOTHING, factory = null, leaseError = null } = {}) => ({ record, lease, projection, factory, leaseError });
+const ids = (list) => list.map((o) => [o.run_id, o.node_id]);
 
-  assert.deepStrictEqual(
-    workLoop.orphanedGateRuns([dead()], { records }).map((o) => [o.run_id, o.node_id]),
-    [["run-orphan", "task-orphan"]]
-  );
-
-  // A LIVE worker owns its own slots — two workers must not both resume one.
-  assert.deepStrictEqual(workLoop.orphanedGateRuns([{ ...dead(), live: true }], { records }), []);
-  assert.deepStrictEqual(
-    workLoop.orphanedGateRuns([dead(), { worker_id: "w2", live: true, gating: [slot], active: [] }], { records }),
-    [],
-    "a run a live worker is already gating is not an orphan, whoever else once held it"
-  );
-
-  // A GATE-ARMED worker's ACTIVE slot counts too: one killed with runs in
-  // flight never reaches the harvest that would have started their gates.
-  assert.strictEqual(workLoop.orphanedGateRuns([dead({ gating: [], active: [slot] })], { records }).length, 1);
-
-  // A settled verdict is not an orphan; an unsettled stamp is.
-  for (const gate_state of ["passed", "failed", "blocked"]) {
-    assert.deepStrictEqual(workLoop.orphanedGateRuns([dead()], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state }]]) }), []);
+test("openPipelines adopts an OPEN pipeline — a dead worker's running journal, a released or expired lease, a never-started gate-armed dispatch — and never one a live worker holds or a record that settled", () => {
+  const now = () => ORPHAN_AT + 60000;
+  // A pipeline a dead worker left running (lease unexpired, worker gone).
+  assert.deepStrictEqual(ids(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf(), projection: RUNNING })], { now, ownerLive: () => false })), [["run-orphan", "task-orphan"]]);
+  // The same lease under a LIVE worker: that worker's, not an orphan.
+  assert.deepStrictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf(), projection: RUNNING })], { now, ownerLive: () => true }), []);
+  // An EXPIRED lease is open even under a live worker (a wedged driver).
+  assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf({ expires: ORPHAN_RECORD.finished_at }), projection: RUNNING })], { now, ownerLive: () => true }).length, 1);
+  // A RELEASED lease (the pipeline yielded) is open at once, worker live or not.
+  assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf({ released: true }), projection: parkedOn() })], { now, ownerLive: () => true }).length, 1);
+  // A gate-armed worker's dispatch that never started its pipeline (no lease,
+  // no journal — the worker died with the run in flight): owed, adopted.
+  assert.strictEqual(workLoop.openPipelines([cand({ ...ORPHAN_RECORD, gate_factory: "factory-a" }, { factory: "factory-a" })], { now, factory: "factory-a" }).length, 1);
+  // A settled verdict is not an orphan; a legacy unsettled stamp is.
+  for (const gate_state of gates.SETTLED_GATE_STATES) {
+    assert.deepStrictEqual(workLoop.openPipelines([cand({ ...ORPHAN_RECORD, gate_state }, { lease: leaseOf(), projection: RUNNING })], { now }), [], gate_state);
   }
-  for (const gate_state of ["interrupted"]) {
-    assert.strictEqual(workLoop.orphanedGateRuns([dead()], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state }]]) }).length, 1, gate_state);
+  for (const gate_state of ["interrupted", "running", undefined]) {
+    assert.strictEqual(workLoop.openPipelines([cand({ ...ORPHAN_RECORD, gate_state }, { lease: leaseOf(), projection: RUNNING })], { now }).length, 1, String(gate_state));
   }
-
-  // Nothing to gate, nothing to resume: a pruned record, a run with no claim,
-  // and a run past the worker's own ceiling on how long it follows one.
-  assert.deepStrictEqual(workLoop.orphanedGateRuns([dead()], { records: new Map() }), []);
-  assert.deepStrictEqual(
-    workLoop.orphanedGateRuns([dead()], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, terminal_state: "reported", terminal_enforced: true }]]) }),
-    [],
-    "an enforced 'reported' run self-declares not-done — there is no claim to gate"
-  );
-  assert.deepStrictEqual(
-    workLoop.orphanedGateRuns([dead()], { records, now: () => Date.parse("2026-09-30T00:00:00.000Z"), maxAgeMs: 86400000 }),
-    []
-  );
-
-  // A run record already claimed `running` by a worker that is STILL LIVE is
-  // that worker's, even though nothing has settled: a worker stamps the record
-  // before it publishes its slot, so this is the earlier of the two signals
-  // that keep two workers off one orphan.
-  const claimed = new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state: "running", gate_worker: "w9" }]]);
-  assert.deepStrictEqual(workLoop.orphanedGateRuns([dead(), { worker_id: "w9", live: true, gating: [], active: [] }], { records: claimed }), []);
-  assert.strictEqual(
-    workLoop.orphanedGateRuns([dead(), { worker_id: "w9", live: false, gating: [], active: [] }], { records: claimed }).length,
-    1,
-    "…but the same claim from a worker that is GONE is exactly what a resume is for"
-  );
+  // Nothing to gate, nothing to resume: a run with no claim, a run past the
+  // worker's own ceiling on how long it follows one, a lease nobody can read.
+  assert.deepStrictEqual(workLoop.openPipelines([cand({ ...ORPHAN_RECORD, terminal_state: "reported", terminal_enforced: true }, { lease: leaseOf() })], { now }), [], "an enforced 'reported' run self-declares not-done — there is no claim to gate");
+  assert.deepStrictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf() })], { now: () => ORPHAN_AT + 2 * 86400000, maxAgeMs: 86400000 }), []);
+  assert.deepStrictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { leaseError: "corrupt" })], { now }), []);
+  assert.deepStrictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf(), projection: { ...RUNNING, unreadable: [{ path: "x", stage: "gates-a0", error: "corrupt at line 2" }] } })], { now }), [], "a journal nobody can read is nobody's to drive — reported by `spor runs`, never adopted and failed");
+  // What an adopted entry carries: the slot the loop opens, and the attempt
+  // the open journal belongs to (a --regate's attempt continues ITS journal).
+  const [o] = workLoop.openPipelines([cand({ ...ORPHAN_RECORD, harness: "fake", item_repo: "demo", gate_regate_count: 2 }, { lease: leaseOf({ released: true }), projection: parkedOn({ reoffers: 2 }) })], { now });
+  assert.deepStrictEqual({ ...o, record: undefined }, { run_id: "run-orphan", node_id: "task-orphan", harness: "fake", project: "demo", attempt: 3, record: undefined, stage: "gates-a0", reoffers: 2, reason: "flake occurrence evidence is pending graph publication", escalate: false });
+  assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf(), projection: RUNNING })], { now })[0].attempt, 0, "a work loop's own pipeline is attempt 0");
 });
 
-// task-spor-gate-escalation-bounded-auto-retry: the lightweight door
-// orphanedGateRuns deliberately does not open — a SETTLED run whose escalation
-// failed to file. pendingEscalationRetries picks these out on their own
-// backoff, for a caller to retry ONLY the escalate+demote pair.
+test("openPipelines re-offers a PARKED journal only when its own timer is due — a reviewer pause at its wake, an ordinary yield after the workflow's timer — and ages it from the wake, not the run's end", () => {
+  const now = () => ORPHAN_AT + 60000;
+  assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf({ released: true }), projection: parkedOn({ due: ORPHAN_AT + 120000 }) })], { now }).length, 0, "not due yet");
+  assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf({ released: true }), projection: parkedOn({ due: ORPHAN_AT + 60000 }) })], { now }).length, 1, "due");
+  assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf({ released: true }), projection: parkedOn({ due: 0 }) })], { now }).length, 1, "a yield with no timer behind it is due now");
+  // A reviewer PAUSE: the journal's timer is the reset; the scan neither
+  // re-offers it early nor ages it out while it waits.
+  const reset = ORPHAN_AT + 44 * 3600000;
+  const paused = parkedOn({ due: reset, paused_until: reset, paused_profile: "profile-codex-review" });
+  assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf({ released: true }), projection: paused })], { now: () => reset - 1, maxAgeMs: 86400000 }).length, 0, "inside the pause");
+  assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf({ released: true }), projection: paused })], { now: () => reset + 3600000, maxAgeMs: 86400000 }).length, 1, "past the wake, well past the run's own age ceiling");
+  assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf({ released: true }), projection: parkedOn({ due: 0 }) })], { now: () => reset + 3600000, maxAgeMs: 86400000 }).length, 0, "an ordinary yield still ages out as before");
+});
+
 test("pendingEscalationRetries: picks out settled-but-unescalated runs due for another attempt, and only those", () => {
   const pending = { gateId: "acceptance", attempt: undefined, attempts: [], detail: "the suite failed", evidence: "", findings: [], ledger: [] };
   const base = { run_id: "run-orphan", node_id: "task-orphan", gate_state: "failed", gate_escalation_failed: true, gate_escalation_pending: pending };
@@ -1626,143 +1629,67 @@ test("nextEscalationRetryDelay: doubles from the base, capped, and never below t
 // runs would let a gate-armed worker retroactively judge work nobody meant to
 // gate, and on a refusal file a `blocks` edge and roll back the status of an
 // item a person may have deliberately closed.
-test("a dead BARE worker's runs are never adopted — a gate is only ever imposed on work that was owed one", () => {
-  const records = new Map([["run-orphan", ORPHAN_RECORD]]);
-  const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
-  const armed = { passed: 0, failed: 0, blocked: 0 };
-
-  // Same dead worker, same terminal run, same gateable claim — the ONLY
-  // difference is whether that worker itself ran gate-armed.
-  assert.deepStrictEqual(
-    workLoop.orphanedGateRuns([{ worker_id: "bare", live: false, gating: [], active: [slot] }], { records }),
-    [],
-    "a bare worker's run was never owed a gate"
-  );
-  assert.strictEqual(
-    workLoop.orphanedGateRuns([{ worker_id: "armed", live: false, gates: armed, gating: [], active: [slot] }], { records }).length,
-    1,
-    "…and a gate-armed worker's run was"
-  );
-
-  // A `gating` slot is self-evidencing — it could not exist without a pipeline
-  // — so it is honored even if the tally is missing from a mangled record.
-  assert.strictEqual(
-    workLoop.orphanedGateRuns([{ worker_id: "odd", live: false, gating: [slot], active: [] }], { records }).length,
-    1
-  );
-
-  // resumableSlots is the whole rule, in isolation.
-  assert.deepStrictEqual(workLoop.resumableSlots({ gates: armed, gating: [slot], active: [slot] }).length, 2);
-  assert.deepStrictEqual(workLoop.resumableSlots({ gating: [], active: [slot] }), []);
-  assert.deepStrictEqual(workLoop.resumableSlots(null), []);
-});
-
-test("an orphan is only ever adopted by the factory that started it — a resume is not a back door into another repo", () => {
+test("a pipeline is only ever adopted by the factory that started it — a resume is not a back door into another repo — and a renamed factory still adopts its own", () => {
   // issue-spor-work-scope-union-factory-mismatch: a resumed pipeline never goes
   // through candidate selection, so the repo-scope guard there does not reach
   // it. Without this, a worker armed with factory B finishes a pipeline factory
   // A started — running B's suite and B's integration command against A's repo,
   // and on a refusal filing a `blocks` edge and rolling the item's status back.
-  const records = new Map([["run-orphan", ORPHAN_RECORD]]);
-  const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
-  const dead = (factory) => ({ worker_id: "w1", live: false, factory, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [slot], active: [] });
-
-  assert.strictEqual(workLoop.orphanedGateRuns([dead("factory-a")], { records, factory: "factory-a" }).length, 1, "the same factory finishes its own work");
-
+  // The factory rides the LEASE (claimed under it), or the record's
+  // `gate_factory` stamp for a pipeline that never started.
+  const now = () => ORPHAN_AT + 60000;
+  const mine = cand(ORPHAN_RECORD, { lease: leaseOf({ factory: "factory-a" }), projection: RUNNING, factory: "factory-a" });
+  assert.strictEqual(workLoop.openPipelines([mine], { now, factory: "factory-a" }).length, 1, "the same factory finishes its own work");
   const foreign = [];
-  assert.deepStrictEqual(
-    workLoop.orphanedGateRuns([dead("factory-a")], { records, factory: "factory-b", onForeign: (o) => foreign.push(o) }),
-    [],
-    "a different factory does not adopt it"
-  );
+  assert.deepStrictEqual(workLoop.openPipelines([mine], { now, factory: "factory-b", onForeign: (o) => foreign.push(o) }), [], "a different factory does not adopt it");
   assert.deepStrictEqual(foreign.map((o) => [o.node_id, o.factory]), [["task-orphan", "factory-a"]], "…and it is reported, not silently stranded");
-
+  // The stamp a gate-armed dispatch leaves is read the same way.
+  assert.deepStrictEqual(workLoop.openPipelines([cand({ ...ORPHAN_RECORD, gate_factory: "factory-a" }, { factory: "factory-a" })], { now, factory: "factory-b" }), []);
   // Both of the pre-existing shapes are untouched: a caller that passes no
-  // factory, and a dead record that carries none, behave exactly as before.
-  assert.strictEqual(workLoop.orphanedGateRuns([dead("factory-a")], { records }).length, 1);
-  assert.strictEqual(workLoop.orphanedGateRuns([dead(undefined)], { records, factory: "factory-b" }).length, 1);
+  // factory, and a pipeline that carries none (a journal from before the lease
+  // log), behave exactly as before.
+  assert.strictEqual(workLoop.openPipelines([mine], { now }).length, 1);
+  assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf(), projection: RUNNING })], { now, factory: "factory-b" }).length, 1);
+  // issue-spor-factory-rename-strands-pipelines: an id this factory was renamed
+  // FROM (the caller already walked the `supersedes` chain) is its own.
+  const old = cand(ORPHAN_RECORD, { lease: leaseOf({ factory: "factory-old" }), projection: RUNNING, factory: "factory-old" });
+  const reported = [];
+  assert.strictEqual(workLoop.openPipelines([old], { now, factory: "factory-new", factoryAliases: ["factory-old"], onForeign: (o) => reported.push(o) }).length, 1, "an old, renamed-from id still finishes its own work");
+  assert.deepStrictEqual(reported, [], "a genuine alias is never reported as foreign");
+  const unrelated = cand(ORPHAN_RECORD, { lease: leaseOf({ factory: "factory-unrelated" }), projection: RUNNING, factory: "factory-unrelated" });
+  assert.deepStrictEqual(workLoop.openPipelines([unrelated], { now, factory: "factory-new", factoryAliases: ["factory-old"], onForeign: (o) => reported.push(o) }), []);
+  assert.deepStrictEqual(reported.map((o) => o.factory), ["factory-unrelated"]);
+  assert.strictEqual(workLoop.openPipelines([old], { now, factory: "factory-new" }).length, 0, "no aliases passed at all is byte-identical to before this existed");
 });
 
-test("a renamed factory still adopts the pipelines it started under its old id (issue-spor-factory-rename-strands-pipelines)", () => {
-  const records = new Map([["run-orphan", ORPHAN_RECORD]]);
-  const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
-  const dead = (factory) => ({ worker_id: "w1", live: false, factory, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [slot], active: [] });
-
-  // A dead worker armed with the OLD id: the current factory declares it as
-  // an alias (the caller already walked the `supersedes` chain), so it is
-  // adopted exactly as if it were the same id — no `onForeign` report.
-  const foreign = [];
-  assert.strictEqual(
-    workLoop.orphanedGateRuns([dead("factory-old")], {
-      records,
-      factory: "factory-new",
-      factoryAliases: ["factory-old"],
-      onForeign: (o) => foreign.push(o),
-    }).length,
-    1,
-    "an old, renamed-from id still finishes its own work"
-  );
-  assert.deepStrictEqual(foreign, [], "a genuine alias is never reported as foreign");
-
-  // An id that is NOT a declared alias is still foreign, unaffected by an
-  // unrelated alias list.
-  assert.deepStrictEqual(
-    workLoop.orphanedGateRuns([dead("factory-unrelated")], { records, factory: "factory-new", factoryAliases: ["factory-old"], onForeign: (o) => foreign.push(o) }),
-    []
-  );
-  assert.deepStrictEqual(foreign.map((o) => o.factory), ["factory-unrelated"]);
-
-  // No aliases passed at all is byte-identical to before this existed.
-  assert.strictEqual(workLoop.orphanedGateRuns([dead("factory-old")], { records, factory: "factory-new" }).length, 0);
-});
-
-// A resumed pipeline RE-RUNS its gates from the first one, and a fix cycle
-// dispatches an implementer with --force --no-worktree into the run's own
-// checkout. The abandoned pipeline's fix agent is DETACHED and outlived the
-// worker that started it, so adopting while it works would put two agents in
-// one checkout — the hazard worktree isolation exists to remove.
-test("an orphan whose node still has a live run is DEFERRED, not adopted — never two agents in one checkout", () => {
+// A resumed pipeline continues its journal, and a fix cycle dispatches an
+// implementer with --force --no-worktree into the run's own checkout. The
+// abandoned pipeline's fix agent is DETACHED and outlived the worker that
+// started it, so adopting while it works would put two agents in one checkout
+// — the hazard worktree isolation exists to remove.
+test("an open pipeline whose node still has a live run is DEFERRED, not adopted — never two agents in one checkout", () => {
   const TERMINAL = new Set(["done", "failed", "failed_launch", "vanished"]);
-  const dead = { worker_id: "w1", live: false, gating: [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake" }], active: [] };
-  const withFix = (state) =>
-    new Map([
-      ["run-orphan", ORPHAN_RECORD],
-      // The fix cycle the abandoned pipeline dispatched at the same node.
-      ["run-fix", { run_id: "run-fix", node_id: "task-orphan", state, created_at: new Date().toISOString() }],
-    ]);
-
-  assert.deepStrictEqual(
-    workLoop.orphanedGateRuns([dead], { records: withFix("running"), terminalStates: TERMINAL }),
-    [],
-    "a live agent at that node defers the resume"
-  );
-  assert.strictEqual(
-    workLoop.orphanedGateRuns([dead], { records: withFix("done"), terminalStates: TERMINAL }).length,
-    1,
-    "deferred, not dropped: once that agent's run is terminal the orphan is adopted"
-  );
+  const open = cand(ORPHAN_RECORD, { lease: leaseOf(), projection: RUNNING });
+  const withFix = (state) => [ORPHAN_RECORD, { run_id: "run-fix", node_id: "task-orphan", state, created_at: new Date().toISOString() }];
+  const now = () => ORPHAN_AT + 60000;
+  assert.deepStrictEqual(workLoop.openPipelines([open], { now, records: withFix("running"), terminalStates: TERMINAL }), [], "a live agent at that node defers the resume");
+  assert.strictEqual(workLoop.openPipelines([open], { now, records: withFix("done"), terminalStates: TERMINAL }).length, 1, "deferred, not dropped: once that agent's run is terminal the pipeline is adopted");
   // A record aged past the worker's own watchdog ceiling is not evidence of a
   // live agent — that is precisely the record runHarvest gives up on — so it
-  // must not defer the orphan forever.
-  const stale = new Map([
-    ["run-orphan", ORPHAN_RECORD],
-    ["run-fix", { run_id: "run-fix", node_id: "task-orphan", state: "running", created_at: "2020-01-01T00:00:00.000Z" }],
-  ]);
-  // Pin `now` to ORPHAN_RECORD's own finished_at rather than the real wall
-  // clock: this assertion means to test the run-fix record aging out of
-  // busyNodes (its `created_at` is 2020, always stale), not ORPHAN_RECORD's
-  // own age against maxAgeMs's watchdog on line ~458 — using real Date.now()
-  // made this fail once real-world time drifted more than a day past
-  // ORPHAN_RECORD.finished_at (2026-08-26), which is exactly what happened.
-  assert.strictEqual(
-    workLoop.orphanedGateRuns([dead], {
-      records: stale,
-      terminalStates: TERMINAL,
-      maxAgeMs: 86400000,
-      now: () => Date.parse(ORPHAN_RECORD.finished_at),
-    }).length,
-    1
-  );
+  // must not defer the pipeline forever.
+  const stale = [ORPHAN_RECORD, { run_id: "run-fix", node_id: "task-orphan", state: "running", created_at: "2020-01-01T00:00:00.000Z" }];
+  assert.strictEqual(workLoop.openPipelines([open], { now: () => ORPHAN_AT, records: stale, terminalStates: TERMINAL, maxAgeMs: 86400000 }).length, 1);
+  // A Map of records is read the same as an array.
+  assert.deepStrictEqual(workLoop.openPipelines([open], { now, records: new Map(withFix("running").map((r) => [r.run_id, r])), terminalStates: TERMINAL }), []);
+});
+
+test("openPipelines marks an entry `escalate` at the re-offer cap — read off the journal's consecutive identical yields — and 0 disables the cap", () => {
+  const now = () => ORPHAN_AT + 60000;
+  const at = (reoffers, max) => workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf({ released: true }), projection: parkedOn({ reoffers }) })], { now, parkedReofferMax: max })[0];
+  assert.strictEqual(at(2, 3).escalate, false);
+  assert.strictEqual(at(3, 3).escalate, true);
+  assert.strictEqual(at(30, 0).escalate, false, "0 re-offers without bound, as before the cap");
+  assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf(), projection: RUNNING })], { now, parkedReofferMax: 1 })[0].escalate, false, "a running journal is not a re-offer");
 });
 
 test("gatingNodeIds names what LIVE workers are gating — the cross-worker half of the candidate exclusion", () => {
@@ -1831,11 +1758,8 @@ test("a refusal whose escalation never landed is MARKED on the run record, and s
   // loop for as long as the graph stayed unwritable. `spor work --regate` is
   // the door back, and the un-demoted status is what keeps it open.
   assert.ok(gates.SETTLED_GATE_STATES.has("failed"));
-  const dead = { worker_id: "w9", live: false, gating: [{ run_id: "run-orphan", node_id: "task-orphan" }], active: [] };
-  const records = new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state: "failed", gate_escalation_failed: true }]]);
   assert.deepStrictEqual(
-    workLoop.orphanedGateRuns([dead], {
-      records,
+    workLoop.openPipelines([cand({ ...ORPHAN_RECORD, gate_state: "failed", gate_escalation_failed: true }, { lease: leaseOf(), projection: RUNNING })], {
       terminalStates: new Set(["done", "failed", "failed_launch", "vanished"]),
       now: () => Date.parse(ORPHAN_RECORD.finished_at),
     }),
@@ -1980,40 +1904,41 @@ test("a stop folds in the verdicts that DID land before abandoning the rest", as
   );
   assert.deepStrictEqual(
     marks.filter((m) => m.run_id === "run-task-b").map((m) => m.gate_state),
-    ["interrupted"],
-    "and the one that never reported is left in the state the next worker resumes from"
+    [],
+    "and the one that never reported is stamped with nothing — its open journal and lapsed lease are what the next worker resumes from"
   );
 });
 
-test("a stop marks its abandoned pipelines INTERRUPTED — the state the next worker resumes from", async () => {
+test("a stop leaves its abandoned pipelines UNSTAMPED — the slot stands in the published status; the open journal and the lease that lapses with this process are what the next worker resumes from", async () => {
   const marks = [];
+  const logs = [];
   const state = { clock: 1_700_000_000_000, ticks: 0 };
   const control = { stopping: false, reason: null, wake: () => {} };
   const deps = {
     now: () => state.clock,
-    log: () => {},
+    log: (l) => logs.push(l),
     publish: () => {},
     candidates: async () => [{ id: "task-a", readiness: "agent" }],
     dispatch: async () => ({ ok: true, run: { run_id: "run-1", harness: "fake" } }),
     pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true } })),
     gate: () => new Promise(() => {}),
     markGate: (runId, patch) => marks.push({ run_id: runId, ...patch }),
+    runRecord: () => ({ run_id: "run-1", gate_fix_run_id: "fix-run-77" }),
     sleep: async (ms) => {
       state.clock += ms;
       if ((state.ticks += 1) >= 2) control.stopping = true;
     },
   };
   const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000 }, deps, control });
-  assert.strictEqual(status.gating.length, 1, "the slot stays in the published record — it is what the next worker joins on");
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"]);
+  assert.strictEqual(status.gating.length, 1, "the slot stays in the published record — what this worker was holding when it left");
+  assert.deepStrictEqual(marks, [], "no transitional stamp: the record carries only final outcomes");
+  assert.ok(logs.some((l) => /task-a gate pipeline abandoned by the stop — its fix cycle \(run fix-run-/.test(l)), logs.join("\n"));
 });
 
-test("a pipeline that REPORTS interrupted on a stop keeps its slot, so the next worker can resume it (F1)", async () => {
+test("a pipeline that REPORTS interrupted frees its slot and stamps nothing — its parked journal is the resume scan's to re-offer, not this loop's", async () => {
   // The outage backoff answers a stop by returning `interrupted` rather than
-  // hanging — so, unlike an abandoned pipeline, it HAS a result by the time
-  // the loop folds verdicts. Folding it like a verdict would drop the slot,
-  // and orphanedGateRuns joins a dead worker's slot to an unsettled record:
-  // with no slot, the un-judged run could never be resumed.
+  // hanging; the gate workflow has already YIELDED (its journal parked on a
+  // durable timer, its lease released), so the loop has nothing to keep.
   const marks = [];
   const logs = [];
   const state = { clock: 1_700_000_000_000, ticks: 0 };
@@ -2037,39 +1962,39 @@ test("a pipeline that REPORTS interrupted on a stop keeps its slot, so the next 
     },
   };
   const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000 }, deps, control });
-  assert.deepStrictEqual(status.gating.map((g) => g.run_id), ["run-1"], "the slot stands in the published record");
+  assert.deepStrictEqual(status.gating, [], "the slot is freed — the journal is parked, not the worker");
   assert.strictEqual(status.gates.failed, 0, "an interruption is not a refusal");
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"], "stamped once, unsettled");
-  assert.match(marks[0].gate_reason, /outage/);
+  assert.deepStrictEqual(marks, [], "nothing is stamped");
+  assert.ok(!status.skipped.some((s) => s.id === "task-a"), "and nothing cooled the node — nothing refused it");
+  assert.ok(logs.some((l) => /task-a gates interrupted — .*outage.* — nothing settled; slot freed, re-offered once its journal is due/.test(l)), logs.join("\n"));
   assert.strictEqual(logs.filter((l) => /abandoned by the stop/.test(l) && /task-a gate pipeline/.test(l)).length, 0, "and it is not re-reported as abandoned");
-  const orphans = workLoop.orphanedGateRuns([{ worker_id: "w", live: false, gating: status.gating }], {
-    records: new Map([["run-1", { run_id: "run-1", node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true, gate_state: "interrupted" }]]),
-  });
-  assert.deepStrictEqual(orphans.map((o) => o.run_id), ["run-1"], "which is exactly the pair the next worker resumes from");
+  assert.strictEqual(status.recent[0].gate, "interrupted", "the status surface shows the yield");
 });
 
 // issue-spor-gate-evidence-pending-interrupted-drops-slot-and-attests: the
 // OTHER unsettled `interrupted` — flake occurrence evidence the pass could not
-// yet publish — reaches the loop while the worker is NOT stopping. Folding it
-// like a verdict dropped the slot (and cooled the node), and orphanedGateRuns
-// only ever joins a slot, so the un-judged run could never be resumed.
+// yet publish — reaches the loop while the worker is NOT stopping. The journal
+// is parked; the resume scan (deps.pendingGates, openPipelines over the
+// journals) re-offers it once its timer is due, to this worker or the next.
 const EVIDENCE_PENDING = { state: "interrupted", gates: [], facts: [], reason: "flake occurrence evidence is pending graph publication; resume this attempt to retry it" };
-const evidenceLoopDeps = ({ state, control, gate, marks, logs }) => {
-  let dispatched = false;
+const scanLoopDeps = ({ state, control, gate, marks, logs, pendingGates, escalateParked = null, queue = ["task-a"] }) => {
+  const dispatched = [];
   return {
     now: () => state.clock,
     log: (l) => logs.push(l),
     publish: () => {},
-    candidates: async () => (dispatched ? [] : [{ id: "task-a", readiness: "agent" }]),
-    dispatch: async () => {
-      dispatched = true;
-      return { ok: true, run: { run_id: "run-1", harness: "fake" } };
+    candidates: async () => queue.filter((id) => !dispatched.includes(id)).slice(0, 1).map((id) => ({ id, readiness: "agent" })),
+    dispatch: async (item) => {
+      dispatched.push(item.id);
+      return { ok: true, run: { run_id: `run-${item.id}`, harness: "fake" } };
     },
-    pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true } })),
+    pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: id.slice(4), state: "done", terminal_state: "resolved", terminal_enforced: true } })),
     gate,
+    pendingGates,
+    ...(escalateParked ? { escalateParked } : {}),
     markGate: (runId, patch) => {
       marks.push({ run_id: runId, ...patch });
-      return { run_id: runId, node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true, ...patch };
+      return { run_id: runId, node_id: runId.slice(4), state: "done", terminal_state: "resolved", terminal_enforced: true, ...patch };
     },
     sleep: async (ms) => {
       state.clock += ms;
@@ -2078,314 +2003,209 @@ const evidenceLoopDeps = ({ state, control, gate, marks, logs }) => {
     },
   };
 };
+const RECORD_A = { run_id: "run-task-a", node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true };
+const offer = (extra = {}) => ({ run_id: "run-task-a", node_id: "task-a", harness: "fake", record: RECORD_A, reoffers: 1, reason: EVIDENCE_PENDING.reason, escalate: false, ...extra });
 
-test("an evidence-pending INTERRUPTED keeps its slot while the worker runs, is re-offered after the retry window, and its real verdict settles normally", async () => {
+test("an evidence-pending INTERRUPTED frees its slot, is re-offered by the scan once its journal is due — as a resume — and its real verdict settles normally", async () => {
   const marks = [];
   const logs = [];
   const state = { clock: 1_700_000_000_000, ticks: 0 };
   const control = { stopping: false, reason: null, wake: () => {} };
   const calls = [];
-  const deps = evidenceLoopDeps({
+  let due = null;
+  const deps = scanLoopDeps({
     state, control, marks, logs,
     gate: async (entry, record) => {
       calls.push({ at: state.clock, entry, record });
-      if (calls.length === 1) return EVIDENCE_PENDING;
+      if (calls.length === 1) { due = state.clock + 5000; return EVIDENCE_PENDING; }
       control.stopping = true;
       return { state: "passed", gates: [{ id: "review", verdict: "pass" }], facts: [] };
     },
+    // What openPipelines reports once the parked journal's timer is due.
+    pendingGates: async () => (due != null && state.clock >= due && calls.length === 1 ? [offer()] : []),
   });
-  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 5000 }, deps, control });
-  assert.strictEqual(calls.length, 2, "the pipeline is re-offered by the worker that parked it");
-  assert.ok(calls[1].at - calls[0].at >= 5000, `re-offered only once the retry window passed (after ${calls[1].at - calls[0].at}ms)`);
-  assert.strictEqual(calls[1].entry.resumed, true, "as a resume — it re-runs over what the interrupted pass recorded");
-  assert.strictEqual(calls[1].record.gate_state, "interrupted", "handed the record as the interruption left it");
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted", "passed"], "stamped unsettled, then settled by the real verdict");
-  assert.match(marks[0].gate_reason, /evidence is pending/);
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000 }, deps, control });
+  assert.strictEqual(calls.length, 2, "the pipeline is re-offered by the scan");
+  assert.ok(calls[1].at >= due, `re-offered only once the journal was due (after ${calls[1].at - calls[0].at}ms)`);
+  assert.strictEqual(calls[1].entry.resumed, true, "as a resume — it continues the journal the interrupted pass parked");
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["passed"], "nothing transitional; settled once by the real verdict");
   assert.strictEqual(status.gates.passed, 1);
   assert.strictEqual(status.gates.failed, 0, "an interruption is not a refusal");
-  assert.deepStrictEqual(status.gating, [], "the settled verdict frees the slot");
+  assert.deepStrictEqual(status.gating, []);
   assert.ok(!status.skipped.some((s) => s.id === "task-a"), "and nothing ever cooled the node — nothing refused it");
-  assert.ok(logs.some((l) => /gates interrupted/.test(l) && /re-offers it in 5s/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /gates interrupted/.test(l) && /slot freed, re-offered once its journal is due/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /re-offering the gate pipeline its interrupted pass left unsettled/.test(l)), logs.join("\n"));
 });
 
-test("a PARKED interrupted pipeline holds its slot until re-offered, and a winding-down worker leaves it for the next one instead of waiting on it", async () => {
-  const marks = [];
-  const logs = [];
-  const state = { clock: 1_700_000_000_000, ticks: 0 };
-  const control = { stopping: false, reason: null, wake: () => {} };
-  let gateCalls = 0;
-  const deps = evidenceLoopDeps({ state, control, marks, logs, gate: async () => ((gateCalls += 1), EVIDENCE_PENDING) });
-  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 600000, once: true }, deps, control });
-  assert.strictEqual(gateCalls, 1);
-  assert.strictEqual(control.stopping, false, "--once exited on its own — the parked slot did not hold it open until the backstop");
-  assert.deepStrictEqual(status.gating.map((g) => g.run_id), ["run-1"], "the slot stands in the published record");
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"], "stamped once — not re-stamped as abandoned");
-  assert.strictEqual(logs.filter((l) => /abandoned by the stop/.test(l) && /task-a gate pipeline/.test(l)).length, 0);
-  const orphans = workLoop.orphanedGateRuns([{ worker_id: "w", live: false, gating: status.gating }], {
-    records: new Map([["run-1", { run_id: "run-1", node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true, gate_state: "interrupted" }]]),
-  });
-  assert.deepStrictEqual(orphans.map((o) => o.run_id), ["run-1"], "which is exactly the pair the next worker resumes from");
-});
-
-test("the exit-time settle re-offers nothing — a pipeline started there would run on after the worker published itself stopped", async () => {
-  // Review finding: with `--retry-after 0` the park is due at once, and the
-  // final settle on a `--once` exit used to start it — unowned, stamped
-  // abandoned, and adoptable by another worker beside it.
-  const marks = [];
-  const logs = [];
-  const state = { clock: 1_700_000_000_000, ticks: 0 };
-  const control = { stopping: false, reason: null, wake: () => {} };
-  let gateCalls = 0;
-  const deps = evidenceLoopDeps({ state, control, marks, logs, gate: async () => ((gateCalls += 1), EVIDENCE_PENDING) });
-  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 0, once: true }, deps, control });
-  assert.strictEqual(gateCalls, 1, "not re-offered on the way out");
-  assert.deepStrictEqual(status.gating.map((g) => g.run_id), ["run-1"]);
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"]);
-  assert.ok(logs.some((l) => /left interrupted by this exit/.test(l)), logs.join("\n"));
-});
-
-test("a PARKED pipeline takes no capacity: a --concurrency 1 worker keeps dispatching, and the re-offer waits for a free slot", async () => {
-  // Review finding: an interruption only a person can clear (a renamed gate
-  // still owing evidence) re-parks forever — it must not pin the worker.
+test("a yielded pipeline takes no capacity: a --concurrency 1 worker keeps dispatching while the journal is parked, and the re-offer takes a free slot like any other adoption", async () => {
   const logs = [];
   const marks = [];
   const state = { clock: 1_700_000_000_000, ticks: 0 };
   const control = { stopping: false, reason: null, wake: () => {} };
-  const queue = ["task-a", "task-b"];
   const calls = [];
-  const deps = {
-    now: () => state.clock,
-    log: (l) => logs.push(l),
-    publish: () => {},
-    candidates: async () => queue.slice(0, 1).map((id) => ({ id, readiness: "agent" })),
-    dispatch: async (item) => {
-      queue.splice(queue.indexOf(item.id), 1);
-      return { ok: true, run: { run_id: `run-${item.id}`, harness: "fake" } };
-    },
-    pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: id.slice(4), state: "done", terminal_state: "resolved", terminal_enforced: true } })),
+  const deps = scanLoopDeps({
+    state, control, marks, logs, queue: ["task-a", "task-b"],
     gate: async (entry) => {
       calls.push(entry.run_id);
       if (entry.run_id === "run-task-a" && calls.filter((c) => c === "run-task-a").length === 1) return EVIDENCE_PENDING;
       if (entry.run_id === "run-task-a") control.stopping = true;
       return { state: "passed", gates: [], facts: [] };
     },
-    markGate: (runId, patch) => {
-      marks.push({ run_id: runId, ...patch });
-      return { run_id: runId, state: "done", terminal_state: "resolved", terminal_enforced: true, ...patch };
-    },
-    sleep: async (ms) => {
-      state.clock += ms;
-      await new Promise((r) => setImmediate(r));
-      if ((state.ticks += 1) >= 60) control.stopping = true;
-    },
-  };
-  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 2000 }, deps, control });
-  assert.deepStrictEqual(calls, ["run-task-a", "run-task-b", "run-task-a"], "task-b was dispatched and gated while task-a was parked, then task-a was re-offered");
+    pendingGates: async () => (calls.includes("run-task-b") && calls.filter((c) => c === "run-task-a").length === 1 ? [offer()] : []),
+  });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000 }, deps, control });
+  assert.deepStrictEqual(calls, ["run-task-a", "run-task-b", "run-task-a"], "task-b was dispatched and gated while task-a's journal was parked, then task-a was re-offered");
   assert.strictEqual(status.gates.passed, 2);
   assert.deepStrictEqual(status.gating, []);
 });
 
-test("a WINDING-DOWN worker re-offers no parked pipeline, even with a free slot — it is the next worker's", async () => {
-  // --once with --concurrency 2: task-a parks while task-b's run keeps the
-  // draining loop alive, and the park comes due with a slot free.
+test("a WINDING-DOWN worker (--once) adopts nothing from the scan and exits on its own — a parked journal is the next worker's, and never holds this one open", async () => {
   const logs = [];
   const marks = [];
-  const state = { clock: 1_700_000_000_000, ticks: 0 };
-  const control = { stopping: false, reason: null, wake: () => {} };
-  const calls = [];
-  let handed = false;
-  let pollsB = 0;
-  const deps = {
-    now: () => state.clock,
-    log: (l) => logs.push(l),
-    publish: () => {},
-    candidates: async () => (handed ? [] : ((handed = true), [{ id: "task-a", readiness: "agent" }, { id: "task-b", readiness: "agent" }])),
-    dispatch: async (item) => ({ ok: true, run: { run_id: `run-${item.id}`, harness: "fake" } }),
-    pollRuns: async (ids) =>
-      ids.map((id) => ({ run_id: id, terminal: id === "run-task-a" || (pollsB += 1) > 6, record: { run_id: id, node_id: id.slice(4), state: "done", terminal_state: "resolved", terminal_enforced: true } })),
-    gate: async (entry) => (calls.push(entry.run_id), entry.run_id === "run-task-a" ? EVIDENCE_PENDING : { state: "passed", gates: [], facts: [] }),
-    markGate: (runId, patch) => {
-      marks.push({ run_id: runId, ...patch });
-      return { run_id: runId, state: "done", terminal_state: "resolved", terminal_enforced: true, ...patch };
-    },
-    sleep: async (ms) => {
-      state.clock += ms;
-      await new Promise((r) => setImmediate(r));
-      if ((state.ticks += 1) >= 60) control.stopping = true;
-    },
-  };
-  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 2, intervalMs: 1000, retryAfterMs: 0, once: true }, deps, control });
-  assert.deepStrictEqual(calls, ["run-task-a", "run-task-b"], "the draining worker never re-offered the parked pipeline");
-  assert.strictEqual(control.stopping, false, "and exited on its own");
-  assert.deepStrictEqual(status.gating.map((g) => g.run_id), ["run-task-a"], "leaving it standing for the next worker");
-});
-
-test("a stop that lands while a pipeline is PARKED leaves its slot standing and does not re-offer it", async () => {
-  const marks = [];
-  const logs = [];
   const state = { clock: 1_700_000_000_000, ticks: 0 };
   const control = { stopping: false, reason: null, wake: () => {} };
   let gateCalls = 0;
-  const deps = evidenceLoopDeps({ state, control, marks, logs, gate: async () => ((gateCalls += 1), EVIDENCE_PENDING) });
-  const sleep = deps.sleep;
-  deps.sleep = async (ms) => {
-    await sleep(ms);
-    if (gateCalls >= 1 && marks.length >= 1) control.stopping = true;
-  };
-  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 1000 }, deps, control });
-  assert.strictEqual(gateCalls, 1, "a stopping worker re-offers nothing");
-  assert.deepStrictEqual(status.gating.map((g) => g.run_id), ["run-1"]);
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"]);
-  assert.strictEqual(logs.filter((l) => /abandoned by the stop/.test(l) && /task-a gate pipeline/.test(l)).length, 0);
+  const deps = scanLoopDeps({ state, control, marks, logs, gate: async () => ((gateCalls += 1), EVIDENCE_PENDING), pendingGates: async () => (gateCalls ? [offer()] : []) });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, once: true }, deps, control });
+  assert.strictEqual(gateCalls, 1, "a draining worker re-offers nothing");
+  assert.strictEqual(control.stopping, false, "--once exited on its own — the parked journal did not hold it open until the backstop");
+  assert.deepStrictEqual(status.gating, [], "the slot was freed by the yield");
+  assert.deepStrictEqual(marks, []);
 });
 
-// task-spor-work-loop-parked-reoffer-cap: a parked pipeline is re-offered every
-// retryAfterMs, and one whose interruption cannot clear on its own would be
-// re-run for the worker's whole lifetime. The record counts CONSECUTIVE
-// identical interruptions; at `parkedReofferMax` the loop escalates instead.
-const reofferRun = ({ max = 3, gate, escalateParked, ticks = 200 }) => {
+// task-spor-work-loop-parked-reoffer-cap: a parked journal is re-offered
+// whenever its timer is due, and one whose interruption cannot clear on its
+// own would be re-run for the box's whole lifetime. The journal's CONSECUTIVE
+// identical yields are the count (stage-projection.js projectJournal
+// `reoffers`, openPipelines `escalate`); at the cap the loop files the
+// escalation in place of the re-offer.
+const capRun = ({ escalateParked, offers, ticks = 60 }) => {
   const marks = [];
   const logs = [];
   const escalations = [];
   const calls = [];
   const state = { clock: 1_700_000_000_000, ticks: 0 };
   const control = { stopping: false, reason: null, wake: () => {} };
-  const deps = evidenceLoopDeps({ state, control, marks, logs, gate: async (entry, record) => (calls.push({ entry, record }), gate(calls.length, control, record)) });
-  // Carry every stamp forward, as the real journal does.
-  let stored = { run_id: "run-1", node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true };
-  deps.markGate = (runId, patch) => {
-    marks.push({ run_id: runId, ...patch });
-    stored = { ...stored, ...patch };
-    return { ...stored };
-  };
+  const deps = scanLoopDeps({
+    state, control, marks, logs,
+    gate: async (entry) => (calls.push(entry), EVIDENCE_PENDING),
+    pendingGates: async () => offers({ calls, marks, escalations }),
+    escalateParked: async (args) => (escalations.push(args), escalateParked(args, escalations.length)),
+  });
   deps.sleep = async (ms) => {
     state.clock += ms;
     await new Promise((r) => setImmediate(r));
     if ((state.ticks += 1) >= ticks) control.stopping = true;
   };
-  if (escalateParked) deps.escalateParked = async (args) => (escalations.push(args), escalateParked(args, escalations.length));
-  const run = workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 1000, parkedReofferMax: max }, deps, control });
-  return { run, marks, logs, escalations, calls, control, stored: () => stored };
+  const run = workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000 }, deps, control });
+  return { run, marks, logs, escalations, calls, control };
 };
 
-test("re-offer cap: after N IDENTICAL interruptions the loop stops re-offering, files a requires:human escalation naming the reason, and settles the run blocked", async () => {
-  const t = reofferRun({ max: 3, gate: () => EVIDENCE_PENDING, escalateParked: () => ({ ok: true, id: "task-gate-parked-a-run1-deadbeef", demoted: true }), ticks: 60 });
+test("re-offer cap: an entry the scan marks `escalate` is not re-offered — the requires:human escalation is filed naming the reason, and the run settles blocked", async () => {
+  // The scan's story: yielded once by the harvest's own pipeline, re-offered
+  // twice, then the third identical yield reaches the cap.
+  const t = capRun({
+    escalateParked: () => ({ ok: true, id: "task-gate-parked-a-run1-deadbeef", demoted: true }),
+    offers: ({ calls, marks }) => (marks.some((m) => m.gate_state) ? [] : calls.length === 0 ? [] : calls.length < 3 ? [offer({ reoffers: calls.length })] : [offer({ reoffers: 3, escalate: true })]),
+  });
   const status = await t.run;
-  assert.strictEqual(t.calls.length, 3, "run once, re-offered twice — then the third identical interruption escalates instead of parking");
-  assert.deepStrictEqual(t.marks.filter((m) => m.gate_state === "interrupted").map((m) => m.gate_interrupt_count), [1, 2, 3], "counted on the run record");
+  assert.strictEqual(t.calls.length, 3, "run once, re-offered twice — then the third identical yield escalates instead of re-offering");
   assert.strictEqual(t.escalations.length, 1);
   assert.strictEqual(t.escalations[0].reason, EVIDENCE_PENDING.reason, "the escalation names the reason");
   assert.strictEqual(t.escalations[0].count, 3);
   assert.strictEqual(t.escalations[0].node_id, "task-a");
   const settled = t.marks[t.marks.length - 1];
-  assert.strictEqual(settled.gate_state, "blocked", "settled — the resume scan never re-offers it again");
+  assert.strictEqual(settled.gate_state, "blocked", "settled — the scan never re-offers a settled record");
   assert.strictEqual(settled.gate_escalated_to, "task-gate-parked-a-run1-deadbeef");
   assert.strictEqual(settled.gate_demoted, true);
   assert.match(settled.gate_reason, /re-offered 3 time\(s\)/);
+  assert.deepStrictEqual(t.marks.map((m) => m.gate_state), ["blocked"], "the only stamp is the settled one");
   assert.strictEqual(status.gates.blocked, 1);
   assert.deepStrictEqual(status.gating, [], "the slot is freed");
   assert.ok(status.skipped.some((s) => s.id === "task-a"), "and the node cools off like any refused pipeline");
   assert.ok(t.logs.some((l) => /interrupted 3 time\(s\) in a row/.test(l) && /escalating to a person/.test(l)), t.logs.join("\n"));
-  assert.deepStrictEqual(workLoop.orphanedGateRuns([{ worker_id: "w", live: false, gating: [{ run_id: "run-1", node_id: "task-a" }] }], { records: new Map([["run-1", t.stored()]]) }), [], "a blocked record is never adopted as an orphan");
 });
 
-test("re-offer cap: a CHANGING reason resets the count — only consecutive identical interruptions escalate", async () => {
-  const reasons = ["reason A", "reason A", "reason B", "reason B", "reason A", "reason A", "reason A"];
-  const t = reofferRun({
-    max: 3,
-    gate: (n) => ({ state: "interrupted", gates: [], facts: [], reason: reasons[n - 1] }),
-    escalateParked: () => ({ ok: true, id: "task-gate-parked-x" }),
-    ticks: 80,
-  });
-  await t.run;
-  assert.deepStrictEqual(
-    t.marks.filter((m) => m.gate_state === "interrupted").map((m) => `${m.gate_interrupt_reason}:${m.gate_interrupt_count}`),
-    ["reason A:1", "reason A:2", "reason B:1", "reason B:2", "reason A:1", "reason A:2", "reason A:3"]
-  );
-  assert.strictEqual(t.escalations.length, 1, "escalated only once three IDENTICAL reasons ran consecutively");
-  assert.strictEqual(t.escalations[0].reason, "reason A");
-  assert.strictEqual(t.calls.length, 7);
-});
-
-test("re-offer cap: a --regate's new pipeline attempt starts a fresh count, and 0 disables the cap", async () => {
-  // Same reason, but the record's pipeline attempt moved on (a person re-gated).
-  const t = reofferRun({
-    max: 2,
-    gate: (n, control, record) => {
-      // A re-gate opened attempt 1: stamped on the journal AND on the record this pass was handed.
-      if (n === 2) record.gate_regate_count = t.stored().gate_regate_count = 1;
-      return EVIDENCE_PENDING;
-    },
-    escalateParked: () => ({ ok: true, id: "task-gate-parked-y" }),
-    ticks: 40,
-  });
-  await t.run;
-  const counts = t.marks.filter((m) => m.gate_state === "interrupted").map((m) => `${m.gate_interrupt_attempt}:${m.gate_interrupt_count}`);
-  assert.deepStrictEqual(counts, ["0:1", "1:1", "1:2"], "the same reason under a new attempt starts again at 1");
-  assert.strictEqual(t.escalations.length, 1);
-  assert.strictEqual(t.calls.length, 3);
-
-  const off = reofferRun({ max: 0, gate: () => EVIDENCE_PENDING, escalateParked: () => ({ ok: true, id: "never" }), ticks: 40 });
-  await off.run;
-  assert.strictEqual(off.escalations.length, 0, "0 re-offers without bound, as before the cap");
-  assert.ok(off.calls.length > 5);
-});
-
-test("re-offer cap: an escalation that could not be filed re-parks the run unsettled (not counted twice) and tries again on the next identical interruption", async () => {
-  const t = reofferRun({
-    max: 2,
-    gate: (n, control) => (n >= 4 ? ((control.stopping = true), EVIDENCE_PENDING) : EVIDENCE_PENDING),
+test("re-offer cap: an escalation that could not be filed settles nothing (no stamp) — the journal stays parked, and the next scan offer tries it again", async () => {
+  const t = capRun({
     escalateParked: (args, n) => (n === 1 ? { ok: false, reason: "offline — graph unreachable" } : { ok: true, id: "task-gate-parked-z" }),
-    ticks: 60,
+    offers: ({ calls, marks }) => (marks.some((m) => m.gate_state) ? [] : calls.length === 0 ? [] : [offer({ reoffers: 2, escalate: true })]),
   });
   const status = await t.run;
-  assert.strictEqual(t.escalations.length, 2, "retried after the failed filing");
-  assert.deepStrictEqual(t.escalations.map((e) => e.count), [2, 3]);
+  assert.strictEqual(t.calls.length, 1, "the pipeline itself is not re-run once the cap is reached");
+  assert.strictEqual(t.escalations.length, 2, "retried on the next offer");
+  assert.deepStrictEqual(t.escalations.map((e) => e.count), [2, 2]);
   assert.ok(t.logs.some((l) => /escalation could not be filed \(offline — graph unreachable\)/.test(l)), t.logs.join("\n"));
-  const interrupted = t.marks.filter((m) => m.gate_state === "interrupted");
-  assert.deepStrictEqual(interrupted.map((m) => m.gate_interrupt_count), [1, 2, undefined, 3], "the failed escalation's re-park stamps no count");
+  assert.deepStrictEqual(t.marks.map((m) => m.gate_state), ["blocked"], "the failed filing stamps nothing");
   assert.strictEqual(status.gates.blocked, 1);
-  assert.strictEqual(t.marks[t.marks.length - 1].gate_state, "blocked");
 });
 
-test("the resume scan reads back what the run journal and the worker status files actually store", () => {
+test("re-offer cap: with no escalateParked dep an `escalate` entry is re-offered as a plain resume — unbounded, as before the cap existed", async () => {
+  const marks = [];
+  const logs = [];
+  const state = { clock: 1_700_000_000_000, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  const calls = [];
+  const deps = scanLoopDeps({
+    state, control, marks, logs,
+    gate: async (entry) => (calls.push(entry), calls.length >= 4 ? ((control.stopping = true), { state: "passed", gates: [], facts: [] }) : EVIDENCE_PENDING),
+    pendingGates: async () => (calls.length && !marks.length ? [offer({ reoffers: 99, escalate: true })] : []),
+  });
+  await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000 }, deps, control });
+  assert.strictEqual(calls.length, 4);
+  assert.ok(calls.slice(1).every((c) => c.resumed === true));
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["passed"]);
+});
+
+test("the resume scan reads back what the run journal, the pipeline lease log and the worker status files actually store", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-resume-"));
   const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const stageProjection = require("../lib/shell/stage-projection.js");
   fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
   const runId = "11111111-2222-3333-4444-555555555555";
   dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, {
-    run_id: runId, node_id: "task-orphan", state: "done", terminal_state: "resolved", terminal_enforced: true, created_at: new Date().toISOString(),
+    run_id: runId, node_id: "task-orphan", state: "done", terminal_state: "resolved", terminal_enforced: true, created_at: new Date().toISOString(), gate_factory: "factory-test",
   });
-  // A worker record with a pid that is gone: STALE, never running (the same
-  // reading `spor work --status` gives an operator).
-  workLoop.writeWorkerStatus(home, {
-    worker_id: "dead", pid: 999999, started_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-    active: [], gating: [{ run_id: runId, node_id: "task-orphan", harness: "fake", started_at: new Date().toISOString() }],
-  });
-  const scan = () =>
-    workLoop.orphanedGateRuns(workLoop.readWorkerStatuses(home, { alive: () => false }), {
-      records: new Map(dispatchRuns.readRunRecords(home).map((r) => [r.run_id, r])),
-    });
-  assert.deepStrictEqual(scan().map((o) => o.node_id), ["task-orphan"]);
+  const alive = (pid) => pid === process.pid;
+  const ownerLive = (owner) => workLoop.readWorkerStatuses(home, { alive }).some((w) => w.live && w.worker_id === owner);
+  const scan = () => workLoop.openPipelines(stageProjection.openPipelineCandidates(home, dispatchRuns.readRunRecords(home)), { ownerLive, factory: "factory-test", terminalStates: dispatchRuns.TERMINAL_STATES });
+  // Never started (a gate-armed dispatch, no lease, no journal): owed, adopted.
+  assert.deepStrictEqual(scan().map((o) => [o.node_id, o.stage]), [["task-orphan", null]]);
 
+  // A worker whose pid is gone claimed it: STALE, never running (the same
+  // reading `spor work --status` gives an operator) — adopted.
+  workLoop.writeWorkerStatus(home, { worker_id: "dead", pid: 999999, started_at: new Date().toISOString(), updated_at: new Date().toISOString(), active: [], gating: [] });
+  const dead = dispatchRuns.claimPipeline(home, runId, { workerId: "dead", factory: "factory-test", ownerLive });
+  assert.strictEqual(dead.ok, true, dead.refused);
+  assert.deepStrictEqual(scan().map((o) => o.node_id), ["task-orphan"]);
+  // …a LIVE worker takes it over (the dead owner's claim is open), and then it
+  // is that worker's: the scan skips it.
+  workLoop.writeWorkerStatus(home, { worker_id: "live", pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), started_at: new Date().toISOString(), updated_at: new Date().toISOString(), active: [], gating: [] });
+  const live = dispatchRuns.claimPipeline(home, runId, { workerId: "live", factory: "factory-test", ownerLive });
+  assert.strictEqual(live.ok, true, live.refused);
+  assert.deepStrictEqual(scan(), [], "a pipeline a live worker holds is not an orphan");
+  assert.match(dispatchRuns.claimPipeline(home, runId, { workerId: "third", ownerLive }).refused, /being gated right now by worker live/);
+  // …released by a yield: open again at once.
+  assert.strictEqual(dispatchRuns.releasePipeline(home, runId, live.token).ok, true);
+  assert.deepStrictEqual(scan().map((o) => o.node_id), ["task-orphan"]);
   // …and once a pipeline settles, the stamp takes it out of the scan for good.
   assert.ok(dispatchRuns.stampGateState(home, runId, { gate_state: "passed", gate_at: new Date().toISOString() }));
   assert.deepStrictEqual(scan(), []);
   assert.strictEqual(dispatchRuns.stampGateState(home, "no-such-run", { gate_state: "passed" }), null);
 
   // A SETTLED verdict is final for this run. Two workers can, in a narrow
-  // window, both adopt one orphan; without this the loser's later `passed`
+  // window, both adopt one pipeline; without this the loser's later `passed`
   // would overwrite the winner's refusal — a refusal laundered into an
   // approval, the one direction this feature must never fail in.
   const refused = dispatchRuns.stampGateState(home, runId, { gate_state: "failed", gate_reason: "the suite fails" });
   assert.strictEqual(refused.gate_state, "passed", "the settled verdict stands");
   assert.strictEqual(refused.gate_reason, undefined);
-  assert.strictEqual(
-    dispatchRuns.stampGateState(home, runId, { gate_state: "interrupted" }).gate_state,
-    "passed",
-    "and a stop cannot reopen one either"
-  );
   assert.strictEqual(dispatchRuns.stampGateState(home, runId, { terminal_state: "failed" }), null, "a patch with nothing of its own writes nothing at all");
+  // A record the pruner removes takes its journals and its lease log with it.
+  assert.ok(fs.existsSync(stageProjection.pipelineLogPath(home, { run_id: runId })));
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, { run_id: runId, node_id: "task-orphan", state: "done", created_at: "2000-01-01T00:00:00Z", finished_at: "2000-01-01T00:00:00Z" });
+  dispatchRuns.pruneRuns(home, { maxAgeMs: 1 });
+  assert.ok(!fs.existsSync(stageProjection.pipelineLogPath(home, { run_id: runId })));
 });
 
 test("a gate stamp only ever writes its own namespace, and survives the writers that own the record", () => {
@@ -2517,8 +2337,8 @@ test("an approval item approves ONLY on a resolving edge — every other termina
 // the same way any other node rename is (GRAPH.md's `supersedes` edge) — the
 // operator writes a NEW factory node with a `supersedes` edge to the old one
 // and retires it. `loadFactoryDefinition` walks that chain from the current
-// node so `spor work`'s orphan-resume scan can treat pipelines started under
-// an old id as this factory's own (see orphanedGateRuns' `factoryAliases`).
+// node so `spor work`'s resume scan can treat pipelines started under an old
+// id as this factory's own (see openPipelines' `factoryAliases`).
 test("loadFactoryDefinition walks a factory's supersedes chain into factory.renamedFrom", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-factory-rename-"));
   const nodes = path.join(home, "nodes");
@@ -2821,6 +2641,27 @@ test("escalateParkedPipeline (the re-offer cap's real door): files a requires:hu
   assert.deepStrictEqual([retried.ok, retried.id], [true, res.id], "a retry at a higher count is the SAME node, not a refused collision (the count is not in the content)");
   const other = await sporCli.escalateParkedPipeline(cfg, { ...args, reason: "a different stuck reason" });
   assert.notStrictEqual(other.id, res.id, "a different reason is a different escalation");
+
+  // The escalation OWNS the pipeline before it writes for it (review F3): with
+  // a run record on this box, it claims the lease like a pipeline run does —
+  // refused (nothing filed, `superseded`) while another live worker holds it,
+  // taken once that worker released it, and handed back when the filing fails.
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const stageProjection = require("../lib/shell/stage-projection.js");
+  const runId = "run-parked-cap-leased";
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, { run_id: runId, node_id: "task-stuck", state: "done", terminal_state: "resolved", terminal_enforced: true });
+  workLoop.writeWorkerStatus(home, { worker_id: "driver", pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), started_at: new Date().toISOString(), updated_at: new Date().toISOString(), active: [], gating: [] });
+  const driver = dispatchRuns.claimPipeline(home, runId, { workerId: "driver" });
+  const leased = { ...args, run_id: runId, worker: "escalator", record: { run_id: runId, node_id: "task-stuck" } };
+  const refused = await sporCli.escalateParkedPipeline(cfg, leased, { home });
+  assert.deepStrictEqual([refused.ok, refused.superseded], [false, true]);
+  assert.match(refused.reason, /being gated right now by worker driver/);
+  assert.strictEqual(stageProjection.pipelineLease(home, { run_id: runId }).token, driver.token, "a refused escalation takes nothing");
+  dispatchRuns.releasePipeline(home, runId, driver.token);
+  const taken = await sporCli.escalateParkedPipeline(cfg, leased, { home, factory: "factory-test" });
+  assert.strictEqual(taken.ok, true, JSON.stringify(taken));
+  const lease = stageProjection.pipelineLease(home, { run_id: runId });
+  assert.deepStrictEqual([lease.worker, lease.factory, lease.released_at], ["escalator", "factory-test", null], "filed: the lease is the escalator's, for the loop's settled stamp");
 });
 
 // gatePromoteItem is gateDemoteItem's mirror (task-spor-integration-propose-
@@ -3888,15 +3729,21 @@ process.stdin.on("end", () => {
     assert.strictEqual(exitCode, 0, `a single SIGTERM must actually end the worker, even mid fix-cycle, not leave it running on the abandoned pipeline's own timer.\nstdout:\n${stdout}\nstderr:\n${stderr}`);
     assert.match(stdout, new RegExp(`gate pipeline abandoned by the stop.*fix cycle \\(run ${fixRunId.slice(0, 8)}\\)`), "the abandon log names the orphaned fix-cycle run");
 
-    // The durable record: interrupted, and still naming the run it left going.
+    // The durable record: UNSETTLED (no transitional stamp — the open journal
+    // and the lease are what the next worker reads), and still naming the run
+    // it left going.
     const finalRecord = dispatchRuns.readRunRecords(home).find((r) => r.run_id === named.run_id);
-    assert.strictEqual(finalRecord.gate_state, "interrupted");
-    assert.strictEqual(finalRecord.gate_fix_run_id, fixRunId, "the interrupted record still names the orphaned fix-cycle run");
+    assert.ok(!gates.SETTLED_GATE_STATES.has(finalRecord.gate_state), `nothing settled (${finalRecord.gate_state})`);
+    assert.strictEqual(finalRecord.gate_fix_run_id, fixRunId, "the abandoned record still names the orphaned fix-cycle run");
+    const stageProjection = require("../lib/shell/stage-projection.js");
+    const projected = stageProjection.projectRun(home, finalRecord);
+    assert.ok(projected.open, `the gate stage's journal is still open: ${JSON.stringify(projected.stages.map((s) => [s.stage, s.status]))}`);
+    assert.ok(projected.lease, "the pipeline was leased");
 
-    // A restarted `spor runs` surfaces both — the pipeline's own interrupted
-    // state and the fix cycle it named — without needing --json.
+    // A restarted `spor runs` surfaces both — the pipeline's open journal and
+    // the fix cycle it named — without needing --json.
     const runs = cli(["runs"], env);
-    assert.match(runs.stdout, /gate:\s+interrupted/);
+    assert.match(runs.stdout, /journal:\s+gates a0 — (running|parked)/);
     assert.match(runs.stdout, new RegExp(`fix cycle:\\s+run ${fixRunId.slice(0, 8)}`));
   } finally {
     // The worker first — it is already gone by every path above, but a SIGTERM
@@ -6930,9 +6777,7 @@ test("the loop settles a SUPERSEDED verdict like a pass: tallied, stamped settle
   assert.strictEqual(status.recent[0].gate, "superseded");
   assert.deepStrictEqual(stamps.map((s) => s.gate_state), ["superseded"]);
   assert.ok(gates.SETTLED_GATE_STATES.has("superseded"));
-  const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
-  const dead = { worker_id: "w1", live: false, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [slot], active: [] };
-  assert.deepStrictEqual(workLoop.orphanedGateRuns([dead], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state: "superseded" }]]) }), []);
+  assert.deepStrictEqual(workLoop.openPipelines([cand({ ...ORPHAN_RECORD, gate_state: "superseded" }, { lease: leaseOf(), projection: RUNNING })], { now: () => ORPHAN_AT + 1 }), []);
   // A pipeline this worker started off its own harvest is called exactly as
   // before; only an ADOPTED slot carries `resumed`.
   assert.strictEqual(state.gateCalls[0].entry.resumed, undefined);
@@ -7338,12 +7183,7 @@ test("the loop tallies SCOPED, stamps it settled, and cools the item off — it 
     "unlike a superseded item, a scoped one may still be live — the worker walks on"
   );
   // Settled: a later worker never re-offers the run, and --regate refuses it.
-  assert.deepStrictEqual(
-    workLoop.orphanedGateRuns([{ worker_id: "w1", live: false, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake" }], active: [] }], {
-      records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state: "scoped" }]]),
-    }),
-    []
-  );
+  assert.deepStrictEqual(workLoop.openPipelines([cand({ ...ORPHAN_RECORD, gate_state: "scoped" }, { lease: leaseOf(), projection: RUNNING })], { now: () => ORPHAN_AT + 1 }), []);
 });
 
 // -------------------------------------------------- stale premise (§10.11) --
@@ -10762,7 +10602,7 @@ test("a re-gate carries the refused attempt's owed evidence from every rescue pa
     }
     // The attempt settled its refusal with that debt still owed.
     dispatchRuns.atomicJson(file, { ...dispatchRuns.readJson(file), gate_state: "failed", gate_settle_id: "prior", gate_worker: "old" });
-    const claim = dispatchRuns.claimGateRecord(home, entry.run_id, { workerId: "regate", reopen: { settleId: "prior", regateCount: 0, state: "failed" } });
+    const claim = dispatchRuns.claimPipeline(home, entry.run_id, { workerId: "regate", reopen: { settleId: "prior", regateCount: 0, state: "failed" } });
     assert.equal(claim.ok, true, claim.refused);
     const item = { ...entry, attempt: 2 };
     const real = sporCli.makeGateDeps(cfg, { entry: item, factory, slug: null, log: () => {}, gateOwner: claim.token });
@@ -11398,4 +11238,90 @@ test("a forged same-key child journal written under a different head is refused,
   const text = JSON.stringify(r && r.message ? r.message : r);
   assert.strictEqual(r.state, "failed", text);
   assert.ok(/gate definition/.test(r.reason), text);
+});
+
+// task-spor-delete-loop-resume-machinery-after-workflow-stages: the resume door
+// end to end, over the REAL doors and a file journal. A pipeline that YIELDS
+// (here: the evidence preflight refuses foreign flake evidence, so the gate
+// workflow parks on its durable timer) releases its lease and stamps NOTHING
+// on the record; the resume scan (openPipelineCandidates + openPipelines)
+// finds the parked journal due; a second drive of runGateAndIntegration
+// CONTINUES the same journal (a new pass, the suite still not run) and yields
+// again — and the count of identical yields is read off the journal.
+test("real doors: a yielded pipeline leaves no record stamp, releases its lease, is found by the resume scan once due, and is continued from its journal", async () => {
+  const executionStoreLib = require("../lib/shell/execution-store.js");
+  const dispatchRunsLib = require("../lib/shell/agent-dispatch-runner.js");
+  const stageProjection = require("../lib/shell/stage-projection.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-resume-door-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_MODE: "local" } });
+  fs.writeFileSync(path.join(nodes, "task-demo.md"), "---\nid: task-demo\ntype: task\nproject: demo\ntitle: Benign work\nsummary: Benign work whose gate pipeline yields on foreign evidence and is resumed by the scan.\nstatus: done\ndate: 2026-09-06\n---\n\nBody.\n");
+  const repo = repoWithBranch({ weakenTest: false, regress: false });
+  const counter = path.join(home, "suite-runs");
+  const gate = { id: "acceptance", kind: "command", command: `"${process.execPath}" test/acceptance.js && "${process.execPath}" -e "require('fs').appendFileSync(process.argv[1], 'x')" "${counter}"` };
+  const factory = factoryOf({ ...BASE, gates: [gate] });
+  factory.id = "factory-test";
+  const runId = "run-resume-door-1";
+  const record = { run_id: runId, node_id: "task-demo", name: "task-demo", harness: "fake", cwd: repo, state: "done", termination_class: "completed", terminal_state: "resolved", terminal_enforced: true, started_at: "2026-09-06T00:00:00.000Z", finished_at: "2026-09-06T00:10:00.000Z", gate_factory: "factory-test" };
+  dispatchRunsLib.atomicJson(dispatchRunsLib.runPaths(home, runId).record, record);
+  // Flake evidence journaled under ANOTHER graph: the preflight refuses it and
+  // the pass yields (issue-spor-gate-evidence-pending-interrupted-drops-slot-and-attests).
+  const foreign = { complete: false, gate: factory.gates[0], origin: { mode: "local", nodes: path.join(home, "elsewhere") }, outcome: { verdict: "passed", flake: { issues: ["issue-flake-one"] } } };
+  assert.strictEqual(stageProjection.writeGateProgress(home, runId, { gates: { acceptance: { evidence: foreign } } }, { key: runId, attempt: 1 }).ok, true);
+  const lines = [];
+  const ctx = { factory, slug: "demo", passthrough: {}, warn: () => {}, runMaxMs: 1000, home, log: (l) => lines.push(l), stopping: () => false, sleep: async () => {}, workerId: "w-1" };
+  const alive = (pid) => pid === process.pid;
+  workLoop.writeWorkerStatus(home, { worker_id: "w-1", pid: process.pid, started_ticks: dispatchRunsLib.processStartTicks(process.pid), started_at: new Date().toISOString(), updated_at: new Date().toISOString(), active: [], gating: [] });
+  const ownerLive = (owner) => workLoop.readWorkerStatuses(home, { alive }).some((w) => w.live && w.worker_id === owner);
+  const scan = (now) => workLoop.openPipelines(stageProjection.openPipelineCandidates(home, dispatchRunsLib.readRunRecords(home)), { now: () => now, ownerLive, factory: "factory-test", terminalStates: dispatchRunsLib.TERMINAL_STATES, parkedReofferMax: 10 });
+
+  // Drive 1: the pipeline yields.
+  const first = await sporCli.runGateAndIntegration(cfg, { run_id: runId, node_id: "task-demo", project: "demo" }, record, ctx);
+  assert.strictEqual(first.state, "interrupted", lines.join("\n"));
+  assert.match(first.reason, /different or unknown graph/);
+  assert.ok(!fs.existsSync(counter), "the suite never ran");
+  const afterFirst = dispatchRunsLib.readJson(dispatchRunsLib.runPaths(home, runId).record);
+  assert.strictEqual(afterFirst.gate_state, undefined, "no transitional stamp on the record");
+  assert.strictEqual(afterFirst.gate_settle_id, undefined);
+  const lease1 = stageProjection.pipelineLease(home, afterFirst);
+  assert.strictEqual(lease1.worker, "w-1");
+  assert.strictEqual(lease1.factory, "factory-test", "the lease names the factory that started it");
+  assert.ok(lease1.released_at, "the yield released the lease");
+  const journalPath = path.join(dispatchRunsLib.runPaths(home, runId).workflows, "gates-a0.workflow.jsonl");
+  const p1 = stageProjection.projectRun(home, afterFirst);
+  assert.deepStrictEqual([p1.current.stage, p1.current.status, p1.current.reoffers], ["gates-a0", "parked", 1]);
+  assert.ok(p1.current.due > 0, "the yield's durable timer is the due time");
+
+  // The scan: not before the timer, then due — under this factory only, never
+  // another's, and with the yield count carried.
+  assert.deepStrictEqual(scan(p1.current.due - 1), [], "not due yet");
+  const due = scan(p1.current.due);
+  assert.deepStrictEqual(due.map((o) => [o.run_id, o.node_id, o.attempt, o.reoffers, o.escalate]), [[runId, "task-demo", 0, 1, false]]);
+  assert.deepStrictEqual(workLoop.openPipelines(stageProjection.openPipelineCandidates(home, dispatchRunsLib.readRunRecords(home)), { now: () => p1.current.due, ownerLive, factory: "factory-other", terminalStates: dispatchRunsLib.TERMINAL_STATES }), [], "another factory does not adopt it");
+
+  // Drive 2 (the adopted re-offer, once the journal's own timer has fired —
+  // the scan would not have offered it before): the SAME journal continues — a
+  // new pass, the same refusal, a second yield — and nothing is re-judged.
+  await new Promise((r) => setTimeout(r, Math.max(0, p1.current.due - Date.now()) + 50));
+  const second = await sporCli.runGateAndIntegration(cfg, { run_id: runId, node_id: "task-demo", project: "demo", resumed: true }, afterFirst, ctx);
+  assert.strictEqual(second.state, "interrupted", lines.join("\n"));
+  assert.ok(!fs.existsSync(counter), "still no suite run");
+  const entries = executionStoreLib.openWorkflowJournalAt(journalPath).journal;
+  assert.strictEqual(entries.filter((e) => e.kind === "effect" && /\/open#1$/.test(e.key)).length, 1, "one journal, opened once");
+  assert.ok(entries.some((e) => e.kind === "effect" && /\/e1\//.test(e.key)), "the second drive ran the next pass over the same journal");
+  const p2 = stageProjection.projectRun(home, dispatchRunsLib.readJson(dispatchRunsLib.runPaths(home, runId).record));
+  assert.deepStrictEqual([p2.current.status, p2.current.reoffers], ["parked", 2]);
+  assert.strictEqual(p2.stages[0].yields.length, 2);
+  const lease2 = stageProjection.pipelineLease(home, { run_id: runId });
+  assert.notStrictEqual(lease2.token, lease1.token, "the re-offer claimed a fresh lease");
+  assert.ok(lease2.released_at, "and released it again on the yield");
+  // The cap reads the journal: at parkedReofferMax 2 the next scan says `escalate`.
+  assert.strictEqual(workLoop.openPipelines(stageProjection.openPipelineCandidates(home, dispatchRunsLib.readRunRecords(home)), { now: () => p2.current.due, ownerLive, factory: "factory-test", terminalStates: dispatchRunsLib.TERMINAL_STATES, parkedReofferMax: 2 })[0].escalate, true);
+  // `spor runs` describes the parked stage, its due time and the lease.
+  const described = stageProjection.describeRun(p2);
+  assert.ok(described.some((l) => /journal:\s+gates a0 — parked — pending flake evidence/.test(l)), described.join("\n"));
+  assert.ok(described.some((l) => /yielded 2 time\(s\) in a row/.test(l)), described.join("\n"));
+  assert.ok(described.some((l) => /lease:\s+released/.test(l)), described.join("\n"));
+  assert.ok(!lines.some((l) => /REPLAY FAULT|fresh in-memory journal/.test(l)), lines.join("\n"));
 });

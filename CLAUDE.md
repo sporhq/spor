@@ -1336,12 +1336,14 @@ commits and so can never restore equality) when its own re-read of the tree
 finds a head other than the one the last passing gate judged (`gatedHead`); its
 OWN fix cycles move the head by construction, so after each one the moved head
 is handed back through `deps.regate` (re-running the real pipeline) and only a
-pass at exactly that head lets it land. `runGateAndIntegration` CLAIMS the run
-record's ownership nonce (`claimGateRecord`, under the record lock) BEFORE the
-first gate runs — a record another pipeline settled, or one a live worker is
-gating, refuses the pipeline outright (`not_run` + `superseded`: no fact, no
-escalation, no demotion, no attestation; only a dead owner's record is taken
-over) — then SETTLES the run record through that claim's `own` door, then
+pass at exactly that head lets it land. `runGateAndIntegration` CLAIMS the run's
+pipeline LEASE (`claimPipeline`, under the record lock, a `claim` line in the
+`pipeline.jsonl` beside the stage journals — the ownership nonce is a journaled
+entry, never a `gate_state: running` stamp) BEFORE the first gate runs — a
+record another pipeline settled, or whose lease a live worker holds, refuses
+the pipeline outright (`not_run` + `superseded`: no fact, no escalation, no
+demotion, no attestation; only a dead, expired or released lease is taken
+over) — then SETTLES the run record through that lease's `own` door, then
 writes ONE `art-attest-<stem>-<run>-<hash>` artifact per run
 (`schema: spor.attestation/1` — subject/factory/gate/integration/
 configIntegrity/timing/environment, `lib/shell/attestation.js`; `allPassed`
@@ -1431,7 +1433,8 @@ node-id spelling resolves one way only (`repo-x` admits `x`, never the
 reverse — the reverse would fail OPEN on a repo genuinely named `repo-x`).
 RESUMPTION is the other door into a gate, and it never goes through selection,
 so an orphaned pipeline is adopted only by a worker armed with the SAME factory
-that started it (`orphanedGateRuns`'s `factory`/`onForeign`) — the wrong-factory
+that started it (`openPipelines`' `factory`/`onForeign`, read off the lease's
+`factory` or the record's `gate_factory` stamp) — the wrong-factory
 case has the same consequences the bare-worker exclusion already exists to
 prevent. A gate/merge fact — and every item a refusal files (the escalation,
 the test-change lane, the approval, the proposal tracker) — is filed under the
@@ -1813,7 +1816,7 @@ read; and EVERY `interrupted` hand-up (a stop, pending evidence, an
 unverifiable origin, a reviewer PAUSE — whose `paused_until` IS the timer)
 is a durable YIELD after which the re-driven workflow runs the NEXT PASS
 (`e<epoch>` keys) over the same journal instead of replaying the interrupted
-verdict. The loop marks every adopted orphan and parked re-offer
+verdict. The loop marks every adopted pipeline (an orphan, a due re-offer)
 `resumed`, and the supersession check keys on it, so each pass journals that
 reading as its own input (`pass`): a continued pass keeps its first drive's,
 a pass started after a yield reads the live flag. `runGatePipeline` in
@@ -1924,13 +1927,37 @@ crash-swept inside a real integration workflow in
 test/integration-workflow.test.js: a crash at every CHILD activity boundary
 resumes the parent, which re-calls `regate` for the same head, and the child
 journal continues — never re-judged.
-What is NOT yet done, and
-still open on the parent task: the fold of `runGateAndIntegration` into one
-workflow, and the deletion of `gate_state`'s transitional writes
-(`running`/`interrupted`), `orphanedGateRuns`, `resumableSlots`, parked
-re-offers and `claimGateRecord` that the rewrite makes possible (slice 4; both stages'
-re-offers still ride the loop's door — the journals only make the
-re-offered pipeline continue rather than restart). See
+**Slice 4 — the loop resumes by driving open journals
+(task-spor-delete-loop-resume-machinery-after-workflow-stages):** the
+worker-status-file join (`orphanedGateRuns`/`resumableSlots`), the in-process
+parked re-offer with its `gate_interrupt_*`/`gate_paused_*` stamps,
+`claimGateRecord` and every transitional `gate_state` write (`running`,
+`interrupted`) are GONE. `work-loop.js openPipelines` over
+`stage-projection.js openPipelineCandidates` is the ONE scan: a run is a
+candidate when a lease was claimed, a stage journal exists, or a gate-armed
+worker dispatched it (`gate_factory`, stamped on the record at launch); it is
+adopted when its record carries an un-judged claim and no settled verdict, its
+factory matches, its node has no live run, its LEASE is not held (released by
+a yield, expired, or its worker not live) and — for a parked journal — the
+yield's own timer is due. The lease is `pipeline.jsonl` beside the stage
+journals (`claim`/`renew`/`release`; `claimPipeline`/`renewPipeline`/
+`releasePipeline` in agent-dispatch-runner.js under the record lock,
+`pipelineLease`/`leaseHeld` in stage-projection.js, 30-minute TTL renewed
+once a pass by the loop and on an interval by `--regate`): the settle's `own`
+door compares against its token, a reopen takes a new token AND clears the
+record's `gate_state`, and `runGateAndIntegration` releases it on every
+`interrupted` return. The record keeps only the final verdict, the attempt
+count and the timestamps. The re-offer cap counts the journal's consecutive
+identical yields (`projectJournal.reoffers`; a pause inside its bound skipped,
+a fallback hand-off resets) and the scan marks the entry `escalate`. Every
+`open` activity journals `opened_at` (same-attempt re-gate children order by
+it, not mtime), the integration and implementation stages close with a
+`settled` entry like the gate list, `latestProgress`/`projectRun` REPORT an
+unreadable gate journal instead of skipping it, and `claimPipeline` reads
+`owesEvidence` only as a function (a boolean override is ignored). Still open
+on the parent task: the fold of `runGateAndIntegration` into one workflow
+function, and splitting the human gate's in-activity approval wait into a
+signal with a deadline. See
 test/workflow-kernel.test.js, test/workflow-journal.test.js,
 test/dispatch-adopt-by-name.test.js, test/integration-workflow.test.js and
 test/gate-workflow.test.js (the crash sweeps: a crash at every activity

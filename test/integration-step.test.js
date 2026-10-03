@@ -4752,8 +4752,12 @@ test("runGateAndIntegration: a record a live worker holds is refused before anyt
   git(repo, "checkout", "-q", "branch");
   const entry = { node_id: "task-claim", run_id: "11111111-2222-3333-4444-000000000089", attempt: 0 };
   const recordPath = dispatchRuns.runPaths(home, entry.run_id).record;
-  const held = { run_id: entry.run_id, node_id: entry.node_id, state: "done", cwd: repo, created_at: new Date().toISOString(), gate_state: "running", gate_at: "2026-09-02T10:00:00.000Z", gate_worker: "other-worker", gate_settle_id: "othertoken00000000000000" };
+  const held = { run_id: entry.run_id, node_id: entry.node_id, state: "done", cwd: repo, created_at: new Date().toISOString() };
   dispatchRuns.atomicJson(recordPath, held);
+  // The other worker's LEASE on the pipeline (the journaled claim).
+  const other = dispatchRuns.claimPipeline(home, entry.run_id, { workerId: "other-worker" });
+  assert.strictEqual(other.ok, true, other.refused);
+  const heldBytes = fs.readFileSync(recordPath, "utf8");
   const factory = {
     id: "factory-claim", trustedRef: "main", protectedPaths: [], riskClasses: {}, testLaneProfile: null, integration: null,
     gates: [{ id: "acceptance", kind: "command", command: "true", timeoutMs: 60000, cycles: 0, source: "inline", risk: [] }],
@@ -4765,9 +4769,9 @@ test("runGateAndIntegration: a record a live worker holds is refused before anyt
   const refused = await sporCli.runGateAndIntegration(cfg, entry, { cwd: repo, run_id: entry.run_id }, { ...base, log: (m) => logs.push(m), ownerLive: (w) => w === "other-worker" });
   assert.strictEqual(refused.not_run, true);
   assert.strictEqual(refused.superseded, true);
-  assert.strictEqual(refused.state, "running", "the record's own state is what the caller is handed");
+  assert.strictEqual(refused.state, "superseded", "no verdict of the caller's: the record's own (none yet) is what it is handed");
   assert.ok(logs.some((m) => /being gated right now by worker other-worker/.test(m)), logs.join(" | "));
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(recordPath, "utf8")), held, "the live owner's record is byte-for-byte untouched");
+  assert.strictEqual(fs.readFileSync(recordPath, "utf8"), heldBytes, "the live owner's record is byte-for-byte untouched");
   assert.deepStrictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-")), []);
   // Dead: taken over — the pipeline runs, settles under ITS token, and the corpse's is gone.
   const taken = await sporCli.runGateAndIntegration(cfg, entry, { cwd: repo, run_id: entry.run_id }, { ...base, log: () => {}, ownerLive: () => false });
@@ -4777,19 +4781,23 @@ test("runGateAndIntegration: a record a live worker holds is refused before anyt
   const after = JSON.parse(fs.readFileSync(recordPath, "utf8"));
   assert.strictEqual(after.gate_state, "passed");
   assert.strictEqual(after.gate_worker, "this-worker");
-  assert.notStrictEqual(after.gate_settle_id, held.gate_settle_id, "the ownership nonce is the taker's");
+  assert.ok(after.gate_settle_id && after.gate_settle_id !== other.token, "the ownership nonce is the taker's");
   assert.strictEqual(after.gate_attestation, taken.attestation);
   assert.ok(fs.readdirSync(nodes).some((f) => f.startsWith("art-gate-")));
   // A settle whose ownership was re-opened underneath it (a --regate between
   // the claim and the settle) does NOT land: the record is not the settler's.
-  const rerun = { run_id: entry.run_id, node_id: entry.node_id, state: "done", cwd: repo, created_at: new Date().toISOString(), gate_state: "running", gate_settle_id: null, gate_worker: null };
+  const rerun = { run_id: entry.run_id, node_id: entry.node_id, state: "done", cwd: repo, created_at: new Date().toISOString(), gate_state: "failed", gate_settle_id: after.gate_settle_id, gate_regate_count: 0 };
   dispatchRuns.atomicJson(recordPath, rerun);
-  const claim = dispatchRuns.claimGateRecord(home, entry.run_id, { workerId: "this-worker" });
-  assert.strictEqual(claim.ok, true);
-  dispatchRuns.stampGateState(home, entry.run_id, { gate_state: "running", gate_settle_id: null, gate_worker: null }, { force: true }); // the re-gate re-opens it
+  // This worker re-opens the refused run (a new attempt under a new lease)...
+  const claim = dispatchRuns.claimPipeline(home, entry.run_id, { workerId: "this-worker", ownerLive: () => false, reopen: { settleId: after.gate_settle_id, regateCount: 0, state: "failed" } });
+  assert.strictEqual(claim.ok, true, claim.refused);
+  assert.strictEqual(claim.record.gate_state, null, "the reopened attempt carries no verdict yet");
+  // ...and a --regate that read this worker as dead resumes the attempt underneath it: a new lease token replaces this worker's.
+  const reopened = dispatchRuns.claimPipeline(home, entry.run_id, { workerId: "regate", ownerLive: () => false, reopen: { settleId: claim.token, regateCount: 1, state: null, resume: true } });
+  assert.strictEqual(reopened.ok, true, reopened.refused);
   const stamped = dispatchRuns.stampGateState(home, entry.run_id, { gate_state: "passed", gate_settle_id: claim.token, gate_worker: "this-worker" }, { own: claim.token });
   assert.notStrictEqual(stamped.gate_settle_id, claim.token, "the stale owner's settle is refused");
-  assert.strictEqual(JSON.parse(fs.readFileSync(recordPath, "utf8")).gate_state, "running");
+  assert.strictEqual(JSON.parse(fs.readFileSync(recordPath, "utf8")).gate_state, null, "the reopened attempt carries no verdict until the new owner settles");
 });
 
 // The mirror: the SETTLER's own evidence stamp goes through stampGateState's

@@ -387,17 +387,20 @@ test("the attested step carries the fallback reviewer, and it is covered by the 
 
 // ------------------------------------------------------------ the work loop --
 
-test("the resume scan does not age out a pipeline paused past the run ceiling", () => {
-  const now = () => T0 + 30 * HOUR;
-  const record = { run_id: "run-1", node_id: "task-demo", state: "done", terminal_state: "resolved", terminal_enforced: true, finished_at: new Date(T0).toISOString(), gate_state: "interrupted", gate_paused_until: new Date(RESET).toISOString() };
-  const statuses = [{ worker_id: "w-dead", live: false, gating: [{ run_id: "run-1", node_id: "task-demo" }] }];
-  const found = workLoop.orphanedGateRuns(statuses, { records: new Map([["run-1", record]]), now, maxAgeMs: 24 * HOUR });
-  assert.deepStrictEqual(found.map((o) => o.run_id), ["run-1"]);
-  const unpaused = workLoop.orphanedGateRuns(statuses, { records: new Map([["run-1", { ...record, gate_paused_until: undefined }]]), now, maxAgeMs: 24 * HOUR });
-  assert.deepStrictEqual(unpaused, [], "an ordinary interrupted run still ages out as before");
+test("the resume scan re-offers a paused pipeline at its wake and does not age it out past the run ceiling", () => {
+  // The pause rides the parked journal (its yield's `paused_until` IS the
+  // durable timer); the scan reads it off the projection, never the record.
+  const record = { run_id: "run-1", node_id: "task-demo", state: "done", terminal_state: "resolved", terminal_enforced: true, finished_at: new Date(T0).toISOString() };
+  const lease = { token: "t", worker: "w-dead", factory: null, attempt: 0, at: record.finished_at, expires_at: "2099-01-01T00:00:00.000Z", renewed_at: null, released_at: record.finished_at };
+  const paused = { stages: [{ status: "parked" }], current: { stage: "gates-a0", kind: "gates", attempt: 0, status: "parked", state: "interrupted", due: RESET, reoffers: 0, parked: { state: "interrupted", reason: "the review lane profile-codex-review is out", paused_until: RESET, paused_profile: "profile-codex-review" } }, open: "gates-a0" };
+  const scan = (projection, now) => workLoop.openPipelines([{ record, lease, projection, factory: null }], { now: () => now, maxAgeMs: 24 * HOUR });
+  assert.deepStrictEqual(scan(paused, T0 + 30 * HOUR), [], "inside the pause: not due, not re-offered");
+  assert.deepStrictEqual(scan(paused, RESET + HOUR).map((o) => o.run_id), ["run-1"], "past the wake: re-offered, though the run ended 45h ago");
+  const unpaused = { ...paused, current: { ...paused.current, due: 0, parked: { state: "interrupted", reason: "evidence pending" } } };
+  assert.deepStrictEqual(scan(unpaused, RESET + HOUR), [], "an ordinary interrupted run still ages out as before");
 });
 
-test("the loop parks a PAUSED pipeline until its wake — not the retry window — and its slot takes other work meanwhile", async () => {
+test("the loop frees a PAUSED pipeline's slot and stamps nothing; the scan re-offers it at its wake — not the retry window — and the slot takes other work meanwhile", async () => {
   const marks = [];
   const logs = [];
   const state = { clock: T0, ticks: 0 };
@@ -416,13 +419,15 @@ test("the loop parks a PAUSED pipeline until its wake — not the retry window �
     },
     pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: id.replace(/^run-/, ""), state: "done", terminal_state: "resolved", terminal_enforced: true } })),
     gate: async (entry) => {
-      calls.push({ at: state.clock, node: entry.node_id });
+      calls.push({ at: state.clock, node: entry.node_id, resumed: !!entry.resumed });
       if (entry.node_id === "task-a" && calls.filter((c) => c.node === "task-a").length === 1) {
         return { state: "interrupted", outage_interrupted: true, gates: [], facts: [], reason: "the review lane profile-codex-review is out", paused_until: wakeAt, paused_profile: "profile-codex-review" };
       }
       if (entry.node_id === "task-a") control.stopping = true;
       return { state: "passed", gates: [], facts: [] };
     },
+    // What openPipelines reports: the parked journal, due at its wake.
+    pendingGates: async () => (calls.filter((c) => c.node === "task-a").length === 1 && state.clock >= wakeAt ? [{ run_id: "run-task-a", node_id: "task-a", harness: "fake", record: { run_id: "run-task-a", node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true }, reoffers: 0, reason: "the review lane profile-codex-review is out", escalate: false }] : []),
     markGate: (runId, patch) => {
       marks.push({ run_id: runId, ...patch });
       return { run_id: runId, state: "done", terminal_state: "resolved", terminal_enforced: true, ...patch };
@@ -433,15 +438,16 @@ test("the loop parks a PAUSED pipeline until its wake — not the retry window �
       if ((state.ticks += 1) >= 200) control.stopping = true; // a backstop
     },
   };
-  await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, maxIntervalMs: 60000, retryAfterMs: 5000 }, deps, control });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, maxIntervalMs: 60000, retryAfterMs: 5000 }, deps, control });
   const a = calls.filter((c) => c.node === "task-a");
   assert.strictEqual(a.length, 2, logs.join("\n"));
   assert.ok(a[1].at >= wakeAt, `re-offered at the wake, not after the ${5}s retry window (after ${(a[1].at - a[0].at) / 1000}s)`);
+  assert.strictEqual(a[1].resumed, true);
   assert.ok(dispatched.includes("task-b") && calls.find((c) => c.node === "task-b").at < wakeAt, "the freed slot took other work during the pause");
-  const pausedMark = marks.find((m) => m.run_id === "run-task-a" && m.gate_state === "interrupted");
-  assert.strictEqual(pausedMark.gate_paused_until, new Date(wakeAt).toISOString(), "the wake rides the run record");
-  assert.strictEqual(pausedMark.gate_paused_profile, "profile-codex-review");
-  assert.ok(logs.some((l) => /gates paused until/.test(l)), logs.join("\n"));
+  assert.deepStrictEqual(marks.filter((m) => m.run_id === "run-task-a").map((m) => m.gate_state), ["passed"], "no transitional stamp; the pause rides the journal");
+  assert.ok(logs.some((l) => /gates paused until/.test(l) && /slot freed, re-offered then/.test(l)), logs.join("\n"));
+  const entry = status.recent.find((r) => r.run_id === "run-task-a");
+  assert.strictEqual(entry.gate, "passed");
 });
 
 test("a gate fact with no reviewer route renders exactly as if the field did not exist", () => {
@@ -481,72 +487,9 @@ test("a stopping worker records the fallback route but dispatches nothing under 
   assert.strictEqual(w.seen.pools.retry.spent, 1);
 });
 
-// ------------------------------------- the parked re-offer cap (1abaa30) --
-//
-// How a reviewer pause and a fallback hand-off combine with
-// task-spor-work-loop-parked-reoffer-cap: a pause inside its bound is a known,
-// time-boxed outage and is not counted; an expired pause or an outage with no
-// stated reset counts as usual and still escalates at the cap; a fallback
-// hand-off is a fresh attempt, never a re-offer.
-function capLoop({ results, max = 3 }) {
-  const marks = [];
-  const logs = [];
-  const escalations = [];
-  const state = { clock: T0, ticks: 0, record: { run_id: "run-task-a", node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true } };
-  const control = { stopping: false, reason: null, wake: () => {} };
-  let dispatched = false;
-  let call = 0;
-  const deps = {
-    now: () => state.clock,
-    log: (l) => logs.push(l),
-    publish: () => {},
-    candidates: async () => (dispatched ? [] : [{ id: "task-a", readiness: "agent" }]),
-    dispatch: async () => ((dispatched = true), { ok: true, run: { run_id: "run-task-a", harness: "fake" } }),
-    pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { ...state.record } })),
-    gate: async () => {
-      const r = results(call++, state.clock);
-      if (!r) { control.stopping = true; return { state: "passed", gates: [], facts: [] }; }
-      return r;
-    },
-    markGate: (runId, patch) => {
-      marks.push({ ...patch });
-      state.record = { ...state.record, ...patch };
-      return { ...state.record };
-    },
-    escalateParked: async (args) => { escalations.push(args); control.stopping = true; return { ok: true, id: "task-gate-parked-x" }; },
-    sleep: async (ms) => {
-      state.clock += ms;
-      await new Promise((r) => setImmediate(r));
-      if ((state.ticks += 1) >= 400) control.stopping = true;
-    },
-  };
-  return { deps, control, marks, logs, escalations, state, run: () => workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, maxIntervalMs: 60000, retryAfterMs: 5000, parkedReofferMax: max }, deps, control }) };
-}
-const PAUSED = (at) => ({ state: "interrupted", outage_interrupted: true, gates: [], facts: [], reason: "the review lane profile-codex-review is out", paused_until: at + 10 * 60000, paused_profile: "profile-codex-review" });
+// The parked re-offer cap (task-spor-work-loop-parked-reoffer-cap) is now a
+// reading of the JOURNAL — consecutive identical yields, with a pause inside
+// its bound skipped and a fallback hand-off resetting the count — pinned in
+// test/stage-projection.test.js (consecutiveYields) and acted on by the loop in
+// test/gate-pipeline.test.js ("re-offer cap"). Nothing here stamps a count.
 
-test("re-offer cap: a pause inside its bound is NOT counted, however many times it recurs", async () => {
-  const w = capLoop({ results: (n, at) => (n < 5 ? PAUSED(at) : null), max: 3 });
-  await w.run();
-  assert.strictEqual(w.escalations.length, 0, "five identical pauses never reach a cap of 3");
-  assert.ok(w.marks.every((m) => m.gate_interrupt_count === undefined), "a pause stamps no count");
-  assert.strictEqual(w.marks.filter((m) => m.gate_paused_until).length, 5);
-});
-
-test("re-offer cap: an expired pause or an outage with no stated reset IS counted, and escalates with the cap", async () => {
-  const noReset = { state: "interrupted", outage_interrupted: true, gates: [], facts: [], reason: "the worker was asked to stop while gate review waited" };
-  const w = capLoop({ results: (n, at) => (n === 0 ? { ...noReset, paused_until: at - 1000 } : noReset), max: 3 });
-  await w.run();
-  assert.deepStrictEqual(w.marks.filter((m) => m.gate_interrupt_count != null).map((m) => m.gate_interrupt_count), [1, 2, 3]);
-  assert.strictEqual(w.escalations.length, 1, "the cap escalates to a person as before");
-  assert.strictEqual(w.escalations[0].count, 3);
-});
-
-test("re-offer cap: a fallback hand-off is a fresh attempt — it resets the count, never increments it", async () => {
-  const plain = { state: "interrupted", gates: [], facts: [], reason: "flake occurrence evidence is pending graph publication" };
-  const handoff = { state: "interrupted", outage_interrupted: true, fallback_route: true, gates: [], facts: [], reason: "routed to the fallback profile-claude-review" };
-  const seq = [plain, plain, handoff, plain, plain];
-  const w = capLoop({ results: (n) => seq[n] || null, max: 3 });
-  await w.run();
-  assert.deepStrictEqual(w.marks.filter((m) => m.gate_state === "interrupted").map((m) => m.gate_interrupt_count), [1, 2, 0, 1, 2], "the hand-off restarts the count, so the cap of 3 is never reached");
-  assert.strictEqual(w.escalations.length, 0);
-});

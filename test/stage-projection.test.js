@@ -109,6 +109,12 @@ test("a settled gate journal projects to its verdicts, the judged head, the ledg
     assert.match(p2.stages[1].parked.reason, /different or unknown graph/);
     assert.deepEqual([p2.current.stage, p2.current.status], ["gates-a1", "parked"], "the open stage is the current one");
     assert.equal(sp.describeRun(p2)[1], "  journal:    gates a1 — parked — pending flake evidence belongs to a different or unknown graph");
+    // A parked stage says when it is due back (its own timer) and how many
+    // times it yielded this way; the scan reads the same fields.
+    assert.match(sp.describeRun(p2)[2], /^\s+due \d{4}-.*; yielded 1 time\(s\) in a row for this reason$/);
+    assert.ok(p2.stages[1].due > 0, "the yield's durable timer is the due time");
+    assert.equal(p2.stages[1].reoffers, 1);
+    assert.equal(p2.open, "gates-a1");
 
     // A TOMBSTONED journal (a refused attempt).
     const tombAbs = path.join(runs.runPaths(home, RUN).workflows, "gates-a2.workflow.jsonl");
@@ -117,7 +123,7 @@ test("a settled gate journal projects to its verdicts, the judged head, the ledg
     h.persist({ kind: "tombstone", reason: "definition_mismatch", detail: { reason: "definition_mismatch", detail: "edited mid-flight" } });
     const p3 = sp.projectRun(home, record);
     assert.deepEqual(p3.stages[2] && [p3.stages[2].stage, p3.stages[2].status, p3.stages[2].tombstone.reason], ["gates-a2", "tombstoned", "definition_mismatch"]);
-    assert.equal(sp.describeRun(p3)[2], "  journal:    gates a2 — refused (definition_mismatch)");
+    assert.equal(sp.describeRun(p3)[3], "  journal:    gates a2 — refused (definition_mismatch)");
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
@@ -297,15 +303,226 @@ test("projectRun.gates reflects only the latest attempt's gate set; a gate a lat
   }
 });
 
-test("claimGateRecord refuses a new attempt over owed flake evidence WITHOUT an owesEvidence override (the callee reads the projection)", () => {
+test("claimPipeline refuses a new attempt over owed flake evidence WITHOUT an owesEvidence override (the callee reads the projection; a boolean override is ignored)", () => {
   const home = scratch();
   try {
     const file = runs.runPaths(home, RUN).record;
-    runs.atomicJson(file, { run_id: RUN, node_id: "task-demo", gate_state: "running", gate_settle_id: "o", gate_worker: "w1", gate_regate_count: 0 });
-    sp.writeGateProgress(home, RUN, { gates: { acceptance: { evidence: { complete: false, gate: { id: "acceptance" } } } } }, { key: RUN, attempt: 1, own: "o" });
-    const claim = runs.claimGateRecord(home, RUN, { workerId: "w2", reopen: { settleId: "o", regateCount: 0, state: "running" } });
+    runs.atomicJson(file, { run_id: RUN, node_id: "task-demo", gate_regate_count: 0 });
+    const first = runs.claimPipeline(home, RUN, { workerId: "w1" });
+    assert.equal(first.ok, true, first.refused);
+    sp.writeGateProgress(home, RUN, { gates: { acceptance: { evidence: { complete: false, gate: { id: "acceptance" } } } } }, { key: RUN, attempt: 1, own: first.token });
+    const reopen = { settleId: first.token, regateCount: 0, state: null };
+    const claim = runs.claimPipeline(home, RUN, { workerId: "w2", reopen });
     assert.equal(claim.ok, false);
     assert.match(claim.refused, /flake occurrence publication is still owed/);
+    // Point 7 of the slice: `owesEvidence: false` is NOT an override — only a
+    // function of the fresh record is read; a boolean falls back to the projection.
+    const ignored = runs.claimPipeline(home, RUN, { workerId: "w2", reopen, owesEvidence: false });
+    assert.equal(ignored.ok, false);
+    assert.match(ignored.refused, /flake occurrence publication is still owed/);
+    const fn = runs.claimPipeline(home, RUN, { workerId: "w2", reopen, owesEvidence: () => false });
+    assert.equal(fn.ok, true, fn.refused);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---------------- the pipeline lease (task-spor-delete-loop-resume-machinery-after-workflow-stages) ----------------
+
+test("the pipeline lease is a journaled claim beside the stage journals: claimed, renewed, released; held only while unexpired, unreleased and its worker live", () => {
+  const home = scratch();
+  try {
+    const file = runs.runPaths(home, RUN).record;
+    runs.atomicJson(file, { run_id: RUN, node_id: "task-demo", state: "done", terminal_state: "resolved", terminal_enforced: true });
+    assert.equal(sp.pipelineLease(home, { run_id: RUN }), null, "no claim yet");
+    const t0 = Date.parse("2026-10-03T10:00:00Z");
+    const claim = runs.claimPipeline(home, RUN, { workerId: "w1", factory: "factory-x", nowMs: () => t0, now: () => new Date(t0).toISOString() });
+    assert.equal(claim.ok, true, claim.refused);
+    assert.ok(fs.existsSync(sp.pipelineLogPath(home, { run_id: RUN })), "the lease log sits beside the stage journals");
+    const lease = sp.pipelineLease(home, { run_id: RUN });
+    assert.deepEqual([lease.token, lease.worker, lease.factory, lease.attempt, lease.released_at], [claim.token, "w1", "factory-x", 0, null]);
+    assert.equal(Date.parse(lease.expires_at), t0 + sp.PIPELINE_LEASE_TTL_MS);
+    // The record carries NO transitional state: no gate_state, no gate_settle_id.
+    const rec = runs.readJson(file);
+    assert.equal(rec.gate_state, undefined);
+    assert.equal(rec.gate_settle_id, undefined);
+    assert.equal(rec.gate_worker, undefined);
+    // Held while the worker is live and the TTL has not passed.
+    assert.equal(sp.leaseHeld(lease, { now: () => t0 + 1000, ownerLive: () => true }), true);
+    assert.equal(sp.leaseHeld(lease, { now: () => t0 + 1000, ownerLive: () => false }), false, "a dead worker's lease is open");
+    assert.equal(sp.leaseHeld(lease, { now: () => t0 + sp.PIPELINE_LEASE_TTL_MS + 1, ownerLive: () => true }), false, "an expired lease is open even under a live worker");
+    // A second worker cannot take a held lease; a dead owner's is taken over.
+    const rival = runs.claimPipeline(home, RUN, { workerId: "w2", ownerLive: () => true, nowMs: () => t0 + 1000 });
+    assert.equal(rival.ok, false);
+    assert.match(rival.refused, /being gated right now by worker w1/);
+    assert.match(runs.claimPipeline(home, RUN, { ownerLive: () => true, nowMs: () => t0 + 1000 }).refused, /being gated right now/, "a caller with no worker id is a stranger to every lease");
+    assert.equal(sp.pipelineLease(home, { run_id: RUN }).token, claim.token, "a refused claim appends nothing that reads back");
+    // Renewal moves the expiry; only the holder renews.
+    const renewed = runs.renewPipeline(home, RUN, { workerId: "w1", nowMs: () => t0 + 60000 });
+    assert.equal(renewed.ok, true);
+    assert.equal(Date.parse(renewed.lease.expires_at), t0 + 60000 + sp.PIPELINE_LEASE_TTL_MS);
+    assert.equal(runs.renewPipeline(home, RUN, { workerId: "w2" }).ok, false, "another worker renews nothing");
+    // Release: the lease reads open at once, whatever the TTL says.
+    assert.equal(runs.releasePipeline(home, RUN, "not-the-token").ok, false);
+    assert.equal(runs.releasePipeline(home, RUN, claim.token).ok, true);
+    const released = sp.pipelineLease(home, { run_id: RUN });
+    assert.ok(released.released_at);
+    assert.equal(sp.leaseHeld(released, { now: () => t0 + 1000, ownerLive: () => true }), false);
+    assert.equal(runs.releasePipeline(home, RUN, claim.token).ok, false, "a release is once");
+    // The settle's compare-and-swap reads the lease: the holder's `own` lands,
+    // a stranger's does not; a re-claim replaces the token.
+    assert.equal(runs.stampGateState(home, RUN, { gate_fix_run_id: "fix-1" }, { own: "stranger" }).gate_fix_run_id, undefined);
+    assert.equal(runs.stampGateState(home, RUN, { gate_fix_run_id: "fix-1" }, { own: claim.token }).gate_fix_run_id, "fix-1");
+    const taker = runs.claimPipeline(home, RUN, { workerId: "w2", factory: "factory-x", ownerLive: () => true, nowMs: () => t0 + 2000 });
+    assert.equal(taker.ok, true, taker.refused);
+    assert.equal(runs.stampGateState(home, RUN, { gate_fix_run_id: "fix-2" }, { own: claim.token }).gate_fix_run_id, "fix-1", "the old token no longer owns the pipeline");
+    assert.equal(runs.stampGateState(home, RUN, { gate_fix_run_id: "fix-2" }, { own: taker.token }).gate_fix_run_id, "fix-2");
+    // The ledger writer's unowned arm refuses a pipeline that has ever been claimed.
+    assert.match(sp.writeGateProgress(home, RUN, { gates: {} }, { key: RUN, attempt: 1 }).reason, /owner changed/);
+    assert.equal(sp.writeGateProgress(home, RUN, { gates: {} }, { key: RUN, attempt: 1, own: taker.token }).ok, true);
+    // The projection carries the lease and describes it.
+    const p = sp.projectRun(home, runs.readJson(file));
+    assert.equal(p.lease.token, taker.token);
+    assert.ok(sp.describeRun(p).some((l) => /^\s+lease:\s+held by w2 until .* \(factory factory-x\)$/.test(l)), sp.describeRun(p).join("\n"));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a reopen is a compare-and-swap on the lease token, the attempt and the state, and only a new attempt moves gate_regate_count", () => {
+  const home = scratch();
+  try {
+    const file = runs.runPaths(home, RUN).record;
+    runs.atomicJson(file, { run_id: RUN, node_id: "task-demo", gate_state: "failed", gate_settle_id: "settled-nonce", gate_regate_count: 0 });
+    // A record settled before any lease: its gate_settle_id is the current token.
+    assert.equal(runs.claimPipeline(home, RUN, { workerId: "w", reopen: { settleId: "other", regateCount: 0, state: "failed" } }).refused, "the prior judgement changed before re-gate could claim it");
+    const re = runs.claimPipeline(home, RUN, { workerId: "w", reopen: { settleId: "settled-nonce", regateCount: 0, state: "failed" } });
+    assert.equal(re.ok, true, re.refused);
+    assert.equal(re.record.gate_regate_count, 1, "a new attempt");
+    assert.equal(re.record.gate_state, null, "the prior verdict is cleared");
+    assert.equal(re.record.gate_settle_id, null, "and so is the prior settle nonce — a stale nonce never stands in for the lease");
+    assert.equal(re.lease.attempt, 1);
+    assert.equal(re.lease.reopen, true);
+    // Settled again under the new token; a RESUME keeps the attempt.
+    runs.stampGateState(home, RUN, { gate_state: "failed", gate_settle_id: re.token }, { own: re.token });
+    assert.match(runs.claimPipeline(home, RUN, { workerId: "w", reopen: { settleId: re.token, regateCount: 1, state: "failed", resume: true } }).refused, /no unsettled attempt to resume/);
+    runs.stampGateState(home, RUN, { gate_state: null }, { own: re.token, force: true });
+    const resumed = runs.claimPipeline(home, RUN, { workerId: "w", reopen: { settleId: re.token, regateCount: 1, state: null, resume: true } });
+    assert.equal(resumed.ok, true, resumed.refused);
+    assert.equal(resumed.record.gate_regate_count, 1, "a resume opens no new attempt");
+    assert.equal(resumed.lease.resume, true);
+    // A settled pass/park/superseded is never reopened.
+    runs.stampGateState(home, RUN, { gate_state: "passed" }, { own: resumed.token });
+    assert.match(runs.claimPipeline(home, RUN, { workerId: "w", reopen: { settleId: resumed.token, regateCount: 1, state: "passed" } }).refused, /already settled as 'passed'/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---------------- yields, due times and the re-offer count ----------------
+
+function yieldJournal(entries) {
+  return entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+}
+const Y = (n, result, { at = null, timer = null } = {}) => [
+  { kind: "effect", key: `${RUN}/gates/a0/e${n}/yield/yield#1`, result },
+  ...(at != null ? [{ kind: "now", key: `${RUN}/gates/a0/e${n}/yield/now#1`, at }] : []),
+  ...(timer != null ? [{ kind: "timer", key: `${RUN}/gates/a0/e${n}/yield/timer#1`, fireAt: timer }] : []),
+];
+
+test("projectJournal reads a parked journal's yields: the due time is the last yield's timer, and `reoffers` counts consecutive identical reasons — a pause inside its bound is skipped, a fallback hand-off resets", () => {
+  const t = Date.parse("2026-10-03T12:00:00Z");
+  const base = [{ kind: "version", spec: 1, workflow: "gates", version: 3 }, { kind: "effect", key: `${RUN}/gates/a0/e0/open#1`, result: { digest: "d", opened_at: "2026-10-03T11:00:00.000Z" } }];
+  const same = { state: "interrupted", reason: "flake occurrence evidence is pending graph publication" };
+  // Three identical yields, the last with its timer: due at the timer, three re-offers.
+  let p = sp.projectJournal([...base, ...Y(0, same, { at: t, timer: t + 1000 }), ...Y(1, same, { at: t + 2000, timer: t + 3000 }), ...Y(2, same, { at: t + 4000, timer: t + 5000 })]);
+  assert.deepEqual([p.status, p.state, p.due, p.reoffers, p.opened_at], ["parked", "interrupted", t + 5000, 3, "2026-10-03T11:00:00.000Z"]);
+  assert.equal(p.yields.length, 3);
+  // A yield with no timer behind it (a crash between the two) is due now.
+  p = sp.projectJournal([...base, ...Y(0, same, { at: t })]);
+  assert.deepEqual([p.status, p.due, p.reoffers], ["parked", 0, 1]);
+  // A differing reason breaks the run.
+  p = sp.projectJournal([...base, ...Y(0, same, { at: t, timer: t + 1 }), ...Y(1, { state: "interrupted", reason: "another" }, { at: t + 2, timer: t + 3 }), ...Y(2, same, { at: t + 4, timer: t + 5 })]);
+  assert.equal(p.reoffers, 1);
+  // A pause inside its bound neither counts nor breaks; an expired one counts.
+  const paused = { ...same, paused_until: t + 600000, paused_profile: "profile-codex-review" };
+  p = sp.projectJournal([...base, ...Y(0, same, { at: t, timer: t + 1 }), ...Y(1, paused, { at: t + 2, timer: t + 600000 }), ...Y(2, same, { at: t + 600001, timer: t + 600002 })]);
+  assert.equal(p.reoffers, 2, "the pause is skipped, the count continues across it");
+  p = sp.projectJournal([...base, ...Y(0, paused, { at: t, timer: t + 600000 })]);
+  assert.deepEqual([p.reoffers, p.due], [0, t + 600000], "a pause alone is not a re-offer; it is due at its wake");
+  p = sp.projectJournal([...base, ...Y(0, { ...same, paused_until: t - 1000 }, { at: t, timer: t + 1 })]);
+  assert.equal(p.reoffers, 1, "an expired pause counts");
+  // A fallback hand-off starts the count again.
+  p = sp.projectJournal([...base, ...Y(0, same, { at: t, timer: t + 1 }), ...Y(1, same, { at: t + 2, timer: t + 3 }), ...Y(2, { state: "interrupted", reason: "routed to the fallback", fallback_route: true }, { at: t + 4, timer: t + 5 }), ...Y(3, same, { at: t + 6, timer: t + 7 })]);
+  assert.equal(p.reoffers, 1);
+  assert.equal(sp.consecutiveYields([]), 0);
+  // The settled closing entry of the integration and implementation stages.
+  const closed = sp.projectJournal([{ kind: "effect", key: `${RUN}/integration/open`, result: { opened_at: "2026-10-03T11:00:00.000Z" } }, { kind: "effect", key: `${RUN}/integration/settled`, result: { state: "failed" } }]);
+  assert.deepEqual([closed.status, closed.state], ["settled", "failed"]);
+  const impl = sp.projectJournal([{ kind: "effect", key: `${RUN}/implementation/open`, result: {} }, { kind: "effect", key: `${RUN}/implementation/settled`, result: { state: "candidate" } }]);
+  assert.deepEqual([impl.status, impl.state], ["settled", "candidate"]);
+});
+
+test("same-attempt re-gate children order by their journaled opened_at, not by mtime; a corrupt gate journal is flagged by latestProgress and projectRun, never skipped in silence", () => {
+  const home = scratch();
+  try {
+    const record = { run_id: RUN };
+    const runDir = runs.runPaths(home, RUN).workflows;
+    fs.mkdirSync(runDir, { recursive: true });
+    const judge = (head, verdict, openedAt) => yieldJournal([
+      { kind: "effect", key: `${RUN}/gates/a0/e0/open#1`, result: { digest: "d", opened_at: openedAt } },
+      { kind: "effect", key: `${RUN}/gates/a0/e0/judge/r0/acceptance/c0/judge#1`, result: { outcome: { verdict, passed: verdict === "passed", head } } },
+    ]);
+    const older = `gates-regate-${"f".repeat(40)}-a0.workflow.jsonl`;
+    const newer = `gates-regate-${"0".repeat(40)}-a0.workflow.jsonl`;
+    fs.writeFileSync(path.join(runDir, older), judge("f".repeat(40), "failed", "2026-10-03T10:00:00.000Z"));
+    fs.writeFileSync(path.join(runDir, newer), judge("0".repeat(40), "passed", "2026-10-03T10:05:00.000Z"));
+    // mtime says the OPPOSITE of opened_at: the newer-opened file is older on disk.
+    const t0 = Date.parse("2026-10-03T00:00:00Z") / 1000;
+    fs.utimesSync(path.join(runDir, newer), t0, t0);
+    fs.utimesSync(path.join(runDir, older), t0 + 600, t0 + 600);
+    assert.deepEqual(sp.stageJournals(home, record).map((j) => j.head[0]), ["f", "0"], "opened_at wins over mtime");
+    assert.deepEqual(sp.projectRun(home, record).gates.map((g) => [g.verdict, g.head[0]]), [["passed", "0"]], "the LAST-opened re-gate's verdict stands");
+
+    // A corrupt interior line in a gate journal: reported, not skipped.
+    fs.writeFileSync(path.join(runDir, "gates-a0.workflow.jsonl"), '{"kind":"version"}\n{not json\n{"kind":"effect","key":"x/saveGateProgress#1","result":{"key":"k"}}\n');
+    const lp = sp.latestProgress(home, record);
+    assert.equal(lp.unreadable.length, 1);
+    assert.match(lp.unreadable[0].error, /corrupt at line 2/);
+    const p = sp.projectRun(home, record);
+    assert.ok(p.unreadable.some((u) => /gates-a0/.test(u.path)));
+    assert.ok(sp.describeRun(p).some((l) => /gates-a0 — UNREADABLE/.test(l)));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("openPipelineCandidates: a record is a candidate only when a lease, a stage journal or a gate-armed dispatch (gate_factory / impl_claim.factory) says a pipeline was owed", () => {
+  const home = scratch();
+  try {
+    const mk = (id, extra = {}) => {
+      const r = { run_id: id, node_id: `task-${id}`, state: "done", terminal_state: "resolved", terminal_enforced: true, ...extra };
+      runs.atomicJson(runs.runPaths(home, id).record, r);
+      return r;
+    };
+    const bare = mk("run-bare");
+    const stamped = mk("run-stamped", { gate_factory: "factory-x" });
+    const claimed = mk("run-claimed");
+    runs.claimPipeline(home, "run-claimed", { workerId: "w", factory: "factory-y" });
+    const journaled = mk("run-journaled");
+    fs.mkdirSync(runs.runPaths(home, "run-journaled").workflows, { recursive: true });
+    fs.writeFileSync(path.join(runs.runPaths(home, "run-journaled").workflows, "gates-a0.workflow.jsonl"), "");
+    const controller = mk("run-controller", { impl_claim: { store: "local", tenant: "local", execution_id: "exec-c", factory: { node_id: "factory-z" } } });
+    const out = sp.openPipelineCandidates(home, [bare, stamped, claimed, journaled, controller]);
+    assert.deepEqual(out.map((c) => [c.record.run_id, c.factory]).sort(), [["run-claimed", "factory-y"], ["run-controller", "factory-z"], ["run-journaled", null], ["run-stamped", "factory-x"]]);
+    assert.ok(out.every((c) => c.projection && Array.isArray(c.projection.stages)));
+    assert.equal(out.find((c) => c.record.run_id === "run-claimed").lease.worker, "w");
+    // The bridge: a run a dead gate-armed worker's status file names (`owedBy`)
+    // is a candidate under that worker's factory even with none of the above —
+    // a record dispatched before the `gate_factory` stamp existed.
+    const bridged = sp.openPipelineCandidates(home, [bare], { owedBy: new Map([["run-bare", "factory-old"]]) });
+    assert.deepEqual(bridged.map((c) => [c.record.run_id, c.factory]), [["run-bare", "factory-old"]]);
+    assert.deepEqual(sp.openPipelineCandidates(home, [bare], { owedBy: new Map([["run-other", "factory-old"]]) }), [], "a map that does not name the run admits nothing");
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

@@ -928,7 +928,10 @@ function describeExecutionHolder(home, executionId) {
   try {
     const rec = dispatchRuns.readRunRecords(home).find((r) => r.impl_claim && r.impl_claim.execution_id === executionId);
     if (rec) {
-      const live = rec.gate_worker && workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === rec.gate_worker);
+      // Live iff the run's pipeline LEASE is held by a worker live on this
+      // box (stage-projection.js pipelineLease) — the journaled claim, never
+      // a record stamp (task-spor-delete-loop-resume-machinery-after-workflow-stages).
+      const live = pipelineHeldLive(home, rec);
       stale = !live;
       where = live ? `run ${String(rec.run_id).slice(0, 8)}, its worker is live` : `STALE — run ${String(rec.run_id).slice(0, 8)} on this box, its worker is gone; a same-factory 'spor work' resumes it`;
     }
@@ -10466,7 +10469,6 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
     // 'spor runs <that id>' is how a human (or a restarted 'spor work') finds
     // out whether it is still going.
     if (r.gate_state) out(`  gate:       ${r.gate_state}${r.gate_reason ? ` — ${r.gate_reason}` : ""}`);
-    if (r.gate_paused_until && r.gate_state === "interrupted") out(`  paused:     until ${r.gate_paused_until}${r.gate_paused_profile ? ` (review lane ${r.gate_paused_profile})` : ""}`);
     if (r.gate_head) out(`  gated head: ${r.gate_head}${r.gate_landed_sha ? ` (landed ${String(r.gate_landed_sha).slice(0, 12)})` : ""}`);
     if (r.gate_attestation) out(`  attested:   ${r.gate_attestation}`);
     // A run that PROMISED an attestation and has none says so here, never
@@ -10478,7 +10480,7 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
     if (r.gate_attestation_missing) out(`  attested:   MISSING — ${r.gate_attestation_error || "the attestation was not recorded"}`);
     if (r.gate_proposal_attestation_stale) out(`  proposal:   PR body carries a STALE attestation${r.gate_proposal_attestation ? ` (graph copy ${r.gate_proposal_attestation})` : ""}${r.gate_proposal_attestation_error ? ` — ${r.gate_proposal_attestation_error}` : ""}`);
     if (r.gate_fix_run_id) {
-      out(`  fix cycle:  run ${String(r.gate_fix_run_id).slice(0, 8)} — 'spor runs ${r.gate_fix_run_id}' follows it${r.gate_state === "interrupted" ? " (left running by a stopped worker)" : ""}`);
+      out(`  fix cycle:  run ${String(r.gate_fix_run_id).slice(0, 8)} — 'spor runs ${r.gate_fix_run_id}' follows it`);
     }
     // What the run's STAGE JOURNALS say (task-spor-run-surfaces-read-stage-
     // journal): each stage's status per attempt, the last verdict per gate,
@@ -10992,10 +10994,18 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
   // unsatisfiable profile, a launcher that does not resolve) clears the hold
   // through the same door, so a refused item is never left held.
   const controller = !!(factory && factory.completion && factory.completion.by === "controller");
-  if (!controller) return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], dispatchOpts);
+  // WHICH factory dispatched this run rides the record from its creation
+  // (`gate_factory`, task-spor-delete-loop-resume-machinery-after-workflow-
+  // stages): a gate-armed worker killed while the run was still in flight
+  // never starts its pipeline, so there is no journal and no lease to say the
+  // run was owed a gate — the stamp is what the resume scan reads for that
+  // case (openPipelineCandidates). A bare worker stamps nothing, and its runs
+  // are never adopted.
+  const gateFactory = factory && factory.id ? { gate_factory: factory.id } : null;
+  if (!controller) return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { ...(gateFactory ? { recordFields: gateFactory } : {}), ...dispatchOpts });
   const held = await claimExecutionHold(cfg, item, factory, { home, log });
   if (!held.ok) return { ok: false, reason: held.reason };
-  const launched = await dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { recordFields: held.recordFields, ...dispatchOpts });
+  const launched = await dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { recordFields: { ...(held.recordFields || {}), ...(gateFactory || {}) }, ...dispatchOpts });
   // The store's copy of the launch (task-spor-client-execution-store-adapter):
   // the attempt row learns its run id, or — I2 — the execution is ended with
   // the hold, so neither the item pointer nor a server's resolving-edge gate
@@ -12649,8 +12659,16 @@ function makeGateDeps(...args) {
 // count is deliberately NOT in the content: it rises on every re-offer, so a
 // retried filing (a write that landed but timed out, a worker stopped
 // mid-escalation) would otherwise collide with its own earlier node forever.
-async function escalateParkedPipeline(cfg, { run_id: runId, node_id: nodeId, project = null, reason = "", record = null }, { slug = null } = {}) {
+async function escalateParkedPipeline(cfg, { run_id: runId, node_id: nodeId, project = null, reason = "", record = null, worker = null }, { slug = null, home = cfg.userConfigHome(), factory = null } = {}) {
   const rec = record || {};
+  // OWN the pipeline before writing for it, exactly as a pipeline run does
+  // (claimPipeline): the escalation writes a blocker, a demotion and — through
+  // the loop — the settled verdict, and a `--regate` or another worker that
+  // claimed the lease meanwhile must not have those land on top of its
+  // attempt. A refused claim files nothing; the next re-offer tries again.
+  const ownerLive = (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner);
+  const claim = dispatchRuns.claimPipeline(home, runId, { workerId: worker, factory, ownerLive });
+  if (claim.refused) return { ok: false, reason: `the pipeline is ${claim.refused}`, superseded: true };
   const attemptKey = Number(rec.gate_regate_count) || 0;
   const short = gateRunner.shortRunAttempt(runId);
   const id = `task-gate-parked-${gateStem(nodeId)}-${short}-${gateIdSuffix("parked", nodeId, runId, `${attemptKey}\n${reason}`)}`.toLowerCase();
@@ -12688,13 +12706,20 @@ async function escalateParkedPipeline(cfg, { run_id: runId, node_id: nodeId, pro
       edges: [{ type: "blocks", to: nodeId }],
     })
   );
-  if (!written || !written.ok) return { ok: false, reason: (written && written.reason) || "the escalation could not be written" };
+  if (!written || !written.ok) {
+    // Nothing filed: hand the lease back so the next re-offer — this worker's
+    // or another's — can try again without waiting out the TTL.
+    if (claim.ok) { try { dispatchRuns.releasePipeline(home, runId, claim.token); } catch { /* lapses on its TTL */ } }
+    return { ok: false, reason: (written && written.reason) || "the escalation could not be written" };
+  }
   let demote = null;
   try {
     demote = await gateDemoteItem(cfg, nodeId, { blockerId: id });
   } catch (e) {
     demote = { ok: false, reason: (e && e.message) || String(e) };
   }
+  // Filed: the loop settles the record `blocked` under this worker's own
+  // lease (its markGate stamps only while nobody else holds the pipeline).
   return {
     ok: true,
     id,
@@ -14331,7 +14356,7 @@ async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = ()
     // settled verdict with the boundary reached but the write not landed, a
     // parked proposal, or an orphan. Its P1 detection still runs for a
     // running pipeline (one read), since that is what "at every poll" means.
-    const running = r.gate_state === "running" && r.gate_worker && workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === r.gate_worker);
+    const running = !gatesKernel.SETTLED_GATE_STATES.has(r.gate_state) && pipelineHeldLive(home, r);
     let landedFactPresent = false;
     if (r.integration_state === "parked" || r.gate_state === "parked") {
       try {
@@ -14429,13 +14454,13 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
         return false;
       }
     });
-  const claim = ctx.gateClaim || dispatchRuns.claimGateRecord(home, item.run_id, { workerId: ctx.workerId || null, ownerLive });
-  if (ctx.gateClaim && freshRecord(home, record).gate_settle_id !== claim.token) claim.refused = "the re-gate ownership changed before judging";
+  const claim = ctx.gateClaim || dispatchRuns.claimPipeline(home, item.run_id, { workerId: ctx.workerId || null, ownerLive, factory: (ctx.factory && ctx.factory.id) || null });
+  if (ctx.gateClaim && currentLeaseToken(home, record) !== claim.token) claim.refused = "the re-gate ownership changed before judging";
   if (claim.refused) {
     const rec = claim.record || null;
     ctx.log(`work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) is ${claim.refused} — this worker does not run the gate pipeline for it: no fact, escalation, demotion or attestation is written`);
     return {
-      state: (rec && rec.gate_state) || "failed",
+      state: (rec && rec.gate_state) || "superseded",
       reason: `the gate pipeline was not run: the run record is ${claim.refused}`,
       gates: [],
       facts: [],
@@ -14447,6 +14472,16 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   }
   const ownToken = claim.ok ? claim.token : null;
   dctx.gateOwner = ownToken;
+  // A pipeline that YIELDS (`interrupted`) hands its lease back: its journal
+  // is parked on its own durable timer, and the resume scan (work-loop.js
+  // openPipelines) re-offers it — to this worker or another — once the timer
+  // is due, rather than waiting out a TTL on a lease nobody is driving.
+  const yielded = (result) => {
+    if (ownToken) {
+      try { dispatchRuns.releasePipeline(home, item.run_id, ownToken); } catch { /* the lease lapses on its TTL or with this worker */ }
+    }
+    return result;
+  };
   const controller = completionKernel.isControllerRecord(record) && ctx.factory.completion && ctx.factory.completion.by === "controller";
   // The boundary is the CLAIM's (pinned at H1), never the factory node's
   // current text — an edit mid-pipeline changes nothing (§7.2).
@@ -14515,7 +14550,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       // lease until the process exited. The execution itself stays live in
       // the store (the hold is kept, T1); what leaves is this pass's beat.
       if (reporter) reporter.leave();
-      return {
+      return (state === "interrupted" ? yielded : (r) => r)({
         state,
         gates: [],
         facts: [],
@@ -14534,7 +14569,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
         // result so the run record and `--status` read them for this stage
         // exactly as for the integration stage's (stage-workflow.js).
         ...stageWorkflow.carryRefusalTags(stage),
-      };
+      });
     }
     if (stage.handoff) ctx.log(`work: ${entry.node_id} — implementation stage hands the run to the gates: ${stage.handoff}`);
   }
@@ -14556,7 +14591,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // and keeps its slot.
   if (gateResult.state === "interrupted") {
     if (reporter) reporter.leave();
-    return gateResult;
+    return yielded(gateResult);
   }
   const gateFacts = [...(gateResult.facts || [])];
   let intResult = null;
@@ -14730,7 +14765,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // stamped, settled or attested, and the resume re-runs the pipeline.
   if (intResult.state === "interrupted") {
     if (reporter) reporter.leave();
-    return { state: "interrupted", ...(intResult.outage_interrupted ? { outage_interrupted: true } : {}), ...(intResult.paused_until ? { paused_until: intResult.paused_until, paused_profile: intResult.paused_profile || null } : {}), ...(intResult.fallback_route ? { fallback_route: true } : {}), gates: gateResult.gates || [], facts: [...gateFacts, ...(intResult.facts || [])], reason: intResult.reason };
+    return yielded({ state: "interrupted", ...(intResult.outage_interrupted ? { outage_interrupted: true } : {}), ...(intResult.paused_until ? { paused_until: intResult.paused_until, paused_profile: intResult.paused_profile || null } : {}), ...(intResult.fallback_route ? { fallback_route: true } : {}), gates: gateResult.gates || [], facts: [...gateFacts, ...(intResult.facts || [])], reason: intResult.reason });
   }
   const intState = completionKernel.INTEGRATION_STATES.includes(intResult.state) ? intResult.state : intResult.state === "passed" ? "landed" : "failed";
   const allFacts = [...gateFacts, ...(intResult.facts || [])];
@@ -14806,6 +14841,31 @@ function freshRecord(home, record) {
     return record;
   }
 }
+// The pipeline's CURRENT ownership token (task-spor-delete-loop-resume-
+// machinery-after-workflow-stages): the lease log's token when a pipeline was
+// ever claimed, else the record's settled `gate_settle_id` (a record settled
+// before the lease log existed). What a re-gate's compare-and-swap and the
+// "do I still own this" reads compare against.
+function currentLeaseToken(home, record) {
+  const fresh = freshRecord(home, record);
+  try {
+    const lease = stageProjection.pipelineLease(home, fresh);
+    if (lease) return lease.token;
+  } catch {
+    return undefined; // an unreadable lease log owns nobody
+  }
+  return fresh.gate_settle_id != null ? fresh.gate_settle_id : null;
+}
+// Is the run's pipeline HELD by a worker live on this box right now (a lease
+// claimed, unreleased, unexpired, and its worker's status file live)?
+function pipelineHeldLive(home, record) {
+  try {
+    const lease = stageProjection.pipelineLease(home, record);
+    return stageProjection.leaseHeld(lease, { ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner) });
+  } catch {
+    return true; // a lease nobody can read is treated as held: the safe direction
+  }
+}
 // The settled verdict, on the run record, in the same shape work-loop.js's
 // settleGates stamps it (one writer's fields, not two disagreeing ones), plus
 // the run's evidence fields when the pipeline's inputs are given. Returns
@@ -14820,11 +14880,11 @@ function freshRecord(home, record) {
 // verdict goes through stampGateState's `own` door with it.
 function settleRunRecord(home, runId, res, workerId = null, { gateResult = null, factory = null, intResult = null, token: owned = null, pending = null } = {}) {
   const at = new Date().toISOString();
-  // The token claimGateRecord minted before the pipeline ran, when there was a
+  // The token claimPipeline minted before the pipeline ran, when there was a
   // record to own — the settle then goes through the `own` door and lands only
-  // while the record still carries it (a re-gate or another owner in between
-  // refuses it). With no record to own beforehand, a fresh nonce and the
-  // settled-verdict guard alone, as before.
+  // while the pipeline's lease still carries it (a re-gate or another owner in
+  // between refuses it). With no record to own beforehand, a fresh nonce and
+  // the settled-verdict guard alone, as before.
   const token = owned || crypto.randomBytes(12).toString("hex");
   try {
     const state = res && res.state ? res.state : "failed";
@@ -15685,17 +15745,23 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     err(`spor work --regate: run ${shortId} already read '${record.gate_state}'${record.gate_reason ? ` (${record.gate_reason})` : ""} — there is nothing to re-judge.`);
     return 1;
   }
-  if ((record.gate_state === "running" || record.gate_state === "interrupted") && record.gate_worker) {
-    const live = workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === record.gate_worker);
-    if (live) {
-      err(
-        record.gate_state === "interrupted"
-          ? `spor work --regate: run ${shortId}'s interrupted gate pipeline is parked with live worker ${String(record.gate_worker).slice(0, 8)}, which re-offers it — wait for its verdict.`
-          : `spor work --regate: run ${shortId} is being gated right now by worker ${String(record.gate_worker).slice(0, 8)} — wait for its verdict.`
-      );
-      return 1;
-    }
+  // The pipeline's lease and journals (stage-projection.js): a pipeline a
+  // live worker is driving is not re-gated out from under it, and an OPEN
+  // journal (running under a dead worker, or parked on a yield) is RESUMED
+  // rather than re-opened below.
+  let lease = null;
+  try {
+    lease = stageProjection.pipelineLease(home, record);
+  } catch (e) {
+    err(`spor work --regate: run ${shortId}'s pipeline lease log is unreadable (${(e && e.message) || e}) — nothing is judged over a lease nobody can read.`);
+    return 1;
   }
+  if (!gatesKernel.SETTLED_GATE_STATES.has(record.gate_state) && lease && stageProjection.leaseHeld(lease, { ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner) })) {
+    err(`spor work --regate: run ${shortId} is being gated right now by worker ${String(lease.worker || "?").slice(0, 8)} — wait for its verdict.`);
+    return 1;
+  }
+  const projected = stageProjection.projectRun(home, record);
+  const openJournal = !gatesKernel.SETTLED_GATE_STATES.has(record.gate_state) && projected.current && (projected.current.status === "running" || projected.current.status === "parked");
   // RESUME rather than re-open (issue-spor-regate-interrupted-evidence-pending-
   // stranded). An `interrupted` pipeline settled nothing, so there is no
   // verdict to re-judge — only an attempt to FINISH; and an attempt that still
@@ -15710,7 +15776,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // Read off the run's gate-progress log (stage-projection.js), never the
   // record: the ledger is no longer a record field.
   const owesEvidence = stageProjection.owesEvidence(home, record);
-  const resume = record.gate_state === "interrupted" || (owesEvidence && !gatesKernel.SETTLED_GATE_STATES.has(record.gate_state));
+  const resume = !!openJournal || (owesEvidence && !gatesKernel.SETTLED_GATE_STATES.has(record.gate_state));
   // Attempt 1 was the pipeline that refused; each re-gate counts up from
   // there. A resume keeps the attempt it continues — and a pipeline no
   // --regate ever re-opened (count 0: a work loop's own) ran with NO attempt,
@@ -15735,11 +15801,16 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   const workerId = crypto.randomUUID();
   const status = { worker_id: workerId, pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), started_at: new Date().toISOString(), updated_at: new Date().toISOString(), kind: "regate" };
   if (!workLoop.writeWorkerStatus(home, status)) { err("spor work --regate: could not publish worker liveness; no judgement started"); return 1; }
+  let renewal = null;
   try {
-  const gateClaim = dispatchRuns.claimGateRecord(home, record.run_id, { workerId, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), owesEvidence: (fresh) => stageProjection.owesEvidence(home, fresh), reopen: { settleId: record.gate_settle_id || null, regateCount: Number(record.gate_regate_count) || 0, state: record.gate_state, ...(resume ? { resume: true } : {}) } });
+  const gateClaim = dispatchRuns.claimPipeline(home, record.run_id, { workerId, factory: factory.id || factoryId || null, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), owesEvidence: (fresh) => stageProjection.owesEvidence(home, fresh), reopen: { settleId: lease ? lease.token : record.gate_settle_id != null ? record.gate_settle_id : null, regateCount: Number(record.gate_regate_count) || 0, state: record.gate_state || null, ...(resume ? { resume: true } : {}) } });
   if (!gateClaim.ok) { err(`spor work --regate: ${gateClaim.refused || gateClaim.reason}`); return 1; }
   if (report) report.claimed = true;
-  const owns = () => freshRecord(home, record).gate_settle_id === gateClaim.token;
+  // The lease is renewed while this process judges, so a work loop on the box
+  // never reads a long re-gate (a human gate's approval wait) as an orphan.
+  renewal = setInterval(() => { try { dispatchRuns.renewPipeline(home, record.run_id, { workerId }); } catch { /* bounded by the TTL */ } }, Math.max(60000, Math.floor(stageProjection.PIPELINE_LEASE_TTL_MS / 3)));
+  if (typeof renewal.unref === "function") renewal.unref();
+  const owns = () => currentLeaseToken(home, record) === gateClaim.token;
   const stamp = (patch) => dispatchRuns.stampGateState(home, record.run_id, patch, { own: gateClaim.token });
   // Bring the implementer's branch up to the trusted ref BEFORE judging it
   // (issue-spor-command-gate-judges-stale-branch-base): the usual reason a
@@ -15802,7 +15873,13 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // failure, and this attempt judged nothing, so it must not stand as though
   // this attempt failed on those tests (--regate-flakes reads it).
   if (state === "interrupted") {
-    stamp({ gate_state: state, gate_reason: reason, gate_failing_tests: null });
+    // Nothing settled, so nothing is stamped: the attempt's journal is parked
+    // and its lease released, for the next --regate (or a gate-armed worker's
+    // resume scan) to continue. The failing-test list of a SETTLED attempt
+    // must not stand for one that judged nothing (--regate-flakes reads it).
+    stamp({ gate_failing_tests: null });
+    try { dispatchRuns.releasePipeline(home, record.run_id, gateClaim.token); } catch { /* lapses on its TTL */ }
+    if (report) report.interrupted = true;
     out(`work: re-gate of ${record.node_id} interrupted${reason ? ` — ${reason}` : ""} — nothing settled; resume attempt ${Math.max(1, attempt)} with 'spor work --regate ${record.run_id}'`);
     return 1;
   }
@@ -15874,7 +15951,10 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   }
   out(`work: re-gate of ${record.node_id} ${state} — ${reason || (state === "scoped" ? "a verified no-code outcome" : "every gate passed")}${notes.length ? `; ${notes.join("; ")}` : ""}`);
   return 0;
-  } finally { workLoop.writeWorkerStatus(home, { ...status, stopped_at: new Date().toISOString(), updated_at: new Date().toISOString() }); }
+  } finally {
+    if (renewal) clearInterval(renewal);
+    workLoop.writeWorkerStatus(home, { ...status, stopped_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  }
 }
 
 // Merge the trusted ref into the run's checkout ahead of a re-gate. Returns
@@ -16282,8 +16362,8 @@ async function cmdWorkRegateFlakes(cfg, values, ctx) {
     // "the flake fix did not clear the refusal" note would be false. The
     // attempt is resumable ('spor work --regate'), and the sweep never re-plans
     // an unsettled record, so it is left to that door.
-    if (after.gate_state === "interrupted") {
-      out(`work: the automatic re-gate of run ${short} on ${record.node_id} was interrupted before a verdict${after.gate_reason ? ` (${String(after.gate_reason).slice(0, 200)})` : ""} — resume it with 'spor work --regate ${record.run_id}'`);
+    if (report.interrupted) {
+      out(`work: the automatic re-gate of run ${short} on ${record.node_id} was interrupted before a verdict — resume it with 'spor work --regate ${record.run_id}'`);
       continue;
     }
     const note = await writeSweepNote(cfg, {
