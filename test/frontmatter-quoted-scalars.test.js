@@ -31,3 +31,12 @@ test("unwrapped and lone-quote values keep the legacy read", () => {
   assert.strictEqual(n.title, 'say "hi" now');
   assert.strictEqual(n.summary, "lone");
 });
+
+test("serializeNode quotes values the scalar read would not return verbatim", () => {
+  const { serializeNode } = require("../lib/kernel/frontmatter.js");
+  for (const t of ['"x"', "'y'", "C:\\new\\temp", 'say "hi"', "plain"]) {
+    const raw = serializeNode({ id: "issue-x", type: "issue", title: t, edges: [], body: "b" });
+    assert.strictEqual(parseFrontmatter(raw, "x.md").title, t);
+  }
+  assert.match(serializeNode({ id: "a", type: "issue", title: "plain" }), /title: plain\n/);
+});
