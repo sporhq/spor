@@ -40,3 +40,46 @@ test("serializeNode quotes values the scalar read would not return verbatim", ()
   }
   assert.match(serializeNode({ id: "a", type: "issue", title: "plain" }), /title: plain\n/);
 });
+
+// ---- round-trip over every scalar position (one reader/writer pair) ----
+const { serializeNode } = require("../lib/kernel/frontmatter.js");
+
+// Deterministic generator (no deps): strings drawn from an alphabet heavy in the
+// characters the grammar treats specially.
+const ALPHABET = ['"', "'", "\\", " ", "\t", ",", "[", "]", "{", "}", ":", "#", "-", "a", "b", "n", "u", "x", "0", "é", "—", "😀", "/"];
+function* values(count = 400) {
+  let seed = 0x9e3779b9;
+  const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32);
+  for (const fixed of [" x", "x ", "   ", "\"", "'", "''", '""', '"a"', "'a'", "a\\", "\\u00", "\\ud83d", "\\xZ9", "- x"]) yield fixed;
+  for (let i = 0; i < count; i++) {
+    let s = "";
+    for (let n = Math.floor(rnd() * 8); n > 0; n--) s += ALPHABET[Math.floor(rnd() * ALPHABET.length)];
+    yield s;
+  }
+}
+
+test("serializeNode round-trips every generated value in flat, list-item and edge-attr positions", () => {
+  for (const v of values()) {
+    const node = { id: "x", type: "task", title: v, tags: [v, "ok"], edges: [{ type: "relates-to", to: "n-1", note: v }] };
+    const raw = serializeNode(node);
+    const back = parseFrontmatter(raw, "x.md");
+    assert.strictEqual(back.title, v, `title ${JSON.stringify(v)}`);
+    // an empty/whitespace-only edge attr is dropped by design (v === "" only)
+    assert.deepStrictEqual(back.tags, [v, "ok"], `tags ${JSON.stringify(v)}`);
+    if (v !== "") assert.strictEqual(back.edges[0].note, v, `attr ${JSON.stringify(v)}`);
+    assert.strictEqual(serializeNode({ ...back, file: undefined, pin: undefined, exclude: undefined }), raw, `stable ${JSON.stringify(v)}`);
+  }
+});
+
+test("a double-quoted scalar folded over continuation lines is unescaped whole", () => {
+  const n = parseFrontmatter('---\nid: x\ntype: task\ntitle: "a \\"b\\"\n  c\\td"\nsummary: \'it\'\'s\n  ok\'\n---\n', "x.md");
+  assert.strictEqual(n.title, 'a "b" c\td');
+  assert.strictEqual(n.summary, "it's ok");
+});
+
+test("malformed escapes stay literal in block items and edge attrs, never throw", () => {
+  const raw = '---\nid: x\ntype: task\ntags:\n  - "a\\"\n  - "\\u12"\nedges:\n  - type: relates-to\n    to: y\n    note: "\\ud83d"\n---\n';
+  const n = parseFrontmatter(raw, "x.md");
+  assert.deepStrictEqual(n.tags, ['a\\', "\\u12"]);
+  assert.strictEqual(n.edges[0].note, String.fromCharCode(0xd83d));
+});
