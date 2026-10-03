@@ -3,6 +3,9 @@
 Input: exact node, repo, worktree, branch, report and expected commit SHA.
 One merge at a time. Execute through the final verdict; if a command yields,
 resume waiting for that command's result. A helper must not select more work.
+Only kill processes you started, by the PID or process group you recorded;
+never `pkill -f`, `killall` or `kill $(pgrep …)` — other agents' suites run
+concurrently on this box and a pattern kills theirs too.
 
 1. Verify the implementer's reported commit exists in this branch, inspect its
    diff and acceptance evidence, and require a clean worktree. Confirm merge

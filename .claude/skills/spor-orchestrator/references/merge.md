@@ -20,6 +20,16 @@ before this rule, issue-spor-orchestrator-merge-subagent-stall). A long
 ends exactly once, at the tight verdict (`MERGED`/`FAILED`/`ESCALATE`), never
 before.
 
+**Only ever kill processes you started — by the PID or process group you
+recorded, never by pattern.** If you detach a long suite to a log (step 6),
+give it its own group and record it — `setsid sh -c 'npm test > "$1" 2>&1;
+echo "EXIT=$?" >> "$1"' sh "$LOG" & echo $! > "$LOG.pgid"` — and stop it with
+`kill -- -"$(cat "$LOG.pgid")"`. Never `pkill -f`, `killall`, `pkill node`, or
+`kill $(pgrep …)`: implementers' suites run concurrently on this box in their
+own worktrees, and a pattern like `pkill -f "node --test"` kills theirs too
+(issue-spor-orchestrator-agent-global-pkill-kills-other-agents). A process you
+did not start that looks hung goes in your verdict, not under your `kill`.
+
 ## Why CAS, and why serialized
 
 Agents implement in parallel, but you merge **one branch at a time**. The reason

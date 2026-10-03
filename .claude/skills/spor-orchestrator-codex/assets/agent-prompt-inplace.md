@@ -21,6 +21,12 @@ unrelated changes. Use path-scoped commits on the existing branch with
 `Spor: {{node}}` in the final trailer block. If your edits cannot be committed
 separately from existing WIP, report the conflict instead of including that WIP.
 
+Only kill processes you started, by the PID or process group you recorded
+(`setsid … & echo $! > "$LOG.pgid"`, then `kill -- -"$(cat "$LOG.pgid")"`).
+Never `pkill -f`, `killall` or `kill $(pgrep …)`: other agents' suites run
+concurrently on this box and a pattern kills theirs too. Report a hung
+process you did not start; don't kill it.
+
 Implement the acceptance, run required tests/checks, self-review and fix verified
 problems. Do not mutate the graph. Stop on missing permission or a blocker;
 report discoveries/decisions for the supervisor to capture. The supervisor will

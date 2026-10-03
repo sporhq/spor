@@ -22,6 +22,12 @@ using swamp. Use the configured runtime/vault; never expose secrets or widen
 permissions as a workaround. Verify the actual runtime after deployment.
 A committed model alone does not count as a deployed change.
 
+Only kill processes you started, by the PID or process group you recorded
+(`setsid … & echo $! > "$LOG.pgid"`, then `kill -- -"$(cat "$LOG.pgid")"`).
+Never `pkill -f`, `killall` or `kill $(pgrep …)`: other agents' suites run
+concurrently on this box and a pattern kills theirs too. Report a hung
+process you did not start; don't kill it.
+
 Commit only your model/config changes, where applicable, with `Spor: {{node}}`
 in the final trailer block. Do not push, merge or write graph nodes/edges/status.
 On failure, report the actual runtime state and safe recovery information;

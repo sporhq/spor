@@ -54,16 +54,28 @@ you work directly on the real checkout at `{{dir}}`.
    a check may run longer than the Bash tool's 600000ms (10min) cap, don't
    fight the cap with a bigger timeout — launch it detached to a log and poll
    for completion in the foreground with an until-loop, each poll comfortably
-   under 10 minutes, e.g.:
+   under 10 minutes.
+   Give the run its own process group and RECORD it, so "stop my suite" can
+   only ever mean yours, e.g.:
    ```bash
-   deno test > /tmp/test.log 2>&1; echo "EXIT=$?" >> /tmp/test.log &
+   LOG=/tmp/{{node}}-test.log
+   setsid sh -c 'deno test > "$1" 2>&1; echo "EXIT=$?" >> "$1"' sh "$LOG" & echo $! > "$LOG.pgid"
    ```
    then, in later Bash calls:
    ```bash
-   until grep -q '^EXIT=' /tmp/test.log; do sleep 30; done; tail -50 /tmp/test.log
+   LOG=/tmp/{{node}}-test.log; until grep -q '^EXIT=' "$LOG"; do sleep 30; done; tail -50 "$LOG"
    ```
    This is the same foreground-only discipline `references/merge.md` holds
    merge subagents to for a long `npm test`.
+   **Only ever kill processes you started — by the PID or process group you
+   recorded, never by pattern.** To stop that suite:
+   `LOG=/tmp/{{node}}-test.log; kill -- -"$(cat "$LOG.pgid")"`. Never
+   `pkill -f`, `killall`, `pkill node`, or `kill $(pgrep …)`: this box runs other agents' suites concurrently in their own
+   worktrees, and a pattern like `pkill -f "node --test"` kills theirs too —
+   they then fail as signal-killed runs with no trace back to you
+   (issue-spor-orchestrator-agent-global-pkill-kills-other-agents). A process
+   you did not start that looks hung is the orchestrator's to handle: name it
+   in your final report; don't kill it.
 
 5. **Capture stray discoveries.** Anything out of scope — a follow-up, a latent
    gap, a secret you don't have access to — `/spor:defer "<2–3 sentences>"` the

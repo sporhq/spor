@@ -42,6 +42,10 @@ Branch: {{node}} — commit here; do not switch or merge branches.
    do an isolated `npm ci` inside the worktree's `server/` (rm the node_modules symlink
    first) — touch ONLY the worktree. Don't hand back red tests; if you can't verify it,
    say so plainly rather than claiming success.
+   Only kill processes you started, by the PID or process group you recorded
+   (`setsid … & echo $! > "$LOG.pgid"`, then `kill -- -"$(cat "$LOG.pgid")"`).
+   Never `pkill -f`, `killall` or `kill $(pgrep …)`: other agents' suites run
+   concurrently on this box and a pattern kills theirs too.
 5. Self-review your diff once for correctness — you're the implementer; the orchestrator
    runs the rigorous adversarial review at the merge gate, so don't over-invest here.
 6. Commit on this branch with a clear message. Do NOT merge, and do NOT resolve the

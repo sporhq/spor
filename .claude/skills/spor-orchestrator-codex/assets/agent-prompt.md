@@ -30,6 +30,11 @@ Remain on the branch selected by dispatch; do not switch branches.
 - Serialize full acceptance suites with other program workers. On Linux run
   the full suite under `flock /tmp/spor-codex-program-acceptance.lock` and save
   complete logs plus exit status. Focused tests can run independently.
+- Only kill processes you started, by the PID or process group you recorded
+  (`setsid … & echo $! > "$LOG.pgid"`, then `kill -- -"$(cat "$LOG.pgid")"`).
+  Never `pkill -f`, `killall` or `kill $(pgrep …)`: other agents' suites run
+  concurrently on this box and a pattern kills theirs too. Report a hung
+  process you did not start; don't kill it.
 - Self-review the diff, correct verified defects, and rerun affected checks.
   The supervisor performs a separate Astra review before merging.
 - Commit on this branch with a clear message and `Spor: {{node}}` in the final
