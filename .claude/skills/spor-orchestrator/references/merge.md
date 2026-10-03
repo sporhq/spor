@@ -196,13 +196,15 @@ id, sanitized by dispatch).
    **Under fleet load, one rule decides "flake" — not your judgment**
    (task-split-spor-bf14e0e45235, issue-spor-full-suite-crashes-under-fleet-load).
    `scripts/test-run.js` prints every file that died outside a test with its
-   exit code/signal and stderr tail, and when the run was lost ONLY to such
-   file-level crashes it re-runs exactly those files together once. Read the
+   exit code/signal and stderr tail, and when the run was lost ONLY to files killed
+   by a recorded signal (SIGKILL/SIGTERM/SIGABRT) it re-runs exactly those files
+   together once, under a fresh TMPDIR. A plain non-zero exit is deterministic
+   and stays red. Read the
    closing line: `test-run: passed` is green; `test-run: FLAKY … passed only
    after re-running …` is accepted — name the files in your report (a
-   `::warning` under CI); anything else is red. A file-level crash with no
+   `::warning` under CI); anything else is red. A signal-killed file with no
    failing test is accepted only because those files re-ran together green. Any
-   failing test, a red or crashed-again re-run, or a signal-killed/timed-out
+   failing test, a file that exited non-zero, a red or crashed-again re-run, or a signal-killed/timed-out
    runner is a REAL failure — fix or revert, never call it a flake.
    `SPOR_TEST_RERUN_CRASHED=0` turns the re-run off (strict).
 

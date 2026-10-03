@@ -226,14 +226,20 @@ test("a failing run ends on a FAILED verdict, and under GitHub Actions also on a
 });
 
 test("crashOnly: only a normal exit 1 with crashed files and no failing test earns the one re-run", () => {
-  const rep = { crashed: [{ file: "a.test.js" }], failedTests: 0 };
+  const rep = { crashed: [{ file: "a.test.js", signal: "SIGKILL" }], failedTests: 0 };
   assert.strictEqual(crashOnly({ code: 1, signal: null }, rep), true);
   assert.strictEqual(crashOnly({ code: 1, signal: null }, { ...rep, failedTests: 1 }), false);
   assert.strictEqual(crashOnly({ code: 1, signal: "SIGTERM" }, rep), false);
   assert.strictEqual(crashOnly({ code: 2, signal: null }, rep), false);
   assert.strictEqual(crashOnly({ code: 1, signal: null }, null), false);
   assert.strictEqual(crashOnly({ code: 1, signal: null }, { crashed: [], failedTests: 0 }), false);
-  const many = { crashed: Array.from({ length: 13 }, () => ({ file: "x" })), failedTests: 0 };
+  for (const signal of ["SIGTERM", "SIGABRT"]) {
+    assert.strictEqual(crashOnly({ code: 1, signal: null }, { crashed: [{ file: "a", signal }], failedTests: 0 }), true);
+  }
+  assert.strictEqual(crashOnly({ code: 1, signal: null }, { crashed: [{ file: "a", signal: "SIGHUP" }], failedTests: 0 }), false);
+  assert.strictEqual(crashOnly({ code: 1, signal: null }, { crashed: [{ file: "a", exitCode: 1, signal: null }], failedTests: 0 }), false, "a plain exit code is deterministic");
+  assert.strictEqual(crashOnly({ code: 1, signal: null }, { crashed: [{ file: "a", signal: "SIGKILL" }, { file: "b", exitCode: 1, signal: null }], failedTests: 0 }), false);
+  const many = { crashed: Array.from({ length: 13 }, () => ({ file: "x", signal: "SIGKILL" })), failedTests: 0 };
   assert.strictEqual(crashOnly({ code: 1, signal: null }, many), false);
 });
 
@@ -272,3 +278,84 @@ test("SPOR_TEST_RERUN_CRASHED=0 is strict: the crash stays red and is still name
   assert.match(r.stderr, /killed by SIGKILL/);
   assert.match(r.stderr, /test-run: FAILED/);
 });
+
+function scratch(prefix) { return fs.mkdtempSync(path.join(os.tmpdir(), prefix)); }
+
+test("a file that exits 1 outside a test stays red: named, never re-run, never FLAKY", () => {
+  const dir = scratch("test-run-exit1-");
+  const file = path.join(dir, "exit1.test.js");
+  fs.writeFileSync(file, "require('node:test').test('a', () => {}); process.exitCode = 1;\n");
+  const r = spawnSync(process.execPath, [RUNNER, file], { env: runnerEnv(), encoding: "utf8", timeout: 120000 });
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /crashed outside a test: .*exit1\.test\.js — exited 1/);
+  assert.doesNotMatch(r.stderr, /re-running|FLAKY/);
+  assert.match(r.stderr, /test-run: FAILED/);
+});
+
+test("a leaf test named after its file that throws an exit-code error is a failing test, not a crash", () => {
+  const dir = scratch("test-run-leaf-");
+  const file = path.join(dir, "leaf.test.js");
+  fs.writeFileSync(file, "require('node:test').test('leaf.test.js', () => { const e = new Error('x'); e.signal = 'SIGKILL'; e.exitCode = 1; throw e; });\n");
+  const r = spawnSync(process.execPath, [RUNNER, file], { env: runnerEnv(), encoding: "utf8", timeout: 120000 });
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.doesNotMatch(r.stderr, /re-running|FLAKY|crashed outside/);
+});
+
+test("the crash re-run gets a fresh TMPDIR, removed afterwards", () => {
+  const dir = scratch("test-run-tmpdir-");
+  const file = path.join(dir, "tmp.test.js");
+  const seen = path.join(dir, "seen.txt");
+  fs.writeFileSync(file, [
+    "const t = require('node:test'), fs = require('node:fs');",
+    "t.test('a', () => {});",
+    `const seen = ${JSON.stringify(seen)};`,
+    "const first = !fs.existsSync(seen);",
+    "fs.appendFileSync(seen, process.env.TMPDIR + '\\n');",
+    "if (first) setTimeout(() => process.kill(process.pid, 'SIGKILL'), 100);",
+  ].join("\n"));
+  const r = spawnSync(process.execPath, [RUNNER, file], { env: runnerEnv({ TMPDIR: dir }), encoding: "utf8", timeout: 120000 });
+  const lines = fs.readFileSync(seen, "utf8").trim().split("\n");
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /test-run: FLAKY/);
+  assert.strictEqual(lines.length, 2, lines.join("|"));
+  assert.notStrictEqual(lines[1], lines[0], "the re-run reused the first run's TMPDIR");
+  assert.ok(!fs.existsSync(lines[1]), "the fresh TMPDIR was not cleaned up");
+});
+
+for (const phase of ["during", "after"]) {
+  test(`a SIGTERM to the wrapper ${phase} the crash re-run exits non-zero and is never FLAKY`, { skip: process.platform === "win32" && "no SIGTERM delivery to a child on Windows" }, async () => {
+    const dir = scratch("test-run-stop-");
+    const file = path.join(dir, "stop.test.js");
+    const flag = path.join(dir, "flag");
+    // First run: SIGKILL itself. Re-run: print READY and either hang ("during",
+    // killed by the forwarded SIGTERM) or trap SIGTERM and exit 0 ("after": the
+    // child finishes green despite the stop).
+    fs.writeFileSync(file, [
+      "const t = require('node:test'), fs = require('node:fs');",
+      "t.test('a', () => {});",
+      `const flag = ${JSON.stringify(flag)};`,
+      "if (!fs.existsSync(flag)) { fs.writeFileSync(flag, '1'); setTimeout(() => process.kill(process.pid, 'SIGKILL'), 100); }",
+      "else {",
+      "  console.log('READY');",
+      phase === "during" ? "  setTimeout(() => {}, 30000);" : "  process.on('SIGTERM', () => process.exit(0)); setTimeout(() => {}, 30000);",
+      "}",
+    ].join("\n"));
+    const r = await new Promise((resolve) => {
+      const child = spawn(process.execPath, [RUNNER, "--test-reporter=spec", file], { env: runnerEnv(), stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      let sent = false;
+      const term = () => { if (!sent) { sent = true; child.kill("SIGTERM"); } };
+      const deadline = setTimeout(term, 60000);
+      child.stdout.on("data", (c) => { stdout += c; if (/READY/.test(stdout)) term(); });
+      child.stderr.on("data", (c) => (stderr += c));
+      child.on("close", (code, signal) => { clearTimeout(deadline); resolve({ code, signal, stdout, stderr }); });
+    });
+    fs.rmSync(dir, { recursive: true, force: true });
+    assert.ok(r.code !== 0 || r.signal, `exited clean after a stop: ${JSON.stringify([r.code, r.signal])}\n${r.stderr}`);
+    assert.doesNotMatch(r.stderr, /FLAKY/);
+  });
+}

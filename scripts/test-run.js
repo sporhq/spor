@@ -42,8 +42,10 @@
 //     (test/helpers/crash-reporter.js) records each such file's exit code/signal
 //     and stderr tail, the closing summary prints them, and a run lost ONLY to
 //     such crashes (runner exited 1 normally, no failing test, <= MAX_RERUN
-//     files) re-runs exactly those files together ONCE and passes only if that
-//     is green — FLAKY + `::warning`, never silent. SPOR_TEST_RERUN_CRASHED=0
+//     files, every one killed by a recorded SIGKILL/SIGTERM/SIGABRT — a plain
+//     exit code is deterministic and stays red) re-runs exactly those files
+//     together ONCE under a fresh TMPDIR and passes only if that is green; a
+//     stop of the wrapper is never a pass — FLAKY + `::warning`, never silent. SPOR_TEST_RERUN_CRASHED=0
 //     is strict (task-split-spor-bf14e0e45235,
 //     dec-spor-server-run-tiers-crash-only-rerun is the server twin).
 
@@ -119,6 +121,9 @@ function defaultConcurrency() {
 }
 
 const MAX_RERUN = 12;
+// Only a recorded signal kill is a crash worth a second try: a plain exit code
+// is deterministic (dec-spor-crash-rerun-signal-kills-only-keyed-on-exit-record).
+const RERUN_SIGNALS = new Set(["SIGKILL", "SIGTERM", "SIGABRT"]);
 
 // `extra.files` replaces the file list and drops the shard (a re-run names its
 // files explicitly).
@@ -171,10 +176,12 @@ function readCrashReport(file) {
 }
 
 // Whether a failed run is eligible for the one re-run: the runner exited 1
-// normally, no test failed, and a small bounded set of files crashed.
+// normally, no test failed, and a small bounded set of files each died of a
+// recorded SIGKILL/SIGTERM/SIGABRT (an exit code, however non-zero, stays red).
 function crashOnly({ code, signal }, rep) {
   return !signal && code === 1 && !!rep && rep.failedTests === 0
-    && rep.crashed.length > 0 && rep.crashed.length <= MAX_RERUN;
+    && rep.crashed.length > 0 && rep.crashed.length <= MAX_RERUN
+    && rep.crashed.every((c) => RERUN_SIGNALS.has(c.signal));
 }
 
 function describeCrashes(crashed) {
@@ -210,10 +217,10 @@ function report(result, env = process.env) {
   }
 }
 
-function runOnce(args, forward) {
+function runOnce(args, forward, env = suiteEnv()) {
   return new Promise((resolve) => {
     const started = Date.now();
-    const child = spawn(process.execPath, args, { cwd: ROOT, stdio: "inherit", env: suiteEnv() });
+    const child = spawn(process.execPath, args, { cwd: ROOT, stdio: "inherit", env });
     forward.child = child;
     child.on("error", (err) => {
       process.stderr.write(`test-run: could not start node --test: ${err.message}\n`);
@@ -236,7 +243,10 @@ async function main() {
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(sig, () => { stopping = true; try { forward.child.kill(sig); } catch { /* already gone */ } });
   }
-  const cleanup = () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } };
+  let freshTmp = null; // the re-run's own TMPDIR
+  const cleanup = () => {
+    for (const d of [dir, freshTmp]) if (d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ } }
+  };
   process.on("exit", cleanup);
 
   let result = await runOnce(withCrashReporter(args, reportFile), forward);
@@ -247,13 +257,19 @@ async function main() {
     const files = rep.crashed.map((c) => path.relative(ROOT, c.file) || c.file);
     process.stderr.write(`test-run: only file-level crashes — re-running ${files.join(" ")} together once\n`);
     try { fs.rmSync(reportFile, { force: true }); } catch { /* best-effort */ }
-    const again = await runOnce(withCrashReporter(buildArgs(argv, { files }), reportFile), forward);
+    // A fresh TMPDIR: state the first run left behind must not green a failure
+    // that only a cold start reproduces.
+    freshTmp = fs.mkdtempSync(path.join(os.tmpdir(), "spor-test-run-tmp-"));
+    const env = { ...suiteEnv(), TMPDIR: freshTmp, TEMP: freshTmp, TMP: freshTmp };
+    const again = await runOnce(withCrashReporter(buildArgs(argv, { files }), reportFile), forward, env);
     const rep2 = readCrashReport(reportFile);
     if (rep2 && rep2.crashed.length) process.stderr.write(`\ntest-run: re-run crashed again\n${describeCrashes(rep2.crashed)}\n`);
-    if (!again.signal && again.code === 0) flaky = { files, ms: result.ms + again.ms };
+    if (!stopping && !again.signal && again.code === 0) flaky = { files, ms: result.ms + again.ms };
     result = { ...again, ms: result.ms + again.ms };
   }
   cleanup();
+  // A stop is never a pass, even if the child it reached exited 0.
+  if (stopping && !result.signal && result.code === 0) result = { ...result, code: 1 };
   if (flaky) {
     const line = `test-run: FLAKY${shard ? ` (shard ${shard})` : ""} — passed only after re-running ${flaky.files.length} crashed file(s) together: ${flaky.files.join(", ")} (${Math.round(flaky.ms / 1000)}s total)`;
     process.stderr.write(`\n${line}\n`);

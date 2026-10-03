@@ -12,7 +12,6 @@
 "use strict";
 
 const fs = require("node:fs");
-const path = require("node:path");
 
 const STDERR_LINES = 12;
 const STDERR_KEEP_BYTES = 16384;
@@ -28,11 +27,13 @@ module.exports = async function* crashReporter(source) {
       tails.set(d.file, (prior + String(d.message || "")).slice(-STDERR_KEEP_BYTES));
     } else if (ev.type === "test:fail") {
       const err = (d.details && d.details.error) || {};
-      const fileLevel = d.file && (d.name === d.file || d.name === path.basename(d.file));
-      const died = err.exitCode != null || err.signal != null;
-      if (fileLevel && died) {
+      // The record is the exitCode/signal node attaches to the file's OWN error
+      // — never the test's name (a leaf test may be named after its file) and
+      // never a property on a `cause` (that is an error a test threw).
+      const died = d.file && (err.exitCode != null || err.signal != null);
+      if (died) {
         crashed.push({ file: d.file, exitCode: err.exitCode ?? null, signal: err.signal ?? null });
-      } else if (!fileLevel || err.failureType !== "subtestsFailed") {
+      } else if (err.failureType !== "subtestsFailed" || d.name !== d.file) {
         // a failing test, or any non-crash file-level failure (cancelled,
         // unparseable): not something a re-run may wave through
         failedTests++;
