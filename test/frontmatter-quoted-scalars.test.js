@@ -83,3 +83,10 @@ test("malformed escapes stay literal in block items and edge attrs, never throw"
   assert.deepStrictEqual(n.tags, ['a\\', "\\u12"]);
   assert.strictEqual(n.edges[0].note, String.fromCharCode(0xd83d));
 });
+
+test("legacy reads are unchanged: trailing space trimmed in items/edge attrs, a closed quote then a continuation", () => {
+  const n = parseFrontmatter('---\nid: x\ntype: task\ntitle: "Foo"\n  bar\ntags:\n  - x  \nedges:\n  - type: blocks  \n    to: b  \n---\n', "x.md");
+  assert.strictEqual(n.title, "Foo bar");
+  assert.deepStrictEqual(n.tags, ["x"]);
+  assert.deepStrictEqual(n.edges, [{ type: "blocks", to: "b" }]);
+});
