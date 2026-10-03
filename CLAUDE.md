@@ -648,7 +648,14 @@ confirmed) and `dropped` (held work this beat SAW — inside this project's own
 scope — but did not renew: the GET→POST race, or a node held live by someone
 else), and the SessionEnd reserve/release hook replays
 both in order (`distill.js` sessionEndLease) so it never `reserve`s — and
-thereby auto-reclaims — a node the beat reported letting go. Note `renewed` is
+thereby auto-reclaims — a node the beat reported letting go. That replay is
+now the FALLBACK (task-split-spor-411451419762): the beat also sends
+`touch_session: <session>`, and SessionEnd first calls `POST
+/v1/queue/session-end {session}`, which converts from the server's own
+per-lease `touched` record (a released or teammate-taken lease is never
+selected); only a 404/405/501 (a server without the door) replays the journal,
+any other failure is a no-op. The journal records and their helpers retire
+once every tenant runs a server with the door. Note `renewed` is
 what the server confirmed only when it answered: on any non-200 the beat keeps
 the optimistic list rather than dropping a live lease out of SessionEnd's
 reach on a blip. The residual: a lease that vanishes from the project lookup

@@ -87,13 +87,24 @@ function seedHeartbeatFor(home, session, project, renewed, dropped) {
 // retaken). Omitted (default), the route falls through to 404 exactly as
 // before this check existed, so every pre-existing test that doesn't pass it
 // keeps hitting the fail-open path unchanged.
-function stubServer(nodesFor, queueItemsFor) {
+//
+// `sessionEndFor(body)`, when given, answers POST /v1/queue/session-end with
+// `{status, body}` (task-split-spor-411451419762) -- a server that ships the
+// door. Omitted (default), the door 404s like every tenant image older than
+// spor-server dd50c3a, so every replay test below exercises the FALLBACK.
+function stubServer(nodesFor, queueItemsFor, sessionEndFor) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       hits.push({ method: req.method, url: req.url, auth: req.headers.authorization, body });
+      if (sessionEndFor && req.method === 'POST' && req.url === '/v1/queue/session-end') {
+        const r = sessionEndFor(JSON.parse(body));
+        res.writeHead(r.status, { 'content-type': 'application/json' });
+        res.end(typeof r.body === 'string' ? r.body : JSON.stringify(r.body));
+        return;
+      }
       const getM = req.method === 'GET' && req.url.match(/^\/v1\/nodes\/([^/]+)$/);
       if (getM) {
         const found = nodesFor(decodeURIComponent(getM[1]));
@@ -165,7 +176,7 @@ test('no claim held this session -> no lookup, no action', async () => {
   }
 });
 
-test('still-open held task -> converts to a Tier-2 reservation via /reserve', async () => {
+test('still-open held task, server without the session-end door (404) -> falls back to /reserve', async () => {
   const { home, cwd } = scratch();
   seedHeartbeat(home, 's1', ['task-mine']);
   const { srv, hits, base } = await stubServer((id) =>
@@ -178,6 +189,8 @@ test('still-open held task -> converts to a Tier-2 reservation via /reserve', as
     const reserve = hits.find((h) => h.method === 'POST' && h.url === '/v1/nodes/task-mine/reserve');
     assert.ok(reserve, `expected a reserve POST; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
     assert.deepStrictEqual(JSON.parse(reserve.body), { session: 's1' });
+    const door = hits.findIndex((h) => h.method === 'POST' && h.url === '/v1/queue/session-end');
+    assert.ok(door >= 0 && door < hits.indexOf(reserve), 'the session-end door is tried first');
     const rec = journal(home).find((e) => e.tool === 'session-lease');
     assert.deepStrictEqual(rec && { id: rec.id, action: rec.action }, { id: 'task-mine', action: 'reserve' });
   } finally {
@@ -429,7 +442,11 @@ test('unverifiable node (non-200 GET) -> lease left alone, no reserve/release at
   seedHeartbeat(home, 's1', ['task-mine']);
   const srv = http.createServer((req, res) => {
     req.on('data', () => {});
-    req.on('end', () => { res.writeHead(500, { 'content-type': 'application/json' }); res.end('{}'); });
+    // the session-end door is absent (404) so the replay's per-node GET is what 500s
+    req.on('end', () => {
+      res.writeHead(req.url === '/v1/queue/session-end' ? 404 : 500, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
   });
   const base = await new Promise((resolve) => srv.listen(0, '127.0.0.1', () =>
     resolve(`http://127.0.0.1:${srv.address().port}`)));
@@ -597,3 +614,86 @@ test('a session holding leases in two different projects checks each project ind
     srv.close();
   }
 });
+
+// task-split-spor-411451419762: a server carrying POST /v1/queue/session-end is
+// the lease truth -- one call, no journal replay, no per-node GET/reserve/release.
+test('server with the session-end door -> ONE POST converts; no replay, no per-node calls', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeat(home, 's1', ['task-open', 'task-done']);
+  seedHeartbeatFor(home, 's1', 'other-repo', ['task-other']);
+  const { srv, hits, base } = await stubServer(
+    (id) => ({ raw: `id: ${id}\nstatus: open\n---\nbody` }),
+    () => [{ id: 'task-open', lease_state: 'in_progress' }],
+    () => ({
+      status: 200,
+      body: {
+        ok: true, status: 'partial', session: 's1', reserved: ['task-open'], released: ['task-done'], count: 2,
+        leases: [], failed: [{ node_id: 'task-gone', code: 'not_found', message: 'x' }],
+      },
+    })
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    const out = await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+    assert.strictEqual(out.trim(), '');
+    assert.deepStrictEqual(
+      hits.map((h) => h.method + ' ' + h.url),
+      ['POST /v1/queue/session-end'],
+      'one unscoped door call and nothing else'
+    );
+    assert.deepStrictEqual(JSON.parse(hits[0].body), { session: 's1' });
+    assert.strictEqual(hits[0].auth, 'Bearer spor_pat_test');
+    const recs = journal(home).filter((e) => e.tool === 'session-lease').map((e) => ({ id: e.id, action: e.action, via: e.via }));
+    assert.deepStrictEqual(recs, [
+      { id: 'task-open', action: 'reserve', via: 'session-end' },
+      { id: 'task-done', action: 'release', via: 'session-end' },
+      { id: 'task-gone', action: 'failed', via: 'session-end' },
+    ]);
+  } finally {
+    srv.close();
+  }
+});
+
+for (const status of [405, 501]) {
+  test(`session-end door answering ${status} counts as absent -> journal replay fallback`, async () => {
+    const { home, cwd } = scratch();
+    seedHeartbeat(home, 's1', ['task-mine']);
+    const { srv, hits, base } = await stubServer(
+      (id) => ({ raw: `id: ${id}\nstatus: open\n---\nbody` }),
+      undefined,
+      () => ({ status, body: {} })
+    );
+    try {
+      const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+      await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+      assert.ok(hits.some((h) => h.url === '/v1/queue/session-end'));
+      assert.ok(hits.some((h) => h.url === '/v1/nodes/task-mine/reserve'), 'fell back to the replay');
+    } finally {
+      srv.close();
+    }
+  });
+}
+
+// Any other failure is NOT a fallback trigger: the door may have partly run,
+// and re-driving the replay could re-reserve (auto-reclaim) what it released.
+for (const [label, resp] of [['a 500', { status: 500, body: {} }], ['an unparseable 200', { status: 200, body: 'not json' }]]) {
+  test(`session-end door answering ${label} -> no replay, one journaled no-op`, async () => {
+    const { home, cwd } = scratch();
+    seedHeartbeat(home, 's1', ['task-mine']);
+    const { srv, hits, base } = await stubServer(
+      (id) => ({ raw: `id: ${id}\nstatus: open\n---\nbody` }),
+      undefined,
+      () => resp
+    );
+    try {
+      const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+      await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+      assert.deepStrictEqual(hits.map((h) => h.method + ' ' + h.url), ['POST /v1/queue/session-end']);
+      assert.strictEqual(journal(home).filter((e) => e.tool === 'session-lease').length, 0, 'nothing converted');
+      const recs = journal(home).filter((e) => e.tool === 'session-end');
+      assert.deepStrictEqual(recs.map((e) => ({ action: e.action, http: e.http })), [{ action: 'none', http: String(resp.status) }]);
+    } finally {
+      srv.close();
+    }
+  });
+}

@@ -1297,6 +1297,9 @@ function makeLogger(file, prefix) {
 // task-spor-heartbeat-journal-protocol-shape-guard). Both ends go through
 // these two functions so a field rename on either side breaks the shape test
 // in test/heartbeat-journal-shape.test.js instead of silently diverging.
+// The replay is now only sessionEndLease's FALLBACK for a server without POST
+// /v1/queue/session-end (task-split-spor-411451419762); retire these helpers
+// and the shape test once every tenant runs a server with that door.
 const HEARTBEAT_TOOL = "claim-heartbeat";
 
 function appendHeartbeatRecord(journalPath, { project, renewed, dropped, skippedOtherProject }) {

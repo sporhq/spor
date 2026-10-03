@@ -222,10 +222,12 @@ test('live claim held by this person -> blanket renew (heartbeat) fires, no nudg
     // one blanket renew — no ids, no session (in the enumerate arm `session` is
     // a FILTER, and a lease claimed outside a session would be skipped by it),
     // and never the singular door, whose auto-reclaim a heartbeat must not use
-    // (dec-spor-heartbeat-adopts-blanket-renew-arm)
+    // (dec-spor-heartbeat-adopts-blanket-renew-arm). `touch_session` is the
+    // non-filtering touch SessionEnd's POST /v1/queue/session-end converts
+    // (task-split-spor-411451419762).
     const bulk = hits.filter((h) => h.method === 'POST' && h.url === '/v1/queue/renew');
     assert.strictEqual(bulk.length, 1, `expected one blanket renew; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
-    assert.deepStrictEqual(JSON.parse(bulk[0].body), { project: 'projx' });
+    assert.deepStrictEqual(JSON.parse(bulk[0].body), { project: 'projx', touch_session: 's1' });
     assert.ok(!hits.some((h) => h.method === 'POST' && /^\/v1\/nodes\//.test(h.url)), 'no per-node renew fired');
     // no claim-nudge journaled; a claim-heartbeat line was
     assert.strictEqual(journal(home).filter((e) => e.tool === 'claim-nudge').length, 0);
@@ -256,7 +258,7 @@ test('multiple live claims held -> one blanket POST /v1/queue/renew, not N singl
     // exactly one blanket renew, no per-node renews
     const bulk = hits.filter((h) => h.method === 'POST' && h.url === '/v1/queue/renew');
     assert.strictEqual(bulk.length, 1, `expected exactly one bulk renew; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
-    assert.deepStrictEqual(JSON.parse(bulk[0].body), { project: 'projx' });
+    assert.deepStrictEqual(JSON.parse(bulk[0].body), { project: 'projx', touch_session: 's1' });
     assert.ok(!hits.some((h) => h.method === 'POST' && /^\/v1\/nodes\//.test(h.url)), 'no per-node renew fired alongside the batch');
     // no claim-nudge journaled; a claim-heartbeat line names both nodes
     assert.strictEqual(journal(home).filter((e) => e.tool === 'claim-nudge').length, 0);
@@ -290,7 +292,7 @@ test('server-reported skipped_other_project is journaled on the claim-heartbeat 
     assert.strictEqual(out.trim(), '');
     const bulk = hits.filter((h) => h.method === 'POST' && h.url === '/v1/queue/renew');
     assert.strictEqual(bulk.length, 1);
-    assert.deepStrictEqual(JSON.parse(bulk[0].body), { project: 'projx' }, 'the heartbeat sends the same slug the lookup used');
+    assert.deepStrictEqual(JSON.parse(bulk[0].body), { project: 'projx', touch_session: 's1' }, 'the heartbeat sends the same slug the lookup used');
     const hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
     assert.strictEqual(hb.length, 1);
     assert.deepStrictEqual(hb[0].renewed, ['task-mine']);

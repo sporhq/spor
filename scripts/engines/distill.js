@@ -110,6 +110,46 @@ function parseFactBlocks(response) {
   return facts;
 }
 
+// POST /v1/queue/session-end {session} — the server-side conversion
+// sessionEndLease prefers. Returns true when the door ANSWERED (converted, or
+// failed in a way the replay must not second-guess) and false only when the
+// server has no such door, so the caller falls back to the journal replay.
+// One `session-lease` journal line per conversion keeps the observability the
+// replay path writes.
+const SESSION_END_ABSENT = new Set(["404", "405", "501"]);
+async function sessionEndDoor({ session, slug, journalPath, timeoutMs }) {
+  const resp = await u
+    .curl(`${u.serverBase()}/v1/queue/session-end`, {
+      method: "POST",
+      headers: { ...u.bearer(), "content-type": "application/json" },
+      body: JSON.stringify({ session }),
+      timeoutMs,
+    })
+    .catch(() => null);
+  const http = resp ? resp.http : "000";
+  if (SESSION_END_ABSENT.has(http)) return false;
+  const line = (rec, tool = "session-lease") =>
+    u.appendLine(journalPath, JSON.stringify({ ts: u.jqNow(), project: slug, tool, ...rec, http, via: "session-end" }));
+  let body = null;
+  if (http === "200") {
+    try {
+      body = JSON.parse(resp.body);
+    } catch {}
+  }
+  if (!body || typeof body !== "object") {
+    // No conversion happened (or none we can read): journaled under its own
+    // tool so `session-lease` stays one line per lease the door named.
+    line({ action: "none" }, "session-end");
+    return true;
+  }
+  for (const id of Array.isArray(body.reserved) ? body.reserved : []) line({ id, action: "reserve" });
+  for (const id of Array.isArray(body.released) ? body.released : []) line({ id, action: "release" });
+  for (const f of Array.isArray(body.failed) ? body.failed : []) {
+    if (f && f.node_id) line({ id: f.node_id, action: "failed", code: f.code });
+  }
+  return true;
+}
+
 // task-cc-client-sessionend-reserve-hook (dec-cc-task-resumption-reservation):
 // the fifth-and-sixth lease actions, called from SessionEnd. Converts every
 // task THIS SESSION held a live Tier-1 lease on — evidenced by its own
@@ -135,6 +175,11 @@ function parseFactBlocks(response) {
 // Same gating posture as the post-tool claim-nudge branch: remote/team mode
 // only, in a real git repo, fail-open, config-cascade knobs
 // (sessionLease.enabled / SPOR_SESSION_LEASE, default on). No LLM.
+//
+// The journal replay described above is now the FALLBACK: a server carrying
+// POST /v1/queue/session-end answers the same question from its own lease
+// table (sessionEndDoor). The replay — and the post-tool heartbeat records it
+// reads — stay only until every tenant runs a server with that door.
 async function sessionEndLease({ graph, slug, session, cwd, remote }) {
   if (!remote) return; // a lease is meaningless without a shared server
   if (u.config() ? !u.config().getBool("sessionLease.enabled", true) : (u.envDual("SESSION_LEASE") ?? "1") === "0")
@@ -160,7 +205,26 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
   } catch {
     return; // no journal for this session -> no heartbeats -> nothing held
   }
-  // Replayed in journal ORDER, because a heartbeat line is a point-in-time
+  // The heartbeat records are still the GATE: a session with none renewed no
+  // lease (and fed no `touch_session` to the server), so it costs no request.
+  if (u.heartbeatJournalProjects(entries).size === 0) return;
+
+  const timeoutMs = u.cfgNum("sessionLease.timeoutMs", "SESSION_LEASE_TIMEOUT", 3000);
+  // task-split-spor-411451419762 (dec-spor-server-session-end-lease-conversion-
+  // touched-record): the server is the lease truth. Each blanket heartbeat
+  // sends `touch_session`, so the server's per-lease `touched` record already
+  // knows which leases this session worked — and, unlike the journal replay
+  // below, it structurally cannot pick a lease released from another terminal
+  // or taken by a teammate. ONE unscoped call converts them all (the server
+  // filters on the session, so a per-project scope would add requests, not
+  // safety). Only a server WITHOUT the door (404/405/501 — every tenant image
+  // older than spor-server dd50c3a) falls back to the journal replay; any other
+  // failure is a no-op, since the door may have partly run and re-driving the
+  // replay could re-reserve (auto-reclaim) what it released — the leases then
+  // lapse on their TTL, the safe direction.
+  if (await sessionEndDoor({ session, slug, journalPath, timeoutMs })) return;
+  // FALLBACK (no session-end door on this server): replayed in journal
+  // ORDER, because a heartbeat line is a point-in-time
   // reading, not a cumulative one: `renewed` adds a node this beat confirmed,
   // `dropped` REMOVES one it no longer holds. The blanket heartbeat never
   // re-acquires a lapsed lease (dec-spor-heartbeat-adopts-blanket-renew-arm),
@@ -219,7 +283,6 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
   }
   if (ids.size === 0) return; // no claim held this session
 
-  const timeoutMs = u.cfgNum("sessionLease.timeoutMs", "SESSION_LEASE_TIMEOUT", 3000);
   // Each id's GET+POST is independent, so run them concurrently rather than
   // paying up to N * 2 * timeoutMs sequentially for a session that held
   // several claims.

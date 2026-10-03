@@ -490,7 +490,12 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
         .curl(`${u.serverBase()}/v1/queue/renew`, {
           method: "POST",
           headers: { ...u.bearer(), "content-type": "application/json" },
-          body: JSON.stringify({ project: slug }),
+          // `touch_session` (task-split-spor-411451419762): never a filter and
+          // never a re-stamp of the lease's session binding — it records this
+          // session on each renewed lease's server-side `touched` list, which
+          // is what SessionEnd's POST /v1/queue/session-end converts. A server
+          // without the door ignores the unknown field.
+          body: JSON.stringify({ project: slug, touch_session: session }),
           timeoutMs,
         })
         .catch(() => null);
