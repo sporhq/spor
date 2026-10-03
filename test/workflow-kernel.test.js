@@ -298,6 +298,29 @@ test("persist runs after every append and before the result reaches the workflow
   assert.throws(() => flaky.signal("approval:x", 1), /disk full/);
   const reopened = new Execution(fn, {}, { journal: [], clock, activities: { a: () => 7 }, persist: () => {} });
   assert.deepEqual(await reopened.run(), { status: "completed", result: 7 });
+  // The run that HIT the failure is poisoned too, even when the workflow
+  // swallows the throw (the pipeline wraps its dispatches in try/catch) and
+  // goes on to return a verdict: that verdict was computed over a journal the
+  // disk may not match, and nothing further is journaled.
+  let launched = 0;
+  const appended = [];
+  const swallow = async (ctx) => {
+    let verdict;
+    try {
+      verdict = await ctx.run("dispatch", "launch", {});
+    } catch {
+      verdict = "escalated";
+    }
+    ctx.now("after");
+    return verdict;
+  };
+  const once = new Execution(swallow, {}, { journal: [], clock, activities: { launch: () => `run-${++launched}` }, persist: (x) => { if (appended.push(x) === 1) throw new Error("EIO"); } });
+  const hit = await drive(once, { clock });
+  assert.equal(hit.status, "failed");
+  assert.equal(hit.error.message, "EIO");
+  assert.equal(once.status, "failed");
+  assert.equal(appended.length, 1, "nothing is journaled after the poison");
+  assert.equal(launched, 1);
   // a signal delivery persists too
   const s = new Execution(fn, {}, { journal: [], clock, activities: { a: () => 7 }, persist: (x) => disk.push(x) });
   s.signal("approval:x", 1);

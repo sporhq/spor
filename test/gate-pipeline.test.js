@@ -54,8 +54,8 @@ const BASE = {
 // A fake world: what the diff says, what the suite does, what a review answers,
 // what the graph accepts. Every write is captured so the tests can assert on
 // the FACTS, which is the deliverable, not just on the verdict.
-function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok: true }), review = () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }), fix = () => ({ ok: true }), approval = () => ({ state: "approved", by: "person-a" }), demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }), writes = null, pools = null, savePools = null } = {}) {
-  const seen = { facts: [], lane: [], human: [], escalations: [], demotions: [], suites: [], reviews: [], fixes: [], approvals: 0, slept: 0, reads: 0, pools: pools ? { ...pools } : null, flakes: [], poolSaves: 0 };
+function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok: true }), review = () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }), fix = () => ({ ok: true }), approval = () => ({ state: "approved", by: "person-a" }), demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }), writes = null, pools = null, savePools = null, poolsUnreadable = false } = {}) {
+  const seen = { facts: [], lane: [], human: [], escalations: [], demotions: [], suites: [], reviews: [], fixes: [], approvals: 0, slept: 0, reads: 0, pools: pools ? { ...pools } : null, flakes: [], poolSaves: 0, reviewRetries: [] };
   let clock = 1_700_000_000_000;
   const deps = {
     now: () => clock,
@@ -78,6 +78,7 @@ function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok:
     },
     review: async (args) => {
       seen.reviews.push({ gate: args.gate.id, cycle: args.cycle });
+      seen.reviewRetries.push(args.retry); // the launch-identity count the door folds into the run name
       return review(args, seen);
     },
     fix: async (args) => {
@@ -116,9 +117,12 @@ function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok:
     // for it: the runner's fail-closed rule is that a caller with no pool
     // deps gets no infrastructure retries at all, which is what keeps every
     // other test in this file byte-identical.
-    ...(pools
+    ...(pools || poolsUnreadable
       ? {
-          loadGatePools: async () => seen.pools,
+          loadGatePools: async () => {
+            if (poolsUnreadable) throw new Error("EIO reading the record");
+            return seen.pools;
+          },
           saveGatePools: async ({ pools: next }) => {
             seen.poolSaves += 1;
             if (savePools) savePools(seen);
@@ -7485,6 +7489,38 @@ test("a pool that RESUMES already spent is not handed a fresh allowance", async 
   assert.strictEqual(res.state, "failed");
   assert.strictEqual(seen.reviews.length, 1, "the killed worker's charge still counts");
   assert.strictEqual(seen.poolSaves, 0);
+});
+
+// The `retry` a review is asked with is its LAUNCH IDENTITY's count: the
+// dispatch door adopts a run already launched under a name, and the review
+// name folds this count in, so a re-ask after an outage must carry a count
+// the dead reviewer's launch did not (dec-spor-adopt-by-name-returns-existing).
+test("a review is asked with the pool's durable count as its launch identity: 0, then 1 after an outage re-ask; a resumed spent pool names its count", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 1, backoff_ms: 60000 } } });
+  let call = 0;
+  const { deps, seen } = fakes({
+    pools: { retry: { spent: 0 } },
+    review: () => {
+      call += 1;
+      return call === 1 ? outageReview() : { ok: true, text: '```json\n{"verdict":"pass"}\n```' };
+    },
+  });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps })).state, "passed");
+  assert.deepStrictEqual(seen.reviewRetries, [0, 1], "the re-ask is a different launch from the one that found the outage");
+  const resumed = fakes({ pools: { retry: { spent: 1 } } });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: resumed.deps })).state, "passed");
+  assert.deepStrictEqual(resumed.seen.reviewRetries, [1], "a resumed worker names the count the dead one had charged");
+});
+
+test("an UNREADABLE pool is spent for headroom but names retry 0, so a resumed worker spells the dead worker's review name and adopts it rather than launching a second reviewer", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 3, backoff_ms: 60000 } } });
+  const ok = fakes({ poolsUnreadable: true });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: ok.deps })).state, "passed");
+  assert.deepStrictEqual(ok.seen.reviewRetries, [0], "the sentinel never reaches the launch identity");
+  const out = fakes({ poolsUnreadable: true, review: () => outageReview() });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: out.deps })).state, "failed", "no headroom: an outage read under the sentinel refuses, never re-asks");
+  assert.strictEqual(out.seen.reviews.length, 1);
+  assert.deepStrictEqual(out.seen.reviewRetries, [0]);
 });
 
 test("an UNROUTABLE review dispatch spends neither pool and is never waited on", async () => {
