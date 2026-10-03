@@ -181,6 +181,126 @@ test("the integration stage's fix cycle carries the same no-auto-route marker", 
   assert.match(calls[0].name, /^integration-fix-.+-0$/);
 });
 
+// The unified wait half (task-spor-gate-deps-unify-await-run, and the third
+// awaitRun makeIntegrationDeps kept for itself, folded in by issue-spor-
+// unfollowable-fix-may-still-dispatch-rescue): ONE `laneAwaitRun` behind the
+// gate pipeline's fix and rescue cycles, the implementation re-dispatch and the
+// integration stage's fix cycle, so every lane is followed under the worker's
+// idle ceiling and reads a run it stopped following as `unfollowable`.
+function awaitRunHost(polls, answer = (id) => ({ ok: true, record: { run_id: id, state: "done", terminal_state: "reported", finished_at: "2026-10-03T00:00:00.000Z" } })) {
+  return fakeHost({
+    gateStem: (id) => id,
+    launchedFixRun: () => null,
+    implBudgetStamp: () => ({}),
+    workerContract: () => "the worker contract",
+    awaitGateRun: async (_cfg, id, opts) => {
+      polls.push({ id, opts: { timeoutMs: opts.timeoutMs, maxAgeMs: opts.maxAgeMs, idleMs: opts.idleMs } });
+      return answer(id, opts);
+    },
+  });
+}
+const WATCHDOG = () => ({ ok: true, unfollowable: true, record: { run_id: "r", state: "running", terminal_note: "idle for 45m; the stop did not take" } });
+
+test("the gate deps' awaitRun is ONE shape for every lane: the fix and implement lanes take the operator's ceilings, the rescue lane its declared await_ms as a wait budget with maxAgeMs 0, and a watchdog verdict comes back ok:false + unfollowable", async (t) => {
+  const home = scratchHome(t);
+  const runId = "66666666-6666-6666-6666-666666666666";
+  writeRecord(home, runId);
+  const polls = [];
+  let verdict = null;
+  const { makeGateDeps } = gateDeps.createGateDeps(awaitRunHost(polls, (id) => (verdict ? verdict() : { ok: true, record: { run_id: id, state: "done", terminal_state: "reported", finished_at: "2026-10-03T00:00:00.000Z" } })));
+  const deps = makeGateDeps(cfgFor(home), {
+    record: { cwd: "/tmp/x", run_id: runId }, entry: { run_id: runId, node_id: "task-x", project: "demo" },
+    factory: { id: "f", trustedRef: "main", rescue: { profile: "p", awaitMs: 300 } },
+    slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home, runMaxMs: 1000, runIdleMs: 50,
+  });
+  const fix = await deps.awaitRun({ runId: "fix-1", lane: "fix" });
+  assert.deepStrictEqual(Object.keys(fix).sort(), ["classification", "finishedAt", "ok", "record", "runId", "unfollowable"]);
+  assert.strictEqual(fix.ok, true);
+  assert.strictEqual(fix.unfollowable, false);
+  assert.strictEqual(fix.finishedAt, "2026-10-03T00:00:00.000Z");
+  await deps.awaitRun({ runId: "impl-1", lane: "implement" });
+  await deps.awaitRun({ runId: "rescue-1", lane: "rescue" });
+  assert.deepStrictEqual(polls.map((p) => p.opts), [
+    { timeoutMs: 1000, maxAgeMs: 1000, idleMs: 50 },
+    { timeoutMs: 1000, maxAgeMs: 1000, idleMs: 50 },
+    { timeoutMs: 300, maxAgeMs: 0, idleMs: 50 },
+  ]);
+  verdict = WATCHDOG;
+  const gaveUp = await deps.awaitRun({ runId: "fix-2", lane: "fix" });
+  assert.strictEqual(gaveUp.ok, false);
+  assert.strictEqual(gaveUp.unfollowable, true);
+  assert.strictEqual(gaveUp.reason, "idle for 45m; the stop did not take");
+  assert.strictEqual(gaveUp.classification, null);
+  // ...and the one-shot `fix` carries the reading to its caller, so the gate
+  // workflow can refuse a rescue into a checkout the fixer may still hold.
+  const onceDeps = makeGateDeps(cfgFor(home), {
+    record: { cwd: "/tmp/x", run_id: runId, harness: "claude-code" }, entry: { run_id: runId, node_id: "task-x", project: "demo" },
+    factory: { id: "f", trustedRef: "main" }, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
+    dispatch: async () => ({ ok: true, run: { run_id: "fix-run-9" } }),
+  });
+  const out = await onceDeps.fix({ gate: { id: "review", cycles: 2 }, cycle: 0, findings: [], detail: "x" });
+  assert.deepStrictEqual(out, { ok: false, reason: "idle for 45m; the stop did not take", unfollowable: true });
+});
+
+test("the integration deps' awaitRun is the SAME wait half: the idle ceiling rides the poll, and a run this worker stopped following is reported unfollowable by its fix cycle too", async (t) => {
+  const home = scratchHome(t);
+  const runId = "77777777-7777-7777-7777-777777777777";
+  writeRecord(home, runId);
+  const polls = [];
+  let verdict = null;
+  const { makeIntegrationDeps } = gateDeps.createGateDeps(awaitRunHost(polls, (id) => (verdict ? verdict() : { ok: true, record: { run_id: id, state: "done" } })));
+  const deps = makeIntegrationDeps(cfgFor(home), {
+    record: { cwd: "/tmp/x", run_id: runId }, entry: { run_id: runId, node_id: "task-x" },
+    factory: { id: "f", trustedRef: "main", integration: { targetRef: "main", mode: "local", strategy: "merge", command: "npm test", cycles: 2 } },
+    passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home, runMaxMs: 2000, runIdleMs: 75,
+    dispatch: async () => ({ ok: true, run: { run_id: "int-fix-1" } }),
+  });
+  const ok = await deps.awaitRun({ runId: "int-fix-0" });
+  assert.strictEqual(ok.ok, true);
+  assert.strictEqual(ok.unfollowable, false);
+  assert.deepStrictEqual(polls[0].opts, { timeoutMs: 2000, maxAgeMs: 2000, idleMs: 75 }, "the fix lane's window, not a bare timeout");
+  const fixed = await deps.fix({ cycle: 0, kind: "conflict", detail: "CONFLICT in a.txt" });
+  assert.strictEqual(fixed.ok, true);
+  assert.strictEqual(fixed.record.run_id, "int-fix-1");
+  verdict = WATCHDOG;
+  const gaveUp = await deps.fix({ cycle: 1, kind: "conflict", detail: "CONFLICT in a.txt" });
+  assert.deepStrictEqual(gaveUp, { ok: false, reason: "idle for 45m; the stop did not take", unfollowable: true });
+  assert.strictEqual(polls.length, 3);
+});
+
+test("the implement one-shot reads a run-await THROW as an unfollowable run that launched — never as a pre-record refusal that would withdraw the reservation and clear the hold", async (t) => {
+  const home = scratchHome(t);
+  const runId = "88888888-8888-8888-8888-888888888888";
+  writeRecord(home, runId);
+  const polls = [];
+  const { makeGateDeps } = gateDeps.createGateDeps(
+    awaitRunHost(polls, () => {
+      throw new Error("the run record vanished mid-poll");
+    })
+  );
+  const launches = [];
+  const deps = makeGateDeps(cfgFor(home), {
+    record: { cwd: "/tmp/the-run-checkout", run_id: runId, resolved_profile: "profile-impl" }, entry: { run_id: runId, node_id: "task-x", project: "demo" },
+    factory: { id: "factory-test", trustedRef: "main", implementation: { budget: { attempts: 2 } } },
+    slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
+    dispatch: async (_cfg, values) => {
+      launches.push(values);
+      return { ok: true, run: { run_id: "impl-run-2" } };
+    },
+  });
+  const out = await deps.implement({ attempt: 2, of: 2, name: "impl-x-2", prior: [], dirty: false });
+  assert.strictEqual(launches.length, 1);
+  assert.strictEqual(out.ok, true, "a launched run is never a refusal");
+  assert.strictEqual(out.runId, "impl-run-2");
+  assert.strictEqual(out.unfollowable, true);
+  assert.strictEqual(out.record, null);
+  assert.match(out.reason, /the run record vanished mid-poll/);
+  assert.strictEqual(polls.length, 1);
+  // The signal halves are still the composition's own.
+  assert.strictEqual(deps.implement.composedOfSignals, true);
+  assert.strictEqual(typeof deps.dispatchImplement, "function");
+});
+
 // pinCandidate against a real repo and a real run record, with the host's
 // graph-facing helpers faked: the provenance names what the HOST reports (the
 // agent, the producer's resolved profile), and a re-pin after a fix cycle

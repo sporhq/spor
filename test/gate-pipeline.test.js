@@ -5917,6 +5917,35 @@ test("the rescue lane is bounded and scoped: `attempts: 2` hands the second resc
   assert.strictEqual(e.seen.escalations[0].rescue, undefined, "byte-identical escalate args without a lane");
 });
 
+test("an UNFOLLOWABLE fix cycle never reaches the rescue lane: the refusal says the fixer may still hold the checkout and escalates straight to a person, while a fix that merely could not run is still rescued", async () => {
+  // issue-spor-unfollowable-fix-may-still-dispatch-rescue: a fix this worker
+  // stopped following (an idle stop that did not take, the age watchdog) is
+  // not evidence the fixer stopped, and the rescue lane dispatches
+  // `--no-worktree --force` into that same checkout.
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }], rescue: RESCUE });
+  const world = withRescue(
+    fakes({ review: confirmOpen, fix: () => ({ ok: false, reason: "this worker stopped following the run", unfollowable: true }) }),
+    () => {
+      throw new Error("no rescue may be dispatched into a checkout the unfollowed fixer may still hold");
+    }
+  );
+  const { deps, seen } = world;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed", res.reason);
+  assert.strictEqual(seen.rescues.length, 0, "no rescue was dispatched");
+  assert.strictEqual(seen.escalations.length, 1, "escalated straight to a person");
+  assert.match(seen.escalations[0].detail, /the fix cycle could not be followed to its end \(this worker stopped following the run\) and may still hold the checkout/);
+  assert.strictEqual(res.gates[0].verdict, "failed");
+
+  // The control: the same refusal WITHOUT the unfollowable reading (a fix
+  // that could not run at all) still reaches the rescue lane, as before.
+  const control = withRescue(fakes({ review: confirmOpen, fix: () => ({ ok: false, reason: "no response" }) }));
+  const r2 = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: control.deps });
+  assert.strictEqual(control.seen.rescues.length, 1, "a fix that merely could not run is still rescued");
+  assert.match(control.seen.rescues[0].attempts.map((a) => a.detail).join("\n"), /the fix cycle could not run \(no response\)/);
+  assert.ok(["passed", "failed"].includes(r2.state));
+});
+
 test("a rescue that could not run escalates the refusal it was handed, saying so — and records the unrun attempt", async () => {
   const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review" }], rescue: RESCUE });
   const { deps, seen } = withRescue(fakes({ review: confirmOpen }), () => ({ ok: false, reason: "profile-claude-fable is not satisfiable on this box" }));
@@ -8466,6 +8495,51 @@ test("real doors: runGateAndIntegration runs the implementation stage before any
   const again = await sporCli.runGateAndIntegration(cfg, entry, JSON.parse(fs.readFileSync(dispatchRunsLib.runPaths(home, runId).record, "utf8")), { factory, slug: "demo", passthrough: {}, warn: () => {}, runMaxMs: 1000, home, log: () => {}, stopping: () => false, sleep: async () => {} });
   assert.strictEqual(again.escalated_to, res.escalated_to);
   assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("task-impl-")).length, 1, "one escalation, however many times the settled stage is re-entered");
+});
+
+test("real doors: an INTERRUPTED implementation stage (a stop before the next dispatch) returns from runGateAndIntegration with the execution reporter LEFT — no heartbeat stays registered in LIVE_EXECUTIONS", async () => {
+  // issue-spor-impl-stage-interrupted-skips-reporter-leave: the gate and
+  // integration `interrupted` returns leave the reporter; the implementation
+  // stage's did not, so a parked stage kept renewing its lease until the
+  // process exited.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-impl-stage-reporter-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_MODE: "local" } });
+  fs.writeFileSync(path.join(nodes, "task-demo.md"), "---\nid: task-demo\ntype: task\nproject: demo\ntitle: Add bounded retry to the sync worker\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\ndate: 2026-09-06\n---\n\nBody.\n");
+  const repo = repoWithBranch({ weakenTest: false, regress: false });
+  git(repo, "checkout", "-q", "main");
+  git(repo, "checkout", "-q", "-b", "empty");
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "node test/acceptance.js" }], implementation: { budget: { attempts: 2 } }, completion: { by: "controller" } });
+  factory.id = "factory-test";
+  // The claim opens the execution in the (local) store, so the record carries
+  // `impl_claim.store` and runGateAndIntegration builds a reporter for it.
+  sporCli.LIVE_EXECUTIONS.clear();
+  const held = await sporCli.claimExecutionHold(cfg, { id: "task-demo", project: "demo" }, factory, { home });
+  assert.strictEqual(held.ok, true, held.reason);
+  assert.strictEqual(held.recordFields.impl_claim.store, "local");
+  const runId = "run-impl-reporter-1";
+  const record = {
+    run_id: runId, node_id: "task-demo", name: "task-demo", harness: "fake", cwd: repo, state: "exited", termination_class: "completed", terminal_state: "reported", terminal_enforced: true,
+    started_at: "2026-09-06T00:00:00.000Z",
+    ...held.recordFields,
+    impl_state: "dispatched", impl_attempt: 1,
+    impl_attempts: held.recordFields.impl_attempts && held.recordFields.impl_attempts.length ? held.recordFields.impl_attempts : gates.reserveImplAttempt([], { index: 1, startedAt: "2026-09-06T00:00:00.000Z" }),
+  };
+  const dispatchRunsLib = require("../lib/shell/agent-dispatch-runner.js");
+  dispatchRunsLib.atomicJson(dispatchRunsLib.runPaths(home, runId).record, record);
+  const lines = [];
+  const entry = { run_id: runId, node_id: "task-demo", project: "demo" };
+  // Attempt 1 committed nothing; the budget has headroom, so the stage reaches
+  // its stop read before dispatching attempt 2 — and the worker is stopping.
+  const res = await sporCli.runGateAndIntegration(cfg, entry, record, { factory, slug: "demo", passthrough: {}, warn: () => {}, runMaxMs: 1000, home, log: (l) => lines.push(l), stopping: () => true, sleep: async () => {} });
+  assert.strictEqual(res.state, "interrupted", lines.join("\n"));
+  assert.strictEqual(res.stage, "interrupted");
+  assert.deepStrictEqual(res.gates, [], "no gate ran");
+  assert.strictEqual(sporCli.LIVE_EXECUTIONS.size, 0, "the reporter left: nothing keeps renewing the execution lease for a parked stage");
+  const after = JSON.parse(fs.readFileSync(dispatchRunsLib.runPaths(home, runId).record, "utf8"));
+  assert.strictEqual(after.gates_state, undefined, "the gate list never settled — nothing to stamp");
+  assert.match(fs.readFileSync(path.join(nodes, "task-demo.md"), "utf8"), new RegExp(`^execution: ${held.executionId}$`, "m"), "the hold stays");
 });
 
 // ------------------------------------------------ head consistency across fix cycles --

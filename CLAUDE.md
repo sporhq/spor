@@ -1830,6 +1830,58 @@ here. See
 test/gate-workflow.test.js (the crash sweep over three scripts — passed,
 settled, rescued — plus the yield, the pause timer, the sliced backoff and
 the fallback).
+**The shared stage-driver half (task-spor-shared-stage-workflow-helper):**
+what the three stage drivers had each kept a copy of lives ONCE in
+`lib/shell/stage-workflow.js` — `plain`, the tagged definition-mismatch throw,
+the LIVE-STEP binding guard (`guardedKernel`: a ctx whose
+`run`/`now`/`sleepUntil`/`awaitSignal` check the `open` digest against the live
+one only before a step that would EXECUTE rather than replay, so a journal
+holding an attempt's whole story replays to its result under an edited
+definition while one parked mid-attempt refuses before its next step is
+journaled — the rule dec-spor-implementation-stage-workflow-function-live-
+step-binding-guard decided for one stage, now every stage's; the integration
+workflow's former unconditional post-open check was aligned to it), the
+readings of a kernel failure (`unresumable` / `isTombstoned` / `replayFault`),
+the drive loop with its bounded poisoned-journal re-open (`driveStage`, on a
+failed run AND on a poisoned signal delivery), the refusal record a tombstone
+carries, the rebuild for a record-less tombstone, the tombstone-FIRST-then-
+settle policy (`settleOrRefuse`) and the tags a settled refusal reports
+(`refusalTags`). Each stage keeps its workflow function, activities table,
+settle writes and suspension handling. The tags are SURFACED the same way for
+every stage: `refusalSurface(result)` reads `definition_mismatch` /
+`journal_version_mismatch` / `refusal_tombstoned` / `refusal_replayed` off a
+pipeline result (runGateAndIntegration carries the implementation stage's onto
+its result; the integration stage's already rode `leave`), the settle stamps it
+on the run record as `gate_refusal` (settleRunRecord, the loop's `markGate`,
+and the `--regate` stamp, answered afresh), `settledGateSummary` and the
+`--status` entry carry it as `refusal`, and `spor work --status` prints one
+`refused: …` line (`describeRefusal`). The gate list's driver still judges an
+unresumable journal afresh rather than refusing, so today only the integration
+and implementation stages mint the tags; the surface is stage-agnostic. One
+gate-list wrinkle: its key sequence is a function of the LIVE factory (the
+gates it iterates), so a COMPLETED gate journal re-driven under an edit that
+moves the gate list diverges from the journal before the guard can run — the
+driver reads that divergence against the journaled `open` digest and logs it
+as the definition changing, never as a REPLAY FAULT; an edit that keeps the
+key sequence (a gate's command text) replays to the journaled verdicts. Two
+folded-in fixes ride the same change: runGateAndIntegration now calls
+`reporter.leave()` on EVERY non-candidate return from the implementation stage,
+the `interrupted` one included (issue-spor-impl-stage-interrupted-skips-
+reporter-leave — a parked stage used to keep its heartbeat in
+`LIVE_EXECUTIONS`); and an UNFOLLOWABLE fix cycle (an idle stop that did not
+take, the age watchdog — `unfollowable` on the awaitRun verdict) is never
+rescued (issue-spor-unfollowable-fix-may-still-dispatch-rescue): the gate
+workflow sets `noRescue` with `UNFOLLOWABLE_FIX_NO_RESCUE_WHY` and escalates,
+since a rescue dispatches `--no-worktree --force` into the checkout the
+unfollowed fixer may still hold. To make that reading reach every lane,
+gate-deps.js has ONE `laneAwaitRun` behind the gate deps' and the integration
+deps' `awaitRun` (the latter now takes `runIdleMs`, so an integration fix is
+followed under the idle ceiling too), the one-shot `fix` compositions carry
+`unfollowable`, and the one-shot `implement` reads a run-await THROW as an
+unfollowable run that LAUNCHED — never as the pre-record refusal that would
+withdraw the reservation and clear the hold over a run in flight. See
+test/stage-workflow.test.js, the awaitRun pins in test/gate-deps.test.js, and
+the two folded-in cases in test/gate-pipeline.test.js.
 What is NOT yet done, and
 still open on the parent task: the fold of `runGateAndIntegration` into one
 workflow, and the deletion of `gate_state`, the `gate_progress`

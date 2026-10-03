@@ -428,6 +428,46 @@ test("a journal recorded by another workflow version — or under an edited defi
   assert.ok(logs2.some((l) => /cannot be continued by this worker/.test(l) && /definition changed/.test(l)), logs2.join("\n"));
 });
 
+test("a COMPLETED gate journal under an EDITED factory: an edit that keeps the key sequence (a gate's command text) replays to the journaled verdicts with nothing re-run; one that moves it (the gate list) is judged afresh and READ as the definition changing, never as a replay fault", async () => {
+  // The gate list iterates the LIVE factory's gates, so its key sequence is
+  // a function of the definition: the live-step guard (stage-workflow.js)
+  // can only fire where replay and definition agree up to the next live step.
+  const home = scratchHome("settled-edit");
+  const clock = fakeClock(1_700_000_000_000);
+  const w = makeWorld({ clock, home });
+  const first = await gateRunner.runGatePipeline({ item: ITEM, factory: SCRIPTS.passed.factory, deps: w.deps });
+  assert.equal(first.state, "passed");
+  const onDisk = () => store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  const j1 = onDisk();
+  const suites = w.suites;
+  const reviews = w.reviews.length;
+
+  // Same gates, same ids, the suite command edited: the journal replays to
+  // its result — nothing is left to execute, so nothing is refused or re-run.
+  const sameShape = factoryOf({ ...BASE, gates: [{ ...GATES[0], command: "npm run test:all" }, GATES[1]] });
+  assert.notEqual(wf.definitionBindingDigest(sameShape), wf.definitionBindingDigest(SCRIPTS.passed.factory));
+  const logs = [];
+  const replayed = await gateRunner.runGatePipeline({ item: ITEM, factory: sameShape, deps: w.deps, log: (l) => logs.push(l) });
+  assert.equal(replayed.state, "passed");
+  assert.deepEqual(replayed.gates.map((g) => g.gate), first.gates.map((g) => g.gate), "the journaled verdicts");
+  assert.ok(!logs.some((l) => /cannot be continued by this worker|REPLAY FAULT|judging over a fresh in-memory journal/.test(l)), logs.join("\n"));
+  assert.equal(w.suites, suites, "no suite re-ran");
+  assert.equal(w.reviews.length, reviews, "no review re-ran");
+  assert.deepEqual(onDisk(), j1, "nothing appended");
+
+  // The gate LIST edited: the replay diverges from the journal before any
+  // live step; the driver reads the moved binding, says so, and judges afresh
+  // under the edited definition — as the record-based resume always did.
+  const moved = factoryOf({ ...BASE, gates: [GATES[0]] });
+  const logs2 = [];
+  const again = await gateRunner.runGatePipeline({ item: ITEM, factory: moved, deps: w.deps, log: (l) => logs2.push(l) });
+  assert.equal(again.state, "passed");
+  assert.deepEqual(again.gates.map((g) => g.gate), ["acceptance"], "judged under the edited definition");
+  assert.ok(logs2.some((l) => /cannot be continued by this worker \(the factory definition changed while task-demo's gate pipeline was in flight/.test(l)), logs2.join("\n"));
+  assert.ok(!logs2.some((l) => /REPLAY FAULT/.test(l)), "a moved definition is never reported as a determinism bug");
+  assert.deepEqual(onDisk(), j1, "the settled journal is left as it was");
+});
+
 test("the one-shot `fix` and `rescue` are still honored when a caller wires them without the signal halves, and a caller-overridden `fix` wins over the composed halves", async () => {
   const clock = fakeClock(1_700_000_000_000);
   const world = makeWorld({ clock });

@@ -97,6 +97,7 @@ const integrationRunner = lazyModule(path.join(ROOT, "lib", "shell", "integratio
 const gateDepsLib = lazyModule(path.join(ROOT, "lib", "shell", "gate-deps.js"));
 const ciGate = lazyModule(path.join(ROOT, "lib", "shell", "ci-gate.js"));
 const implementationStage = lazyModule(path.join(ROOT, "lib", "shell", "implementation-stage.js"));
+const stageWorkflow = lazyModule(path.join(ROOT, "lib", "shell", "stage-workflow.js"));
 const workerContractLib = lazyModule(path.join(ROOT, "lib", "shell", "worker-contract.js"));
 // workerContractLib is lazy, so this can't be a destructure (that would force
 // the require right here, at every startup) — a thin wrapper defers it like
@@ -11302,6 +11303,9 @@ function cmdWorkStatus(cfg, { json }) {
           `${r.gate ? `  gates ${r.gate}` : ""}${r.superseded ? " (superseded)" : ""}`
       );
       if (r.gate && r.gate !== "passed" && r.gate_reason) out(`            ${r.gate_reason}`);
+      // A REFUSED attempt — the factory edited mid-flight, a journal of another
+      // workflow version, a tombstone re-settled — says so, for every stage.
+      if (r.refusal) out(`            ${stageWorkflow.describeRefusal(r.refusal)}`);
       // A pipeline PAUSED on a review lane's stated reset: when it wakes.
       if (r.paused_until) out(`            paused until ${r.paused_until} — slot freed; re-offered then`);
       // A verdict this worker's pipeline did NOT produce (cross-model review,
@@ -14479,6 +14483,13 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       // states), so the resume scan re-offers it and the ledger picks up where
       // it stopped; everything else settles the pipeline as a refusal.
       const state = stage.state === "interrupted" ? "interrupted" : "failed";
+      // The reporter leaves the heartbeat set on EVERY return from this pass,
+      // the interrupted one included (issue-spor-impl-stage-interrupted-skips-
+      // reporter-leave): a stage parked on a stop or a backoff yield used to
+      // return here with the reporter still in LIVE_EXECUTIONS, renewing its
+      // lease until the process exited. The execution itself stays live in
+      // the store (the hold is kept, T1); what leaves is this pass's beat.
+      if (reporter) reporter.leave();
       return {
         state,
         gates: [],
@@ -14493,6 +14504,11 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
         // from (retryOneEscalation's `stage: "implementation"` arm), so a
         // held item whose blocker never landed is not left for `--regate`.
         ...(stage.escalation_retry ? { escalation_retry: stage.escalation_retry } : {}),
+        // A REFUSED attempt's tags (definition_mismatch / journal_version_
+        // mismatch / refusal_tombstoned / refusal_replayed) ride the pipeline
+        // result so the run record and `--status` read them for this stage
+        // exactly as for the integration stage's (stage-workflow.js).
+        ...stageWorkflow.carryRefusalTags(stage),
       };
     }
     if (stage.handoff) ctx.log(`work: ${entry.node_id} — implementation stage hands the run to the gates: ${stage.handoff}`);
@@ -14769,6 +14785,10 @@ function settleRunRecord(home, runId, res, workerId = null, { gateResult = null,
       ...(res && Array.isArray(res.failing_tests) ? { gate_failing_tests: res.failing_tests } : {}),
       ...(res && res.empty_diff ? { gate_empty_diff: true } : {}),
       ...(res && res.demoted != null ? { gate_demoted: !!res.demoted } : {}),
+      // A refused attempt (a definition edited mid-flight, a journal of another
+      // workflow version, a tombstoned journal re-settled) says WHY on the
+      // record, in one vocabulary for every stage (stage-workflow.js).
+      ...(stageWorkflow.refusalSurface(res) ? { gate_refusal: stageWorkflow.refusalSurface(res) } : {}),
       ...(gateResult
         ? {
             gate_head: gateResult.head || null,
@@ -14804,6 +14824,7 @@ function settledGateSummary(rec) {
     proposal_attestation_error: rec.gate_proposal_attestation_error || null,
     worker: rec.gate_worker || null,
     at: rec.gate_at || null,
+    refusal: rec.gate_refusal || null,
   };
 }
 
@@ -15740,6 +15761,9 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     // this refusal reached the graph" is answered afresh by every attempt, and
     // a re-gate that escalated (or passed) must not leave the old claim standing.
     gate_escalation_failed: !!(res && res.escalation_failed),
+    // Whether THIS attempt was a refusal of the journal (stage-workflow.js) —
+    // answered afresh too, so a re-gate that judged clears the old reading.
+    gate_refusal: stageWorkflow.refusalSurface(res),
     // The bounded auto-retry's own bookkeeping (task-spor-gate-escalation-
     // bounded-auto-retry) is reset to a clean slate for THIS attempt, not
     // carried from whichever earlier attempt last touched it — a stale

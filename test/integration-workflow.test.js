@@ -740,6 +740,32 @@ test("the DRIVER settles a journal recorded by another workflow version the same
   assert.equal(seen.lands, 0);
 });
 
+test("a COMPLETED journal replays to its result under an EDITED factory — the live-step rule: nothing is left to execute, so nothing is refused, tombstoned or appended", async () => {
+  // The integration stage is re-entered over its own journal on an orphan
+  // resume; before the shared live-step guard (lib/shell/stage-workflow.js)
+  // its unconditional post-open check turned a factory edit AFTER the land
+  // into a refusal of an attempt that had already landed.
+  const home = scratchHome("settled-edit");
+  const clock = fakeClock(1_700_000_000_000);
+  const { deps, seen } = stageFakes({ home, clock, suite: () => ({ ok: true }) });
+  const factory = { ...FACTORY, trustedRef: "main" };
+  const first = await integrationRunner.runIntegrationStage({ item: ITEM, factory, deps, gatedHead: "head-v1" });
+  assert.equal(first.state, "passed", JSON.stringify(first));
+  const onDisk = () => store.readWorkflowJournal(home, "local", EXEC, { stage: "integration-a0" });
+  const j1 = onDisk();
+  assert.ok(!kernel.journalTombstone(j1));
+  const { builds, suites, lands, escalations } = seen;
+
+  const edited = { ...factory, integration: { ...factory.integration, command: "npm run test:all" } };
+  const again = await integrationRunner.runIntegrationStage({ item: ITEM, factory: edited, deps, gatedHead: "head-v1" });
+  assert.equal(again.state, "passed", JSON.stringify(again));
+  assert.equal(again.landed_sha, first.landed_sha);
+  assert.equal(again.definition_mismatch, undefined, "not a refusal");
+  assert.equal(again.refusal_tombstoned, undefined);
+  assert.deepEqual([seen.builds, seen.suites, seen.lands, seen.escalations], [builds, suites, lands, escalations], "nothing re-executed");
+  assert.deepEqual(onDisk(), j1, "nothing appended — no tombstone");
+});
+
 test("the activities table and the binding name the same set", () => {
   const { activities } = wf.bindIntegrationActivities({});
   const bound = Object.keys(activities).sort();

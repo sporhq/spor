@@ -1740,6 +1740,41 @@ test("spor work --status says out loud when a refusal filed NOTHING on the graph
   assert.match(text.stdout, /no escalation could be filed, so nothing was demoted — re-judge with 'spor work --regate run-abcdef12'/);
 });
 
+test("spor work --status says when an attempt was REFUSED — the factory edited mid-flight, a journal of another workflow version, a tombstone re-settled — in one line for every stage", () => {
+  // task-spor-shared-stage-workflow-helper: the stage drivers tag a refused
+  // attempt (definition_mismatch / journal_version_mismatch /
+  // refusal_tombstoned / refusal_replayed); the loop reads them into one
+  // `refusal` entry (lib/shell/stage-workflow.js refusalSurface) that the
+  // record carries as `gate_refusal`.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-refused-"));
+  workLoop.writeWorkerStatus(home, {
+    worker_id: "11111111-2222-3333-4444-777777777777",
+    pid: 999999,
+    state: "polling",
+    project: "demo",
+    concurrency: 1,
+    dispatched: 2,
+    outcomes: { resolved: 2, reported: 0, failed: 0 },
+    active: [],
+    gating: [],
+    recent: [
+      { run_id: "run-abcdef12", node_id: "task-demo", terminal_state: "resolved", terminal_enforced: true, gate: "failed", gate_reason: "integration failed: the factory's integration definition was edited", stage: undefined,
+        refusal: { reason: "definition_mismatch", journaled: "sha256:aaaa", live: "sha256:bbbb", tombstoned: true, replayed: true } },
+      { run_id: "run-12345678", node_id: "task-other", terminal_state: "resolved", terminal_enforced: true, gate: "failed", gate_reason: "implementation stage escalated", stage: "escalated",
+        refusal: { reason: "journal_version_mismatch", tombstoned: true, replayed: false, stage: "escalated" } },
+    ],
+    skipped: [],
+    started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    stopped_at: new Date().toISOString(),
+    stop_reason: "one pass (--once)",
+  });
+  const text = cli(["work", "--status"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(text.status, 0, text.stderr);
+  assert.match(text.stdout, /refused: the factory definition was edited while the attempt was in flight \(opened under sha256:aaaa, now sha256:bbbb\); the attempt's journal is tombstoned \(re-settled from the tombstone\) — a fresh attempt is 'spor work --regate <run>'/);
+  assert.match(text.stdout, /refused: the attempt's journal was recorded by another version of the workflow; the attempt's journal is tombstoned — a fresh attempt/);
+});
+
 test("spor work --status counts the skips it does not list, instead of stopping silently at five", () => {
   // The human renderer is the DEFAULT surface: showing five of 25 told an
   // operator that five items were skipped (the review's second finding).
