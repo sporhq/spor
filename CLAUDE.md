@@ -1783,18 +1783,64 @@ legacy run runs over an in-memory journal, byte-identical). See
 test/implementation-workflow.test.js (the crash sweep over the retry,
 outage and exhausted scripts; the worker-dies-mid-run proof; the stop and
 backoff yields over the file journal; the definition-mismatch refusal).
+**The gate list IS a workflow function too
+(task-spor-gate-list-as-workflow-function, the second slice):**
+`lib/shell/gate-workflow.js` holds runGatePipeline's whole control flow —
+the candidate read, the evidence preflight, the superseded/scoped/no-code
+routes, the dirty-tree round-trip, the gate list with its fix cycles and
+review ledger, the infrastructure pool, the rescue lane, the escalation —
+as `gateWorkflow(ctx, input)`: every deps call a `ctx.run` keyed on run id /
+attempt / pass / gate id / cycle plus a per-key sequence; ONE gate attempt
+(`runOneGate`: the suite, the review dispatch-and-await, the approval poll)
+is ONE activity (`judge`); the fix cycle's and the rescue's run-terminal
+waits are signals (`run:<id>`, `rescue-run:<id>`) when gate-deps wires the
+halves (`dispatchFix`/`dispatchRescue` + `awaitRun` + `rescueReport`; the
+one-shot `fix`/`rescue` are their tagged compositions, and a caller-
+overridden one-shot still wins); the outage backoff and the in-process
+reviewer wait are durable timers sliced exactly as the runner sliced them
+(the driver sleeps a slice and re-drives, so a stop is still answered inside
+the wait and the existing sleep counts hold); `deps.stopping` is a journaled
+read; and EVERY `interrupted` hand-up (a stop, pending evidence, an
+unverifiable origin, a reviewer PAUSE — whose `paused_until` IS the timer)
+is a durable YIELD after which the re-driven workflow runs the NEXT PASS
+(`e<epoch>` keys) over the same journal instead of replaying the interrupted
+verdict. The loop marks every adopted orphan and parked re-offer
+`resumed`, and the supersession check keys on it, so each pass journals that
+reading as its own input (`pass`): a continued pass keeps its first drive's,
+a pass started after a yield reads the live flag. `runGatePipeline` in
+gate-runner.js is the DRIVER with the same signature and result shape (the
+346-test gate-pipeline suite is unchanged); bin/spor.js hands it
+`workflowJournal` for stage `gates-a<attempt>` beside the integration
+stage's. Unlike the integration stage, a journal this worker cannot continue
+— another version, an edited factory (the `open` digest), a tombstone — is
+NOT refused: the gate list's own rules already re-judge a moved definition
+and the record-based resume (`gate_progress`, the rescue state) still
+stands until slice 4, so the driver logs it and judges over a fresh
+in-memory journal, exactly today's resume; a key-sequence fault takes the
+same door under its own "REPLAY FAULT" line (it is a workflow bug, never an
+operator's situation), and so does a step that THREW on an earlier drive
+(the record-based resume re-ran it live). One resume stays record-based BY
+DESIGN: an orphan adopted MID-AWAIT — a resumed drive whose pure replay ends
+on a run another worker dispatched — re-runs the pass through the record
+(the supersession check a resumed pipeline owes runs, adopt-by-name
+re-attaches the same run), because a journal continued past that await
+would skip the check that issue-spor-work-adopts-orphaned-pipeline-of-hand-
+landed-run exists for. The loop-level machinery is deliberately untouched
+here. See
+test/gate-workflow.test.js (the crash sweep over three scripts — passed,
+settled, rescued — plus the yield, the pause timer, the sliced backoff and
+the fallback).
 What is NOT yet done, and
-still open on the parent task: the rewrite of `runGateAndIntegration`/
-`runGatePipeline` as one workflow function over
-this kernel, and the deletion of `gate_state`, the `gate_progress`
+still open on the parent task: the fold of `runGateAndIntegration` into one
+workflow, and the deletion of `gate_state`, the `gate_progress`
 save/reload, `orphanedGateRuns`, `resumableSlots`, parked re-offers and
-`claimGateRecord` that the rewrite makes possible (the integration stage's
-own re-offer still rides the loop's door; the journal only makes the
+`claimGateRecord` that the rewrite makes possible (slice 4; both stages'
+re-offers still ride the loop's door — the journals only make the
 re-offered pipeline continue rather than restart). See
 test/workflow-kernel.test.js, test/workflow-journal.test.js,
-test/dispatch-adopt-by-name.test.js, test/integration-workflow.test.js (the
-crash sweep: a crash at every activity boundary resumes to the same result
-and side effects).
+test/dispatch-adopt-by-name.test.js, test/integration-workflow.test.js and
+test/gate-workflow.test.js (the crash sweeps: a crash at every activity
+boundary resumes to the same result and side effects).
 Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard

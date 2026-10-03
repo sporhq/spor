@@ -2576,6 +2576,24 @@ slot held by a worker that is not live, whose run record is terminal, carries a
 claim worth gating (§10.2), and has no settled `gate_state`, is adopted and
 re-gated.
 
+**The journal is the third record** (task-spor-gate-list-as-workflow-function,
+following the integration stage's task-spor-integration-stage-as-workflow-
+function). The gate list runs as one deterministic workflow function over the
+replay kernel (`lib/shell/gate-workflow.js` over `lib/kernel/workflow.js`): every
+dep call is journaled under a stable key beside the execution record
+(`journal/executions/<tenant>/exec/<id>.gates-a<attempt>.workflow.jsonl`), a
+gate attempt is one journaled activity, a fix cycle's or a rescue's run is
+awaited as a signal, the outage backoff and a reviewer pause are durable
+timers, and a reported `interrupted` is a durable yield — so a re-gated orphan
+or a re-offered pipeline REPLAYS what already landed (the same facts, the same
+run awaited, never a second fixer) and continues with a fresh pass from the
+yield. The two records above are unchanged and still authoritative for the
+resume scan and for a run with no execution to key a journal on; a journal this
+worker cannot continue (another workflow version, a factory edited in flight) is
+set aside and the pipeline is judged afresh through them, as it always was. The
+deletion of `gate_state`/`gate_progress`-based resumption in favour of the
+journal is the parent task's last slice.
+
 **A pipeline can also REPORT `interrupted` — and that is not a verdict
 either.** Besides a stop inside an outage backoff (§10.4), a pass whose gate
 evidence could not yet be published (flake occurrence evidence pending, pending

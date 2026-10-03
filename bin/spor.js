@@ -14497,7 +14497,12 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     }
     if (stage.handoff) ctx.log(`work: ${entry.node_id} — implementation stage hands the run to the gates: ${stage.handoff}`);
   }
-  let gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: gateDeps });
+  // The gate list's durable journal (task-spor-gate-list-as-workflow-function):
+  // beside the execution record, keyed on the execution the claim opened and
+  // this gate ATTEMPT, exactly as the integration stage's is below. A legacy
+  // run or a pre-adapter claim runs over an in-memory journal, byte-identical.
+  const gateJournal = stageWorkflowJournal(home, record, item, "gates");
+  let gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: { ...gateDeps, ...(gateJournal ? { workflowJournal: gateJournal } : {}) } });
   // An `interrupted` pipeline settled nothing — a stop that caught it waiting
   // out a dispatch OUTAGE (issue-spor-review-gate-reviewer-outage-read-as-
   // rejection), or evidence it could not yet publish (flake occurrence
@@ -14708,6 +14713,8 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
 // has no execution to key it on. A function (re-openable): the driver opens
 // a fresh handle after a poisoned persist, so what it replays is what is on
 // disk.
+// One STAGE's workflow journal (gates, implementation, integration): a per-stage
+// file beside the execution record, keyed on the gate attempt.
 function stageWorkflowJournal(home, record, item, stageName) {
   const claim = record && record.impl_claim;
   if (!claim || !claim.store || !claim.execution_id || !claim.tenant) return null;
