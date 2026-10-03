@@ -14459,8 +14459,8 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     // The stage's durable journal (task-spor-implementation-stage-as-
     // workflow-function): beside the execution record, keyed on the execution
     // the claim opened and this gate ATTEMPT, exactly as the integration
-    // stage's is — a legacy run or a pre-adapter claim runs over an in-memory
-    // journal, byte-identical.
+    // stage's is — or beside the RUN record for a legacy run or a pre-adapter
+    // claim (stageWorkflowJournal).
     const implJournal = stageWorkflowJournal(home, record, item, "implementation");
     const stage = await implementationStage.runImplementationStage({ item, factory: ctx.factory, record, log: ctx.log, deps: { ...gateDeps, ...(implJournal ? { workflowJournal: implJournal } : {}) } });
     if (stage.state !== "candidate") {
@@ -14515,8 +14515,9 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   }
   // The gate list's durable journal (task-spor-gate-list-as-workflow-function):
   // beside the execution record, keyed on the execution the claim opened and
-  // this gate ATTEMPT, exactly as the integration stage's is below. A legacy
-  // run or a pre-adapter claim runs over an in-memory journal, byte-identical.
+  // this gate ATTEMPT, exactly as the integration stage's is below — or beside
+  // the RUN record for a legacy run or a pre-adapter claim (stageWorkflowJournal):
+  // every gated run has a durable journal, since it is the only resume.
   const gateJournal = stageWorkflowJournal(home, record, item, "gates");
   let gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: { ...gateDeps, ...(gateJournal ? { workflowJournal: gateJournal } : {}) } });
   // An `interrupted` pipeline settled nothing — a stop that caught it waiting
@@ -14670,8 +14671,8 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // opened and this gate ATTEMPT (an explicit --regate opens a fresh attempt
   // and judges afresh; the loop's orphan resume and --regate --resume keep
   // the attempt and continue from the journal). A legacy run or a pre-adapter
-  // claim has no execution to key on and runs over an in-memory journal,
-  // byte-identical to before.
+  // claim has no execution to key on and keeps the journal beside its RUN
+  // record instead (stageWorkflowJournal).
   const integrationJournal = stageWorkflowJournal(home, record, item, "integration");
   intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null, deps: { ...makeIntegrationDeps(cfg, { ...intCtx, gateResult: () => gateResult, regate }), ...(integrationJournal ? { workflowJournal: integrationJournal } : {}) } });
   // A passing re-gate the stage REPLAYED (a resumed worker: the journal holds
@@ -14730,13 +14731,24 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
 // a fresh handle after a poisoned persist, so what it replays is what is on
 // disk.
 // One STAGE's workflow journal (gates, implementation, integration): a per-stage
-// file beside the execution record, keyed on the gate attempt.
+// file keyed on the gate attempt. Beside the execution record when the claim
+// opened one (`impl_claim.store`); otherwise beside the RUN record, under
+// `runPaths().workflows` — every gated run has a durable journal
+// (task-spor-delete-loop-resume-machinery-after-workflow-stages), because the
+// journal is what a later worker resumes from: a run that only ever ran over an
+// in-memory journal could be re-judged, never continued. A record with no run
+// id at all (a test seam handing the stage a bare entry) is the one case left
+// in memory.
 function stageWorkflowJournal(home, record, item, stageName) {
-  const claim = record && record.impl_claim;
-  if (!claim || !claim.store || !claim.execution_id || !claim.tenant) return null;
   const stage = `${stageName}-a${Math.max(0, Number(item && item.attempt) || 0)}`;
-  if (!executionStore.validSegment(String(claim.tenant)) || !executionStore.validSegment(String(claim.execution_id))) return null;
-  return () => executionStore.openWorkflowJournal(home, String(claim.tenant), String(claim.execution_id), { stage });
+  const claim = record && record.impl_claim;
+  if (claim && claim.store && claim.execution_id && claim.tenant && executionStore.validSegment(String(claim.tenant)) && executionStore.validSegment(String(claim.execution_id))) {
+    return () => executionStore.openWorkflowJournal(home, String(claim.tenant), String(claim.execution_id), { stage });
+  }
+  const runId = (record && record.run_id) || (item && item.run_id) || null;
+  if (!runId || !executionStore.validSegment(String(runId))) return null;
+  const abs = path.join(dispatchRuns.runPaths(home, String(runId)).workflows, `${stage}.workflow.jsonl`);
+  return () => executionStore.openWorkflowJournalAt(abs, { stage, label: `${stageName} workflow journal for run ${runId}` });
 }
 
 // The run record as it reads NOW — the pipeline's captured copy predates every

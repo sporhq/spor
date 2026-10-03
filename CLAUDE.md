@@ -1665,8 +1665,12 @@ result): `openWorkflowJournal` in `lib/shell/execution-store.js` binds it to
 `journal/executions/<tenant>/exec/<id>.workflow.jsonl` beside the execution
 record in BOTH modes (the kernel's entry kinds are not in the hosted store's
 §7.3 event vocabulary, and the box that drives a workflow is the box that
-resumes it). The spike's thirteen proofs (`spikes/durable-workflow/`) run over
-this kernel. **Adopt-by-name is the dispatch DOOR's contract**
+resumes it). The spike that chose this model (`spikes/durable-workflow/`)
+kept only its README once the three stages shipped as real workflow functions
+with their own crash sweeps; its `pipeline.workflow.js` twin and the proofs
+over it were deleted rather than left to drift
+(task-spor-delete-loop-resume-machinery-after-workflow-stages). **Adopt-by-name
+is the dispatch DOOR's contract**
 (dec-spor-adopt-by-name-returns-existing): `dispatchThrough` in bin/spor.js —
 the one door every review, fix, rescue, implementer and integration-fix launch
 goes through — returns the run this box already launched under

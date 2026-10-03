@@ -18,9 +18,16 @@
 //      forever;
 //   5. the outage backoff is a durable timer sliced as the runner sliced it;
 //   6. a journal this worker cannot continue (another version, an edited
-//      definition) is judged over a fresh in-memory journal, as the record-
-//      based resume always did;
-//   7. the activities table and the binding name the same set.
+//      definition) is REFUSED through the shared tombstone-then-settle door
+//      (stage-workflow.js settleOrRefuse) — escalation, demotion, fact — and a
+//      re-drive re-settles from the tombstone; a COMPLETED journal replays
+//      under any edit, since the gate list rides its `open` entry
+//      (task-spor-delete-loop-resume-machinery-after-workflow-stages);
+//   7. a REPLAY FAULT is a hard, tagged failure that never logs a fallback —
+//      every resume scenario here asserts the words never appear in a log;
+//   8. an orphan adopted mid-await is continued, and the journaled
+//      `afterAwait` read runs the supersession check it owes;
+//   9. the activities table and the binding name the same set.
 // test/gate-pipeline.test.js is the behavioural oracle (unchanged by the
 // rewrite); this file is the durability oracle.
 require("./helpers/tmp-cleanup");
@@ -398,7 +405,14 @@ test("the outage backoff is a durable timer sliced as the runner sliced it: one 
   assert.equal(pools2.retry.spent, 1, "the retry stays charged for the resume");
 });
 
-test("a journal recorded by another workflow version — or under an edited definition — is judged over a fresh in-memory journal, as the record-based resume always did", async () => {
+// A journal this worker cannot continue is REFUSED, never re-judged
+// (task-spor-delete-loop-resume-machinery-after-workflow-stages): the same
+// tombstone-then-settle door as the integration and implementation stages
+// (stage-workflow.js settleOrRefuse). The settle makes the three §10.7 writes
+// under deterministic ids — the escalation that blocks the item, the demotion,
+// the art-gate fact — and the result carries the shared refusal tags the run
+// record stamps as `gate_refusal`.
+test("a journal recorded by another workflow version is REFUSED: tombstoned first, then settled as failed with the escalation, the demotion and the fact — never judged over a fresh in-memory journal; a re-drive re-settles from the tombstone under the same ids", async () => {
   const home = scratchHome("version");
   const clock = fakeClock(1_700_000_000_000);
   const world = makeWorld({ clock, home });
@@ -407,31 +421,116 @@ test("a journal recorded by another workflow version — or under an edited defi
   h.persist({ kind: "effect", key: "stale", result: null });
   const logs = [];
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory: SCRIPTS.passed.factory, deps: world.deps, log: (l) => logs.push(l) });
-  assert.equal(res.state, "passed");
-  assert.ok(logs.some((l) => /cannot be continued by this worker/.test(l)), logs.join("\n"));
-  assert.equal(store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" }).length, 2, "the stale journal is left as it was");
+  assert.equal(res.state, "failed", JSON.stringify(res));
+  assert.equal(res.journal_version_mismatch, true);
+  assert.equal(res.refusal_tombstoned, true);
+  assert.equal(res.refusal_replayed, undefined);
+  assert.equal(res.noRescue, true, "a refusal never reaches the rescue lane");
+  assert.match(res.reason, /another version of the workflow/);
+  assert.equal(world.suites, 0, "no suite ran");
+  assert.equal(world.reviews.length, 0, "no review ran");
+  assert.deepEqual(world.escalations, ["task-gate-acceptance"], "the escalation is filed against the first gate of the live list (the stale journal names none)");
+  assert.deepEqual(world.demotions, ["task-gate-acceptance"]);
+  assert.equal(res.escalated_to, "task-gate-acceptance");
+  assert.equal(res.demoted, true);
+  assert.deepEqual(res.facts, [...world.facts.keys()]);
+  assert.equal(res.facts.length, 1);
+  assert.match(world.facts.get(res.facts[0]), /another version of the workflow/);
+  assert.ok(!logs.some((l) => /fresh in-memory journal|REPLAY FAULT|gate progress carries/.test(l)), logs.join("\n"));
+  const onDisk = store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  assert.equal(onDisk.length, 3, "the stale journal gained exactly its tombstone");
+  assert.equal(onDisk[2].kind, "tombstone");
+  assert.equal(onDisk[2].reason, "journal_version_mismatch");
+  assert.equal(onDisk[2].detail.gate.id, "acceptance");
 
-  // An edited factory between two drives of the same journal: refused by the
-  // workflow's digest check, judged afresh by the driver.
-  const home2 = scratchHome("definition");
-  const w2 = makeWorld({ clock, home: home2 });
-  w2.preflight = { ok: false, reason: "pending flake evidence belongs to a different or unknown graph" };
-  const first = await gateRunner.runGatePipeline({ item: ITEM, factory: SCRIPTS.passed.factory, deps: w2.deps });
-  assert.equal(first.state, "interrupted");
-  w2.preflight = { ok: true };
-  clock.advanceBy(wf.YIELD_MS + 1);
-  const edited = factoryOf({ ...BASE, gates: [GATES[0]] });
+  // A re-drive (a parked re-offer, an orphan resume): re-settled from the
+  // tombstone's record — same ids, nothing new on the graph, nothing judged.
   const logs2 = [];
-  const second = await gateRunner.runGatePipeline({ item: ITEM, factory: edited, deps: w2.deps, log: (l) => logs2.push(l) });
-  assert.equal(second.state, "passed");
-  assert.deepEqual(second.gates.map((g) => g.gate), ["acceptance"], "judged under the edited definition");
-  assert.ok(logs2.some((l) => /cannot be continued by this worker/.test(l) && /definition changed/.test(l)), logs2.join("\n"));
+  const again = await gateRunner.runGatePipeline({ item: { ...ITEM, resumed: true }, factory: SCRIPTS.passed.factory, deps: world.deps, log: (l) => logs2.push(l) });
+  assert.equal(again.state, "failed");
+  assert.equal(again.refusal_replayed, true);
+  assert.equal(again.escalated_to, res.escalated_to);
+  assert.deepEqual(again.facts, res.facts);
+  assert.equal(world.escalations.length, 1);
+  assert.equal(world.facts.size, 1);
+  assert.equal(world.suites + world.reviews.length, 0);
+  assert.ok(logs2.some((l) => /re-settled from the attempt's refusal tombstone/.test(l)), logs2.join("\n"));
+  assert.equal(store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" }).length, 3, "a tombstoned journal is never appended to");
 });
 
-test("a COMPLETED gate journal under an EDITED factory: an edit that keeps the key sequence (a gate's command text) replays to the journaled verdicts with nothing re-run; one that moves it (the gate list) is judged afresh and READ as the definition changing, never as a replay fault", async () => {
-  // The gate list iterates the LIVE factory's gates, so its key sequence is
-  // a function of the definition: the live-step guard (stage-workflow.js)
-  // can only fire where replay and definition agree up to the next live step.
+test("an EDITED definition between two drives of a parked journal is REFUSED at the next live step (the gate list, rescue, implementation, completion, trusted ref, protected paths, test lane and risk classes are the binding — never the revision stamps or the factory id); a revert after the refusal re-settles the refusal, never lands", async () => {
+  const home = scratchHome("definition");
+  const clock = fakeClock(1_700_000_000_000);
+  const w = makeWorld({ clock, home });
+  w.preflight = { ok: false, reason: "pending flake evidence belongs to a different or unknown graph" };
+  const first = await gateRunner.runGatePipeline({ item: ITEM, factory: SCRIPTS.passed.factory, deps: w.deps });
+  assert.equal(first.state, "interrupted");
+  w.preflight = { ok: true };
+  clock.advanceBy(wf.YIELD_MS + 1);
+  // Provenance is not binding: a re-stamped revision, a rename chain, a repo
+  // scope, a different factory id — none refuses.
+  const restamped = { ...SCRIPTS.passed.factory, id: "factory-renamed", revision: "deadbeef", renamedFrom: ["factory-test"], repos: ["demo"], definition: { ...SCRIPTS.passed.factory.definition, factory: { ...SCRIPTS.passed.factory.definition.factory, revision: "deadbeef" } } };
+  assert.equal(wf.definitionBindingDigest(restamped), wf.definitionBindingDigest(SCRIPTS.passed.factory));
+  // The integration block is the integration stage's binding, not the gate
+  // list's (declaring one re-parses the completion DEFAULT to `after:
+  // integration`, which IS a gate-stage input — so the block is swapped on the
+  // parsed object here, not re-parsed).
+  const otherBlock = { ...SCRIPTS.passed.factory, integration: { mode: "merge", strategy: "merge", targetRef: "main", command: "npm test" } };
+  assert.equal(wf.definitionBindingDigest(otherBlock), wf.definitionBindingDigest(SCRIPTS.passed.factory));
+  const boundaryMoved = { ...SCRIPTS.passed.factory, completion: { ...SCRIPTS.passed.factory.completion, after: "integration" } };
+  assert.notEqual(wf.definitionBindingDigest(boundaryMoved), wf.definitionBindingDigest(SCRIPTS.passed.factory), "the completion boundary is a gate-stage input");
+  const edited = factoryOf({ ...BASE, gates: [GATES[0]] });
+  assert.notEqual(wf.definitionBindingDigest(edited), wf.definitionBindingDigest(SCRIPTS.passed.factory));
+  // Every bound input refuses the same way — the gate list is driven to the
+  // settle below; the others are driven over their own parked journals here,
+  // each a block gatePass itself branches on (the pin, the pool caps, the
+  // completion boundary), so a replay reaches the live-step guard rather than
+  // a key mismatch.
+  for (const [label, moved] of [
+    ["implementation", factoryOf({ ...BASE, gates: GATES, implementation: { profile: "profile-impl", retry: { backoff_ms: 1000 } }, completion: { by: "controller" } })],
+    ["completion", { ...SCRIPTS.passed.factory, completion: { ...SCRIPTS.passed.factory.completion, after: "integration" } }],
+    ["trusted ref", { ...SCRIPTS.passed.factory, trustedRef: "release" }],
+    ["rescue", factoryOf({ ...BASE, gates: GATES, rescue: { profile: "profile-rescue", attempts: 1 } })],
+  ]) {
+    const homeN = scratchHome(`definition-${label.replace(/\s+/g, "-")}`);
+    const wN = makeWorld({ clock, home: homeN });
+    wN.preflight = { ok: false, reason: "pending flake evidence belongs to a different or unknown graph" };
+    assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory: SCRIPTS.passed.factory, deps: wN.deps })).state, "interrupted", label);
+    wN.preflight = { ok: true };
+    clock.advanceBy(wf.YIELD_MS + 1);
+    const logsN = [];
+    const refused = await gateRunner.runGatePipeline({ item: ITEM, factory: moved, deps: wN.deps, log: (l) => logsN.push(l) });
+    assert.equal(refused.state, "failed", `${label}: ${JSON.stringify(refused)}`);
+    assert.equal(refused.refusal_tombstoned, true, label);
+    assert.equal(refused.definition_mismatch.live, wf.definitionBindingDigest(moved), label);
+    assert.equal(wN.suites + wN.reviews.length, 0, `${label}: nothing judged`);
+    assert.deepEqual(wN.escalations, ["task-gate-acceptance"], label);
+    assert.ok(!logsN.some((l) => /REPLAY FAULT|fresh in-memory journal/.test(l)), `${label}: ${logsN.join("\n")}`);
+  }
+  const logs = [];
+  const second = await gateRunner.runGatePipeline({ item: ITEM, factory: edited, deps: w.deps, log: (l) => logs.push(l) });
+  assert.equal(second.state, "failed", JSON.stringify(second));
+  assert.deepEqual(second.definition_mismatch, { runId: ITEM.run_id, journaled: wf.definitionBindingDigest(SCRIPTS.passed.factory), live: wf.definitionBindingDigest(edited) });
+  assert.equal(second.refusal_tombstoned, true);
+  assert.match(second.reason, /definition .* was edited while this attempt was in flight/);
+  assert.equal(w.suites + w.reviews.length, 0, "nothing was judged under a mixed definition");
+  assert.deepEqual(w.escalations, ["task-gate-acceptance"], "filed against the first gate of the list the attempt OPENED under");
+  assert.deepEqual(w.demotions, ["task-gate-acceptance"]);
+  assert.equal(w.facts.size, 1);
+  assert.ok(!logs.some((l) => /fresh in-memory journal|REPLAY FAULT|judging over a fresh/.test(l)), logs.join("\n"));
+  const j = store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  assert.equal(j[j.length - 1].kind, "tombstone");
+  assert.equal(j[j.length - 1].reason, "definition_mismatch");
+  // Reverted: the journal is closed for good — re-settled, never continued.
+  const third = await gateRunner.runGatePipeline({ item: ITEM, factory: SCRIPTS.passed.factory, deps: w.deps });
+  assert.equal(third.state, "failed");
+  assert.equal(third.refusal_replayed, true);
+  assert.equal(w.suites + w.reviews.length, 0);
+  assert.equal(w.escalations.length, 1);
+  assert.equal(w.facts.size, 1);
+});
+
+test("a COMPLETED gate journal is a pure function of the journal: under an EDITED factory — a gate's command, or the gate LIST itself — it replays to the journaled verdicts with nothing re-run, nothing refused, nothing appended and nothing re-logged", async () => {
   const home = scratchHome("settled-edit");
   const clock = fakeClock(1_700_000_000_000);
   const w = makeWorld({ clock, home });
@@ -439,33 +538,102 @@ test("a COMPLETED gate journal under an EDITED factory: an edit that keeps the k
   assert.equal(first.state, "passed");
   const onDisk = () => store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
   const j1 = onDisk();
+  const opened = j1.find((x) => x.kind === "effect" && /\/open#1$/.test(x.key));
+  assert.deepEqual(opened.result.gates.map((g) => g.id), ["acceptance", "review"], "the gate list rides the open entry");
+  assert.equal(opened.result.rescue, null);
   const suites = w.suites;
   const reviews = w.reviews.length;
 
-  // Same gates, same ids, the suite command edited: the journal replays to
-  // its result — nothing is left to execute, so nothing is refused or re-run.
-  const sameShape = factoryOf({ ...BASE, gates: [{ ...GATES[0], command: "npm run test:all" }, GATES[1]] });
-  assert.notEqual(wf.definitionBindingDigest(sameShape), wf.definitionBindingDigest(SCRIPTS.passed.factory));
-  const logs = [];
-  const replayed = await gateRunner.runGatePipeline({ item: ITEM, factory: sameShape, deps: w.deps, log: (l) => logs.push(l) });
-  assert.equal(replayed.state, "passed");
-  assert.deepEqual(replayed.gates.map((g) => g.gate), first.gates.map((g) => g.gate), "the journaled verdicts");
-  assert.ok(!logs.some((l) => /cannot be continued by this worker|REPLAY FAULT|judging over a fresh in-memory journal/.test(l)), logs.join("\n"));
-  assert.equal(w.suites, suites, "no suite re-ran");
-  assert.equal(w.reviews.length, reviews, "no review re-ran");
-  assert.deepEqual(onDisk(), j1, "nothing appended");
+  for (const [label, factory] of [
+    ["the suite command edited", factoryOf({ ...BASE, gates: [{ ...GATES[0], command: "npm run test:all" }, GATES[1]] })],
+    ["the gate list moved", factoryOf({ ...BASE, gates: [GATES[0]] })],
+    ["a gate added", factoryOf({ ...BASE, gates: [...GATES, { id: "lint", kind: "command", command: "npm run lint" }] })],
+  ]) {
+    assert.notEqual(wf.definitionBindingDigest(factory), wf.definitionBindingDigest(SCRIPTS.passed.factory), label);
+    const logs = [];
+    const replayed = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: w.deps, log: (l) => logs.push(l) });
+    assert.equal(replayed.state, "passed", `${label}: ${JSON.stringify(replayed)}`);
+    assert.deepEqual(replayed.gates.map((g) => g.gate), first.gates.map((g) => g.gate), `${label}: the journaled verdicts`);
+    assert.deepEqual(logs, [], `${label}: a full replay re-logs nothing — ${logs.join(" | ")}`);
+    assert.equal(w.suites, suites, `${label}: no suite re-ran`);
+    assert.equal(w.reviews.length, reviews, `${label}: no review re-ran`);
+    assert.deepEqual(onDisk(), j1, `${label}: nothing appended`);
+    assert.equal(w.escalations.length, 0, `${label}: nothing refused`);
+  }
+});
 
-  // The gate LIST edited: the replay diverges from the journal before any
-  // live step; the driver reads the moved binding, says so, and judges afresh
-  // under the edited definition — as the record-based resume always did.
-  const moved = factoryOf({ ...BASE, gates: [GATES[0]] });
-  const logs2 = [];
-  const again = await gateRunner.runGatePipeline({ item: ITEM, factory: moved, deps: w.deps, log: (l) => logs2.push(l) });
-  assert.equal(again.state, "passed");
-  assert.deepEqual(again.gates.map((g) => g.gate), ["acceptance"], "judged under the edited definition");
-  assert.ok(logs2.some((l) => /cannot be continued by this worker \(the factory definition changed while task-demo's gate pipeline was in flight/.test(l)), logs2.join("\n"));
-  assert.ok(!logs2.some((l) => /REPLAY FAULT/.test(l)), "a moved definition is never reported as a determinism bug");
-  assert.deepEqual(onDisk(), j1, "the settled journal is left as it was");
+test("a journal whose key sequence diverges DURING replay under a binding that has MOVED (its `open` digest differs from the live one) is read as the definition changing and REFUSED through the tombstone door — never thrown as a replay fault; the same divergence under a MATCHING digest is the fault", async () => {
+  // The shape a journal recorded before a bound input existed would take once
+  // the code branches on that input during replay: the `open` entry's digest
+  // no longer matches the live binding, and the next journaled key is one the
+  // code no longer asks for. (Every bound input is journaled today, so this is
+  // reachable only from such a journal; the version bump refuses the ones that
+  // exist, which is why the fallback is pinned here by hand.)
+  const home = scratchHome("moved-binding-replay-fault");
+  const clock = fakeClock(1_700_000_000_000);
+  const w = makeWorld({ clock, home });
+  const h = store.openWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  h.persist({ kind: "version", spec: kernel.JOURNAL_SPEC_VERSION, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+  h.persist({ kind: "effect", key: `${ITEM.run_id}/gates/a0/e0/open#1`, result: { has: {}, attempt: 0, digest: "sha256:old", factoryId: "factory-test", gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }], rescue: null } });
+  h.persist({ kind: "effect", key: `${ITEM.run_id}/gates/a0/e0/a-key-the-code-no-longer-asks-for#1`, result: {} });
+  const logs = [];
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: SCRIPTS.passed.factory, deps: w.deps, log: (l) => logs.push(l) });
+  assert.equal(res.state, "failed", JSON.stringify(res));
+  assert.equal(res.refusal_tombstoned, true);
+  assert.deepEqual(res.definition_mismatch, { runId: ITEM.run_id, journaled: "sha256:old", live: wf.definitionBindingDigest(SCRIPTS.passed.factory) });
+  assert.ok(!logs.some((l) => /REPLAY FAULT/.test(l)), logs.join("\n"));
+  assert.equal(w.suites + w.reviews.length, 0, "nothing judged");
+  assert.deepEqual(w.escalations, ["task-gate-review"], "filed against the first gate of the list the journal OPENED under");
+  const j = store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  assert.equal(j[j.length - 1].kind, "tombstone");
+  assert.equal(j[j.length - 1].reason, "definition_mismatch");
+
+  // The control: the same divergence under a digest that MATCHES the live
+  // binding is a determinism bug, thrown and tagged (see the next test).
+  const home2 = scratchHome("matching-binding-replay-fault");
+  const w2 = makeWorld({ clock, home: home2 });
+  const h2 = store.openWorkflowJournal(home2, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  h2.persist({ kind: "version", spec: kernel.JOURNAL_SPEC_VERSION, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+  h2.persist({ kind: "effect", key: `${ITEM.run_id}/gates/a0/e0/open#1`, result: { has: {}, attempt: 0, digest: wf.definitionBindingDigest(SCRIPTS.passed.factory), factoryId: "factory-test", gates: [], rescue: null } });
+  h2.persist({ kind: "effect", key: `${ITEM.run_id}/gates/a0/e0/a-key-the-code-no-longer-asks-for#1`, result: {} });
+  let threw = null;
+  try {
+    await gateRunner.runGatePipeline({ item: ITEM, factory: SCRIPTS.passed.factory, deps: w2.deps });
+  } catch (e) {
+    threw = e;
+  }
+  assert.ok(threw && threw.replayFault === true, threw && threw.message);
+  assert.equal(w2.escalations.length, 0, "a fault settles nothing");
+  assert.equal(store.readWorkflowJournal(home2, "local", "exec-0123456789abcdef", { stage: "gates-a0" }).length, 3, "a fault appends nothing");
+});
+
+// A REPLAY FAULT — the journal's key sequence is not the one this code produces
+// — is a determinism BUG, and a hard failure: thrown, tagged, never logged as
+// a fallback and never judged afresh. Every resume scenario in this file
+// asserts the words never appear in a log line; this is the one place they do
+// appear, in the thrown error's message.
+test("a REPLAY FAULT is a hard failure: the driver throws it tagged `replayFault`, logs no fallback, judges nothing afresh, appends nothing", async () => {
+  const home = scratchHome("replay-fault");
+  const clock = fakeClock(1_700_000_000_000);
+  const w = makeWorld({ clock, home });
+  const h = store.openWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  h.persist({ kind: "version", spec: kernel.JOURNAL_SPEC_VERSION, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+  h.persist({ kind: "effect", key: `${ITEM.run_id}/gates/a0/e0/not-a-key-this-code-produces#1`, result: {} });
+  const before = store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  const logs = [];
+  let threw = null;
+  try {
+    await gateRunner.runGatePipeline({ item: ITEM, factory: SCRIPTS.passed.factory, deps: w.deps, log: (l) => logs.push(l) });
+  } catch (e) {
+    threw = e;
+  }
+  assert.ok(threw, "thrown, not settled");
+  assert.equal(threw.replayFault, true);
+  assert.match(threw.message, /REPLAY FAULT in the gate workflow for task-demo/);
+  assert.ok(threw.cause && /NonDeterminism/.test(threw.cause.name), threw.cause && threw.cause.name);
+  assert.deepEqual(logs, [], `nothing logged — ${logs.join(" | ")}`);
+  assert.equal(w.suites + w.reviews.length + w.escalations.length + w.facts.size, 0, "nothing judged, nothing filed");
+  assert.deepEqual(store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" }), before, "nothing appended");
 });
 
 test("the one-shot `fix` and `rescue` are still honored when a caller wires them without the signal halves, and a caller-overridden `fix` wins over the composed halves", async () => {
@@ -517,7 +685,7 @@ test("a RESUMED drive (the loop marks every adopted orphan and parked re-offer `
   assert.deepEqual(passes, [false, true], "each pass journals the reading it was driven under");
 });
 
-test("an orphan adopted MID-AWAIT (the journal ends on a run another worker dispatched) takes the record-based door by design: the pass re-runs with the supersession check, and adopt-by-name keeps it at one fixer", async () => {
+test("an orphan adopted MID-AWAIT (the journal ends on a run another worker dispatched) is CONTINUED through the journal: the dispatch door adopts the same run by name, the delivered signal continues the pass, and the journaled `afterAwait` read runs the supersession check a resumed drive owes — no record-based door", async () => {
   const home = scratchHome("resumed-await");
   const clock = fakeClock(1_700_000_000_000);
   const world = makeWorld({ clock, home });
@@ -536,13 +704,47 @@ test("an orphan adopted MID-AWAIT (the journal ends on a run another worker disp
   const logs = [];
   const res = await gateRunner.runGatePipeline({ item: { ...ITEM, resumed: true }, factory: SCRIPTS.passed.factory, deps: world.deps, log: (l) => logs.push(l) });
   assert.equal(res.state, "passed", JSON.stringify(res));
-  assert.ok(logs.some((l) => /ends awaiting run fix-1 dispatched by another worker/.test(l)), logs.join("\n"));
-  assert.equal(checks, 1, "the supersession check a resumed pipeline owes ran");
+  assert.ok(!logs.some((l) => /ends awaiting run|fresh in-memory journal|REPLAY FAULT/.test(l)), logs.join("\n"));
+  assert.equal(checks, 1, "the supersession check a resumed pipeline owes ran — once, after the adopted await");
   assert.equal(world.dispatches, 1, "the dispatch door adopted the same run by name");
-  assert.equal(world.reviews.length, 2, "the record-based pass resumed past the launched fix from the saved progress: one more review, not a re-ask of cycle 0");
+  assert.equal(world.reviews.length, 2, "the pass continued past the launched fix: one more review, not a re-ask of cycle 0");
+  const j = store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  const delivered = j.filter((x) => x.kind === "signal").map((x) => !!x.payload.adopted);
+  assert.deepEqual(delivered, [true], "the delivered signal says THIS drive adopted the await");
+  const passes = j.filter((x) => x.kind === "effect" && /\/pass\/pass#1$/.test(x.key)).map((x) => x.result.resumed);
+  assert.deepEqual(passes, [false], "the pass itself keeps the reading its first drive made");
+
+  // ...and when the item WAS hand-landed meanwhile, the continued pass ends
+  // superseded instead of judging on.
+  const home2 = scratchHome("resumed-await-landed");
+  const w2 = makeWorld({ clock, home: home2 });
+  w2.deps.resolved = async () => ({ terminal_state: "resolved", resolved_by: "dec-x" });
+  w2.deps.landed = async () => ({ known: true, landed: true, head: "head-v2" });
+  const h2 = store.openWorkflowJournal(home2, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  const a2 = new Execution(wf.gateWorkflow, { item: ITEM, factory: SCRIPTS.passed.factory, deps: w2.deps, log: () => {}, driver: { parked: null } }, { journal: h2.journal, persist: h2.persist, clock, activities: w2.activities, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+  assert.equal((await a2.run()).status, "suspended");
+  const res2 = await gateRunner.runGatePipeline({ item: { ...ITEM, resumed: true }, factory: SCRIPTS.passed.factory, deps: w2.deps });
+  assert.equal(res2.state, "superseded", JSON.stringify(res2));
+  assert.equal(res2.resolved_by, "dec-x");
+  assert.equal(w2.reviews.length, 1, "no review after the adopted fix: the item is already landed");
+  assert.equal(w2.dispatches, 1);
 });
 
-test("a step that THREW out of the workflow on an earlier drive is re-run live on the next, as the record-based resume always did", async () => {
+test("a drive that dispatched a run ITSELF and waited it out owes no post-await check, whatever the loop marked its slot", async () => {
+  const home = scratchHome("own-await");
+  const clock = fakeClock(1_700_000_000_000);
+  const world = makeWorld({ clock, home });
+  let checks = 0;
+  world.deps.resolved = async () => { checks += 1; return { terminal_state: "open" }; };
+  world.deps.landed = async () => ({ known: true, landed: false });
+  const res = await gateRunner.runGatePipeline({ item: { ...ITEM, resumed: true }, factory: SCRIPTS.passed.factory, deps: world.deps });
+  assert.equal(res.state, "passed");
+  assert.equal(checks, 1, "the top-of-pass check a resumed slot owes, and nothing after the fix it launched and followed itself");
+  const j = store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  assert.deepEqual(j.filter((x) => x.kind === "signal").map((x) => !!x.payload.adopted), [false]);
+});
+
+test("a step that THREW out of the workflow on an earlier drive is the SAME failure on the next: the journal is the attempt, and a fresh attempt (a new stage journal) is the door back", async () => {
   const home = scratchHome("replayed-throw");
   const clock = fakeClock(1_700_000_000_000);
   const world = makeWorld({ clock, home });
@@ -560,9 +762,19 @@ test("a step that THREW out of the workflow on an earlier drive is re-run live o
   assert.ok(threw && /git is gone/.test(threw.message), "the ancestor read escapes the workflow as it escaped the runner");
   const logs = [];
   world.deps.retainedHeadIsAncestor = () => true;
-  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: controller, deps: world.deps, log: (l) => logs.push(l) });
+  let again = null;
+  try {
+    await gateRunner.runGatePipeline({ item: ITEM, factory: controller, deps: world.deps, log: (l) => logs.push(l) });
+  } catch (e) {
+    again = e;
+  }
+  assert.ok(again && /git is gone/.test(again.message) && again.replayed === true, "replayed, not re-run");
+  assert.ok(!logs.some((l) => /replays a step that threw|fresh in-memory journal|REPLAY FAULT/.test(l)), logs.join("\n"));
+  // The next ATTEMPT opens its own journal and runs live.
+  const w3 = makeWorld({ clock, home, stage: "gates-a1" });
+  w3.deps.retainedHeadIsAncestor = () => true;
+  const res = await gateRunner.runGatePipeline({ item: { ...ITEM, attempt: 1 }, factory: controller, deps: w3.deps });
   assert.ok(["passed", "failed"].includes(res.state), JSON.stringify(res));
-  assert.ok(logs.some((l) => /replays a step that threw on an earlier drive/.test(l)), logs.join("\n"));
 });
 
 test("the activities table and the binding name the same set", () => {

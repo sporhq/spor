@@ -41,15 +41,18 @@ tier, with js-wf revisited when it grows a non-Go invocation surface.
 | file | what |
 |---|---|
 | ~~`harness.js`~~ | PROMOTED to `lib/kernel/workflow.js` (task-spor-gate-pipeline-as-workflow-kernel): the smallest durable-workflow runtime exhibiting the model the three engines share — replay from a journal, keyed activities (`ctx.run`), journaled clock, durable timers (`sleepUntil`), signals with deadlines (`awaitSignal`), a crash plan for the at-least-once window, a `drive()` loop standing in for an engine's worker — now shipped, versioned, with an injected `persist` seam the execution store binds (`openWorkflowJournal`). The proofs below run against the shipped kernel. |
-| `pipeline.workflow.js` | the gate pipeline as one deterministic workflow function against that model, preserving the shipped RULES (gate-0 restart on a moved head; cycle caps cumulative across restarts AND the integration re-gate, which re-enters the same function over shared state; demonstrated-only blocking findings with the ledger carried; an outage — implementer's or reviewer's — spends ONE shared retry pool and never a fix cycle, a reviewer's stated reset inside `pause_max_ms` is a durable pause and one beyond it goes to a person; rescue lane with fresh per-gate budgets and carried ledger; human gate on an approval signal with a durable deadline, `blocked` demoting like any refusal; integration conflict/suite = fix cycle vs lost CAS = uncharged retry; controller completion at the boundary; deterministic fact ids). ~350 lines including the ACTIVITIES table. |
-| `spike.test.js` | thirteen proofs, each naming the shipped defect class it exercises, run over `lib/kernel/workflow.js`. Run with `node --test spikes/durable-workflow/spike.test.js`. Deliberately NOT in `npm test`: a spike is not a shipped surface (the kernel's own contract is pinned by `test/workflow-kernel.test.js`). |
+| ~~`pipeline.workflow.js`~~ | DELETED (task-spor-delete-loop-resume-machinery-after-workflow-stages). The gate pipeline as one deterministic workflow function is now SHIPPED, stage by stage, over the kernel above: `lib/shell/integration-workflow.js` (task-spor-integration-stage-as-workflow-function), `lib/shell/gate-workflow.js` (task-spor-gate-list-as-workflow-function) and `lib/shell/implementation-workflow.js` (task-spor-implementation-stage-as-workflow-function), with the driver half they share in `lib/shell/stage-workflow.js`. The spike's single-function sketch would have drifted from them, so it is gone. |
+| ~~`spike.test.js`~~ | DELETED with it. Every proof below is held by a shipped test over the real workflows: `test/workflow-kernel.test.js` (the kernel's contract), `test/integration-workflow.test.js`, `test/gate-workflow.test.js` and `test/implementation-workflow.test.js` (each stage's crash sweep over every activity boundary, the worker-dies-mid-run proof, the pure replay, the yields and durable timers, the refusal through the tombstone door), `test/dispatch-adopt-by-name.test.js` (adopt-by-name at the dispatch door), `test/stage-workflow.test.js` (the shared driver half). |
 
 The directory is outside `package.json` `files` and outside every lint walk
 (`test/frontmatter-lint`, `config-keys`, `record-write-lint` scan `lib`,
 `bin`, `scripts`, `adapters`, `skills`, `conformance`), so it adds nothing to
 the published client and can be deleted once the decision is acted on.
 
-## What the proofs show
+## What the proofs showed
+
+(Historical — the proofs now live in the shipped tests named above; this is
+the record of what the spike established and why.)
 
 1. **Happy path**: every activity executes exactly once; replaying the journal
    through a fresh execution whose activities all throw reproduces the result

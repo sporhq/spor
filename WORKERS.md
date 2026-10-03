@@ -2587,12 +2587,36 @@ awaited as a signal, the outage backoff and a reviewer pause are durable
 timers, and a reported `interrupted` is a durable yield — so a re-gated orphan
 or a re-offered pipeline REPLAYS what already landed (the same facts, the same
 run awaited, never a second fixer) and continues with a fresh pass from the
-yield. The two records above are unchanged and still authoritative for the
-resume scan and for a run with no execution to key a journal on; a journal this
-worker cannot continue (another workflow version, a factory edited in flight) is
-set aside and the pipeline is judged afresh through them, as it always was. The
-deletion of `gate_state`/`gate_progress`-based resumption in favour of the
-journal is the parent task's last slice.
+yield. **Every gated run has a journal** (task-spor-delete-loop-resume-
+machinery-after-workflow-stages): a run with no execution to key it on keeps its
+stage journals beside its run record (`journal/dispatch/<run>.workflows/
+<stage>.workflow.jsonl`, pruned with the record), so no gated run ever runs over
+an in-memory journal a killed worker could not continue. The gate stage is a
+PURE FUNCTION of that journal: its `open` entry carries the gate list and the
+rescue block the attempt opened under and every pass iterates that copy, so a
+completed journal replays to its verdicts under any later edit of the factory,
+and a journal parked mid-attempt refuses at its next live step when the
+binding (the gate list, rescue, implementation, completion, trusted ref,
+protected paths, test lane and risk classes — never a revision stamp or the
+factory id) has moved. A journal this worker cannot continue — that
+mismatch, or another workflow version — is REFUSED through the same
+tombstone-then-settle door as the other two stages (§10.9, §10.16): the
+attempt's journal is tombstoned first, then settled `failed` outside it with
+the §10.7 escalation, the demotion and an `art-gate-*` fact filed against the
+first gate of the list it opened under, and the result's refusal tags land on
+the run record as `gate_refusal` (read by `spor work --status`); a re-drive
+re-settles from the tombstone under the same ids, so a factory reverted after
+the refusal can never continue the attempt. It is never judged afresh. A
+REPLAY FAULT (a key sequence this code no longer produces) is a determinism bug
+and a hard failure the pipeline is settled on, never a fallback. An orphan
+adopted mid-await is continued through the journal — the delivered run signal
+is tagged `adopted`, and the pass runs the supersession check it owes before
+judging on. The two records above still drive the resume SCAN (which orphans a
+later worker adopts) and the `--status` surface; the `gate_progress` and
+rescue-state stamps are still written for `spor runs`, `--regate` and the
+flake-evidence debt, but no resume rebuilds a pipeline from them — the journal
+is the progress. Deleting the scan and those stamps outright is what remains of
+the parent task.
 
 **A pipeline can also REPORT `interrupted` — and that is not a verdict
 either.** Besides a stop inside an outage backoff (§10.4), a pass whose gate
