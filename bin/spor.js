@@ -14604,7 +14604,11 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   const intCtx = completed && completed.ok && (completed.settled === "written" || completed.settled === "consumed") ? { ...dctx, completedBeforeIntegration: true } : dctx;
   dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: "running" });
   if (reporter) await reporter.integrationStarted();
+    // Whether a re-gate RAN in this process this pass — the one case the
+    // adoption below must not touch (the closure's own merge is the truth).
+    let regateRan = false;
     const regate = async ({ head }) => {
+      regateRan = true;
       const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
       for (const f of again.facts || []) if (!gateFacts.includes(f)) gateFacts.push(f);
       gateResult = again;
@@ -14620,7 +14624,27 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     const common = (git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout || "").trim();
     return common ? path.dirname(common) : null;
   })();
-  intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null, deps: makeIntegrationDeps(cfg, { ...intCtx, gateResult: () => gateResult, regate }) });
+  // The stage's durable journal (task-spor-integration-stage-as-workflow-
+  // function): beside the execution record, keyed on the execution the claim
+  // opened and this gate ATTEMPT (an explicit --regate opens a fresh attempt
+  // and judges afresh; the loop's orphan resume and --regate --resume keep
+  // the attempt and continue from the journal). A legacy run or a pre-adapter
+  // claim has no execution to key on and runs over an in-memory journal,
+  // byte-identical to before.
+  const integrationJournal = integrationWorkflowJournal(home, record, item);
+  intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null, deps: { ...makeIntegrationDeps(cfg, { ...intCtx, gateResult: () => gateResult, regate }), ...(integrationJournal ? { workflowJournal: integrationJournal } : {}) } });
+  // A passing re-gate the stage REPLAYED (a resumed worker: the journal holds
+  // the re-gate's result, so the `regate` closure above — whose merge into
+  // gateResult/gateFacts is a side effect of running it — never ran here):
+  // adopt what the result carries, so the settle, the attestation and the
+  // fact list describe the re-gated head exactly as the live pass did.
+  // Only when NO re-gate ran here: a live pass merged its own result (and a
+  // live re-gate that FAILED after an earlier pass must not be clobbered by
+  // the earlier pass the result still carries).
+  if (!regateRan && intResult.regate_result && intResult.regate_result.state === "passed" && gateResult.head !== intResult.regate_result.head) {
+    gateResult = intResult.regate_result;
+    for (const f of intResult.regate_facts || []) if (!gateFacts.includes(f)) gateFacts.push(f);
+  }
   // The same unsettled interruption as the gate list's own (above), reached
   // through the integration stage's re-gate of a moved head: nothing is
   // stamped, settled or attested, and the resume re-runs the pipeline.
@@ -14654,6 +14678,18 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     return leave({ ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: allFacts, demoted: false, demote_reason: null, reason: `${intResult.reason || intResult.state} (the item was completed at the 'gates' boundary and stays completed; the landing is a person's to finish)` });
   }
   return leave({ ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: allFacts });
+}
+
+// The integration stage's workflow journal for a run, or null when the run
+// has no execution to key it on. A function (re-openable): the driver opens
+// a fresh handle after a poisoned persist, so what it replays is what is on
+// disk.
+function integrationWorkflowJournal(home, record, item) {
+  const claim = record && record.impl_claim;
+  if (!claim || !claim.store || !claim.execution_id || !claim.tenant) return null;
+  const stage = `integration-a${Math.max(0, Number(item && item.attempt) || 0)}`;
+  if (!executionStore.validSegment(String(claim.tenant)) || !executionStore.validSegment(String(claim.execution_id))) return null;
+  return () => executionStore.openWorkflowJournal(home, String(claim.tenant), String(claim.execution_id), { stage });
 }
 
 // The run record as it reads NOW — the pipeline's captured copy predates every

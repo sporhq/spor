@@ -1673,14 +1673,55 @@ goes through — returns the run this box already launched under
 `values.name` (for `values.node` when one is named; a review names none and is
 matched on the name alone) and launches nothing, so a re-executed dispatch is
 idempotent at the door, not by each caller remembering `launchedFixRun` first
-(the callers' own checks are now a redundant belt). What is NOT yet done, and
-still open on the task: the rewrite of `runGateAndIntegration`/
-`runGatePipeline`/`runIntegrationStage`/the implementation stage as one
-workflow function over this kernel, and the deletion of `gate_state`, the
-`gate_progress` save/reload, `orphanedGateRuns`, `resumableSlots`, parked
-re-offers and `claimGateRecord` that the rewrite makes possible. See
+(the callers' own checks are now a redundant belt). **The integration stage IS a workflow function
+(task-spor-integration-stage-as-workflow-function, the first per-stage
+slice):** `lib/shell/integration-workflow.js` holds the stage's control flow
+as `integrationWorkflow(ctx, input)` — every deps call a `ctx.run` keyed on
+the ids the stage already mints (run id / attempt / fact id / blocker id),
+the fix cycle's run-terminal wait an `awaitSignal(run:<id>)` when the deps
+wire `dispatchFix` + `awaitRun` (gate-deps.js does; the one-shot `fix` is
+their composition), the two UNSETTLED hand-ups (a ci candidate suite nobody
+judged, a re-gate a stop caught mid-outage) a durable YIELD (the
+`interrupted` result journaled, the lease released and the candidate torn
+down — both journaled — then a `sleepUntil` timer), and the clock
+`ctx.now`. `runIntegrationStage` in integration-runner.js is now the DRIVER
+with the same signature and result shape: it binds deps to the activities
+table (`bindIntegrationActivities`, which also keeps the LIVE resources — the
+candidate's cleanup closure, the lease token — out of the journal and
+releases leftovers on the way out), opens the `Execution` over
+`deps.workflowJournal()` (bin/spor.js hands it
+`openWorkflowJournal(home, impl_claim.tenant, impl_claim.execution_id,
+{stage: "integration-a<attempt>"})` — a per-stage file beside the execution
+record, keyed on the gate ATTEMPT so an explicit `--regate` judges afresh
+while the loop's orphan resume and `--regate --resume` continue from the
+journal; a legacy run or a pre-adapter claim runs over an in-memory journal,
+byte-identical), and maps the kernel's outcomes back (completed → the result;
+a timer suspend → the journaled interrupted result, so the work loop's
+bounded re-offer is still the scheduler and the re-driven workflow continues
+from the yield — the next attempt after an outage, the re-gate retried under
+a new key — instead of replaying the outage verdict forever; a `run:<id>`
+suspend → `deps.awaitRun` delivers the terminal state in-process). Rules
+the function holds to: every decision reads journaled data (the `open`
+activity journals the gated head and the wired-deps shape; `top` rides on
+every git-side activity's args because a resumed worker's deps closures never
+saw the opening read), results are JSON-plain, a log line is held to the live
+portion (`ctx.isReplaying()`), and a kernel control throw passes through every
+try/finally untouched (`isControlFlow`) — a journaled step taken on the way
+out of a suspend lands out of order. `landCandidate` reads a ref already at
+the candidate sha as landed (the at-least-once window), and
+`discardCandidateTree` tears down by path a worktree a dead worker built.
+What is NOT yet done, and
+still open on the parent task: the rewrite of `runGateAndIntegration`/
+`runGatePipeline`/the implementation stage as one workflow function over
+this kernel, and the deletion of `gate_state`, the `gate_progress`
+save/reload, `orphanedGateRuns`, `resumableSlots`, parked re-offers and
+`claimGateRecord` that the rewrite makes possible (the integration stage's
+own re-offer still rides the loop's door; the journal only makes the
+re-offered pipeline continue rather than restart). See
 test/workflow-kernel.test.js, test/workflow-journal.test.js,
-test/dispatch-adopt-by-name.test.js.
+test/dispatch-adopt-by-name.test.js, test/integration-workflow.test.js (the
+crash sweep: a crash at every activity boundary resumes to the same result
+and side effects).
 Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
