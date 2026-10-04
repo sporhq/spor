@@ -9,6 +9,8 @@
 // `git commit`/`add`/`apply` whose effective working tree, resolves into the
 // main checkout instead of the session's own worktree.
 //
+// It also refuses pattern-based process termination (pkill/killall) from Bash.
+//
 // Active ONLY inside a dispatch worktree session (a linked git worktree
 // whose main checkout sits elsewhere) — a plain repo or non-repo cwd is a
 // pure no-op, so ordinary sessions see byte-identical (no-output) behavior.
@@ -320,9 +322,68 @@ function scanBashForViolation(command, cwd, session, depth = 0) {
   return null;
 }
 
+// Pattern-based process termination (issue-spor-orchestrator-agent-global-
+// pkill-kills-other-agents): a box runs many agents' suites concurrently, so
+// `pkill -f "node --test"` kills the siblings' runs too. The prompts forbid it;
+// this denies it mechanically. Matches the command word of any segment
+// (through env/sudo/command/exec prefixes and sh -c / eval wrappers), plus the
+// `kill $(pgrep …)` / `pgrep … | xargs kill` spellings of the same thing.
+// Killing by recorded PID or process group (`kill -- -<pgid>`) passes.
+const PATTERN_KILLERS = new Set(["pkill", "killall", "killall5"]);
+const KILL_PREFIXES = new Set([
+  "sudo", "command", "exec", "nohup", "time", "env", "timeout", "nice", "ionice", "setsid", "stdbuf", "xargs",
+  "then", "do", "else", "elif", "!",
+]);
+// A heredoc body is data, not commands: drop it before scanning.
+const HEREDOC_RE = /<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\n|$)/g;
+const KILL_PGREP_RE = /\bkill\b[^\n;&|]*(?:\$\(|`)\s*(?:pgrep|pidof)\b|\bpgrep\b[^\n;&]*\|\s*(?:sudo\s+)?xargs\b[^\n;&|]*\bkill\b/;
+
+function denyKill(detail) {
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: `[spor process guard] Blocked: ${detail}. Kill only processes you started, by recorded PID or process group (\`kill -- -<pgid>\`) — never by pattern, since other agents' processes share this box. (issue-spor-orchestrator-agent-global-pkill-kills-other-agents)`,
+    },
+  };
+}
+
+function scanBashForPatternKill(command, depth = 0) {
+  if (!command || depth > 4) return null;
+  command = command.replace(HEREDOC_RE, "");
+  if (KILL_PGREP_RE.test(command)) return denyKill("'kill' of a pgrep-selected process set matches by pattern");
+  for (const rawTokens of segmentsOf(command)) {
+    let tokens = stripEnvAssignments(rawTokens).rest;
+    // Peel wrappers plus their flags/numeric args (`sudo -u x`, `timeout 5`, `env -i`).
+    while (tokens.length) {
+      const t = tokens[0];
+      if (KILL_PREFIXES.has(t) || ENV_ASSIGN_RE.test(t) || /^-\w*$/.test(t) || /^\d+[smhd]?$/.test(t)) {
+        tokens = tokens.slice((t === "-u" || t === "-g") ? 2 : 1);
+      } else break;
+    }
+    if (!tokens.length) continue;
+    const word = path.basename(tokens[0].replace(/^\\/, ""));
+    if (PATTERN_KILLERS.has(word)) return denyKill(`'${word}' terminates processes by pattern`);
+    if (SHELL_DASH_C.has(word)) {
+      const i = findDashC(tokens);
+      if (i !== -1 && tokens[i + 1]) {
+        const nested = scanBashForPatternKill(tokens[i + 1], depth + 1);
+        if (nested) return nested;
+      }
+    } else if (word === "eval" && tokens[1]) {
+      const nested = scanBashForPatternKill(tokens.slice(1).join(" "), depth + 1);
+      if (nested) return nested;
+    }
+  }
+  return null;
+}
+
 function checkBashTool(input, session) {
   if (input.tool_name !== "Bash") return null;
-  return scanBashForViolation(input.tool_input?.command, input.cwd, session);
+  return (
+    scanBashForViolation(input.tool_input?.command, input.cwd, session) ??
+    scanBashForPatternKill(input.tool_input?.command)
+  );
 }
 
 async function preTool(input) {
@@ -337,4 +398,5 @@ module.exports = {
   violatesIsolation,
   resolveTarget,
   scanBashForViolation,
+  scanBashForPatternKill,
 };

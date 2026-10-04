@@ -414,6 +414,36 @@ test("preTool: Bash commands unrelated to git pass through", async () => {
   fs.rmSync(base, { recursive: true, force: true });
 });
 
+test("preTool: pattern-based process kills are denied; PID/pgid kills pass", async () => {
+  const { base, wt, main } = scratchWorktree();
+  const run = (command, cwd = wt) => pt.preTool({ cwd, tool_name: "Bash", tool_input: { command } });
+  for (const c of [
+    'pkill -f "node --test"',
+    "killall node",
+    "sudo pkill node",
+    "FOO=1 /usr/bin/pkill -9 node",
+    "npm test; pkill -f x",
+    'sh -c "pkill -f foo"',
+    "kill $(pgrep -f node)",
+    "kill -9 `pgrep node`",
+    "pgrep -f node | xargs kill",
+    "timeout 5 pkill x",
+    "sudo -u foo pkill x",
+    "env -i pkill x",
+    "\\pkill x",
+    "for i in 1; do pkill x; done",
+    "kill $(pidof node)",
+  ]) {
+    const out = await run(c);
+    assert.equal(out?.hookSpecificOutput?.permissionDecision, "deny", c);
+    assert.match(out.hookSpecificOutput.permissionDecisionReason, /process guard/, c);
+  }
+  for (const c of ["kill -- -12345", "kill 4242", "pgrep -f node", 'git commit -m "pkill is banned"', "echo pkill", "cat > n.md <<EOF\npkill -f x\nEOF"])
+    assert.equal(await run(c), null, c);
+  assert.equal(await run("pkill node", main), null, "non-worktree session is a no-op");
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
 test("preTool: a non-worktree session (plain repo cwd) never denies, even for the same file", async () => {
   const { base, main } = scratchWorktree();
   const out = await pt.preTool({
