@@ -976,7 +976,7 @@ test("end to end: an unresolved supervised run files its report and releases its
       record_path: p.record, prompt_path: p.prompt, log_path: p.log, report_path: p.report,
       scratch_path: p.scratch, server: base, renew_node: "task-x",
       node_id: "task-x", release_node: "task-x", project: "demo",
-    }, { SPOR_DISPATCH_RENEW_TOKEN: "agent-token" });
+    }, { SPOR_DISPATCH_RENEW_TOKEN: "agent-token", SPOR_DISPATCH_PIPE_DRAIN_MS: "60000" });
 
     assert.strictEqual(record.state, "done");
     assert.strictEqual(record.terminal_state, "reported");

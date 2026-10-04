@@ -103,9 +103,8 @@ test("sandbox: SPOR_SANDBOX_TIMEOUT_MS overrides the default cap; invalid keeps 
   const prev = process.env.SPOR_SANDBOX_TIMEOUT_MS;
   try {
     process.env.SPOR_SANDBOX_TIMEOUT_MS = "30";
-    const t0 = Date.now();
-    assert.throws(() => createSandbox(spin).call("spin", [], {}), /timed out/);
-    assert.ok(Date.now() - t0 < 90, "the 30ms override applies, not the 100ms default");
+    // node names the cap that fired, so assert it rather than a wall-clock bound
+    assert.throws(() => createSandbox(spin).call("spin", [], {}), /timed out after 30ms/);
     process.env.SPOR_SANDBOX_TIMEOUT_MS = "nope";
     assert.throws(() => createSandbox(spin).call("spin", [], {}), /timed out/);
   } finally {
