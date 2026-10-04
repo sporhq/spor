@@ -9,6 +9,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { hermeticEnv } = require("./helpers/env.js");
+const { gitEnv } = require("./helpers/git.js");
 const { defaultOf } = require("../lib/config-keys.js");
 const { WORK_DEFAULTS } = require("../lib/shell/work-loop.js");
 
@@ -53,6 +54,22 @@ test("session-start hints when the repo has no dispatch.repos entry, and writes 
   assert.ok(!(written.dispatch && written.dispatch.repos), "session-start registered no repo");
   fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { repos: { projx: cwd } } }));
   assert.doesNotMatch(hook("session-start", cwd, env).stdout, /spor repos add/);
+});
+
+test("registration hint is suppressed under SPOR_AGENT_RUN and in a linked worktree of a registered repo", () => {
+  const { home, cwd } = scratch();
+  const base = { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_ENABLED: "1", SPOR_DISTILLING: "1" };
+  assert.doesNotMatch(hook("session-start", cwd, hermeticEnv({ ...base, SPOR_AGENT_RUN: "1" })).stdout, /spor repos add/);
+
+  const git = (args, dir) => spawnSync("git", args, { cwd: dir, env: gitEnv(), encoding: "utf8" });
+  git(["init", "-q"], cwd);
+  git(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i"], cwd);
+  const wt = path.join(path.dirname(cwd), "linked-wt");
+  git(["worktree", "add", "-q", wt], cwd);
+  const env = hermeticEnv(base);
+  assert.match(hook("session-start", wt, env).stdout, /spor repos add projx/);
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { repos: { projx: cwd } } }));
+  assert.doesNotMatch(hook("session-start", wt, env).stdout, /spor repos add/);
 });
 
 test("callers read defaults from the key table", () => {

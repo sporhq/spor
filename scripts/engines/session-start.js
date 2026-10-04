@@ -810,6 +810,11 @@ ${pbody}`;
 // config only; the hint rides the existing envelope.
 function registrationHint(input) {
   try {
+    // A dispatched agent run is never a registration target: its worktree
+    // isn't (and shouldn't be) in dispatch.repos. A LINKED worktree of a
+    // registered repo is already covered — projectSlug resolves it to the main
+    // checkout's slug, which is the dispatch.repos key.
+    if (process.env.SPOR_AGENT_RUN) return "";
     const cwd = input.cwd ?? "";
     const slug = u.projectSlug(cwd);
     if (!slug || !u.config()) return "";
