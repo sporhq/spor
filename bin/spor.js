@@ -13290,19 +13290,20 @@ async function acquireIntegrationLease(
 // releases through the bulk door narrowed to that session, so a lease another
 // driver of ours has since re-claimed under ITS nonce (a later attempt, a
 // different run) is never freed by this release — the singular route would
-// free it, since it scopes on the holder alone. Only a server WITHOUT the
-// bulk door (404/405/501) falls back to the singular, holder-scoped release;
-// any other failure leaves the lease to lapse on its TTL (the safe reading —
-// a release that may have partly run must not be re-driven unscoped). A
-// legacy token with no nonce (an older journal's) takes the singular route as
-// before.
+// free it, since it scopes on the holder alone. A nonce-bearing token NEVER
+// falls back to the singular route (issue-spor-integration-lease-singular-
+// release-fallback): on a server without the bulk door (404/405/501) or on any
+// other failure the lease lapses on its TTL — the safe reading, since an
+// unscoped release could free a same-holder lease a later driver re-claimed.
+// Only a legacy token with no nonce (an older journal's) takes the singular
+// route as before.
 async function releaseIntegrationLease(cfg, token) {
   if (!token) return;
   if (token.kind === "remote") {
     try {
       if (token.nonce) {
-        const r = await remote.post(cfg, "/v1/queue/release", { session: token.nonce }, { timeoutMs: 6000 });
-        if (r && (r.ok || ![404, 405, 501].includes(r.status))) return;
+        await remote.post(cfg, "/v1/queue/release", { session: token.nonce }, { timeoutMs: 6000 });
+        return;
       }
       await remote.post(cfg, `/v1/nodes/${encodeURIComponent(token.id)}/release`, {}, { timeoutMs: 6000 });
     } catch {

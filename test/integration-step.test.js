@@ -5388,7 +5388,7 @@ test("a `ci` candidate suite OUTAGE is handed up INTERRUPTED — no rerun, no fi
     }
   });
 
-  test("releaseIntegrationLease (remote): a token with a nonce releases through POST /v1/queue/release narrowed to that session — never the holder-wide singular release; the singular route is only the fallback for a server without the door, and a legacy token takes it as before", async () => {
+  test("releaseIntegrationLease (remote): a token with a nonce releases through POST /v1/queue/release narrowed to that session — never the holder-wide singular release; a server without the door leaves the lease to lapse (no singular fallback), and only a legacy token takes the singular route", async () => {
     const seen = [];
     const { srv, calls, base } = await serve((req, body, j) => {
       seen.push(req.url);
@@ -5406,7 +5406,8 @@ test("a `ci` candidate suite OUTAGE is handed up INTERRUPTED — no rerun, no fi
     } finally {
       srv.close();
     }
-    // A server WITHOUT the bulk door (404): fall back to the singular release.
+    // A server WITHOUT the bulk door (404): NO singular fallback for a nonce token
+    // (holder-scoped, could free a same-holder lease a later driver re-claimed).
     const noDoor = await serve((req, body, j) => {
       if (req.method === "POST" && req.url === "/v1/queue/release") return j(404, { error: { code: "not_found" } });
       if (req.method === "POST" && /\/release$/.test(req.url)) return j(200, { ok: true });
@@ -5414,7 +5415,7 @@ test("a `ci` candidate suite OUTAGE is handed up INTERRUPTED — no rerun, no fi
     });
     try {
       await sporCli.releaseIntegrationLease(remoteCfg(noDoor.base), { kind: "remote", id: "lock-integration-demo", nonce: "integration-abc" });
-      assert.deepStrictEqual(noDoor.calls.map((c) => c.url), ["/v1/queue/release", "/v1/nodes/lock-integration-demo/release"]);
+      assert.deepStrictEqual(noDoor.calls.map((c) => c.url), ["/v1/queue/release"], "lapses on TTL; the holder-scoped singular route is never tried");
     } finally {
       noDoor.srv.close();
     }
