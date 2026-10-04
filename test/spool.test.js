@@ -29,7 +29,7 @@ test('the engines read their horizons from the one table', () => {
   assert.strictEqual(u.SPOOL_TTL, spool.SPOOL_TTL);
   const engines = path.join(__dirname, '..', 'scripts', 'engines');
   for (const [file, re] of [
-    ['prompt-context.js', /PENDING_ORPHAN_MS = u\.SPOOL_TTL\.orphanInput/],
+    ['spool-drain.js', /PENDING_ORPHAN_MS = u\.SPOOL_TTL\.orphanInput/],
     ['distill.js', /SPOOL_COLLECT_AFTER_MS = u\.SPOOL_TTL\.collectForeign/],
     ['spool-sweeper.js', /SWEEP_INTERVAL_MS = u\.SPOOL_TTL\.sweepInterval/],
   ]) {
