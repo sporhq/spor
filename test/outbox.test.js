@@ -66,7 +66,7 @@ const live = (graph, name) => fs.existsSync(path.join(graph, 'outbox', name));
 test('drain dead-letters a 401 (revoked token) to outbox/dead/', async () => {
   const graph = scratchGraph();
   spool(graph, 'a.json');
-  await withServer(async () => fakeResponse(401), () => drainOutbox(graph, 'test', 2, 0));
+  await withServer(async () => fakeResponse(401), () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 0 }));
   assert.ok(dead(graph, 'a.json'), '401 file should move to outbox/dead/');
   assert.ok(!live(graph, 'a.json'), '401 file should not stay spooled');
   const log = fs.readFileSync(path.join(graph, 'journal', 'remote.log'), 'utf8');
@@ -78,7 +78,7 @@ test('drain still dead-letters 400/413/422 (existing permanent set preserved)', 
   for (const code of [400, 413, 422]) {
     const graph = scratchGraph();
     spool(graph, 'a.json');
-    await withServer(async () => fakeResponse(code), () => drainOutbox(graph, 'test', 2, 0));
+    await withServer(async () => fakeResponse(code), () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 0 }));
     assert.ok(dead(graph, 'a.json'), `${code} should dead-letter`);
   }
 });
@@ -88,7 +88,7 @@ test('drain leaves transient failures (500, transport 000) spooled', async () =>
     const graph = scratchGraph();
     spool(graph, 'a.json');
     // maxTimeSec=2 => retry=0, so no backoff sleeps and the call is immediate.
-    await withServer(responder, () => drainOutbox(graph, 'test', 2, 0));
+    await withServer(responder, () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 0 }));
     assert.ok(live(graph, 'a.json'), 'transient failure must stay spooled for a later drain');
     assert.ok(!dead(graph, 'a.json'), 'transient failure must not be dead-lettered');
   }
@@ -98,7 +98,7 @@ test('drain unlinks a successfully drained file (200/207)', async () => {
   for (const code of [200, 207]) {
     const graph = scratchGraph();
     spool(graph, 'a.json');
-    await withServer(async () => fakeResponse(code), () => drainOutbox(graph, 'test', 2, 0));
+    await withServer(async () => fakeResponse(code), () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 0 }));
     assert.ok(!live(graph, 'a.json') && !dead(graph, 'a.json'), `${code} should be unlinked`);
   }
 });
@@ -115,7 +115,7 @@ test('drainOutbox returns an {attempted,drained,deadLettered,failed} tally', asy
   // key off call order against the lexical sort the drain uses (a,b,c,d).
   const order = ['a.json', 'b.json', 'c.json', 'd.json'];
   let i = 0;
-  const s = await withServer(async () => fakeResponse(codes[order[i++]]), () => drainOutbox(graph, 'test', 2, 0));
+  const s = await withServer(async () => fakeResponse(codes[order[i++]]), () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 0 }));
   assert.deepStrictEqual(s, { attempted: 4, drained: 2, deadLettered: 1, failed: 1 });
   assert.ok(live(graph, 'd.json'), 'the 500 stays spooled');
   assert.ok(dead(graph, 'c.json'), 'the 422 dead-letters');
@@ -127,7 +127,7 @@ test('drainOutbox returns a zero tally when there is no server / no outbox', asy
   const realServer = process.env.SPOR_SERVER;
   delete process.env.SPOR_SERVER;
   try {
-    assert.deepStrictEqual(await drainOutbox(graph, 'test', 2, 0), { attempted: 0, drained: 0, deadLettered: 0, failed: 0 });
+    assert.deepStrictEqual(await drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 0 }), { attempted: 0, drained: 0, deadLettered: 0, failed: 0 });
   } finally {
     if (realServer === undefined) delete process.env.SPOR_SERVER;
     else process.env.SPOR_SERVER = realServer;
@@ -139,7 +139,7 @@ test('drainOutbox honors the maxFiles cap and reports only what it attempted', a
   spool(graph, 'a.json');
   spool(graph, 'b.json');
   spool(graph, 'c.json');
-  const s = await withServer(async () => fakeResponse(200), () => drainOutbox(graph, 'test', 2, 2));
+  const s = await withServer(async () => fakeResponse(200), () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 2 }));
   assert.strictEqual(s.attempted, 2, 'the cap stops after 2 files');
   assert.strictEqual(s.drained, 2);
   assert.ok(live(graph, 'c.json'), 'the capped-out file stays spooled');
@@ -204,7 +204,7 @@ test('drain: a transiently failing head does not block the files behind it', asy
   fs.utimesSync(path.join(graph, 'outbox', 'a.json'), old, old);
   let calls = 0;
   const s = await withServer(async () => (calls++ === 0 ? fakeResponse(503) : fakeResponse(200)), () =>
-    drainOutbox(graph, 'test', 2, 10, 20)
+    drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 10, maxWallSec: 20 })
   );
   assert.deepStrictEqual({ drained: s.drained, failed: s.failed }, { drained: 4, failed: 1 });
   assert.ok(live(graph, 'a.json'), 'the failing file stays spooled');
@@ -231,14 +231,14 @@ test('drain: a failed file rotates behind the untried ones under a file cap of 1
   // the name tiebreak would hand a the head again.
   const mid = new Date(Date.now() - 30000);
   fs.utimesSync(path.join(graph, 'outbox', 'b.json'), mid, mid);
-  await withServer(responder, () => drainOutbox(graph, 'test', 2, 1));
-  await withServer(responder, () => drainOutbox(graph, 'test', 2, 1));
+  await withServer(responder, () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 1 }));
+  await withServer(responder, () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 1 }));
   assert.match(seen[0], /n-a/);
   assert.match(seen[1], /n-b/, 'the second pass takes the untried file, not the failed head again');
   assert.ok(!live(graph, 'b.json'));
   assert.ok(live(graph, 'a.json'));
   // A later success clears the stamp.
-  await withServer(async () => fakeResponse(200), () => drainOutbox(graph, 'test', 2, 0));
+  await withServer(async () => fakeResponse(200), () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 0 }));
   assert.deepStrictEqual(fs.readdirSync(path.join(graph, 'outbox', '.attempts')), []);
 });
 
@@ -251,7 +251,7 @@ test('drain: the wall-clock budget stops a pass and leaves the rest spooled', as
       await new Promise((r) => setTimeout(r, 1100));
       return fakeResponse(200);
     },
-    () => drainOutbox(graph, 'test', 2, 0, 1)
+    () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2, maxFiles: 0, maxWallSec: 1 })
   );
   assert.strictEqual(s.attempted, 1);
 });
@@ -269,7 +269,7 @@ test('drain: two overlapping drains POST one spooled capture exactly once', asyn
       await new Promise((r) => setTimeout(r, 50));
       return fakeResponse(200);
     },
-    () => Promise.all([drainOutbox(graph, 'a', 2), drainOutbox(graph, 'b', 2)])
+    () => Promise.all([drainOutbox(graph, { tag: 'a', maxTimeSec: 2 }), drainOutbox(graph, { tag: 'b', maxTimeSec: 2 })])
   );
   assert.strictEqual(posts.length, 1, 'exactly one POST');
   assert.match(posts[0], /\/v1\/capture$/, 'a claimed capture still routes to /v1/capture');
@@ -293,7 +293,7 @@ test('drain: a file claimed by another live drain is skipped; a stale claim is r
       posts.push(String(url));
       return fakeResponse(200);
     },
-    () => drainOutbox(graph, 'test', 2)
+    () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2 })
   );
   assert.deepStrictEqual(posts.map((p) => p.replace(/^.*\/v1/, '/v1')), ['/v1/capture']);
   assert.strictEqual(s.attempted, 1);
@@ -304,12 +304,12 @@ test('drain: a file claimed by another live drain is skipped; a stale claim is r
 test('drain: a failed POST releases the claim back under the original name', async () => {
   const graph = scratchGraph();
   spool(graph, 'r.capture.json');
-  const s = await withServer(async () => fakeResponse(503), () => drainOutbox(graph, 'test', 2));
+  const s = await withServer(async () => fakeResponse(503), () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2 }));
   assert.strictEqual(s.failed, 1);
   assert.deepStrictEqual(fs.readdirSync(path.join(graph, 'outbox')).filter((f) => f.endsWith('.json')), ['r.capture.json']);
   assert.deepStrictEqual(fs.readdirSync(path.join(graph, 'outbox', '.attempts')), ['r.capture.json']);
   // and it is retried (and drained) by a later pass
-  const s2 = await withServer(async () => fakeResponse(200), () => drainOutbox(graph, 'test', 2));
+  const s2 = await withServer(async () => fakeResponse(200), () => drainOutbox(graph, { tag: 'test', maxTimeSec: 2 }));
   assert.strictEqual(s2.drained, 1);
   assert.ok(!live(graph, 'r.capture.json'));
   assert.deepStrictEqual(fs.readdirSync(path.join(graph, 'outbox', '.attempts')), []);
@@ -332,7 +332,7 @@ test('classifyHttpFailure: ok / auth / rejected / rate-limit / transport / serve
 test('drain dead-letters a 403 exactly as a 401 (auth kind)', async () => {
   const graph = scratchGraph();
   spool(graph, 'a.json');
-  await withServer(async () => fakeResponse(403), () => drainOutbox(graph, 't', 1));
+  await withServer(async () => fakeResponse(403), () => drainOutbox(graph, { tag: 't', maxTimeSec: 1 }));
   assert.ok(fs.existsSync(path.join(graph, 'outbox', 'dead', 'a.json')));
   const log = fs.readFileSync(path.join(graph, 'journal', 'remote.log'), 'utf8');
   assert.match(log, /http=403, revoked\/invalid token/);
@@ -395,7 +395,7 @@ test('drainOutbox: a pinned retry of 0 POSTs a failing file once even with a lon
   const s = await withServer(async () => {
     calls++;
     return fakeResponse(503);
-  }, () => drainOutbox(graph, 't', 120, 10, 60, 0));
+  }, () => drainOutbox(graph, { tag: 't', maxTimeSec: 120, maxFiles: 10, maxWallSec: 60, retryOverride: 0 }));
   assert.strictEqual(calls, 1);
   assert.strictEqual(s.failed, 1);
 });
@@ -455,7 +455,7 @@ test('drain refreshes an expired token once and delivers instead of dead-letteri
     const graph = scratchGraph();
     spool(graph, 'a.json');
     spool(graph, 'b.json');
-    const s = await drainOutbox(graph, 'test', 5, 0);
+    const s = await drainOutbox(graph, { tag: 'test', maxTimeSec: 5, maxFiles: 0 });
     assert.strictEqual(s.drained, 2, JSON.stringify(s));
     assert.strictEqual(s.deadLettered, 0);
     assert.ok(!dead(graph, 'a.json') && !dead(graph, 'b.json'));
@@ -476,7 +476,7 @@ test('drain still dead-letters when the refresh itself fails, and tries it only 
     const graph = scratchGraph();
     spool(graph, 'a.json');
     spool(graph, 'b.json');
-    const s = await drainOutbox(graph, 'test', 5, 0);
+    const s = await drainOutbox(graph, { tag: 'test', maxTimeSec: 5, maxFiles: 0 });
     assert.strictEqual(s.deadLettered, 2, JSON.stringify(s));
     assert.ok(dead(graph, 'a.json') && dead(graph, 'b.json'));
     assert.strictEqual(hits.filter((h) => h.url === '/oauth/token').length, 1, 'a dead refresh token is not re-tried per file');
@@ -517,7 +517,7 @@ test('an env token that is not the store tenant\'s own (a dispatched agent) is n
     );
     const graph = scratchGraph();
     spool(graph, 'a.json');
-    const s = await drainOutbox(graph, 'test', 5, 0);
+    const s = await drainOutbox(graph, { tag: 'test', maxTimeSec: 5, maxFiles: 0 });
     assert.strictEqual(s.deadLettered, 1, JSON.stringify(s));
     assert.strictEqual(hits.filter((h) => h.url === '/oauth/token').length, 0, 'no refresh of the person tenant');
     assert.ok(hits.every((h) => h.bearer === 'AGENT'), 'never retried as the person');
@@ -538,7 +538,7 @@ test('a store tenant whose token another process already rotated still refreshes
     auth.writeStore(home, s0);
     const graph = scratchGraph();
     spool(graph, 'a.json');
-    const s = await drainOutbox(graph, 'test', 5, 0);
+    const s = await drainOutbox(graph, { tag: 'test', maxTimeSec: 5, maxFiles: 0 });
     assert.strictEqual(s.drained, 1, JSON.stringify(s));
     assert.strictEqual(hits.filter((h) => h.url === '/oauth/token').length, 1);
   } finally {
@@ -558,7 +558,7 @@ test('a flat env token equal to the stored one refreshes like the store tenant',
     );
     const graph = scratchGraph();
     spool(graph, 'a.json');
-    const s = await drainOutbox(graph, 'test', 5, 0);
+    const s = await drainOutbox(graph, { tag: 'test', maxTimeSec: 5, maxFiles: 0 });
     assert.strictEqual(s.drained, 1, JSON.stringify(s));
   } finally {
     u.clearConfig();

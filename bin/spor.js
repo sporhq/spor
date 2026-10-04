@@ -4359,7 +4359,7 @@ async function cmdDrain(cfg, { values }) {
   const limit = Math.max(0, Number(values.limit) || 0);
   out(`draining ${before.count} spooled capture${before.count === 1 ? "" : "s"} -> ${u.serverHost()} ...`);
   const { drainOutbox } = require(path.join(ROOT, "scripts", "engines", "drain-outbox.js"));
-  const s = await drainOutbox(graph, "manual", timeout, limit);
+  const s = await drainOutbox(graph, { tag: "manual", maxTimeSec: timeout, maxFiles: limit });
   const parts = [`drained ${s.drained}/${s.attempted}`];
   if (s.deadLettered) parts.push(`${s.deadLettered} dead-lettered (permanent reject)`);
   if (s.failed) parts.push(`${s.failed} left spooled (server unreachable/transient)`);
@@ -4385,7 +4385,7 @@ async function opportunisticDrain(cfg) {
     if (!u.spoolStats(path.join(graph, "outbox")).count) return;
     u.setConfig(cfg);
     const { drainOutbox } = require(path.join(ROOT, "scripts", "engines", "drain-outbox.js"));
-    const s = await drainOutbox(graph, "cli-add", 5, 0);
+    const s = await drainOutbox(graph, { tag: "cli-add", maxTimeSec: 5 });
     if (s.drained) out(`  (also flushed ${s.drained} spooled capture${s.drained === 1 ? "" : "s"} from the outbox)`);
   } catch {
     /* the add already succeeded — draining the backlog is a bonus, never a gate */

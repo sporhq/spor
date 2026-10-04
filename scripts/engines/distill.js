@@ -1021,7 +1021,7 @@ async function distill(input) {
   const rlog = u.makeLogger(path.join(graph, "journal", "remote.log"), `distill ${slug}: `);
 
   // In remote mode, drain any previously-spooled outbox payloads first.
-  if (remote) await drainOutbox(graph, "distill").catch(() => {});
+  if (remote) await drainOutbox(graph, { tag: "distill" }).catch(() => {});
 
   // Conversation text (last ~24k chars), roles prefixed; generic .text
   // fallback for non-Claude transcript shapes.

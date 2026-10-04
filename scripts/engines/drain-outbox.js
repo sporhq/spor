@@ -28,7 +28,7 @@ const u = require("./util");
 const inFlight = new Set();
 const suffixOf = (name) => (name.endsWith(".capture.json") ? ".capture.json" : ".json");
 
-async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0, maxWallSec = 0, retryOverride = null) {
+async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0, maxWallSec = 0, retryOverride = null } = {}) {
   const summary = { attempted: 0, drained: 0, deadLettered: 0, failed: 0 };
   if (!u.serverBase()) return summary;
   const outbox = path.join(graph, "outbox");
@@ -203,7 +203,7 @@ if (require.main === module) {
   const maxWallSec = Number(process.argv[5]) || 0;
   const retryArg = process.argv[6];
   const retryOverride = retryArg != null && /^\d+$/.test(retryArg) ? Number(retryArg) : null;
-  drainOutbox(u.graphHome(), tag, maxTimeSec, maxFiles, maxWallSec, retryOverride)
+  drainOutbox(u.graphHome(), { tag, maxTimeSec, maxFiles, maxWallSec, retryOverride })
     .catch(() => {})
     .finally(() => process.exit(0));
 }
