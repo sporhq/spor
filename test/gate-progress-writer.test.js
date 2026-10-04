@@ -237,7 +237,10 @@ test('a fix launch stamp from UNOWNED deps lands only on a record nobody has cla
   const claim = runs.claimPipeline(home, runId, { workerId: 'worker-1' });
   assert.equal(claim.ok, true, claim.refused);
   runs.stampGateState(home, runId, { gate_fix_run_id: null, gate_fix_gate: null, gate_fix_cycle: null }, { own: claim.token });
-  await assert.rejects(() => unowned.dispatchFix({ gate: { id: 'acceptance' }, cycle: 1, findings: [], detail: 'still failing', evidence: '' }), /could not be updated: the gate pipeline is settled or its owner changed/);
+  // Refused BEFORE the launch now (the owner guard on every pipeline durable
+  // writer, issue-spor-pipeline-completion-writers-unfenced): no second fixer
+  // is dispatched, let alone stamped.
+  await assert.rejects(() => unowned.dispatchFix({ gate: { id: 'acceptance' }, cycle: 1, findings: [], detail: 'still failing', evidence: '' }), /no longer owns the gate pipeline/);
   await assert.rejects(() => unowned.saveGateProgress({ gate: { id: 'acceptance' }, progress: { fixes: 1 } }), /owner changed/);
   const after = runs.readJson(file);
   assert.equal(after.gate_fix_run_id, null, "the worker's record gained no fix id it did not launch");

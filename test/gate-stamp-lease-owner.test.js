@@ -115,7 +115,10 @@ test("the integration fix cycle's launch stamp (gate_fix_*) under A's displaced 
       passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home, gateOwner,
       dispatch: async () => ({ ok: true, run: { run_id: `int-fix-${gateOwner}` } }),
     });
-  await assert.rejects(make(a).dispatchFix({ cycle: 0, kind: "conflict", detail: "CONFLICT in a.txt" }), /settled or its owner changed/);
+  // The owner guard refuses the dispatch itself — no fixer is launched into
+  // the holder's checkout (issue-spor-pipeline-completion-writers-unfenced) —
+  // before the owned launch stamp would have refused the record write.
+  await assert.rejects(make(a).dispatchFix({ cycle: 0, kind: "conflict", detail: "CONFLICT in a.txt" }), /no longer owns the gate pipeline/);
   assert.strictEqual(read(file).gate_fix_run_id, undefined, "A's fix launch is not stamped onto B's record");
   const ok = await make(b).dispatchFix({ cycle: 0, kind: "conflict", detail: "CONFLICT in a.txt" });
   assert.strictEqual(ok.ok, true);
@@ -142,7 +145,10 @@ test("the proposal's park stamp (gate_proposal_*) under A's displaced token is r
       slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home, gateOwner,
     });
   const proposal = { number: 42, repo: "o/r", url: "https://example.invalid/pr/42", branch: "impl", targetSha: "abc123" };
-  await assert.rejects(make(a).parkForReview({ proposal }), /settled or its owner changed/);
+  // The owner guard on every pipeline durable writer refuses the park before
+  // it files the tracking item (issue-spor-pipeline-completion-writers-
+  // unfenced); the owned stamp door below it is the second fence.
+  await assert.rejects(make(a).parkForReview({ proposal }), /no longer owns the gate pipeline/);
   assert.strictEqual(read(file).gate_proposal_number, undefined, "A's park is not stamped onto B's record");
   const parked = await make(b).parkForReview({ proposal });
   assert.strictEqual(parked.ok, true);

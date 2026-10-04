@@ -13678,7 +13678,17 @@ function completionStatusFor(cfg, type) {
 
 // The deps one completion write runs on. `runId` names the record the
 // stamps land on (the pipeline's own run).
-function makeCompletionDeps(cfg, { home = cfg.userConfigHome(), runId = null, execution = null } = {}) {
+// `own` (present) makes these the PIPELINE's completion deps
+// (issue-spor-pipeline-completion-writers-unfenced): every graph write — the
+// resolver, its edge, the item's CAS, a retype — runs only after
+// assertPipelineOwner passes for that token, and the record stamps go through
+// the completion/impl stampers' owned doors, decided under the record lock. A
+// driver displaced by a takeover therefore completes nothing over the new
+// holder's live attempt: the graph writes throw PipelineOwnerLost before they
+// are made. Absent, these are the unowned deps the per-pass reconcile and the
+// proposal poller use — byte-identical to before.
+function makeCompletionDeps(cfg, { home = cfg.userConfigHome(), runId = null, execution = null, own } = {}) {
+  if (own !== undefined) return ownedCompletionDeps(cfg, { home, runId, execution, own });
   return {
     // The execution store's doors (task-spor-client-execution-store-adapter):
     // the fence confirmation before the resolving edge, the completion event
@@ -13698,6 +13708,25 @@ function makeCompletionDeps(cfg, { home = cfg.userConfigHome(), runId = null, ex
     stamp: (patch) => (runId ? dispatchRuns.stampCompletionState(home, runId, patch) : null),
     stampImpl: (patch) => (runId ? dispatchRuns.stampImplState(home, runId, patch) : null),
     now: () => Date.now(),
+  };
+}
+function ownedCompletionDeps(cfg, { home, runId, execution, own }) {
+  const base = makeCompletionDeps(cfg, { home, runId, execution });
+  const guard = () => dispatchRuns.assertPipelineOwner(home, runId, own);
+  // A stamp the owned door refused is the same loss the graph guard throws on:
+  // the completion must not go on to write the graph on a debt nobody recorded.
+  const refused = (after) => {
+    if (after && after.owner_refused) throw new dispatchRuns.PipelineOwnerLost(runId, after.owner_refused);
+    return after;
+  };
+  return {
+    ...base,
+    casWrite: (args) => (guard(), base.casWrite(args)),
+    writeNode: (id, markdown) => (guard(), base.writeNode(id, markdown)),
+    addEdge: (from, type, to) => (guard(), base.addEdge(from, type, to)),
+    removeEdge: (from, type, to) => (guard(), base.removeEdge(from, type, to)),
+    stamp: (patch) => (runId ? refused(dispatchRuns.stampCompletionState(home, runId, patch, { own })) : null),
+    stampImpl: (patch) => (runId ? refused(dispatchRuns.stampImplState(home, runId, patch, { own })) : null),
   };
 }
 
@@ -14179,7 +14208,9 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
       return st.release(id, { fence });
     },
     leave() {
-      LIVE_EXECUTIONS.delete(id);
+      // Only THIS pass's beat: a displaced pass leaving must not drop the
+      // holder's reporter registered under the same execution id.
+      if (LIVE_EXECUTIONS.get(id) === reporter) LIVE_EXECUTIONS.delete(id);
     },
   };
   return reporter;
@@ -14621,7 +14652,37 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     }
     return { ...result, ...attested };
   };
-  const completionDeps = () => makeCompletionDeps(cfg, { home, runId: entry.run_id, execution: executionCompletionDeps(reporter) });
+  // THE OWNER GUARD for every durable write the parent workflow makes itself
+  // (issue-spor-pipeline-completion-writers-unfenced): the split-verdict
+  // stamps, the completion writes at either boundary, the withdraw and the
+  // landed-work reconcile. A record stamp goes through the completion
+  // stamper's owned door (decided under the record lock); everything the
+  // record lock cannot cover — the graph, the execution store — is preceded by
+  // assertPipelineOwner. A driver whose lease another worker took over THROWS
+  // PipelineOwnerLost out of the activity, which the drive below reads as a
+  // superseded pass: nothing more is written, and B's attempt is B's.
+  // test/record-write-lint.test.js R10 lists every activity and holds each
+  // writer to one of these.
+  const assertOwner = () => dispatchRuns.assertPipelineOwner(home, item.run_id, ownToken);
+  const stampOwned = (patch) => {
+    const after = dispatchRuns.stampCompletionState(home, entry.run_id, patch, { own: ownToken });
+    if (after && after.owner_refused) throw new dispatchRuns.PipelineOwnerLost(entry.run_id, after.owner_refused);
+    return after;
+  };
+  // Every stage journal this pass opens — the parent's and each child's —
+  // persists only while the lease is ours: a displaced driver's appends would
+  // land in the very file the new holder replays (same attempt, same name), so
+  // its refused activity's failure entry would read back to B as a verdict. A
+  // persist that throws PipelineOwnerLost poisons the Execution, and the stage
+  // driver (stage-workflow.js driveStage) hands that loss straight up rather
+  // than re-opening the journal.
+  const ownedJournal = (open) =>
+    open &&
+    (() => {
+      const handle = open();
+      return { ...handle, persist: (e) => (assertOwner(), handle.persist(e)) };
+    });
+  const completionDeps = () => makeCompletionDeps(cfg, { home, runId: entry.run_id, execution: executionCompletionDeps(reporter), own: ownToken });
   const pipelineDeps = {
     open: (args) => ({ ...args, opened_at: new Date().toISOString() }),
     implementation: async ({ stage }) => {
@@ -14629,10 +14690,11 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       if (!ctx.factory.implementation) return { state: "escalated", reason: "the factory no longer declares an implementation block; the attempt opened under one", definition_mismatch: { runId: item.run_id, journaled: "implementation", live: "none" }, refusal_tombstoned: false };
       // The stage's durable journal (task-spor-implementation-stage-as-
       // workflow-function): the child the `open` entry named.
-      const implJournal = stageWorkflowJournal(home, record, item, stage.replace(/-a\d+$/, ""));
+      const implJournal = ownedJournal(stageWorkflowJournal(home, record, item, stage.replace(/-a\d+$/, "")));
       return implementationStage.runImplementationStage({ item, factory: ctx.factory, record, log: ctx.log, deps: { ...gateDeps, ...(implJournal ? { workflowJournal: implJournal } : {}) } });
     },
     withdraw: async ({ reason }) => {
+      assertOwner();
       // Through the same outcome door as a refused first dispatch: end the
       // execution (under the fence the record holds NOW — a resumed pipeline
       // may have advanced it), then clear the exact hold.
@@ -14648,7 +14710,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       renewLease(true);
       // The gate list's durable journal (task-spor-gate-list-as-workflow-
       // function): the child the `open` entry named.
-      const gateJournal = stageWorkflowJournal(home, record, item, stage.replace(/-a\d+$/, ""));
+      const gateJournal = ownedJournal(stageWorkflowJournal(home, record, item, stage.replace(/-a\d+$/, "")));
       return gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: { ...gateDeps, ...(gateJournal ? { workflowJournal: gateJournal } : {}) } });
     },
     // The SPLIT verdict of the gate list alone (task-spor-factory-controller-
@@ -14656,7 +14718,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     // `integration_state` below what the integration stage said, so the
     // completion predicate can read WHICH boundary was passed.
     stampGatesState: ({ state, facts }) => {
-      if (completionKernel.GATES_STATES.includes(state)) dispatchRuns.stampCompletionState(home, entry.run_id, { gates_state: state, ...(facts && facts.length ? { completion_facts: facts } : {}) });
+      if (completionKernel.GATES_STATES.includes(state)) stampOwned({ gates_state: state, ...(facts && facts.length ? { completion_facts: facts } : {}) });
       return { ok: true };
     },
     // The completion at the `gates` boundary (C1): edge, then the CAS that
@@ -14664,12 +14726,13 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     // writes nothing and clears nothing — the item stays held, open, blocked by
     // the escalation the gate filed (§4.4).
     completeAtGates: async ({ facts }) => {
+      assertOwner();
       const completed = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: completionDeps(), log: ctx.log, facts: facts || [], boundary: "gates" });
       if (!completed.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the gates boundary (${completed.reason}); the debt stands and the next pass retries it`);
       return { ok: !!completed.ok, settled: completed.settled || null, reason: completed.reason || null };
     },
     integrationStart: async () => {
-      dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: "running" });
+      stampOwned({ integration_state: "running" });
       if (reporter) await reporter.integrationStarted();
       return { ok: true };
     },
@@ -14699,7 +14762,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
         // head it judges, under the prefix and attempt the parent's `open`
         // entry JOURNALED (`regateKey`), so a resumed parent names the same
         // child for the same head whatever the live entry says.
-        const regateJournal = stageWorkflowJournal(home, record, { ...item, attempt: regateKey ? regateKey.attempt : item.attempt }, regateStageName(head, regateKey && regateKey.prefix));
+        const regateJournal = ownedJournal(stageWorkflowJournal(home, record, { ...item, attempt: regateKey ? regateKey.attempt : item.attempt }, regateStageName(head, regateKey && regateKey.prefix)));
         const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, pinHead: head || null, deps: { ...makeGateDeps(cfg, dctx), ...(regateJournal ? { workflowJournal: regateJournal } : {}) } });
         for (const f of lastRegateFacts) {
           if (originalFacts.includes(f)) continue;
@@ -14714,7 +14777,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       };
       // The stage's durable journal (task-spor-integration-stage-as-workflow-
       // function): the child the `open` entry named.
-      const integrationJournal = stageWorkflowJournal(home, record, item, stage.replace(/-a\d+$/, ""));
+      const integrationJournal = ownedJournal(stageWorkflowJournal(home, record, item, stage.replace(/-a\d+$/, "")));
       const intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null, deps: { ...makeIntegrationDeps(cfg, { ...intCtx, gateResult: () => gateResult, regate }), ...(integrationJournal ? { workflowJournal: integrationJournal } : {}) } });
       // A passing re-gate the stage REPLAYED (a resumed worker: the journal
       // holds the re-gate's result, so the `regate` closure above never ran
@@ -14729,7 +14792,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     },
     stampIntegrationState: async ({ intResult, facts }) => {
       const intState = completionKernel.INTEGRATION_STATES.includes(intResult.state) ? intResult.state : intResult.state === "passed" ? "landed" : "failed";
-      dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: intState, ...(facts && facts.length ? { completion_facts: facts } : {}) });
+      stampOwned({ integration_state: intState, ...(facts && facts.length ? { completion_facts: facts } : {}) });
       // The store's integration verdict: landed and parked are its own words; a
       // failure or a refusal is `failed` (a fix cycle or a refusal follows).
       if (reporter) await reporter.integrationSettled(intState === "landed" || intState === "parked" ? intState : "failed", { ref: intResult.ref || (ctx.factory.integration && ctx.factory.integration.targetRef) || null, commit: intResult.commit || null });
@@ -14739,6 +14802,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     // candidate completes; a parked proposal completes when checkProposals
     // sees the merge (N8), a refusal never does.
     completeAtIntegration: async ({ facts }) => {
+      assertOwner();
       const written = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: completionDeps(), log: ctx.log, facts: facts || [], boundary: "integration" });
       if (!written.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the integration boundary (${written.reason}); the debt stands and the next pass retries it`);
       return { ok: !!written.ok, settled: written.settled || null, reason: written.reason || null };
@@ -14748,11 +14812,12 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     // each gets a draft resolver and a confirm-close finding now, never an
     // automatic close. This run's own item is excluded. Fail-open.
     reconcileLanded: async ({ ref, targetSha, landedSha }) => {
+      assertOwner();
       await reconcileAfterLand(cfg, { dir: landRepoDir, ref, targetSha, landedSha, itemId: entry.node_id, log: ctx.log });
       return { ok: true };
     },
     leave,
-    workflowJournal: stageWorkflowJournal(home, record, item, "pipeline") || undefined,
+    workflowJournal: ownedJournal(stageWorkflowJournal(home, record, item, "pipeline")) || undefined,
   };
   let res;
   // Created beside the try that clears it, so no setup throw can leave it beating.
@@ -14760,6 +14825,24 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   if (renewal && typeof renewal.unref === "function") renewal.unref();
   try {
     res = await pipelineWorkflow.drivePipeline({ item, binding, deps: pipelineDeps, log: ctx.log });
+  } catch (e) {
+    if (!dispatchRuns.isPipelineOwnerLost(e) || e.replayed) throw e;
+    // DISPLACED MID-DRIVE: another worker took the lease over while this pass
+    // ran (it lapsed under a stall), and an owner-guarded write refused. This
+    // pass is the loser's — like a refused claim it settles nothing and
+    // attests nothing, and it does NOT release the lease (it is B's).
+    ctx.log(`work: ${entry.node_id} (run ${String(item.run_id).slice(0, 8)}) — ${e.message}; this pass stops here and leaves the pipeline to its current holder`);
+    const rec = freshRecord(home, record);
+    return {
+      state: (rec && rec.gate_state) || "superseded",
+      reason: `the gate pipeline lost its lease mid-drive: ${e.message}`,
+      gates: [],
+      facts: [],
+      attestation: null,
+      superseded: true,
+      owner_lost: true,
+      settled: rec && rec.gate_state ? settledGateSummary(rec) : null,
+    };
   } finally {
     if (renewal) clearInterval(renewal);
     // The reporter leaves the heartbeat set on EVERY return from this pass,

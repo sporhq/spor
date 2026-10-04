@@ -71,6 +71,25 @@ const UNOWNED_GATE_STAMP_CALLERS = {
   "lib/shell/gate-deps.js": new Set(["stampPipelineLaunch"]),
   "lib/shell/work.js": new Set(["stampLoopVerdict"]),
 };
+// R10 — the pipeline's durable writers (issue-spor-pipeline-completion-
+// writers-unfenced). Every activity of the parent pipeline workflow
+// (pipeline-workflow.js PIPELINE_ACTIVITIES) is classified here, so a new one
+// must say which it is: a WRITER makes durable state itself and must pass the
+// owner guard (`assertOwner()`, the owned `stampOwned()` door, or — the
+// settle — the lease `token: ownToken`); a DRIVER drives a stage whose writes
+// go through the guarded gate/integration deps; PURE writes nothing durable.
+const PIPELINE_ACTIVITY_WRITERS = new Set(["withdraw", "stampGatesState", "completeAtGates", "integrationStart", "stampIntegrationState", "completeAtIntegration", "reconcileLanded", "leave"]);
+const PIPELINE_ACTIVITY_DRIVERS = new Set(["implementation", "gates", "integration"]);
+const PIPELINE_ACTIVITY_PURE = new Set(["open", "yield", "settled"]);
+// The graph-write helpers a gate/integration dep may call only from a dep
+// listed in gate-deps.js PIPELINE_DURABLE_WRITERS (which guardPipelineWriters
+// wraps in the owner guard).
+// `dispatch(` is the injected launcher (dispatchThrough): an agent launched
+// into the run's checkout is a durable act of the pipeline too.
+const GRAPH_WRITE_HELPERS = /(?<![A-Za-z0-9_$.])(writeGateNode|addGateEdge|gateDemoteItem|proposePR|makeCompletionDeps|graphEdgeMutation|dispatch|dispatchThrough)\s*\(|\.landCandidate\s*\(/g;
+// Writers the item named explicitly — they must stay listed.
+const REQUIRED_GUARDED = { gate: ["recordFact", "escalate"], integration: ["recordFact", "parkForReview", "escalate"] };
+
 // Keys only the writer may spell as an object key: the progress stamp and the
 // revision the versioned put owns.
 const WRITER_ONLY_KEYS = ["gate_progress", "rev", "rev_at"];
@@ -385,6 +404,8 @@ function scan() {
     }
   }
 
+  for (const v of pipelineWriterViolations(sources)) violations.push(v);
+
   // R9 — an allowlisted unowned caller that no longer stamps unowned is a
   // stale entry: drop it, so the list stays the exact set it claims to be.
   for (const [rel, fns] of Object.entries(UNOWNED_GATE_STAMP_CALLERS)) {
@@ -406,6 +427,123 @@ function scan() {
     assert.doesNotMatch(body, /(?<![A-Za-z0-9_$])atomicJson\s*\(/, `${name} must write through putRecord, not atomicJson`);
   }
   return violations;
+}
+
+// The R10 scan, over the tokenized sources (see the constants above).
+function pipelineWriterViolations(sources) {
+  const out = [];
+  // (a) gate-deps.js: every graph-write helper call sits inside a listed
+  // durable writer of its deps family, both families are returned through
+  // guardPipelineWriters, and every impl stamp names its owner.
+  const GD = "lib/shell/gate-deps.js";
+  const gd = sources.get(GD).code;
+  const listed = require(path.join(ROOT, GD)).PIPELINE_DURABLE_WRITERS;
+  for (const [family, names] of Object.entries(REQUIRED_GUARDED)) {
+    for (const n of names) if (!listed[family].includes(n)) out.push(`${GD}: PIPELINE_DURABLE_WRITERS.${family} must list ${n}`);
+  }
+  const gateStart = gd.search(/^  function makeGateDeps\(/m);
+  const intStart = gd.search(/^  function makeIntegrationDeps\(/m);
+  assert.ok(gateStart > 0 && intStart > gateStart, `${GD}: makeGateDeps/makeIntegrationDeps not found where R10 expects them`);
+  const lines = gd.split("\n");
+  const offsets = [];
+  for (let i = 0, at = 0; i < lines.length; i += 1) { offsets.push(at); at += lines[i].length + 1; }
+  const region = (index) => {
+    let line = gd.slice(0, index).split("\n").length - 1;
+    for (; line >= 0; line -= 1) {
+      const kw = lines[line].match(/^      (if|for|while|switch|catch|return|try|else|await|log|const|let)\b/);
+      const m = (!kw && lines[line].match(/^      (?:async\s+)?([A-Za-z_$][\w$]*)\s*[:(]/)) || lines[line].match(/^    (?:const|let|function)\s+([A-Za-z_$][\w$]*)/) || lines[line].match(/^\s{0,2}function\s+([A-Za-z_$][\w$]*)/);
+      if (m) return m[1];
+    }
+    return null;
+  };
+  for (const m of gd.matchAll(GRAPH_WRITE_HELPERS)) {
+    if (m.index < gateStart || isDefinition(gd, m.index)) continue;
+    const family = m.index < intStart ? "gate" : "integration";
+    const name = region(m.index);
+    if (!listed[family].includes(name)) out.push(`${GD}:${lineOf(gd, m.index)} ${m[1] || "landCandidate"} called from ${family} dep ${name || "?"}, which PIPELINE_DURABLE_WRITERS.${family} does not list — an unguarded pipeline durable write`);
+  }
+  for (const [family, from, to] of [["gate", gateStart, intStart], ["integration", intStart, gd.length]]) {
+    const body = gd.slice(from, to);
+    if (!new RegExp(`return guardPipelineWriters\\([\\s\\S]*PIPELINE_DURABLE_WRITERS\\.${family}\\b`).test(body)) out.push(`${GD}: the ${family} deps are not returned through guardPipelineWriters(…, PIPELINE_DURABLE_WRITERS.${family}, …)`);
+  }
+  for (const m of gd.matchAll(/\.stampImplState\s*\(/g)) {
+    if (!ownsCall(callText(gd, m.index + m[0].length - 1))) out.push(`${GD}:${lineOf(gd, m.index)} stampImplState without \`own\` in ${region(m.index) || "?"} — a pipeline impl stamp must go through the lease's own door`);
+  }
+  // (b) bin/spor.js runGateAndIntegration: every parent activity classified,
+  // every writer guarded, every completion/impl stamp owned, the completion
+  // deps built owned.
+  const BIN = "bin/spor.js";
+  const bin = sources.get(BIN).code;
+  const fnAt = bin.search(/^async function runGateAndIntegration\(/m);
+  assert.ok(fnAt > 0, `${BIN}: runGateAndIntegration not found`);
+  const fnEnd = bin.slice(fnAt + 10).search(/^(?:async\s+)?function\s/m);
+  const fnBody = bin.slice(fnAt, fnEnd < 0 ? undefined : fnAt + 10 + fnEnd);
+  const activities = require(path.join(ROOT, "lib/shell/pipeline-workflow.js")).PIPELINE_ACTIVITIES.map(([name]) => name);
+  for (const name of activities) {
+    if (![PIPELINE_ACTIVITY_WRITERS, PIPELINE_ACTIVITY_DRIVERS, PIPELINE_ACTIVITY_PURE].some((set) => set.has(name))) out.push(`pipeline activity '${name}' is not classified in R10 (writer, driver or pure)`);
+  }
+  for (const set of [PIPELINE_ACTIVITY_WRITERS, PIPELINE_ACTIVITY_DRIVERS, PIPELINE_ACTIVITY_PURE]) {
+    for (const name of set) if (!activities.includes(name)) out.push(`R10 classifies '${name}', which is not a pipeline activity`);
+  }
+  const depsAt = fnBody.indexOf("const pipelineDeps = {");
+  assert.ok(depsAt > 0, `${BIN}: runGateAndIntegration's pipelineDeps not found`);
+  const depsText = fnBody.slice(depsAt, depsAt + callTextBraces(fnBody, depsAt + "const pipelineDeps = ".length).length + 22);
+  const props = [...depsText.matchAll(/^    ([A-Za-z_$][\w$]*)\s*[:,]/gm)].map((m) => ({ name: m[1], at: m.index }));
+  for (const name of PIPELINE_ACTIVITY_WRITERS) {
+    const i = props.findIndex((p) => p.name === name);
+    if (i < 0) { out.push(`${BIN}: pipeline writer '${name}' is not a property of runGateAndIntegration's pipelineDeps`); continue; }
+    // A shorthand property (`leave,`) is a closure defined above: read its definition.
+    let text = depsText.slice(props[i].at, i + 1 < props.length ? props[i + 1].at : undefined);
+    if (/^    [A-Za-z_$][\w$]*\s*,/.test(text)) {
+      // Its definition runs to the next statement at the function's own indent.
+      const def = fnBody.search(new RegExp(`^  const ${name} = `, "m"));
+      const end = def < 0 ? -1 : fnBody.slice(def + 1).search(/^  \S/m);
+      text = def < 0 ? "" : fnBody.slice(def, end < 0 ? undefined : def + 1 + end);
+    }
+    // The guard: an assertOwner()/stampOwned() call, or the settle CAS itself
+    // carrying the lease token (its own compare-and-swap is the guard).
+    const settle = text.search(/\bsettleRunRecord\s*\(/);
+    const settleOwned = settle >= 0 && /\btoken\s*:\s*ownToken\b/.test(callText(text, text.indexOf("(", settle)));
+    const guards = [text.search(/\bassertOwner\s*\(/), text.search(/\bstampOwned\s*\(/), settleOwned ? settle : -1].filter((i) => i >= 0);
+    const guard = guards.length ? Math.min(...guards) : -1;
+    // ...and the guard comes BEFORE the activity's first durable call.
+    const firstWrite = text.search(/\b(?:writeCompletion|withdrawHeldExecution|reconcileAfterLand|writeRunAttestation|stampCompletionState|reporter\.(?:integration\w+|end|release))\s*\(|\bsettleRunRecord\s*\((?![\s\S]*?\btoken\s*:\s*ownToken)/);
+    if (guard < 0) out.push(`${BIN}: pipeline writer '${name}' writes durable state without the owner guard (assertOwner(), stampOwned(), or the settle's token: ownToken)`);
+    else if (firstWrite >= 0 && firstWrite < guard) out.push(`${BIN}: pipeline writer '${name}' makes a durable call before its owner guard`);
+  }
+  for (const m of fnBody.matchAll(/\.(stampCompletionState|stampImplState)\s*\(/g)) {
+    if (!ownsCall(callText(fnBody, m.index + m[0].length - 1))) out.push(`${BIN}: runGateAndIntegration calls ${m[1]} without \`own\``);
+  }
+  // ...and every stage journal it opens persists through the owner guard.
+  for (const m of fnBody.matchAll(/(?<![A-Za-z0-9_$.])stageWorkflowJournal\s*\(/g)) {
+    if (!/ownedJournal\(\s*$/.test(fnBody.slice(Math.max(0, m.index - 40), m.index))) out.push(`${BIN}: runGateAndIntegration opens a stage journal outside ownedJournal(…) — its appends would not be owner-checked`);
+  }
+  for (const m of fnBody.matchAll(/(?<![A-Za-z0-9_$.])makeCompletionDeps\s*\(/g)) {
+    if (!ownsCall(callText(fnBody, m.index + m[0].length - 1))) out.push(`${BIN}: runGateAndIntegration builds completion deps without \`own\``);
+  }
+  return out;
+}
+
+// The text of a `{...}` block starting at the `{` at (or after) `open`.
+function callTextBraces(src, open) {
+  const start = src.indexOf("{", open);
+  let depth = 0;
+  let quote = null;
+  for (let i = start; i < src.length; i += 1) {
+    const c = src[i];
+    if (quote) {
+      if (c === "\\") { i += 1; continue; }
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === "'" || c === "\"" || c === "`") { quote = c; continue; }
+    if (c === "{") depth += 1;
+    else if (c === "}") {
+      depth -= 1;
+      if (depth === 0) return src.slice(start, i + 1);
+    }
+  }
+  return src.slice(start);
 }
 
 test("run records are written through ONE versioned put, from the lock-taking writers only, and nothing else writes them", () => {

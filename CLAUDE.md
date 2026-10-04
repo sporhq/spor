@@ -2001,6 +2001,26 @@ starts, and an unref'd interval beats at the same cadence for the whole drive
 spawn or poll with no slice of ours inside) — so a stalled-but-live worker past
 the 30m TTL is never double-driven. The residual: a single SYNCHRONOUS step
 longer than the TTL still lapses.
+**Every pipeline durable write is owner-checked
+(issue-spor-pipeline-completion-writers-unfenced):** one guard,
+`assertPipelineOwner(home, run, token)` (agent-dispatch-runner.js, over the
+same `ownsRecord` reading the settle's `own` door uses), THROWS
+`PipelineOwnerLost` before any write a lease-displaced driver must not make.
+Record writes check it UNDER the record lock (`own` on
+`stampCompletionState`/`stampImplState`); the parent activities guard the
+rest (`assertOwner`/`stampOwned` in runGateAndIntegration — split verdicts,
+completion writes, withdraw, landed reconcile); `makeCompletionDeps(…, {own})`
+guards the completion's graph writes; gate-deps `PIPELINE_DURABLE_WRITERS` +
+`guardPipelineWriters` wrap every graph-writing dep AND every agent launch
+(review/fix/rescue/implement, land, propose); and every stage journal's
+persist goes through `ownedJournal`, so a displaced driver's refused step never
+reaches the journal file the new holder (same attempt, same file) replays — the
+poisoned Execution is control flow, `driveStage` hands a live loss straight up
+without re-opening, and runGateAndIntegration returns `superseded`/`owner_lost`
+WITHOUT releasing the lease. R10 of test/record-write-lint.test.js classifies
+every parent activity (writer/driver/pure), requires each writer's guard before
+its first durable call, and maps every gate-deps graph-write/launch call to a
+listed writer; see test/pipeline-writer-owner.test.js.
 **The attempt's identity is the LEASE's:** `gate_regate_count`/`gate_regated_at`
 are no longer written to the record — the claim line's `attempt` and the
 folded lease's `regated_at` carry them, read everywhere through
