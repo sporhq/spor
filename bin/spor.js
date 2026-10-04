@@ -14152,22 +14152,36 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
       }
       return pinnedResult;
     },
-    gateSettled: (gateId, verdict, { candidateId = null } = {}) => {
+    // `key` (optional): a deterministic identity for THIS verdict — the gate
+    // fact id the workflow journaled — sent as the event's idempotency key, so
+    // a re-executed report (its activity's result never reached the journal)
+    // is recorded once by the store rather than as a fresh attempt under a
+    // new derived key (issue-spor-slice5-leave-not-idempotent-and-regate-
+    // stamps-unowned, the activity sweep). The attempt number still counts
+    // up; the reducer reads it as a label, never a sequence.
+    gateSettled: (gateId, verdict, { candidateId = null, key = null } = {}) => {
       const state = GATE_VERDICT_TO_STATE[String(verdict || "")] || null;
       if (!state) return Promise.resolve({ ok: true, skipped: true });
       if (pinned.size && !pinned.has(String(gateId))) return Promise.resolve({ ok: true, skipped: true }); // a synthetic gate (scoping, no-code) is not in the pinned list
       const attempt = gateAttempt(String(gateId));
-      return send({ type: "gate.settled", gate_id: String(gateId), attempt, state, candidate_id: candidateId || candidateTip?.candidate_id || last?.candidate?.candidate_id || null });
+      return send({ type: "gate.settled", gate_id: String(gateId), attempt, state, candidate_id: candidateId || candidateTip?.candidate_id || last?.candidate?.candidate_id || null, ...(key ? { idempotency_key: `${id}:${gateId}:settled:${key}` } : {}) });
     },
     rescueStarted: (attempt) => send({ type: "rescue.started", attempt }),
     escalationFiled: (nodeId, reason, { terminal = false } = {}) => send({ type: "escalation.filed", node_id: nodeId, reason: reason || null, ...(terminal ? { terminal: true } : {}) }),
-    integrationStarted: () => {
+    // `key` (optional): the journaled identity of the pipeline step that
+    // starts this integration attempt — a re-executed start is recorded once.
+    integrationStarted: ({ key = null } = {}) => {
       seedAttempts(last);
       integrationAttempt += 1;
-      return send({ type: "integration.started", attempt: integrationAttempt });
+      return send({ type: "integration.started", attempt: integrationAttempt, ...(key ? { idempotency_key: `${id}:integration:started:${key}` } : {}) });
     },
-    integrationSettled: (state, { ref = null, commit = null } = {}) =>
-      send({ type: "integration.settled", attempt: integrationAttempt || 1, state, ...(ref ? { ref } : {}), ...(commit ? { commit } : {}) }),
+    // `key` (optional): the journaled identity of the pipeline step that
+    // settles it. With one, the settle never takes the derived
+    // `<x>:integration:<attempt>` key — whose attempt label a deduped start
+    // can leave behind the store's, so a LATER attempt's settle would land on
+    // a key already spent and be dropped as a replay.
+    integrationSettled: (state, { ref = null, commit = null, key = null } = {}) =>
+      send({ type: "integration.settled", attempt: integrationAttempt || 1, state, ...(ref ? { ref } : {}), ...(commit ? { commit } : {}), ...(key ? { idempotency_key: `${id}:integration:settled:${key}` } : {}) }),
     completionWritten: (resolver) => send({ type: "completion.written", resolver }),
     // Refusal retains the hold. Persist both steps until the explicit release
     // is acknowledged; graph completion stamps must not hide this store debt.
@@ -14261,7 +14275,7 @@ function reportingGateDeps(deps, reporter) {
     try {
       const gate = args && args.gate;
       if (gate && gate.kind === "rescue") return await reporter.rescueStarted(Number(args.rescue) || 1);
-      if (gate && gate.id) return await reporter.gateSettled(gate.id, args.verdict, { candidateId: args.candidate_id || null });
+      if (gate && gate.id) return await reporter.gateSettled(gate.id, args.verdict, { candidateId: args.candidate_id || null, key: args.fact || null });
     } catch {
       // Fail-soft for the verdict, but preserve the caller's reporting retry.
     }
@@ -14609,7 +14623,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   };
   // The live pipeline verdicts the `leave` activity settles and attests —
   // what the gates said, as it stands after any re-gate.
-  const leave = async ({ result, gateResult, gateFacts, intResult }) => {
+  const leave = async ({ result, gateResult, gateFacts, intResult, at = null }) => {
     const gateAsStands = { ...gateResult, facts: gateFacts };
     // SETTLE FIRST, ATTEST SECOND (review finding 5): the verdict is written to
     // the run record — the durable, read-back-verified `gate_state` the resume
@@ -14622,8 +14636,18 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     // attestation and touches NO evidence field (cross-model review, blocking
     // finding 1): the graph and the record must describe one verdict at one
     // head, and that is the winner's.
+    //
+    // IDEMPOTENT PER LEASE TOKEN (issue-spor-slice5-leave-not-idempotent-and-
+    // regate-stamps-unowned): this is one journaled activity, so a pass whose
+    // settle landed but whose `leave` entry never reached the journal re-runs
+    // it. The verdict time is the workflow's journaled clock read (`at`), and a
+    // record already carrying this token's verdict is returned as it stands
+    // (`settled.already`) — no re-stamp, so the attestation's own stamps are
+    // never reset to "pending/missing" under a node already written; the
+    // attestation and the PR-body refresh run again only if they did not
+    // complete the first time, publishing the record's own debt bytes.
     const pending = prepareRunAttestation(cfg, { item, factory: ctx.factory, gateResult: gateAsStands, intResult, workerId: ctx.workerId || null, cwd: record && record.cwd });
-    const settled = settleRunRecord(home, item.run_id, result, ctx.workerId || null, { gateResult: gateAsStands, factory: ctx.factory, intResult, token: ownToken, pending });
+    const settled = settleRunRecord(home, item.run_id, result, ctx.workerId || null, { gateResult: gateAsStands, factory: ctx.factory, intResult, token: ownToken, pending, at });
     if (!settled.landed) {
       ctx.log(
         `work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) was already settled${settled.record && settled.record.gate_state ? ` as '${settled.record.gate_state}'` : ""}${settled.record && settled.record.gate_worker ? ` by ${settled.record.gate_worker}` : ""} — this pipeline's '${result.state}' verdict is not recorded and no attestation is written for it`
@@ -14631,24 +14655,41 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       const rec = settled.record || null;
       return { ...result, attestation: null, superseded: true, settled: rec ? settledGateSummary(rec) : null };
     }
+    const rec = settled.already ? settled.record : null;
+    const debt = (rec && rec.gate_attestation_pending && rec.gate_attestation_pending.built ? rec.gate_attestation_pending : null) || pending;
     // ONE attestation per run (piece 4): the evidence chain over everything
     // above, written as a graph artifact and stamped onto the run record
     // (`gate_attestation`) through the settler's OWN door, so it can never land
     // on a record another writer settled. Fail-soft like every fact write —
     // the verdict is the enforcement, the attestation is its record.
-    const { attestationObject, ...attested } = await writeRunAttestation(cfg, {
-      item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token, built: pending.built, origin: pending.origin,
-    });
+    let attestationObject = (debt && debt.built && debt.built.attestation) || null;
+    let attested;
+    if (rec && rec.gate_attestation && rec.gate_attestation_missing !== true) {
+      attested = { attestation: rec.gate_attestation, attestation_missing: false, attestation_error: null };
+    } else {
+      ({ attestationObject, ...attested } = await writeRunAttestation(cfg, {
+        item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token, built: debt.built, origin: debt.origin,
+      }));
+    }
     // Propose mode: the PR body written at propose time predates the graph
     // artifact it must be bound to, so the PR is refreshed with the final,
-    // digest-bound copy the graph holds.
-    if (attested.attestation && attestationObject && intResult && intResult.state === "parked" && intResult.proposal && intResult.proposal.number && ctx.factory.integration && ctx.factory.integration.mode === "propose") {
-      const refreshed = await refreshProposalAttestation(cfg, {
-        item, factory: ctx.factory, intResult, attestationObject, home, log: ctx.log, settleToken: settled.token,
-        cwd: (record && record.cwd) || null, editBody: ctx.editProposalBody || editProposalBody,
-      });
-      attested.proposal_attestation_stale = !refreshed.ok;
-      if (!refreshed.ok) attested.proposal_attestation_error = String(refreshed.reason || "no response").slice(0, 300);
+    // digest-bound copy the graph holds — once: a refresh this token already
+    // landed (`gate_proposal_attestation` naming this attestation, not stale)
+    // is not re-sent.
+    if (attested.attestation && intResult && intResult.state === "parked" && intResult.proposal && intResult.proposal.number && ctx.factory.integration && ctx.factory.integration.mode === "propose") {
+      if (rec && rec.gate_proposal_attestation === attested.attestation && rec.gate_proposal_attestation_stale === false) {
+        attested.proposal_attestation_stale = false;
+      } else if (!attestationObject) {
+        attested.proposal_attestation_stale = true;
+        attested.proposal_attestation_error = "the bound attestation's bytes are no longer on the run record; the PR body still carries the propose-time copy";
+      } else {
+        const refreshed = await refreshProposalAttestation(cfg, {
+          item, factory: ctx.factory, intResult, attestationObject, home, log: ctx.log, settleToken: settled.token,
+          cwd: (record && record.cwd) || null, editBody: ctx.editProposalBody || editProposalBody,
+        });
+        attested.proposal_attestation_stale = !refreshed.ok;
+        if (!refreshed.ok) attested.proposal_attestation_error = String(refreshed.reason || "no response").slice(0, 300);
+      }
     }
     return { ...result, ...attested };
   };
@@ -14733,7 +14774,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     },
     integrationStart: async () => {
       stampOwned({ integration_state: "running" });
-      if (reporter) await reporter.integrationStarted();
+      if (reporter) await reporter.integrationStarted({ key: `${item.run_id}/pipeline/a${Math.max(0, Number(item.attempt) || 0)}/integration/start` });
       return { ok: true };
     },
     integration: async ({ stage, regate: regateKey, completedBeforeIntegration, gateResult: gateIn, gateFacts: factsIn }) => {
@@ -14795,7 +14836,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       stampOwned({ integration_state: intState, ...(facts && facts.length ? { completion_facts: facts } : {}) });
       // The store's integration verdict: landed and parked are its own words; a
       // failure or a refusal is `failed` (a fix cycle or a refusal follows).
-      if (reporter) await reporter.integrationSettled(intState === "landed" || intState === "parked" ? intState : "failed", { ref: intResult.ref || (ctx.factory.integration && ctx.factory.integration.targetRef) || null, commit: intResult.commit || null });
+      if (reporter) await reporter.integrationSettled(intState === "landed" || intState === "parked" ? intState : "failed", { ref: intResult.ref || (ctx.factory.integration && ctx.factory.integration.targetRef) || null, commit: intResult.commit || null, key: `${item.run_id}/pipeline/a${Math.max(0, Number(item.attempt) || 0)}/integration/stamp` });
       return { state: intState };
     },
     // The completion at the `integration` boundary (N7): only a LANDED
@@ -14944,8 +14985,11 @@ function pipelineHeldLive(home, record) {
 // (`gate_settle_id`, random — two settlers in one millisecond cannot share it
 // the way they could share `gate_at`): every evidence field stamped after the
 // verdict goes through stampGateState's `own` door with it.
-function settleRunRecord(home, runId, res, workerId = null, { gateResult = null, factory = null, intResult = null, token: owned = null, pending = null } = {}) {
-  const at = new Date().toISOString();
+function settleRunRecord(home, runId, res, workerId = null, { gateResult = null, factory = null, intResult = null, token: owned = null, pending = null, at: when = null } = {}) {
+  // The verdict's time: the caller's JOURNALED clock read when it has one (the
+  // pipeline workflow's `leave/now`), so a replayed settle names the instant
+  // the recording did.
+  const at = when != null && Number.isFinite(new Date(when).getTime()) ? new Date(when).toISOString() : new Date().toISOString();
   // The token claimPipeline minted before the pipeline ran, when there was a
   // record to own — the settle then goes through the `own` door and lands only
   // while the pipeline's lease still carries it (a re-gate or another owner in
@@ -14957,6 +15001,17 @@ function settleRunRecord(home, runId, res, workerId = null, { gateResult = null,
   const token = owned || crypto.randomBytes(12).toString("hex");
   try {
     const state = res && res.state ? res.state : "failed";
+    // IDEMPOTENT under the lease token: a record that already carries THIS
+    // token's verdict was settled by this very attempt (only its holder can
+    // write that nonce — a reopen mints a new one), so a re-run — the
+    // `leave` activity re-executed because its journal entry never landed —
+    // returns the record unchanged rather than re-stamping it. A re-stamp
+    // would re-arm `gate_attestation_pending`/`_missing` over an attestation
+    // the first run already wrote and cleared.
+    if (owned) {
+      const current = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+      if (current && current.gate_settle_id === owned && current.gate_state === state) return { landed: true, already: true, at: current.gate_at || at, token, record: current };
+    }
     const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
     const patch = {
       gate_state: state,
@@ -15941,8 +15996,19 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // A re-gate re-opens a controller record's completion: a refusal's
   // `consumed` stamp (reconcileCompletions) must not hide a completion this
   // attempt may now write and then owe.
+  //
+  // Both reopen stamps below go through the lease's OWN door with the token
+  // this re-gate just claimed (issue-spor-slice5-leave-not-idempotent-and-
+  // regate-stamps-unowned): a re-gate whose lease was taken over between the
+  // claim and here must not reopen state under the adopter's attempt, so a
+  // refused stamp stops the re-gate before it judges anything.
+  const ownedReopen = (after, what) => {
+    if (!after || !after.owner_refused) return true;
+    err(`spor work --regate: ${what} was refused — ${after.owner_refused}; no judgement started`);
+    return false;
+  };
   if (!resume && completionKernel.isControllerRecord(record) && record.completion_consumed_at) {
-    dispatchRuns.stampCompletionState(home, record.run_id, { completion_consumed_at: null, completion_note: null });
+    if (!ownedReopen(dispatchRuns.stampCompletionState(home, record.run_id, { completion_consumed_at: null, completion_note: null }, { own: gateClaim.token }), "reopening the completion")) return 1;
   }
   // ...and a settled implementation-stage REFUSAL (task-spor-factory-
   // implementation-stage-runner): `exhausted`/`escalated`/`unroutable`/
@@ -15953,7 +16019,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // `candidate` or `declined` is a verdict on what the run produced and is
   // left alone — the gates re-judge the candidate as before.
   if (!resume && ["exhausted", "escalated", "unroutable", "mismatch"].includes(String(record.impl_state || ""))) {
-    dispatchRuns.stampImplState(home, record.run_id, { impl_state: "running", impl_attempt: 1 }, { force: true });
+    if (!ownedReopen(dispatchRuns.stampImplState(home, record.run_id, { impl_state: "running", impl_attempt: 1 }, { force: true, own: gateClaim.token }), "reopening the implementation stage")) return 1;
     out(`work: re-gating ${record.node_id} — its implementation stage had settled '${record.impl_state}'; re-judging the run under attempt ${attempt}`);
   }
   const entry = { run_id: record.run_id, node_id: record.node_id, harness: record.harness || null, project, attempt };

@@ -2141,6 +2141,43 @@ test("REGRESSION: buildCandidateTree's own sha is NOT updated by forceProtectedP
   }
 });
 
+// The integration deps' forceProtected is a journaled ACTIVITY, re-executed
+// when its result never reached the journal — on a candidate tree it already
+// restored and re-committed. A clean status there used to hand back the args'
+// `sha` (the PRE-restoration commit) for the land; the re-run must return the
+// same restored commit the first run did (issue-spor-slice5-leave-not-
+// idempotent-and-regate-stamps-unowned, the activity sweep).
+test("the integration deps' forceProtected re-run on its own restored tree returns the restored commit, never the pre-restoration sha", () => {
+  const sporCli = require("../bin/spor.js");
+  const { loadConfig } = require("../lib/config.js");
+  const dir = integrationRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-force-replay-"));
+  const head = git(dir, "rev-parse", "branch").trim();
+  for (const strategy of ["merge", "squash", "rebase"]) {
+    const built = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy });
+    assert.strictEqual(built.ok, true, `${strategy}: ${built.reason}`);
+    try {
+      const deps = sporCli.makeIntegrationDeps(loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_MODE: "local" } }), {
+        record: { cwd: dir, run_id: "11111111-2222-3333-4444-0000000000f1" }, entry: { run_id: "11111111-2222-3333-4444-0000000000f1", node_id: "task-force" },
+        factory: { id: "factory-force", trustedRef: "main", protectedPaths: ["test/**"], integration: { targetRef: "main", mode: "local", strategy, command: "true", cycles: 0 } },
+        slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
+      });
+      const args = { top: dir, dir: built.dir, sha: built.sha, base: built.expectedSha };
+      const first = deps.forceProtected(args);
+      assert.strictEqual(first.ok, true, `${strategy}: ${first.reason}`);
+      assert.notStrictEqual(first.sha, built.sha, `${strategy}: the first run re-committed the restored tree`);
+      const again = deps.forceProtected(args);
+      assert.strictEqual(again.ok, true, `${strategy}: ${again.reason}`);
+      assert.notStrictEqual(again.sha, built.sha, `${strategy}: the re-run never hands back the pre-restoration sha`);
+      assert.strictEqual(git(dir, "rev-parse", `${again.sha}^{tree}`).trim(), git(dir, "rev-parse", `${first.sha}^{tree}`).trim(), `${strategy}: the re-run lands the same restored tree`);
+      assert.match(git(dir, "show", `${again.sha}:test/acceptance.js`), /add is broken/, `${strategy}: the trusted copy of the protected file`);
+    } finally {
+      built.cleanup();
+    }
+  }
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test("reconcileCandidateSha re-commits the restored tree and lands THAT sha — never the pre-restoration one", () => {
   const dir = integrationRepo();
   const head = git(dir, "rev-parse", "branch").trim();

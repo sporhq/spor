@@ -84,8 +84,15 @@ const PIPELINE_ACTIVITY_PURE = new Set(["open", "yield", "settled"]);
 // The settle's host-side writers in bin/spor.js that run AFTER the settle
 // (issue-spor-slice5-regate-attempt-mismatch-and-unguarded-attestation): each
 // must call assertPipelineOwner(…) before its durable write — the attestation
-// node and the propose-mode PR body.
-const PIPELINE_HOST_WRITERS = { writeRunAttestation: "writeGateNode", refreshProposalAttestation: "editBody" };
+// node and the propose-mode PR body. An entry whose value is `{owned: [...]}`
+// names a pipeline host function whose record stamps must ALL carry the
+// lease's `own` door instead (issue-spor-slice5-leave-not-idempotent-and-
+// regate-stamps-unowned): cmdWorkRegate's post-claim reopen stamps.
+const PIPELINE_HOST_WRITERS = {
+  writeRunAttestation: "writeGateNode",
+  refreshProposalAttestation: "editBody",
+  cmdWorkRegate: { owned: ["stampCompletionState", "stampImplState"] },
+};
 // The graph-write helpers a gate/integration dep may call only from a dep
 // listed in gate-deps.js PIPELINE_DURABLE_WRITERS (which guardPipelineWriters
 // wraps in the owner guard).
@@ -555,6 +562,14 @@ function pipelineWriterViolations(sources) {
     if (at < 0) { out.push(`${BIN}: R10 lists post-settle writer '${name}', which is not a top-level async function`); continue; }
     const end = bin.slice(at + 10).search(/^(?:async\s+)?function\s/m);
     const body = bin.slice(at, end < 0 ? undefined : at + 10 + end);
+    if (write && typeof write === "object") {
+      for (const stamper of write.owned) {
+        const calls = [...body.matchAll(new RegExp(`\\.${stamper}\\s*\\(`, "g"))];
+        if (!calls.length) out.push(`${BIN}: ${name} no longer calls ${stamper}( — update R10's PIPELINE_HOST_WRITERS`);
+        for (const m of calls) if (!ownsCall(callText(body, m.index + m[0].length - 1))) out.push(`${BIN}: ${name} calls ${stamper} without \`own\` — a re-gate whose lease was taken over would reopen state under the adopter's attempt`);
+      }
+      continue;
+    }
     const guard = body.search(/\bassertPipelineOwner\s*\(/);
     const first = body.search(new RegExp(`(?<![A-Za-z0-9_$.])${write}\\s*\\(`));
     if (first < 0) out.push(`${BIN}: ${name} no longer calls ${write}( — update R10's PIPELINE_HOST_WRITERS`);

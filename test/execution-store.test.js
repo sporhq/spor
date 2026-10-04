@@ -610,6 +610,64 @@ test("reporter: attempt keys advance on every settlement of one gate and every i
   }
 });
 
+// The pipeline's activities re-execute when their result never reached the
+// journal: a re-sent verdict (gateEvidenceRecorded) or integration start
+// (integrationStart) carries the journaled identity as its idempotency key, so
+// the store records it ONCE instead of as a fresh attempt
+// (issue-spor-slice5-leave-not-idempotent-and-regate-stamps-unowned).
+test("reporter: a gate verdict or integration start re-sent under the same journaled key is recorded once", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const home = tmp("replay-keys");
+    const cfg = remoteCfg(home, fake.base);
+    const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller", after: "integration" }, integration: { target_ref: "main", strategy: "merge", command: "true" } });
+    const held = await spor.claimExecutionHold(cfg, { id: "task-x" }, factory, { home });
+    assert.equal(held.ok, true, held.reason);
+    const record = { run_id: "run-1", node_id: "task-x", ...held.recordFields };
+    const p = dispatchRuns.runPaths(home, "run-1");
+    fs.mkdirSync(path.dirname(p.record), { recursive: true });
+    fs.writeFileSync(p.record, JSON.stringify(record));
+    const reporter = spor.executionReporter(cfg, record, { home });
+    assert.equal((await reporter.resume()).ok, true);
+    await reporter.candidateSubmitted(CAND);
+    await reporter.gateSettled("acceptance", "passed", { key: "art-gate-x-1" });
+    const settledAt = fake.record(reporter.id).gate_results[0].settled_at;
+    await reporter.gateSettled("acceptance", "passed", { key: "art-gate-x-1" });
+    // A successor pass (a crash, then the activity replayed) too.
+    reporter.leave();
+    const successor = spor.executionReporter(cfg, record, { home });
+    assert.equal((await successor.resume()).ok, true);
+    await successor.gateSettled("acceptance", "passed", { key: "art-gate-x-1" });
+    const gates = fake.events(successor.id).filter((e) => e.type === "gate.settled");
+    assert.equal(gates.length, 1, "one verdict, one event");
+    assert.equal(fake.record(successor.id).gate_results[0].attempt, 1);
+    assert.equal(fake.record(successor.id).gate_results[0].settled_at, settledAt, "the replay did not move the settle time");
+    await successor.integrationStarted({ key: "run-1/pipeline/a0/integration/start" });
+    await successor.integrationStarted({ key: "run-1/pipeline/a0/integration/start" });
+    assert.equal(fake.events(successor.id).filter((e) => e.type === "integration.started").length, 1, "one start, one event");
+    assert.equal(fake.record(successor.id).integration.attempt, 1);
+    // The deduped start still advanced the local label; the settle carries its
+    // own journaled key, so a LATER attempt's settle cannot land on a key this
+    // one spent (review finding on the sweep).
+    await successor.integrationSettled("failed", { key: "run-1/pipeline/a0/integration/stamp" });
+    await successor.integrationSettled("failed", { key: "run-1/pipeline/a0/integration/stamp" });
+    assert.equal(fake.events(successor.id).filter((e) => e.type === "integration.settled").length, 1, "one settle, one event");
+    const later = spor.executionReporter(cfg, record, { home });
+    assert.equal((await later.resume()).ok, true);
+    await later.integrationStarted({ key: "run-1/pipeline/a1/integration/start" });
+    await later.integrationSettled("landed", { commit: "d".repeat(40), key: "run-1/pipeline/a1/integration/stamp" });
+    assert.equal(fake.record(successor.id).integration.state, "landed", "the later attempt's landing is recorded, not dropped as a replay");
+    later.leave();
+    // A different journaled identity is a new verdict.
+    await successor.gateSettled("acceptance", "failed", { key: "art-gate-x-2" });
+    assert.equal(fake.events(successor.id).filter((e) => e.type === "gate.settled").length, 2);
+    successor.leave();
+  } finally {
+    spor.LIVE_EXECUTIONS.clear();
+    await fake.close();
+  }
+});
+
 test("legacy and pre-adapter records report nothing: no impl_claim, or an impl_claim without a store, yields no reporter and byte-identical completion deps", () => {
   const cfg = loadConfig({ cwd: os.tmpdir(), env: { SPOR_HOME: tmp("legacy") } });
   assert.equal(spor.executionReporter(cfg, { run_id: "r", node_id: "task-x" }), null);

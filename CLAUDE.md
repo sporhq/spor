@@ -2036,6 +2036,19 @@ to be deleted, not kept dormant. Driver live data (a yield's parked result, an
 approval wait's item) rides the kernel Suspend's `meta` (`sleepUntil(key, at,
 meta)` / `awaitSignal(key, name, {meta})`), never a side slot on the input.
 See test/pipeline-workflow.test.js (the crash sweep over the parent).
+**Every activity is idempotent on a re-run** (issue-spor-slice5-leave-not-
+idempotent-and-regate-stamps-unowned): an activity whose result never reached
+the journal re-executes with the same args, so `leave` settles at a JOURNALED
+clock read (`…/leave/now`, WORKFLOW_VERSION 2) and `settleRunRecord` returns a
+record already carrying this lease token's verdict unchanged (the attestation
+and PR-body refresh run again only if they did not complete);
+`writeCompletion` returns a settled completion as it stands rather than
+consuming over it; the integration `forceProtected` rewinds the candidate tree
+to its `sha` first (a clean re-run used to hand back the PRE-restoration
+commit for the land); a re-made fix/rescue launch stamp keeps the adopted
+run's first time; and a re-sent gate verdict or integration start carries the
+journaled identity as its store idempotency key. See
+test/pipeline-leave-replay.test.js.
 **Journal-format discipline — when to bump a WORKFLOW_VERSION:** a journal is
 bound to the version that recorded it (`WorkflowVersionMismatch`), so bump when
 the change would make a journal recorded yesterday replay DIFFERENTLY or fail
