@@ -5795,7 +5795,54 @@ async function acquireTenant(cfg, { server, token, org, refresh_token, exp, labe
   out(`  ${auth.credentialsPath(cfg.userConfigHome())}`);
   if (res.becameDefault) out(`  active tenant: ${res.key}`);
   else out(`  (run 'spor auth switch ${resolvedOrg || res.key}' to make it active)`);
+  if (token) await reconcileShadowingFlatToken(cfg, server, token);
   return 0;
+}
+
+// A flat bearer the cascade pairs with `server` ahead of the store (SPOR_TOKEN,
+// or the config.json `token` — Config.flatTokenShadow) is sent instead of the
+// credential just stored, so a stale one used to turn a successful login into
+// silent 401s (issue-spor-tenant-resolution-gaps). Ask the server about it —
+// but only a token recorded FOR this server (its config file names this server,
+// or none): one recorded for another server is that server's credential, which
+// SPOR_SERVER merely borrows, so it is neither sent here nor touched. A 401 for
+// one in a user/global config file removes it (it can no longer authenticate
+// anything, and the store now holds this server's credential); one in the
+// environment can only be reported; one the server still accepts, forbids
+// (403), or could not be asked about is left alone and reported — only its
+// owner knows whether it is meant to win.
+async function reconcileShadowingFlatToken(cfg, server, token) {
+  const shadow = cfg.flatTokenShadow(server, token);
+  if (!shadow) return;
+  const where = shadow.source === "env" ? `${shadow.origin} in your environment` : `the flat 'token' in ${shadow.origin}`;
+  const fix = shadow.source === "env" ? "unset it" : "remove that key";
+  if (shadow.recordedFor && shadow.recordedFor !== server) {
+    out(`⚠ ${where} (recorded for ${shadow.recordedFor}) is sent to ${server} while SPOR_SERVER names it, INSTEAD of this credential — set SPOR_TOKEN or move that token to use the one just stored`);
+    return;
+  }
+  const me = await fetchMe(server, shadow.token);
+  if (me.status === 401 && shadow.source !== "env") {
+    // Through the shared atomic, mode- and symlink-preserving config writer
+    // (the user or global config.json — both are '<dir>/config.json'), and only
+    // while the file still holds exactly the token we probed.
+    try {
+      const r = editUserConfig(path.dirname(shadow.origin), (data) => {
+        if (data.token !== shadow.token) return false;
+        delete data.token;
+        return undefined;
+      });
+      if (r.malformed) throw new Error("not valid JSON — left untouched");
+      if (r.wrote) {
+        out(`  removed a stale flat token for ${server} from ${shadow.origin} (rejected by the server, 401) — it ${shadow.reached ? "was" : "would have been"} sent instead of this credential`);
+        return;
+      }
+    } catch (e) {
+      out(`  note: could not remove the stale flat token from ${shadow.origin} (${e.message})`);
+    }
+  }
+  const state = me.status === 401 || me.status === 403 ? `is rejected by the server (${me.status})` : me.ok ? "is still accepted by the server" : "could not be checked";
+  const when = shadow.reached ? `is sent to ${server} INSTEAD of this credential` : `would be sent to ${server} instead of this credential whenever no stored tenant is the default`;
+  out(`⚠ ${where} ${state} and ${when} — ${fix} to use the one just stored`);
 }
 
 // `spor auth login` / flat `spor login` — interactive sign-in, default = the
