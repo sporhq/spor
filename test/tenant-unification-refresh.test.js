@@ -326,6 +326,36 @@ test("curlWithRefresh: a caller's deadline bounds the refresh — no retry past 
   }
 });
 
+test("curlWithRefresh: timeoutMs is one overall deadline — a 401 with a slow refresh returns in about timeoutMs", async () => {
+  let grantAnswered;
+  const answered = new Promise((r) => (grantAnswered = r));
+  const { srv, hits, base } = await listen((req, { bearer, send }) => {
+    if (req.url === "/oauth/token") {
+      return setTimeout(() => {
+        send(200, { access_token: "FRESH", refresh_token: "RT2", expires_in: 3600 });
+        grantAnswered();
+      }, 3000);
+    }
+    return bearer === "FRESH" ? send(200, {}) : send(401, {});
+  });
+  try {
+    const home = tmp();
+    const key = `${base}/acme`;
+    auth.writeStore(home, { tenants: { [key]: { server: base, org: "acme", access_token: "STALE", refresh_token: "RT" } }, default: key });
+    u.setConfig(loadAt(home));
+    const t0 = Date.now();
+    const r = await u.curlWithRefresh(`${base}/v1/thing`, { timeoutMs: 800 });
+    const took = Date.now() - t0;
+    assert.strictEqual(r.http, "401");
+    assert.ok(took < 2000, `returned in ${took}ms, well before the 3s grant`);
+    assert.ok(!hits.some((h) => h.url === "/v1/thing" && h.bearer === "FRESH"), "no retry past the deadline");
+  } finally {
+    u.clearConfig();
+    await answered;
+    srv.close();
+  }
+});
+
 // task-spor-refresh-coverage-distill-and-remaining-engines: the distill,
 // link-commits, agents-md and doctor-candidate calls refresh once too.
 test("link-commits and agents-md: an expired store token is refreshed and the call retried", async () => {
