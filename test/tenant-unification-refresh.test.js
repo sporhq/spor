@@ -391,8 +391,9 @@ test("curlWithRefresh: a caller-supplied Authorization is sent as-is and never r
     const key = `${base}/acme`;
     auth.writeStore(home, { tenants: { [key]: { server: base, org: "acme", access_token: "STALE", refresh_token: "RT" } }, default: key });
     u.setConfig(loadAt(home));
-    const r = await u.curlWithRefresh(`${base}/v1/thing`, { headers: { Authorization: "Bearer THEIRS" } });
+    const r = await u.curlWithRefresh(`${base}/v1/thing`, { headers: { authorization: "Bearer THEIRS" } });
     assert.strictEqual(r.http, "401");
+    assert.deepStrictEqual(hits.filter((h) => h.url === "/v1/thing").map((h) => h.bearer), ["THEIRS"], "only the caller's bearer is sent");
     assert.strictEqual(hits.filter((h) => h.url === "/v1/thing").length, 1, "no retry");
     assert.ok(!hits.some((h) => h.url === "/oauth/token"), "no refresh grant");
   } finally {

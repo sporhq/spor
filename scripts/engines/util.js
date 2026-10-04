@@ -1637,7 +1637,7 @@ async function curlWithRefresh(url, opts = {}) {
   const totalMs = opts.timeoutMs === undefined ? 6000 : opts.timeoutMs;
   const signal = anySignal([AbortSignal.timeout(totalMs), opts.signal]);
   try {
-    const r = await curl(url, { ...opts, signal, headers: { ...bearer(), ...headers } });
+    const r = await curl(url, { ...opts, signal, headers: callerAuth ? headers : { ...bearer(), ...headers } });
     if (callerAuth || classifyHttpFailure(r.http) !== "auth") return r;
     // The deadline bounds the refresh too: the token grant has its own 8s timeout
     // and must not stretch the call past it, after which the retry would only
