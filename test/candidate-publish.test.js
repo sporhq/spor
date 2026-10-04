@@ -521,6 +521,14 @@ test("ensureStoreGitignore is idempotent and fail-open on a bad path", () => {
   assert.strictEqual(publisher.ensureStoreGitignore(null), false);
 });
 
+test("ensureStoreGitignore refuses a store inside the checkout the module runs from (the repo's own .gitignore stays untouched)", () => {
+  const repoRoot = path.resolve(__dirname, "..");
+  const before = fs.existsSync(path.join(repoRoot, ".gitignore")) ? fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8") : null;
+  assert.strictEqual(publisher.ensureStoreGitignore(path.join(repoRoot, "candidates")), false);
+  const after = fs.existsSync(path.join(repoRoot, ".gitignore")) ? fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8") : null;
+  assert.strictEqual(after, before);
+});
+
 test("a store nested several directories below the git root is found by walking up, and the ignore line is RELATIVE to the root", (t) => {
   const shared = scratch(t, "cand-shared-nested");
   execFileSync("git", ["init", "-q", shared], { stdio: "ignore" });
