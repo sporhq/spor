@@ -97,3 +97,19 @@ test("sandboxFor: memoizes per schema id+version", () => {
   assert.equal(a.call("f", [], SLACK), 7);
   assert.equal(sandboxFor({ id: "schema-x", version: "2026.06.10.1", codeBlocks: [] }), null, "no code -> null");
 });
+
+test("sandbox: SPOR_SANDBOX_TIMEOUT_MS overrides the default cap; invalid keeps 100ms", () => {
+  const spin = `export function spin() { while (true) {} }`;
+  const prev = process.env.SPOR_SANDBOX_TIMEOUT_MS;
+  try {
+    process.env.SPOR_SANDBOX_TIMEOUT_MS = "30";
+    const t0 = Date.now();
+    assert.throws(() => createSandbox(spin).call("spin", [], {}), /timed out/);
+    assert.ok(Date.now() - t0 < 90, "the 30ms override applies, not the 100ms default");
+    process.env.SPOR_SANDBOX_TIMEOUT_MS = "nope";
+    assert.throws(() => createSandbox(spin).call("spin", [], {}), /timed out/);
+  } finally {
+    if (prev === undefined) delete process.env.SPOR_SANDBOX_TIMEOUT_MS;
+    else process.env.SPOR_SANDBOX_TIMEOUT_MS = prev;
+  }
+});

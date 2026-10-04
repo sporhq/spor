@@ -27,3 +27,10 @@ if (process.env.NODE_COMPILE_CACHE) {
     if (typeof mod.enableCompileCache === "function") mod.enableCompileCache(process.env.NODE_COMPILE_CACHE);
   } catch { /* no cache — tests run exactly as before */ }
 }
+
+// Attached-code sandbox cap (lib/sandbox.js): 100ms in production, but a
+// fleet-loaded box starves the vm past it
+// (issue-spor-sandbox-100ms-timeout-flakes-under-load). Raised for every test
+// process and the CLIs they spawn; a test asserting the cap itself passes an
+// explicit timeoutMs.
+if (process.env.SPOR_SANDBOX_TIMEOUT_MS === undefined) process.env.SPOR_SANDBOX_TIMEOUT_MS = "5000";
