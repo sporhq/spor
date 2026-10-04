@@ -1687,7 +1687,14 @@ outside git (a database on a fixed port, a `db reset`):
   as a DIAGNOSTIC whose result rides the detail and evidence and never the
   verdict. If the partial output DID name an actual failure, that is separate
   evidence and takes the ordinary charged-defect path (no isolation pass),
-  with the timeout stated beside it.
+  with the timeout stated beside it. "Named a failure" is not "named a file":
+  a failure marker with no repo-relative path (an `AssertionError`, a bare
+  `Error:`, a TAP `not ok`), an earlier completed failed run, or output that
+  cannot be read as text are all actual failures; only empty or clean partial
+  output is an outage (`gates.partialOutputRead`,
+  issue-spor-gate-runner-timeout-pathless-failure-read-as-outage). The verdict
+  is a journaled activity result, so a gate journal recorded under the older
+  reading replays to the verdict it recorded.
 
 The suite's environment says what it is judging: `SPOR_GATE_BASE` and
 `SPOR_GATE_HEAD` (the shas), `SPOR_TRUSTED_REF`, `SPOR_GATE_STAGE` (`gate`,

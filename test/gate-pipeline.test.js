@@ -11659,3 +11659,66 @@ test("a completed failure followed by a timed-out rerun is still an actual failu
   assert.strictEqual(res.state, "failed");
   assert.notStrictEqual(res.gates[0].verdict, "infrastructure");
 });
+
+// --- a timed-out run whose real failure names NO path
+// (issue-spor-gate-runner-timeout-pathless-failure-read-as-outage) ---
+//
+// The outage reading must not hang on failingFiles alone: a failure marker in
+// the partial output (an AssertionError, a bare `Error:`, a TAP `not ok`) is an
+// actual failure even when it names no repo-relative file, and output that
+// cannot be read is never shown clean. Only empty or clean partial output is an
+// outage.
+
+for (const [label, output] of [
+  ["an AssertionError with no stack into the tree", "▶ queue paging\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal\n"],
+  ["a bare Error:", "> spor@0.18.6 test\nError: boom\n"],
+  ["a TAP not ok", "TAP version 13\nnot ok 3 - queue pages past the cursor\n"],
+]) {
+  test(`a timeout whose partial output carries ${label} but no file path is an ACTUAL failure, never an outage`, async () => {
+    const { deps, seen } = fakes({ pools: { retry: { spent: 0 } }, changed: ["lib/kernel/queue.js", "lib/queue-mine.test.js"], suite: (args) => (args && args.command ? { ok: true } : TIMED_OUT(output)) });
+    deps.rescue = async () => ({ ok: false, reason: "no rescue in this test" });
+    const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY({ rescue: undefined }), deps });
+    assert.strictEqual(res.state, "failed");
+    assert.notStrictEqual(res.gates[0].verdict, "infrastructure");
+    assert.strictEqual(seen.pools.retry.spent, 0, "the infrastructure pool is not charged for a real failure");
+    assert.strictEqual(seen.suites.length, 1, "no diagnostic isolation over an actual failure");
+    assert.match(seen.escalations[0].detail, /did not finish within 900s, and its partial output named an actual failure/);
+  });
+}
+
+for (const [label, output] of [
+  ["empty", ""],
+  ["clean (headers and passing lines only)", "> spor@0.18.6 test\n> node scripts/test-run.js\n✔ handles Error input gracefully (3ms)\nok 1 - test/a.test.js\n# fail 0\n"],
+]) {
+  test(`a timeout whose partial output is ${label} is still the OUTAGE`, async () => {
+    const { deps, seen } = fakes({ changed: ["lib/kernel/queue.js"], suite: () => TIMED_OUT(output) });
+    const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY(), deps });
+    assert.strictEqual(res.gates[0].verdict, "infrastructure");
+    assert.deepStrictEqual(seen.fixes, []);
+  });
+}
+
+test("partialOutputRead: markers are a failure, non-text is unreadable, empty and passing lines are clean", () => {
+  assert.strictEqual(gates.partialOutputRead(""), "clean");
+  assert.strictEqual(gates.partialOutputRead(null), "clean");
+  assert.strictEqual(gates.partialOutputRead("✔ throws TypeError on bad input\nok 2 - x\n"), "clean");
+  assert.strictEqual(gates.partialOutputRead("\u001b[31m✖ boom\u001b[0m\n"), "failure");
+  assert.strictEqual(gates.partialOutputRead("Error: ENOSPC\n"), "failure");
+  assert.strictEqual(gates.partialOutputRead("  Traceback (most recent call last):\n"), "failure");
+  assert.strictEqual(gates.partialOutputRead(Buffer.from("x")), "unreadable");
+  assert.strictEqual(gates.partialOutputRead("tests/test_x.py ..F.  [ 50%]\n"), "failure", "pytest's live progress mark");
+  assert.strictEqual(gates.partialOutputRead("tests/test_x.py ....  [ 50%]\n"), "clean");
+  assert.strictEqual(gates.partialOutputRead("  queue\n    1) pages past the cursor\n"), "failure", "mocha's live numbered failure");
+});
+
+test("a timeout whose captured output was cut by the capture cap is an actual failure: what scrolled away cannot be shown clean", async () => {
+  const { deps } = fakes({ changed: ["lib/kernel/queue.js"], suite: () => ({ ...TIMED_OUT("✔ a.test.js\n"), outputDropped: true }) });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY({ rescue: undefined }), deps });
+  assert.notStrictEqual(res.gates[0].verdict, "infrastructure");
+});
+
+test("a timeout whose output cannot be read as text is an actual failure, not an outage", async () => {
+  const { deps } = fakes({ changed: ["lib/kernel/queue.js"], suite: () => ({ ...TIMED_OUT(), output: { garbled: true } }) });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY({ rescue: undefined }), deps });
+  assert.notStrictEqual(res.gates[0].verdict, "infrastructure");
+});

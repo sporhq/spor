@@ -1082,3 +1082,44 @@ test("a zero approval timeout blocks on judge's one read, with no wait at all", 
   assert.equal(world.polls, 1);
   assert.equal(world.slept, 0);
 });
+
+// A timed-out suite whose partial output carries a failure marker but no path
+// (issue-spor-gate-runner-timeout-pathless-failure-read-as-outage) is now
+// charged rather than read as an outage. The verdict is a `judge` activity's
+// journaled RESULT, so a journal recorded under the old reading (simulated by
+// pinning partialOutputRead to "clean" for the first drive) replays to its
+// journaled outage verdict with nothing re-run — no WORKFLOW_VERSION bump —
+// while a fresh journal judges under the new reading.
+test("a gate journal recorded before the pathless-timeout fix replays to its journaled outage verdict unchanged; a fresh journal charges the same output as an actual failure", async () => {
+  const factory = factoryOf({ ...BASE, gates: [GATES[0]] });
+  const timedOut = { ok: false, code: null, timedOut: true, reason: "`npm test` did not finish within 900s", output: "not ok 3 - queue pages\n  Error: boom\n" };
+  const home = scratchHome("pre-fix-timeout");
+  const clock = fakeClock(1_700_000_000_000);
+  const w = makeWorld({ clock, home, script: { factory } });
+  w.deps.runSuite = async () => { w.suites += 1; return timedOut; };
+  const real = gates.partialOutputRead;
+  gates.partialOutputRead = () => "clean";
+  let first;
+  try {
+    first = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: w.deps });
+  } finally {
+    gates.partialOutputRead = real;
+  }
+  assert.equal(first.state, "failed", JSON.stringify(first));
+  assert.equal(first.gates[0].verdict, "infrastructure", "the old reading: an outage");
+  const onDisk = () => store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  const j1 = onDisk();
+  const suites = w.suites;
+  const replayed = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: w.deps });
+  assert.deepEqual(replayed.gates.map((g) => [g.gate, g.verdict]), first.gates.map((g) => [g.gate, g.verdict]), "the journaled verdict stands");
+  assert.equal(replayed.state, first.state);
+  assert.equal(w.suites, suites, "no suite re-ran");
+  assert.deepEqual(onDisk(), j1, "nothing appended");
+
+  const home2 = scratchHome("post-fix-timeout");
+  const w2 = makeWorld({ clock: fakeClock(1_700_000_000_000), home: home2, script: { factory } });
+  w2.deps.runSuite = async () => { w2.suites += 1; return timedOut; };
+  const fresh = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: w2.deps });
+  assert.equal(fresh.state, "failed");
+  assert.notEqual(fresh.gates[0].verdict, "infrastructure", "the new reading: an actual failure, charged");
+});
