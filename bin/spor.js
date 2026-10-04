@@ -14911,7 +14911,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       // The gate list's durable journal (task-spor-gate-list-as-workflow-
       // function): the child the `open` entry named.
       const gateJournal = ownedJournal(stageWorkflowJournal(home, record, item, stage.replace(/-a\d+$/, "")));
-      return gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: { ...gateDeps, ...(gateJournal ? { workflowJournal: gateJournal } : {}) } });
+      return gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: { ...gateDeps, withdrawHold: (args) => (record.impl_claim ? pipelineDeps.withdraw(args) : { ok: true, skipped: true }), ...(gateJournal ? { workflowJournal: gateJournal } : {}) } });
     },
     // The SPLIT verdict of the gate list alone (task-spor-factory-controller-
     // completion-boundary, §6.5): `gates_state` says what the gates said, and

@@ -7505,6 +7505,39 @@ test("an UNROUTABLE review dispatch spends neither pool and is never waited on",
   assert.match(seen.escalations[0].detail, /a dispatch this box refused/);
 });
 
+test("T1: an UNROUTABLE review dispatch withdraws the execution hold; an outage or a real rejection keeps it", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 0 } } });
+  const run = async (review) => {
+    const f = fakes({ review });
+    const withdrawn = [];
+    f.deps.withdrawHold = async (args) => (withdrawn.push(args), { ok: true });
+    const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+    return { res, withdrawn };
+  };
+  const refused = await run(() => outageReview("cannot dispatch: this box cannot satisfy profile-review", "unroutable"));
+  assert.strictEqual(refused.res.state, "failed");
+  assert.strictEqual(refused.withdrawn.length, 1, "nothing is judging the item: the hold is released");
+  assert.match(refused.withdrawn[0].reason, /cannot satisfy profile-review/);
+  const outage = await run(() => outageReview());
+  assert.strictEqual(outage.withdrawn.length, 0, "an outage keeps the hold (T1)");
+  const rejected = await run(() => ({ ok: true, text: '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"lib/x.js","summary":"boom","evidence":"ran it"}]}\n```' }));
+  assert.strictEqual(rejected.withdrawn.length, 0, "a judged rejection keeps the hold");
+});
+
+test("T1: an UNROUTABLE fix dispatch withdraws the hold too", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 1 } } });
+  const f = fakes({
+    pools: { retry: { spent: 0 } },
+    review: () => ({ ok: true, text: '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"lib/x.js","summary":"boom","evidence":"ran npm test, it failed"}]}\n```' }),
+    fix: () => ({ ok: false, reason: "cannot dispatch task-demo: this box cannot satisfy profile-fix", classification: { outcome: "unroutable", pool: null, reason: "cannot dispatch task-demo: this box cannot satisfy profile-fix" } }),
+  });
+  const withdrawn = [];
+  f.deps.withdrawHold = async (args) => (withdrawn.push(args), { ok: true });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(withdrawn.length, 1);
+});
+
 test("a reviewer that RAN and wrote garbage is still a rejection — the fail-closed rule is unchanged", async () => {
   const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 2 } } });
   const { deps, seen } = fakes({ pools: { retry: { spent: 0 } }, review: () => ({ ok: true, text: "I had a look and it seemed fine" }) });
