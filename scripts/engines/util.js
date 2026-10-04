@@ -16,6 +16,7 @@ const CODEX_NUDGE_MODEL = "gpt-5.4-mini";
 const home = require(path.join(ROOT, "lib", "shell", "home.js"));
 const { writeFileAtomic } = require(path.join(ROOT, "lib", "shell", "atomic-write.js"));
 const spool = require(path.join(ROOT, "lib", "shell", "spool.js"));
+const tokenizer = require(path.join(ROOT, "lib", "kernel", "tokenizer.js"));
 const { untilAborted } = require(path.join(ROOT, "lib", "shell", "abort.js"));
 const { gitEnv, gitSpawn, gitToplevelAndCommonDir } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 // The harness vocabulary the capability probe emits — owned by the pure matcher
@@ -150,10 +151,17 @@ function byteTail(s, n) {
   return b.length <= n ? String(s) : b.subarray(b.length - n).toString("utf8");
 }
 
-// `wc -w`: whitespace-delimited word count.
+// `wc -w`: whitespace-delimited word count — except that a whitespace run
+// holding a script written without spaces (Chinese, Japanese, Thai) is one
+// `wc -w` word per PHRASE, so it counts the segmenter's words instead
+// (issue-spor-prompt-context-word-count-undercounts-cjk). Spaced text is
+// unchanged.
 function wordCount(s) {
   const m = String(s).match(/\S+/g);
-  return m ? m.length : 0;
+  if (!m) return 0;
+  let n = 0;
+  for (const t of m) n += tokenizer.UNSPACED.test(t) ? Math.max(1, tokenizer.words(t).length) : 1;
+  return n;
 }
 
 // `$(...)` command substitution strips trailing newlines.

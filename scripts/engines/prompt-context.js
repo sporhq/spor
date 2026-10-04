@@ -11,6 +11,7 @@ const crypto = require("crypto");
 const { spawnSync } = require("child_process");
 const u = require("./util");
 const { drainPendingNudges, drainPendingDigests, digestSignature, parseDigest } = require("./spool-drain");
+const { UNSPACED } = require(path.join(u.ROOT, "lib", "kernel", "tokenizer.js"));
 
 const MICRO_MAX_NODES = 5;
 const MICRO_MAX_BYTES = 2200;
@@ -145,6 +146,9 @@ function hasHighSignalToken(prompt) {
 function isContinuationPrompt(prompt) {
   const s = String(prompt).trim();
   if (!s || s.startsWith("/") || hasHighSignalToken(s)) return false;
+  // The ASCII word scan below is blind to unspaced scripts: "continue 请继续"
+  // would read as just "continue".
+  if (UNSPACED.test(s)) return false;
   const words = (s.toLowerCase().replace(/[’']/g, "").match(/[a-z0-9]+/g) || [])
     .filter((w) => w !== "ll");
   if (!words.length || words.length > 10) return false;
