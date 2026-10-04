@@ -1994,6 +1994,38 @@ b
   assert.ok(!v.warnings.some((w) => /dangling edge relates-to -> dec-a/.test(w)));
 });
 
+test("validateGraph: a loader-skipped file's node is not registered — edges into it dangle and the census excludes it", () => {
+  const fx = tmpGraph({
+    "task-bad.md": `---
+id: task-bad
+type: task
+title: T
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+---
+b
+`,
+    "dec-a.md": `---
+id: dec-a
+type: decision
+title: A
+summary: s
+date: 2026-08-08
+edges:
+  - {type: relates-to, to: task-bad}
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.ok(v.errors.some((e) => /task-bad\.md/.test(e) && /SKIPPED by the loader/.test(e)));
+  assert.ok(v.warnings.some((w) => /dec-a\.md: dangling edge relates-to -> task-bad/.test(w)));
+  assert.equal(v.count, 1);
+  assert.equal(v.nodes["task-bad"], undefined);
+});
+
 test("validateGraph: block-form and flow-form edges may mix under one 'edges:' key, both recognized", () => {
   const fx = tmpGraph({
     "task-e.md": `---
