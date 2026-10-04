@@ -431,12 +431,22 @@ test("preTool: pattern-based process kills are denied; PID/pgid kills pass", asy
     "\\pkill x",
     "for i in 1; do pkill x; done",
     "kill $(pidof node)",
+    'kill "$(pgrep node)"',
+    'eval "kill $(pgrep node)"',
+    "sh -c 'kill $(pgrep node)'",
+    "pgrep x | while read p; do kill $p; done",
+    "pgrep x | while read p\ndo kill $p\ndone",
+    "pgrep x | while read p; do\n kill $p\ndone",
+    'kill "`pgrep foo`"',
+    "# don't\nkill $(pgrep foo)",
+    "echo it's; kill $(pgrep foo)",
+    "ps aux | grep x | awk '{print $2}' | xargs kill",
   ]) {
     const out = await run(c);
     assert.equal(out?.hookSpecificOutput?.permissionDecision, "deny", c);
     assert.match(out.hookSpecificOutput.permissionDecisionReason, /process guard/, c);
   }
-  for (const c of ["kill -- -12345", "kill 4242", "pgrep -f node", 'git commit -m "pkill is banned"', "echo pkill", "cat > n.md <<EOF\npkill -f x\nEOF"])
+  for (const c of ["kill -- -12345", "kill 4242", "pgrep -f node", 'git commit -m "pkill is banned"', "echo pkill", "echo 'kill $(pgrep node)'", "git commit -m 'avoid kill $(pgrep x)'", 'git commit -m "avoid kill $(pgrep x)"', "git log --grep='pgrep x | xargs kill'", "pgrep x | while read p; do echo $p; done; kill 4242", "cat > n.md <<EOF\npkill -f x\nEOF"])
     assert.equal(await run(c), null, c);
   assert.equal(await run("pkill node", main), null, "non-worktree session is a no-op");
   fs.rmSync(base, { recursive: true, force: true });

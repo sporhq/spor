@@ -336,7 +336,78 @@ const KILL_PREFIXES = new Set([
 ]);
 // A heredoc body is data, not commands: drop it before scanning.
 const HEREDOC_RE = /<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\n|$)/g;
-const KILL_PGREP_RE = /\bkill\b[^\n;&|]*(?:\$\(|`)\s*(?:pgrep|pidof)\b|\bpgrep\b[^\n;&]*\|\s*(?:sudo\s+)?xargs\b[^\n;&|]*\bkill\b/;
+// `kill $(pgrep …)`, and a pgrep/pidof/ps pipeline feeding `xargs … kill` or a
+// `while read` loop that kills. Run on codeView(), never the raw string.
+const KILL_PGREP_RE = new RegExp(
+  [
+    "\\bkill\\b[^\\n;&|]*(?:\\$\\(|`)\\s*(?:pgrep|pidof)\\b",
+    "\\b(?:pgrep|pidof|ps)\\b[^\\n;&]*\\|\\s*(?:sudo\\s+)?xargs\\b[^\\n;&|]*\\bkill\\b",
+    "\\b(?:pgrep|pidof|ps)\\b[^\\n;&]*\\|\\s*while\\b[^;]*?[;\\n]\\s*do\\b[^;\\n]*\\n?[^;\\n]*\\bkill\\b",
+  ].join("|")
+);
+
+// The command string with quoted DATA blanked out, so KILL_PGREP_RE sees only
+// what the shell would execute: a single-quoted span is inert, and a
+// double-quoted span is inert except for its `$(…)`/backtick substitutions,
+// which run. (`sh -c`/`eval` bodies are rescanned separately from their
+// tokens, so blanking them here loses nothing.) Length-preserving.
+function codeView(command) {
+  let out = "";
+  let i = 0;
+  const blank = (c) => (c === "\n" ? c : " ");
+  while (i < command.length) {
+    const c = command[i];
+    if (c === "\\") {
+      out += c + (command[i + 1] ?? "");
+      i += 2;
+    } else if (c === "'") {
+      const j = command.indexOf("'", i + 1);
+      if (j === -1) {
+        out += c; // unterminated: a stray apostrophe, not a span — keep scanning
+        i++;
+        continue;
+      }
+      out += command.slice(i, j + 1).replace(/[^\n]/g, " ");
+      i = j + 1;
+    } else if (c === "#" && (i === 0 || /\s/.test(command[i - 1]))) {
+      const j = command.indexOf("\n", i);
+      const end = j === -1 ? command.length : j;
+      out += " ".repeat(end - i); // a comment is not executed (and may hold an apostrophe)
+      i = end;
+    } else if (c === '"') {
+      out += " ";
+      i++;
+      let depth = 0;
+      let bt = false;
+      while (i < command.length && !(command[i] === '"' && depth === 0)) {
+        const d = command[i];
+        if (d === "\\") {
+          out += "  ";
+          i += 2;
+          continue;
+        }
+        if (d === "$" && command[i + 1] === "(") {
+          depth++;
+          out += "$(";
+          i += 2;
+          continue;
+        }
+        if (depth > 0 && d === ")") depth--;
+        if (d === "`") bt = !bt;
+        out += depth > 0 || bt || d === "`" ? d : blank(d);
+        i++;
+      }
+      if (i < command.length) {
+        out += " ";
+        i++;
+      }
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
 
 function denyKill(detail) {
   return {
@@ -351,7 +422,7 @@ function denyKill(detail) {
 function scanBashForPatternKill(command, depth = 0) {
   if (!command || depth > 4) return null;
   command = command.replace(HEREDOC_RE, "");
-  if (KILL_PGREP_RE.test(command)) return denyKill("'kill' of a pgrep-selected process set matches by pattern");
+  if (KILL_PGREP_RE.test(codeView(command))) return denyKill("'kill' of a pgrep-selected process set matches by pattern");
   for (const rawTokens of segmentsOf(command)) {
     let tokens = stripEnvAssignments(rawTokens).rest;
     // Peel wrappers plus their flags/numeric args (`sudo -u x`, `timeout 5`, `env -i`).
