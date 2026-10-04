@@ -12719,10 +12719,12 @@ async function escalateParkedPipeline(cfg, { run_id: runId, node_id: nodeId, pro
     demote = { ok: false, reason: (e && e.message) || String(e) };
   }
   // Filed: the loop settles the record `blocked` under this worker's own
-  // lease (its markGate stamps only while nobody else holds the pipeline).
+  // lease (its markGate stamps through the `own` door with the token below).
   return {
     ok: true,
     id,
+    // The lease this escalation claimed: the loop's markGate settles under it.
+    token: claim.ok ? claim.token : null,
     demoted: !!(demote && demote.ok && demote.demoted),
     ...(demote && !demote.ok ? { demote_reason: demote.reason || "the demotion did not land" } : {}),
   };
@@ -14456,6 +14458,9 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     });
   const claim = ctx.gateClaim || dispatchRuns.claimPipeline(home, item.run_id, { workerId: ctx.workerId || null, ownerLive, factory: (ctx.factory && ctx.factory.id) || null });
   if (ctx.gateClaim && currentLeaseToken(home, record) !== claim.token) claim.refused = "the re-gate ownership changed before judging";
+  // The caller's handle on this pass's lease token (the work loop's markGate
+  // settles through the `own` door with it).
+  if (typeof ctx.onClaim === "function" && !claim.refused && claim.ok) ctx.onClaim(claim.token);
   if (claim.refused) {
     const rec = claim.record || null;
     ctx.log(`work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) is ${claim.refused} — this worker does not run the gate pipeline for it: no fact, escalation, demotion or attestation is written`);

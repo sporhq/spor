@@ -57,6 +57,20 @@ const SETTLED_PATCH_CALLERS = {
 const FORCE_CALLERS = {
   "bin/spor.js": new Set(["cmdWorkRegate", "checkProposals"]),
 };
+// The stampGateState callers that may stamp WITHOUT the pipeline lease's
+// `own` door (issue-spor-gate-stamps-bypass-lease-owner), by caller. Every
+// gate-pipeline stamp passes `own` — the lease is the ownership contract, so a
+// driver displaced by a takeover lands nothing on the new holder's record. The
+// rest are NOT pipeline drivers: post-settle bookkeeping on a record whose
+// pipeline is over (the escalation retry's CAS on its own pending payload, the
+// flake sweep's reservation CAS and retirement stamp, the proposal poller's
+// debt flags), and the two no-owner arms whose builder refuses any record a
+// lease has ever claimed.
+const UNOWNED_GATE_STAMP_CALLERS = {
+  "bin/spor.js": new Set(["retryOneEscalation", "casFlakeRegateReservation", "cmdWorkRegateFlakes", "checkProposals"]),
+  "lib/shell/gate-deps.js": new Set(["stampPipelineLaunch"]),
+  "lib/shell/work.js": new Set(["stampLoopVerdict"]),
+};
 // Keys only the writer may spell as an object key: the progress stamp and the
 // revision the versioned put owns.
 const WRITER_ONLY_KEYS = ["gate_progress", "rev", "rev_at"];
@@ -242,6 +256,7 @@ function firstArg(text) {
 
 function scan() {
   const violations = [];
+  const unownedSeen = new Set();
   const sources = new Map();
   for (const rel of sourceFiles()) {
     const raw = fs.readFileSync(path.join(ROOT, rel), "utf8");
@@ -333,12 +348,31 @@ function scan() {
       }
     }
 
+    // R9 — every stampGateState call outside the runner passes the pipeline
+    // lease's `own` door, unless its caller is a listed non-pipeline one.
+    if (!inRunner) {
+      for (const m of code.matchAll(/\.stampGateState\s*\(/g)) {
+        const text = callText(code, m.index + m[0].length - 1);
+        if (/\bown\s*:/.test(text)) continue;
+        const fn = enclosingFunction(code, m.index);
+        const allowed = UNOWNED_GATE_STAMP_CALLERS[rel];
+        if (!allowed || !allowed.has(fn)) flag(rel, code, m.index, `stampGateState without \`own\` from ${fn || "module scope"}, not a listed non-pipeline caller — a gate-pipeline stamp must go through the lease's own door`);
+        else unownedSeen.add(`${rel}:${fn}`);
+      }
+    }
+
     // R7 — the record lock is the runner's; a second lock user is a second writer.
     if (!inRunner) {
       for (const m of code.matchAll(/\b(withRecordLock|recordLockPath|breakerLockPath|breakStaleLock)\b/g)) {
         flag(rel, code, m.index, `${m[1]} referenced outside the runner (in ${enclosingFunction(code, m.index) || "module scope"})`);
       }
     }
+  }
+
+  // R9 — an allowlisted unowned caller that no longer stamps unowned is a
+  // stale entry: drop it, so the list stays the exact set it claims to be.
+  for (const [rel, fns] of Object.entries(UNOWNED_GATE_STAMP_CALLERS)) {
+    for (const fn of fns) if (!unownedSeen.has(`${rel}:${fn}`)) violations.push(`${rel}: ${fn} is listed in UNOWNED_GATE_STAMP_CALLERS but makes no unowned stampGateState call`);
   }
 
   // R8 — every listed writer exists, takes the lock, and defaults it to withRecordLock.
@@ -381,6 +415,10 @@ test("the lint's own detectors fire on the shapes they exist for", () => {
   assert.match(firstArg(callText(code, w.index + w[0].length - 1)), /record/);
   const s = code.match(/\.stampGateState\s*\(/);
   assert.match(callText(code, s.index + s[0].length - 1), /force\s*:\s*true/);
+  // R9: a call is owned by its `own:` option, wherever the options object sits.
+  const own = tokenize("function f() { r.stampGateState(home, id, { gate_fix_run_id: x }); r.stampGateState(home, id, (fresh) => patch, { own: token }); }");
+  const owns = [...own.matchAll(/\.stampGateState\s*\(/g)].map((m) => /\bown\s*:/.test(callText(own, m.index + m[0].length - 1)));
+  assert.deepStrictEqual(owns, [false, true]);
   assert.strictEqual([...code.matchAll(/(?<![A-Za-z0-9_$.])gate_progress\s*:(?!:)/g)].length, 1);
   assert.strictEqual(lineOf(code, code.indexOf("fs.writeFileSync")), 5);
   const blanked = tokenize("const s = \"rev: x\"; const t = `gate_progress: ${1}`; writeFileAtomic(p.record, x);");
