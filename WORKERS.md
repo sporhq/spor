@@ -1692,7 +1692,20 @@ outside git (a database on a fixed port, a `db reset`):
   `Error:`, a TAP `not ok`), an earlier completed failed run, or output that
   cannot be read as text are all actual failures; only empty or clean partial
   output is an outage (`gates.partialOutputRead`,
-  issue-spor-gate-runner-timeout-pathless-failure-read-as-outage). The verdict
+  issue-spor-gate-runner-timeout-pathless-failure-read-as-outage). "Clean" is
+  an ALLOWLIST, not the absence of a known failure marker
+  (issue-spor-gate-partial-output-read-allowlist-outage): every non-blank line
+  must be a recognized PASS line — a TAP `ok N`, plan (`1..N`), `TAP version`
+  or `# Subtest:` header and the YAML block under an `ok`; a count summary
+  (`# tests N`, `# pass N`, `# suites N`, `# skipped N`, `# todo N`,
+  `# duration_ms N`, or node's `ℹ` spelling) and `# fail 0`/`# cancelled 0`
+  (never a nonzero count); a spec-reporter `✔`/`▶`/`﹣` line; an npm script
+  banner (`> …`); a pytest progress line of passing marks; jest/go/gtest PASS
+  lines. Any other line — `# fail 1`, `# cancelled 2`, or a test's own log
+  output — reads as a failure. The accepted cost: a suite that PASSES but is
+  chatty (its tests log to stdout) and then times out is charged as a failure
+  rather than retried as an outage. That errs toward the side that costs repair
+  budget, never toward reading a real failure as an outage. The verdict
   is a journaled activity result, so a gate journal recorded under the older
   reading replays to the verdict it recorded.
 

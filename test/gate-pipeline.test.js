@@ -11711,6 +11711,50 @@ test("partialOutputRead: markers are a failure, non-text is unreadable, empty an
   assert.strictEqual(gates.partialOutputRead("  queue\n    1) pages past the cursor\n"), "failure", "mocha's live numbered failure");
 });
 
+// --- the outage reading is an ALLOWLIST of pass lines
+// (issue-spor-gate-partial-output-read-allowlist-outage) ---
+//
+// Skipping every `#` line let a TAP/node:test `# fail 1` summary read clean, so
+// the rule is flipped: only empty output, or output whose every non-blank line
+// is a recognized pass line, is clean; anything else is a failure.
+
+test("partialOutputRead is an allowlist: a nonzero fail/cancelled summary or any unrecognized line is a failure", () => {
+  assert.strictEqual(gates.partialOutputRead("# fail 1\n"), "failure", "a TAP fail summary alone");
+  assert.strictEqual(gates.partialOutputRead("# cancelled 2\n"), "failure");
+  assert.strictEqual(gates.partialOutputRead("\u001b[34mℹ fail 3\u001b[39m\n"), "failure", "the spec reporter's spelling");
+  assert.strictEqual(gates.partialOutputRead("ok 1 - a\nconnecting to db...\n"), "failure", "chatty output is charged (the accepted cost)");
+  assert.strictEqual(gates.partialOutputRead("# some test's own log line\n"), "failure");
+  assert.strictEqual(gates.partialOutputRead("not ok 1 - x\n  ---\n  duration_ms: 1\n  ...\n"), "failure", "a YAML block under not ok is not a pass");
+  const tap = "TAP version 13\n# Subtest: a\n    # Subtest: nested\n    ok 1 - nested\n      ---\n      duration_ms: 0.4\n      ...\n    1..1\nok 1 - a\n  ---\n  duration_ms: 1.2\n  type: 'test'\n  ...\n1..1\n# tests 2\n# suites 0\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 12.3\n";
+  assert.strictEqual(gates.partialOutputRead(tap), "clean", "all-pass TAP");
+  assert.strictEqual(gates.partialOutputRead("ok 1 - a\n  ---\n  dura"), "clean", "cut inside an ok's YAML block");
+  assert.strictEqual(gates.partialOutputRead("ok 1 a\n---\nnot ok 2 b\n  ---\n  operator: equal\n  ...\n"), "failure", "a test's own `---` divider at the ok line's depth opens no block");
+  assert.strictEqual(gates.partialOutputRead("ok 1 a\n  ---\n  duration_ms: 1\nnot ok 2 b\n"), "failure", "an outdented line ends the block and is judged");
+  const spec = "▶ suite\n  \u001b[32m✔ x \u001b[90m(0.6ms)\u001b[39m\n  ﹣ y (0.1ms) # SKIP\n✔ suite (9ms)\r\n\u001b[34mℹ tests 3\u001b[39m\nℹ fail 0\nℹ skipped 1\n";
+  assert.strictEqual(gates.partialOutputRead(spec), "clean", "all-pass spec reporter");
+});
+
+for (const [label, output, verdict] of [
+  ["a lone `# fail 1` summary", "TAP version 13\nok 1 - a\n# fail 1\n", "failure"],
+  ["`# cancelled 2`", "ok 1 - a\n# cancelled 2\n", "failure"],
+  ["all-pass partial output", "> spor@0.18.6 test\n> node scripts/test-run.js\n\nTAP version 13\nok 1 - a\n  ---\n  duration_ms: 1\n  ...\n# pass 1\n# fail 0\n", "outage"],
+  ["empty output", "", "outage"],
+]) {
+  test(`a timeout whose partial output is ${label} is ${verdict === "outage" ? "the OUTAGE" : "an ACTUAL failure"}`, async () => {
+    const { deps, seen } = fakes({ pools: { retry: { spent: 0 } }, changed: ["lib/kernel/queue.js"], suite: (args) => (args && args.command ? { ok: true } : TIMED_OUT(output)) });
+    const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY({ rescue: undefined }), deps });
+    if (verdict === "outage") {
+      assert.strictEqual(res.gates[0].verdict, "infrastructure");
+      assert.deepStrictEqual(seen.fixes, []);
+    } else {
+      assert.strictEqual(res.state, "failed");
+      assert.notStrictEqual(res.gates[0].verdict, "infrastructure");
+      assert.strictEqual(seen.pools.retry.spent, 0, "the infrastructure pool is not charged for a real failure");
+      assert.match(seen.escalations[0].detail, /did not finish within 900s, and its partial output named an actual failure/);
+    }
+  });
+}
+
 test("a timeout whose captured output was cut by the capture cap is an actual failure: what scrolled away cannot be shown clean", async () => {
   const { deps } = fakes({ changed: ["lib/kernel/queue.js"], suite: () => ({ ...TIMED_OUT("✔ a.test.js\n"), outputDropped: true }) });
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY({ rescue: undefined }), deps });
