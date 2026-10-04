@@ -12195,6 +12195,19 @@ async function gateDemoteItem(cfg, id, { blockerId = null } = {}) {
     return { ok: true, demoted: false, note: `${id} reads '${status}', which is not a claim of completion — nothing to roll back; ${blocked}` };
   }
 
+  // The blocker must still be LIVE (issue-spor-regate-resume-demote-reflips-
+  // resolved-item): a re-judge (`--regate --resume`) replays the escalate/demote
+  // pair against an escalation a person may have since resolved and marked the
+  // item done. Rolling that back would re-open settled work with nothing left
+  // to block it. Only a readable, terminal blocker withholds; an unreadable one
+  // is "unknown", which is not closure (blockerAlreadyClosed's rule).
+  try {
+    if (await blockerAlreadyClosed(cfg, blockerId)) {
+      return { ok: true, demoted: false, note: `${blockerId} is already closed — ${id} reads '${status}' and is not rolled back` };
+    }
+  } catch {
+    /* unknown is not closed — fall through to the rollback */
+  }
   const wrote = await gateWriteStatus(cfg, id, GATE_DEMOTED_STATUS, graph);
   if (!wrote.ok) return { ok: false, reason: wrote.reason };
   return {

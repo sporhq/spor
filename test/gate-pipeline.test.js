@@ -2566,6 +2566,35 @@ test("a refused item's COMPLETION status is rolled back — and nothing else is"
   assert.strictEqual(statusOf("task-done-2"), "done", "the status is left exactly as the run left it");
 });
 
+// issue-spor-regate-resume-demote-reflips-resolved-item: a re-judge replays the
+// escalate/demote pair; if a person already closed the escalation and marked
+// the item done, the demotion must not re-open it.
+test("a demotion behind an already-closed escalation leaves the resolved item alone", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-demote-closed-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const doc = (id, type, status, extra = "") =>
+    fs.writeFileSync(
+      path.join(nodes, `${id}.md`),
+      `---\nid: ${id}\ntype: ${type}\ntitle: Add bounded retry to the sync worker\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\n${status ? `status: ${status}\n` : ""}${extra}date: 2026-08-26\n---\n\nBody.\n`
+    );
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+  doc("task-done", "task", "done");
+  doc("dec-resolver", "decision", null, "edges:\n  - {type: resolves, to: task-done}\n");
+
+  doc("task-esc-closed", "task", "done", "edges:\n  - {type: blocks, to: task-done}\n");
+  const closed = await sporCli.gateDemoteItem(cfg, "task-done", { blockerId: "task-esc-closed" });
+  assert.deepStrictEqual([closed.ok, closed.demoted], [true, false]);
+  assert.match(closed.note, /already closed/);
+  assert.strictEqual(statusOf("task-done"), "done", "a person's resolution is not re-flipped");
+
+  doc("task-esc-live", "task", "open", "edges:\n  - {type: blocks, to: task-done}\n");
+  const live = await sporCli.gateDemoteItem(cfg, "task-done", { blockerId: "task-esc-live" });
+  assert.strictEqual(live.demoted, true);
+  assert.strictEqual(statusOf("task-done"), "open");
+});
+
 // issue-spor-gate-escalation-demote-status-rollback-not-applied: every other
 // pipeline test above wires `demote` as a mock that records what it was CALLED
 // with, never what actually happened to the graph — so a bug where the pipeline
