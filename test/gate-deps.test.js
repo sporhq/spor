@@ -459,3 +459,76 @@ test("a review the door reports as ADOPTED is logged as adopted and its run awai
   assert.equal(awaited, "already-reviewing");
   assert.ok(logs.some((l) => /review \(cycle 0\) on task-x was already launched as run already- — adopting it/.test(l)), logs.join("\n"));
 });
+
+// A crash MID-SUITE, then a resume (issue-spor-gate-resume-loses-change-under-
+// judgement): the first drive journals `changedPaths` and dies inside the
+// command gate's `judge` — the suite ran, its result never reached the
+// journal. A fresh worker builds FRESH deps (its `change` closure empty) and
+// drives the same journal: `changedPaths` replays, so no live read ever sets
+// the closure. The change set must come back from the journaled result, so
+// the re-run suite judges the change and the gate passes — never the fail-
+// closed "the change under judgement could not be read" and its escalation.
+test("a gate journal crashed mid-suite resumes with the journaled change set: the re-run command gate judges the change and passes", async (t) => {
+  const sporCli = require("../bin/spor.js");
+  const gatesKernel = require("../lib/kernel/gates.js");
+  const gw = require("../lib/shell/gate-workflow.js");
+  const { Execution } = require("../lib/kernel/workflow.js");
+  const { dir, g } = realRepo(t);
+  // The suite lives on the TRUSTED ref (a protected path the change must not touch).
+  g("checkout", "-q", "main");
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "acceptance.js"), 'if (!require("fs").existsSync(require("path").join(__dirname, "..", "b.txt"))) process.exit(1);\n');
+  g("add", "-A");
+  g("commit", "-q", "-m", "acceptance");
+  g("checkout", "-q", "impl");
+  g("rebase", "-q", "main");
+  const home = scratchHome(t);
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(path.join(nodes, "task-x.md"), "---\nid: task-x\ntype: task\nproject: demo\ntitle: Work\nsummary: Work whose gate passes.\nstatus: open\ndate: 2026-10-04\n---\n\nBody.\n");
+  const runId = "77777777-7777-7777-7777-777777777777";
+  const record = { run_id: runId, node_id: "task-x", state: "exited", cwd: dir, harness: "fake", terminal_state: "reported", started_at: "2026-10-04T00:00:00.000Z", finished_at: "2026-10-04T00:10:00.000Z" };
+  writeRecord(home, runId, record);
+  const claim = dispatchRuns.claimPipeline(home, runId, { workerId: "worker-1", factory: "factory-test", ownerLive: () => true });
+  assert.strictEqual(claim.ok, true, claim.refused);
+  const body = ["```json", JSON.stringify({ factory: "test", trusted_ref: "main", protected_paths: ["test/**"], test_lane_profile: "profile-test-lane", gates: [{ id: "acceptance", kind: "command", command: "node test/acceptance.js" }] }), "```"].join("\n");
+  const { factory, errors } = gatesKernel.parseFactory(body, { id: "factory-test", gateNodes: new Map() });
+  assert.deepStrictEqual(errors, []);
+  const cfg = cfgFor(home);
+  const item = { run_id: runId, node_id: "task-x", project: "demo" };
+  const lines = [];
+  const freshDeps = () =>
+    sporCli.makeGateDeps(cfg, { record, entry: item, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: (l) => lines.push(l), workerId: "worker-1", gateOwner: claim.token, home });
+  const journal = [];
+  const input = (deps) => ({ item, factory, deps, log: (l) => lines.push(l), pinHead: null });
+  const exec = (deps, crashInJudge) => {
+    const { activities } = gw.bindGateActivities(deps, { item, factory, log: (l) => lines.push(l) });
+    let e = null;
+    if (crashInJudge) {
+      const judge = activities.judge;
+      // Crash in the at-least-once window of the judge: the suite EXECUTES,
+      // the worker dies before its result is journaled.
+      activities.judge = (args, meta) => {
+        e.crashPlan = { at: "before-journal", nth: e.executedEffects };
+        return judge(args, meta);
+      };
+    }
+    e = new Execution(gw.gateWorkflow, input(deps), { journal, clock: { now: () => Date.now() }, activities, workflow: gw.WORKFLOW_NAME, version: gw.WORKFLOW_VERSION });
+    return e;
+  };
+
+  const first = await exec(freshDeps(), true).run();
+  assert.strictEqual(first.status, "crashed", JSON.stringify(first));
+  assert.match(first.where, /\/judge#\d+/, "the crash is inside the command gate's judge");
+  assert.ok(journal.some((x) => x.kind === "effect" && /\/changedPaths#\d+$/.test(x.key) && x.result && x.result.ok), "the change set was read and journaled before the crash");
+  assert.ok(!journal.some((x) => /\/judge#\d+$/.test(x.key || "")), "the suite's result never reached the journal");
+
+  // The resume: a NEW worker's deps (an empty `change` closure) over the same
+  // journal; `changedPaths` replays and never re-reads.
+  const resumed = await exec(freshDeps(), false).run();
+  assert.strictEqual(resumed.status, "completed", JSON.stringify(resumed));
+  assert.strictEqual(resumed.result.state, "passed", `${JSON.stringify(resumed.result)}\n${lines.join("\n")}`);
+  assert.ok(!lines.some((l) => /could not be read/.test(l)), lines.join("\n"));
+  assert.ok(!resumed.result.escalated_to, "nothing escalated");
+  assert.match(fs.readFileSync(path.join(nodes, "task-x.md"), "utf8"), /status: open/, "the item was not demoted or touched");
+});

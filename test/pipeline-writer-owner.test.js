@@ -300,21 +300,17 @@ test("end to end: worker A's lease is taken over while its command gate runs —
   assert.ok(!resB.superseded && !resB.owner_lost, `B owns the pipeline and drives it to a verdict: ${JSON.stringify(resB)}\n${linesB.join("\n")}`);
   assert.ok(["passed", "failed"].includes(resB.state), `${JSON.stringify(resB)}\n${linesB.join("\n")}`);
   assert.ok(!linesB.some((l) => /REPLAY FAULT|cannot be continued/.test(l)), `B's journals replay cleanly — none of A's refused steps is in them:\n${linesB.join("\n")}`);
-  // B's writes LAND — the fact, the split verdict, the settle. (B's VERDICT is
-  // not asserted: a command gate resumed past `changedPaths` reads no change
-  // set today — the deps' `change` closure is set only by a live read — which
-  // is a separate resume defect; when it reads one, the gate passes and the
-  // completion lands, and that is asserted when it does.)
+  // B's writes LAND — the fact, the split verdict, the settle.
   assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-gate-")).length, 1, "B's gate fact landed");
   const afterB = read(dispatchRuns.runPaths(home, runId).record);
   assert.strictEqual(afterB.gate_state, resB.state, "B's settle landed");
   assert.strictEqual(afterB.gates_state, resB.state, "B's split verdict landed");
-  if (resB.state !== "passed") assert.ok(resB.escalated_to && fs.existsSync(path.join(nodes, `${resB.escalated_to}.md`)), "B's escalation landed");
-  // What a takeover SHOULD end in: B passes the gate A was inside and its
-  // completion lands. Held back only by the separate resume defect above.
-  await t.test("B passes the gate A was inside, and B's completion lands", { todo: "a command gate resumed past changedPaths reads no change set (gate-deps.js `change` is set only by a live changedPaths)" }, () => {
-    assert.strictEqual(resB.state, "passed");
-    assert.match(fs.readFileSync(path.join(nodes, "task-demo.md"), "utf8"), /status: done/);
-    assert.ok(afterB.completion_written_at);
-  });
+  // What a takeover ends in: B — resumed past A's journaled `changedPaths`,
+  // so the change set is restored from the journal, never re-read live
+  // (issue-spor-gate-resume-loses-change-under-judgement) — passes the gate A
+  // was inside, and its completion lands.
+  assert.strictEqual(resB.state, "passed", `${JSON.stringify(resB)}\n${linesB.join("\n")}`);
+  assert.ok(!linesB.some((l) => /could not be read/.test(l)), `B judged the change A read:\n${linesB.join("\n")}`);
+  assert.match(fs.readFileSync(path.join(nodes, "task-demo.md"), "utf8"), /status: done/);
+  assert.ok(afterB.completion_written_at);
 });

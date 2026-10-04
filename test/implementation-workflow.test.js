@@ -432,3 +432,34 @@ test("the activities table and the binding name the same set", () => {
   const documented = wf.IMPLEMENTATION_ACTIVITIES.map(([name]) => name).filter((n) => !/^(signal|timer) /.test(n)).sort();
   assert.deepEqual(bound, documented);
 });
+
+// A LIVE loss of the pipeline lease is a control throw for this workflow, as
+// it is for the gate list (gate-workflow.js rethrowControl): the displaced
+// driver stops at the refused step instead of reading it as the activity's
+// failure and walking on. A REPLAYED one is only a journal entry, read as the
+// failure it always was.
+test("a live PipelineOwnerLost passes through the workflow's act; a replayed one is the activity's failure", async () => {
+  const { PipelineOwnerLost } = require("../lib/shell/agent-dispatch-runner.js");
+  const clock = fakeClock(1000);
+  const script = SCRIPTS.retry;
+  const world = makeWorld({ clock, script });
+  world.activities.loadImplAttempts = () => {
+    throw new PipelineOwnerLost(ITEM.run_id, "the lease was taken over");
+  };
+  const lines = [];
+  const input = { item: ITEM, factory: script.factory, record: script.record, deps: world.deps, log: (l) => lines.push(l), driver: { parked: null, mode: null } };
+  const e = new Execution(wf.implementationWorkflow, input, { clock, activities: world.activities, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+  const r = await e.run();
+  assert.equal(r.status, "failed", JSON.stringify(r));
+  assert.equal(r.error.code, "PIPELINE_OWNER_LOST");
+  assert.ok(!lines.some((l) => /ledger could not be read/.test(l)), lines.join("\n"));
+  assert.equal(world.dispatches, 0, "the displaced driver launched nothing");
+
+  // The same journal, replayed: the journaled failure is the ledger read's,
+  // and the workflow walks on from it as it always did.
+  const replayLines = [];
+  const replay = new Execution(wf.implementationWorkflow, { ...input, log: (l) => replayLines.push(l) }, { journal: e.journal.slice(), clock, activities: makeWorld({ clock, script }).activities, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+  const rr = await replay.run();
+  assert.notEqual(rr.error && rr.error.code, "PIPELINE_OWNER_LOST", "a replayed loss is not re-thrown");
+  assert.ok(replayLines.some((l) => /ledger could not be read/.test(l)), replayLines.join("\n"));
+});
