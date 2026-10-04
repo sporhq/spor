@@ -1,7 +1,6 @@
 "use strict";
 require("./helpers/tmp-cleanup");
 const test = require("node:test");
-const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
