@@ -89,7 +89,8 @@ function parseNodeBlocks(response) {
   return blocks;
 }
 
-// ===FACT=== ... ===END=== blocks (content preserves inner newlines).
+// ===FACT=== ... ===END=== blocks (content preserves inner newlines; a
+// whitespace-only block is not a fact).
 function parseFactBlocks(response) {
   const facts = [];
   let emit = false;
@@ -101,7 +102,7 @@ function parseFactBlocks(response) {
       continue;
     }
     if (line === "===END===") {
-      if (emit && content !== "") facts.push(content);
+      if (emit && content.trim() !== "") facts.push(content);
       emit = false;
       continue;
     }
@@ -1293,6 +1294,8 @@ async function distill(input) {
     .split("\n")
     .filter((l) => l.startsWith("===NODE")).length;
   log(`distill complete (${candidates} candidate nodes)`);
+  // No block parsed: nothing was written, so skip linting all of nodes/.
+  if (blockCount < 1) return null;
 
   // Lint what we just wrote; problems are logged, not fatal.
   const v = spawnSync(process.execPath, [path.join(u.ROOT, "lib", "validate.js"), "--nodes", nodes], {
