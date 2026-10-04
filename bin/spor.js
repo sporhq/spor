@@ -15596,7 +15596,9 @@ async function blockerAlreadyClosed(cfg, id) {
     }
   }
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
-  return graphLib.isTerminalStatusOffline(status, node.type || null);
+  // Tiered (dec-spor-offline-inert-tiered-fallback): the server's `inert` is
+  // authoritative both ways; only a server that said nothing falls to the seed.
+  return graphLib.isNodeInertOffline(node.inert, status, node.type || null);
 }
 
 // checkProposal's `restore` dep, real: promotes the work item's own status

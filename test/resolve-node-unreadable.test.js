@@ -101,6 +101,22 @@ test("blockerAlreadyClosed: a 2xx with an unparseable body is not evidence of cl
   });
 });
 
+test("blockerAlreadyClosed (remote): the server's inert flag is authoritative both ways, over the seed table", async () => {
+  const cfg = remoteCfg();
+  await withNodeBodies(
+    {
+      // seed table says `done` is terminal; the server says the node is live.
+      "task-inert-false": { id: "task-inert-false", inert: false, raw: "---\nid: task-inert-false\ntype: task\nstatus: done\n---\nb\n" },
+      // seed table says `open` is live; the server says it is inert.
+      "task-inert-true": { id: "task-inert-true", inert: true, raw: "---\nid: task-inert-true\ntype: task\nstatus: open\n---\nb\n" },
+    },
+    async () => {
+      assert.strictEqual(await sporCli.blockerAlreadyClosed(cfg, "task-inert-false"), false);
+      assert.strictEqual(await sporCli.blockerAlreadyClosed(cfg, "task-inert-true"), true);
+    }
+  );
+});
+
 test("proposalSettledMeanwhile: an unparseable landed-fact body is not evidence of settlement — reads false, not true", async () => {
   const cfg = remoteCfg();
   const integrationRunner = require("../lib/shell/integration-runner.js");
