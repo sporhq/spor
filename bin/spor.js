@@ -14888,13 +14888,16 @@ function settleRunRecord(home, runId, res, workerId = null, { gateResult = null,
   // The token claimPipeline minted before the pipeline ran, when there was a
   // record to own — the settle then goes through the `own` door and lands only
   // while the pipeline's lease still carries it (a re-gate or another owner in
-  // between refuses it). With no record to own beforehand, a fresh nonce and
-  // the settled-verdict guard alone, as before.
+  // between refuses it). With no record to own beforehand, a fresh nonce
+  // through the loop's unowned guard (stampLoopVerdict): it lands only on a
+  // record no lease has EVER claimed and none settled — a record that appeared
+  // under another driver's live lease, or whose lease log cannot be read, is
+  // refused (issue-spor-settle-run-record-no-token-path-unguarded).
   const token = owned || crypto.randomBytes(12).toString("hex");
   try {
     const state = res && res.state ? res.state : "failed";
     const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
-    const stamped = dispatchRuns.stampGateState(home, runId, {
+    const patch = {
       gate_state: state,
       gate_at: at,
       gate_settle_id: token,
@@ -14921,9 +14924,12 @@ function settleRunRecord(home, runId, res, workerId = null, { gateResult = null,
             ...(intResult && intResult.landed_sha ? { gate_landed_sha: intResult.landed_sha } : {}),
           }
         : {}),
-    }, owned ? { own: owned } : {});
+    };
+    const stamped = owned ? dispatchRuns.stampGateState(home, runId, patch, { own: owned }) : workLib.stampLoopVerdict(home, runId, patch, null);
     const landed = !!stamped && stamped.gate_settle_id === token && stamped.gate_state === state;
-    return { landed, at, token, record: stamped || null };
+    // A refused unowned builder hands back nothing: read the record as it
+    // stands, so a superseded settle still reports the winner's verdict.
+    return { landed, at, token, record: stamped || (owned ? null : dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record) || null) };
   } catch {
     /* fail-soft: the loop's own settle stamp is the second writer */
     return { landed: false, at, token, record: null };
@@ -15124,7 +15130,9 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
   }
   if (!out.attestation) return missing("could not be recorded on the graph");
   try {
-    const stamped = dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: out.attestation, gate_attestation_missing: false, gate_attestation_error: null, ...(!(intResult && intResult.state === "parked") ? { gate_attestation_pending: null } : {}) }, settleToken ? { own: settleToken } : {});
+    // No settle token, no stamp: an unowned stamp would land on any unsettled
+    // record, whoever's pipeline it is.
+    const stamped = settleToken ? dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: out.attestation, gate_attestation_missing: false, gate_attestation_error: null, ...(!(intResult && intResult.state === "parked") ? { gate_attestation_pending: null } : {}) }, { own: settleToken }) : null;
     if (!stamped || stamped.gate_attestation !== out.attestation) log(`work: the run record for ${item.node_id} no longer holds this pipeline's verdict — attestation ${out.attestation} is on the graph but not stamped on the record`);
   } catch {
     /* fail-soft: the run record is bookkeeping, the attestation node is the record */
@@ -15138,7 +15146,7 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
 // review, major finding 3). `spor runs` and `--status` read the field.
 function stampAttestationMissing(cfg, { item, home, settleToken, reason }) {
   try {
-    dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: null, gate_attestation_missing: true, gate_attestation_error: String(reason || "unknown").slice(0, 300) }, settleToken ? { own: settleToken } : {});
+    if (settleToken) dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: null, gate_attestation_missing: true, gate_attestation_error: String(reason || "unknown").slice(0, 300) }, { own: settleToken });
   } catch {
     /* the log line above is the last record of it */
   }

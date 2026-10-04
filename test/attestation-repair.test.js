@@ -9,6 +9,7 @@ const { spawnSync } = require("node:child_process");
 const cli = require("../bin/spor.js");
 const runner = require("../lib/shell/agent-dispatch-runner.js");
 const att = require("../lib/shell/attestation.js");
+const stageProjection = require("../lib/shell/stage-projection.js");
 const { loadConfig } = require("../lib/config.js");
 
 function fixture() {
@@ -87,6 +88,46 @@ test("losing observer cannot take a live owner's lease or install its own settle
   assert.equal(fs.readFileSync(f.file, "utf8"), bytes);
   // The owner's own settle lands under its lease token.
   assert.equal(cli.settleRunRecord(f.home, f.item.run_id, f.gateResult, "w", { token: owner.token, pending: f.pending }).landed, true);
+});
+
+// A driver that saw NO record at claim time settles with no token
+// (issue-spor-settle-run-record-no-token-path-unguarded): it may land only on
+// a record no lease has ever claimed.
+function unclaimedFixture() {
+  const f = fixture();
+  runner.atomicJson(f.file, { ...f.item, state: "done" });
+  return f;
+}
+
+test("a no-token settle lands on a record no lease has ever claimed", () => {
+  const f = unclaimedFixture();
+  const settle = cli.settleRunRecord(f.home, f.item.run_id, { state: "failed", reason: "no owner" }, "stale", {});
+  assert.equal(settle.landed, true);
+  assert.equal(JSON.parse(fs.readFileSync(f.file, "utf8")).gate_state, "failed");
+});
+
+test("a no-token stale driver whose record appeared under another driver's live lease is refused", () => {
+  const f = unclaimedFixture();
+  const owner = runner.claimPipeline(f.home, f.item.run_id, { workerId: "owner", ownerLive: () => true });
+  assert.equal(owner.ok, true);
+  const bytes = fs.readFileSync(f.file, "utf8");
+  const settle = cli.settleRunRecord(f.home, f.item.run_id, { state: "failed", reason: "stale verdict" }, "stale", { pending: f.pending });
+  assert.equal(settle.landed, false);
+  assert.equal(fs.readFileSync(f.file, "utf8"), bytes, "the live owner's record is untouched");
+  assert.equal(settle.record && settle.record.run_id, f.item.run_id, "a refused settle reports the record as it stands");
+  assert.equal(cli.settleRunRecord(f.home, f.item.run_id, f.gateResult, "owner", { token: owner.token }).landed, true, "the owner still settles under its own token");
+});
+
+test("a no-token driver with an unreadable lease log is refused", () => {
+  const f = unclaimedFixture();
+  const log = stageProjection.pipelineLogPath(f.home, { run_id: f.item.run_id });
+  fs.mkdirSync(path.dirname(log), { recursive: true });
+  fs.writeFileSync(log, "{not json\n" + JSON.stringify({ kind: "release", at: "2026-10-04T00:00:00.000Z", token: "x" }) + "\n");
+  assert.throws(() => stageProjection.pipelineLease(f.home, { run_id: f.item.run_id }), "the fixture's log is unreadable");
+  const bytes = fs.readFileSync(f.file, "utf8");
+  const settle = cli.settleRunRecord(f.home, f.item.run_id, { state: "failed", reason: "stale verdict" }, "stale", {});
+  assert.equal(settle.landed, false);
+  assert.equal(fs.readFileSync(f.file, "utf8"), bytes);
 });
 
 test("stale breaker observation cannot unlink a successor; the waiter fails closed", () => {

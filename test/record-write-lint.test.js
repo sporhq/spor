@@ -215,6 +215,22 @@ function enclosingFunction(src, index) {
 
 // The text of a call starting at the `(` at `open`, balanced on parens with
 // strings skipped.
+// R9's owned test: a call is owned only when its options NAME an owner — an
+// `own:` whose value is not a nullish literal (`own: null`, `own: undefined`,
+// `own: void 0` reach stampGateState as the unowned door), or the `{ own }`
+// shorthand — and are not a conditional with an owner-less arm
+// (`token ? { own: token } : {}` stamps unowned whenever the token is
+// missing; issue-spor-record-write-lint-r9-own-value-validation).
+function ownsCall(text) {
+  const values = [...text.matchAll(/\bown\s*:\s*([^,}]*)/g)].map((m) => m[1].trim());
+  const shorthand = /[{,]\s*own\s*[,}]/.test(text);
+  if (!values.length && !shorthand) return false;
+  if (values.some((v) => !v || /^(?:null|undefined|void\s+0)$/.test(v))) return false;
+  if (/\?\s*\{[^{}]*\bown\b[^{}]*\}\s*:\s*(?:\{\s*\}|null|undefined)/.test(text)) return false;
+  if (/\?\s*(?:\{\s*\}|null|undefined)\s*:\s*\{[^{}]*\bown\b[^{}]*\}/.test(text)) return false;
+  return true;
+}
+
 function callText(src, open) {
   let depth = 0;
   let quote = null;
@@ -353,7 +369,7 @@ function scan() {
     if (!inRunner) {
       for (const m of code.matchAll(/\.stampGateState\s*\(/g)) {
         const text = callText(code, m.index + m[0].length - 1);
-        if (/\bown\s*:/.test(text)) continue;
+        if (ownsCall(text)) continue;
         const fn = enclosingFunction(code, m.index);
         const allowed = UNOWNED_GATE_STAMP_CALLERS[rel];
         if (!allowed || !allowed.has(fn)) flag(rel, code, m.index, `stampGateState without \`own\` from ${fn || "module scope"}, not a listed non-pipeline caller — a gate-pipeline stamp must go through the lease's own door`);
@@ -417,8 +433,23 @@ test("the lint's own detectors fire on the shapes they exist for", () => {
   assert.match(callText(code, s.index + s[0].length - 1), /force\s*:\s*true/);
   // R9: a call is owned by its `own:` option, wherever the options object sits.
   const own = tokenize("function f() { r.stampGateState(home, id, { gate_fix_run_id: x }); r.stampGateState(home, id, (fresh) => patch, { own: token }); }");
-  const owns = [...own.matchAll(/\.stampGateState\s*\(/g)].map((m) => /\bown\s*:/.test(callText(own, m.index + m[0].length - 1)));
+  const owns = [...own.matchAll(/\.stampGateState\s*\(/g)].map((m) => ownsCall(callText(own, m.index + m[0].length - 1)));
   assert.deepStrictEqual(owns, [false, true]);
+  // ...and only by a VALUE that names an owner: a nullish `own:` or an
+  // owner-less conditional arm is the unowned door wearing the owned spelling.
+  const values = tokenize([
+    "function g() {",
+    "  r.stampGateState(home, id, patch, { own: null });",
+    "  r.stampGateState(home, id, patch, { own: undefined });",
+    "  r.stampGateState(home, id, patch, { own: void 0 });",
+    "  r.stampGateState(home, id, patch, owned ? { own: owned } : {});",
+    "  r.stampGateState(home, id, patch, !owned ? {} : { own: owned });",
+    "  r.stampGateState(home, id, patch, { own });",
+    "  r.stampGateState(home, id, patch, { force: false, own: rec.gate_settle_id });",
+    "}",
+  ].join("\n"));
+  const valued = [...values.matchAll(/\.stampGateState\s*\(/g)].map((m) => ownsCall(callText(values, m.index + m[0].length - 1)));
+  assert.deepStrictEqual(valued, [false, false, false, false, false, true, true]);
   assert.strictEqual([...code.matchAll(/(?<![A-Za-z0-9_$.])gate_progress\s*:(?!:)/g)].length, 1);
   assert.strictEqual(lineOf(code, code.indexOf("fs.writeFileSync")), 5);
   const blanked = tokenize("const s = \"rev: x\"; const t = `gate_progress: ${1}`; writeFileAtomic(p.record, x);");
