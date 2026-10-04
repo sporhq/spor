@@ -782,3 +782,36 @@ test("put-node (remote) --if-exists error refuses a bad priority before writing"
     srv.close();
   }
 });
+
+// task-spor-cli-put-node-spill-opt-in: --spill is forwarded as spill:true and
+// the continuation part ids the server returns are printed.
+test("put-node (remote) --spill forwards spill:true and prints the part ids", async () => {
+  const results = [{ ok: true, status: "created", id: "art-long", revision: "rev-0", parts: ["art-long-2", "art-long-3"] }];
+  const { srv, hits, base } = await batchStub({ results });
+  try {
+    const file = tmpNodeFile(nodeMd("art-long"));
+    const r = await runAsync(["put-node", file, "--spill"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /put-node created: art-long @ rev-0/);
+    assert.match(r.stdout, /spilled into 2 continuation parts: art-long-2, art-long-3/);
+    const post = hits.find((h) => h.url === "/v1/nodes");
+    assert.strictEqual(JSON.parse(post.body).nodes[0].spill, true);
+    const plain = await runAsync(["put-node", tmpNodeFile(nodeMd("art-short"))], remoteEnv(base));
+    assert.strictEqual(plain.status, 0, plain.stderr);
+    const last = hits.filter((h) => h.url === "/v1/nodes").pop();
+    assert.ok(!("spill" in JSON.parse(last.body).nodes[0]), "no spill key without the flag");
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node --spill is refused locally and with --if-exists update", () => {
+  const { home } = fixtureGraph();
+  const file = tmpNodeFile(nodeMd("dec-new"));
+  const r = run(["put-node", file, "--spill"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /--spill is remote-only/);
+  const u = run(["put-node", file, "--spill", "--if-exists", "update", "--revision", "abc"], { SPOR_HOME: home });
+  assert.strictEqual(u.status, 1);
+  assert.match(u.stderr, /only applies to creates/);
+});

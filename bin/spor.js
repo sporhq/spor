@@ -1045,9 +1045,20 @@ function renderPutNodeResult(cfg, res, json) {
   const id = res && res.id ? res.id : "(unknown)";
   const rev = res && res.revision ? ` @ ${res.revision}` : "";
   out(status === "skipped" ? `put-node skipped: ${id}${rev}` : `put-node ${status}: ${id}${rev}`);
+  renderPutNodeParts(res);
   renderPriorityStamp(id, res && res.priority_stamp);
   out(writeTargetLine(cfg));
   for (const w of (res && res.warnings) || []) err(`  warning: ${w}`);
+}
+
+// A spilled create returns the server-minted continuation parts
+// (`parts`: ids, or {id,...} objects) beside the base node.
+function putNodePartIds(res) {
+  return ((res && Array.isArray(res.parts)) ? res.parts : []).map((p) => (p && typeof p === "object" ? p.id : p)).filter(Boolean);
+}
+function renderPutNodeParts(res) {
+  const ids = putNodePartIds(res);
+  if (ids.length) out(`  spilled into ${ids.length} continuation part${ids.length === 1 ? "" : "s"}: ${ids.join(", ")}`);
 }
 
 function putNodeEntryDetail(res0) {
@@ -1519,6 +1530,7 @@ async function cmdPutNodeBatch(cfg, values, docs, policy) {
     if (res.ok) {
       const rev = res.revision ? ` @ ${res.revision}` : "";
       out(`put-node ${res.status || "ok"}: ${res.id || entry.id}${rev}`);
+      renderPutNodeParts(res);
       for (const w of res.warnings || []) err(`  warning: ${w}`);
       renderPriorityStamp(entry.id, res.priority_stamp);
     } else {
@@ -1528,7 +1540,7 @@ async function cmdPutNodeBatch(cfg, values, docs, policy) {
 
   if (isRemote) {
     const byId = new Map(ordered.map((e) => [e.id, e]));
-    const wire = ordered.map((e) => ({ node: e.raw, if_exists: policy }));
+    const wire = ordered.map((e) => (values.spill ? { node: e.raw, if_exists: policy, spill: true } : { node: e.raw, if_exists: policy }));
     let sent = 0;
     for (const chunk of chunkPutEntries(wire)) {
       const batch = ordered.slice(sent, sent + chunk.length);
@@ -1628,6 +1640,17 @@ async function cmdPutNode(cfg, { values, positionals }) {
     err("put-node takes either <file>|- or --dir <dir>, not both");
     return 1;
   }
+  if (values.spill) {
+    // spill splits an over-cap CREATE into server-minted continuation parts
+    if (policy === "update") {
+      err("--spill only applies to creates; it cannot be combined with --if-exists update");
+      return 1;
+    }
+    if (cfg.mode() !== "remote") {
+      err("--spill is remote-only: the server mints the continuation parts. Local mode keeps the 8192-byte body cap — split the node yourself (a derived-from chain of art-<stem>-<n> parts)");
+      return 1;
+    }
+  }
 
   const batch = readPutNodeBatch(values, input);
   if (batch.error) {
@@ -1660,6 +1683,7 @@ async function cmdPutNode(cfg, { values, positionals }) {
   if (cfg.mode() === "remote") {
     const entry = { node: raw, if_exists: policy };
     if (revision) entry.revision = revision;
+    if (values.spill) entry.spill = true;
     const r = await remote.post(cfg, "/v1/nodes", { nodes: [entry] }, { timeoutMs: 15000 });
     if (r.transport) {
       err(`offline — could not reach server (${r.error})`);
@@ -18401,14 +18425,21 @@ const COMMANDS = {
       "Priority at create: a new node carrying `priority: p1|p2|p3` is stamped with\n" +
       "priority_by/_at/_via exactly as 'spor priority' would (remote: the server's\n" +
       "set_priority door, from your token; local: your git identity), so a backfill\n" +
-      "needs no second priority pass. Skipped and updated nodes are not re-stamped.",
+      "needs no second priority pass. Skipped and updated nodes are not re-stamped.\n\n" +
+      "Long bodies: a node body is capped at 8192 bytes and an over-cap create is\n" +
+      "refused with the byte overage. --spill (remote only, creates only) opts in to\n" +
+      "the server rolling the overflow into linked art-<stem>-<n> continuation parts;\n" +
+      "the base node and every part id are printed. Use it for long artifacts instead\n" +
+      "of truncating the body. Local mode refuses --spill.",
     options: {
       "if-exists": { type: "string", value: "error|skip|update", desc: "collision policy (default: error)" },
       dir: { type: "string", value: "dir", desc: "write every *.md node file in <dir> as one batch" },
       revision: { type: "string", value: "sha", desc: "required with --if-exists update; from 'spor get <id> --json'" },
+      spill: { type: "boolean", desc: "remote only: let the server split an over-cap create into continuation parts" },
       json: { type: "boolean", desc: "machine-readable result envelope" },
     },
     examples: [
+      "spor put-node ./art-long-report.md --spill",
       "spor put-node ./nodes/dec-x.md",
       "spor get dec-x --json",
       "spor put-node ./dec-x.md --if-exists update --revision <blob-sha>",

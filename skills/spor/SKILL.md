@@ -99,7 +99,7 @@ spor status [--quiet]          # resolved mode, graph, project, identity, health
                                #   `project:`)
 spor next [--project <slug>]   # the ranked decision queue — "what's next"
 spor get <id>                  # one node by id
-spor put-node [<file>|-] --if-exists <error|skip|update> [--revision <sha>]
+spor put-node [<file>|-] --if-exists <error|skip|update> [--revision <sha>] [--spill]
                                # write a full node markdown file through validated put_node semantics;
                                # use `spor get <id> --json` first and pass its revision for updates
 spor put-node --dir <dir> --if-exists skip   # batch: every *.md in <dir> (or concatenated nodes
@@ -209,6 +209,12 @@ A few of these have enough surface to be worth a sentence:
   --json` so updates are optimistic-concurrency checked instead of last-writer
   wins. Prefer `spor edge`/`spor set-status` for narrow mutations; use
   `put-node` for full-node artifacts such as briefing versions or body edits.
+  Node bodies are capped at 8192 bytes. When authoring a long artifact in remote
+  mode, add `--spill` (MCP `put_node` `spill: true`) to a CREATE: the server then
+  splits the overflow into linked `art-<stem>-<n>` continuation parts and the CLI
+  prints the part ids — don't truncate the body or abandon the write. Without
+  it an over-cap create is refused naming the byte overage. `--spill` is
+  remote-only and not valid with `--if-exists update`.
   For many nodes at once (a backfill), `--dir <dir>` or several concatenated
   nodes on stdin submit them as one batch (`--if-exists error|skip`): every
   entry is parsed before anything is written, resolvers are moved ahead of the
