@@ -360,7 +360,7 @@ function pendingResultCount(graph, session) {
 // SPOR_CLAIM_NUDGE=0 (claimNudge.enabled:false). FAIL-OPEN: any error, or a
 // lease state we cannot verify (server down, non-200, unparseable), yields NO
 // nudge and exits 0 — never nudge during an outage, never block the tool loop.
-async function claimNudge({ graph, slug, session, cwd, file, remote }) {
+async function claimNudge({ graph, slug, session, cwd, file, remote, signal }) {
   // Remote/team mode only — claims are meaningless without a shared server.
   if (!remote) return null;
   // Disable lever: SPOR_CLAIM_NUDGE=0 / claimNudge.enabled:false. Like the
@@ -387,7 +387,7 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
   // returns http "000" and we fail open.
   const timeoutMs = u.cfgNum("claimNudge.timeoutMs", "CLAIM_NUDGE_TIMEOUT", 3000);
   const journalPath = path.join(graph, "journal", `${session}.jsonl`);
-  const myItems = await u.fetchAssigneeMineItems(slug, timeoutMs);
+  const myItems = await u.fetchAssigneeMineItems(slug, timeoutMs, signal);
   if (!myItems) return null; // can't verify -> never nudge (fail-open)
 
   // Person-scoped suppression: any item the person holds (live Tier-1
@@ -496,6 +496,7 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
           // without the door ignores the unknown field.
           body: JSON.stringify({ project: slug, touch_session: session }),
           timeoutMs,
+          signal,
         })
         .catch(() => null);
       // Narrow to what the server CONFIRMED, when it told us: a blanket beat
@@ -568,6 +569,7 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
   // grab. Empty pool -> nothing worth nudging about; stay silent.
   const pool = await u.curlWithRefresh(`${u.serverBase()}/v1/queue?project=${encodeURIComponent(slug)}&limit=3`, {
     timeoutMs,
+    signal,
   });
   if (pool.http !== "200") return null;
   let poolItems;
@@ -672,7 +674,7 @@ function localCouplingData(graph) {
 // none, the cached-title-index rule). Delete cache/coupling.json to force a
 // refresh. A lighter server read than the full export is deferred work.
 const COUPLING_CACHE_TTL_MS = 3600000;
-async function remoteCouplingData(graph) {
+async function remoteCouplingData(graph, signal) {
   const cacheFile = path.join(graph, "cache", "coupling.json");
   let cached = null;
   try {
@@ -681,6 +683,10 @@ async function remoteCouplingData(graph) {
   const now = Date.now();
   if (cached && typeof cached.fetched === "number" && now - cached.fetched < COUPLING_CACHE_TTL_MS) return cached;
   const stale = cached && Array.isArray(cached.norms) ? cached : { v: 1, norms: [], repo_tags: {} };
+  // The shared deadline already spent (earlier calls on this write) means the
+  // export is never attempted: don't stamp `fetched`, or the TTL would hold off
+  // the next real attempt for an hour over a download that never ran.
+  if (signal && signal.aborted) return stale;
   stale.fetched = now;
   if (u.ensureDir(path.join(graph, "cache"))) {
     try {
@@ -690,7 +696,7 @@ async function remoteCouplingData(graph) {
   const timeoutMs = u.cfgNum("couplingNudge.timeoutMs", "COUPLING_NUDGE_TIMEOUT", 3000);
   const remoteLib = require(path.join(u.ROOT, "lib", "remote.js"));
   const tar = require(path.join(u.ROOT, "lib", "tar.js"));
-  const r = await remoteLib.download(u.config(), "/v1/export", { timeoutMs }).catch(() => null);
+  const r = await remoteLib.download(u.config(), "/v1/export", { timeoutMs, signal }).catch(() => null);
   if (!r || !r.ok || !r.buffer) return stale;
   let entries;
   try {
@@ -708,7 +714,7 @@ async function remoteCouplingData(graph) {
   return data;
 }
 
-async function couplingNudge({ input, graph, slug, session, cwd, remote }) {
+async function couplingNudge({ input, graph, slug, session, cwd, remote, signal }) {
   if (u.config() ? !u.config().getBool("couplingNudge.enabled", true) : (u.envDual("COUPLING_NUDGE") ?? "1") === "0") return null;
   if (u.isSystemSession()) return null; // headless calls don't nudge
   const tool = input.tool_name ?? "";
@@ -740,7 +746,7 @@ async function couplingNudge({ input, graph, slug, session, cwd, remote }) {
   if (!rels.length) return null;
   const rel = rels[0]; // literal-first, for the human-facing "you edited ..." line
 
-  const data = remote ? await remoteCouplingData(graph) : localCouplingData(graph);
+  const data = remote ? await remoteCouplingData(graph, signal) : localCouplingData(graph);
   if (!data || !Array.isArray(data.norms) || data.norms.length === 0) return null;
   // Declared alias map (issue-spor-coupling-matcher-reverse-symlink-gap): when
   // the edited path arrives already resolved (no alias-derivable spelling),
@@ -811,7 +817,7 @@ async function couplingNudge({ input, graph, slug, session, cwd, remote }) {
 // never the output envelope. Disable with SPOR_HEARTBEAT=0 (dispatch.heartbeat:
 // false). A 404 means caps were never published (publish-before-heartbeat); we
 // journal it and fail open — the next session-start auto-publish re-seeds them.
-async function agentHeartbeat({ graph, session, remote }) {
+async function agentHeartbeat({ graph, session, remote, signal }) {
   try {
     if (!remote) return null; // local mode: no fleet, no-op (keeps output byte-identical)
     const cfg = u.config();
@@ -841,6 +847,7 @@ async function agentHeartbeat({ graph, session, remote }) {
     const r = await u.curlWithRefresh(`${u.serverBase()}/v1/agents/${encodeURIComponent(agent)}/heartbeat`, {
       method: "POST",
       timeoutMs,
+      signal,
     });
     // Journal the tick (best-effort) so the operability log can correlate
     // write-activity to liveness pings.
@@ -853,6 +860,11 @@ async function agentHeartbeat({ graph, session, remote }) {
   }
   return null;
 }
+
+// Shared budget for the post-tool engine's deterministic server calls on one
+// write (see postTool). Above any single 3s per-call default, so one slow call
+// still gets its full window, while a chain of slow ones is cut off.
+const POST_TOOL_DEADLINE_MS = 6000;
 
 async function postTool(input) {
   const graph = u.graphHome();
@@ -881,17 +893,24 @@ async function postTool(input) {
         file: input.tool_input?.file_path ?? null,
       })
     );
+    // The deterministic server calls below (fleet heartbeat, claim lookup/renew/
+    // pool read, coupling export) ride ONE shared deadline, the session-start
+    // pattern (dec-spor-shared-http-failure-classifier-and-session-start-deadline):
+    // each keeps its own per-call timeout, but together they can no longer stack
+    // to the sum of their timeouts on a single write. The LLM capture nudge is
+    // deliberately NOT under it (its own nudge.timeoutMs governs).
+    const deadline = AbortSignal.timeout(POST_TOOL_DEADLINE_MS);
     // Fleet liveness heartbeat (task-spor-fleet-scheduler-client-heartbeat-tick):
     // keep this box's agent last_seen fresh mid-session. A throttled, fail-open
     // side effect that always returns null (never the output envelope), so it
     // doesn't compete with the claim/capture nudges below; no-op in local mode.
-    await agentHeartbeat({ graph, session, remote }).catch(() => null);
+    await agentHeartbeat({ graph, session, remote, signal: deadline }).catch(() => null);
     // Claim heartbeat / nudge (task-cc-claim-nudge-hook) runs FIRST: it's the
     // cheap no-LLM lease lookup, and its nudge (the no-claim branch) takes
     // precedence over the LLM capture nudge for the single output envelope. The
     // heartbeat branch returns null, so a held-claim write still falls through
     // to the nudges below. Both branches no-op in local mode. Fail-open.
-    const claim = await claimNudge({ graph, slug, session, cwd, file, remote }).catch(() => null);
+    const claim = await claimNudge({ graph, slug, session, cwd, file, remote, signal: deadline }).catch(() => null);
     if (claim) return claim;
     // Coupling nudge (task-spor-coupling-nudge-posttool) runs SECOND: a
     // deterministic declared-coupling hit beats the LLM capture classifier for
@@ -899,7 +918,7 @@ async function postTool(input) {
     // does NOT permanently starve the capture nudge — no `.nudged` state line
     // is written for the file, so its NEXT edit still classifies. Runs in both
     // modes; a graph with no coupling norms is a no-op.
-    const coupled = await couplingNudge({ input, graph, slug, session, cwd, remote }).catch(() => null);
+    const coupled = await couplingNudge({ input, graph, slug, session, cwd, remote, signal: deadline }).catch(() => null);
     if (coupled) return coupled;
     return (await nudge({ input, graph, slug, session, file, remote }).catch(() => null)) ?? null;
   }

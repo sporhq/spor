@@ -236,3 +236,29 @@ test('404 (caps never published) -> journaled, fail-open, exit 0', async () => {
     srv.close();
   }
 });
+
+test('post-tool server calls share ONE deadline: hung heartbeat + claim + coupling calls do not stack their per-call timeouts', async () => {
+  const { home, cwd } = scratch();
+  const hits = [];
+  const sockets = new Set();
+  const srv = http.createServer((req) => { hits.push(req.url); }); // never answers
+  srv.on('connection', (s) => sockets.add(s));
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const env = freshEnv(home, {
+      SPOR_SERVER: `http://127.0.0.1:${srv.address().port}`, SPOR_TOKEN: 'spor_pat_test',
+      SPOR_DISPATCH_AGENT: AGENT, SPOR_CLAIM_NUDGE: '1',
+      // each call alone would wait 5s; stacked they would take 10s+ (heartbeat + claim lookup [+ coupling])
+      SPOR_HEARTBEAT_TIMEOUT: '5000', SPOR_CLAIM_NUDGE_TIMEOUT: '5000', SPOR_COUPLING_NUDGE_TIMEOUT: '5000',
+    });
+    const t0 = Date.now();
+    const out = await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd), env);
+    const elapsed = Date.now() - t0;
+    assert.strictEqual(out.trim(), '', 'fail-open: no envelope');
+    assert.ok(hits.length >= 2, `heartbeat and claim lookup both attempted: ${hits}`);
+    assert.ok(elapsed < 8500, `bounded by the shared deadline, not the stacked sum (took ${elapsed}ms)`);
+  } finally {
+    for (const s of sockets) s.destroy();
+    srv.close();
+  }
+});

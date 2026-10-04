@@ -1655,9 +1655,10 @@ function serverBase() {
 // not just held) on a parseable 200, or null on anything that can't be
 // trusted — non-200, dead/slow server, unparseable body — so every caller
 // fails open the exact same way instead of re-deriving the same try/catch.
-async function fetchAssigneeMineItems(slug, timeoutMs) {
+async function fetchAssigneeMineItems(slug, timeoutMs, signal) {
   const mine = await curlWithRefresh(`${serverBase()}/v1/queue?project=${encodeURIComponent(slug)}&assignee=me`, {
     timeoutMs,
+    signal,
   });
   if (mine.http !== "200") return null;
   try {
