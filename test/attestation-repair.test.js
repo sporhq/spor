@@ -384,6 +384,73 @@ test("an interrupted --regate on pending flake evidence is resumed by the next -
   assert.equal(rec.gate_attestation_pending || null, null);
 });
 
+// issue-spor-slice5-regate-attempt-mismatch-and-unguarded-attestation: the
+// attempt has ONE source, the lease the claim wrote. A --regate interrupted
+// mid-attempt parks its journals under that attempt; a gate-armed worker's
+// resume scan reads the SAME lease and adopts the SAME journals — never a
+// neighbouring attempt's.
+test("an interrupted --regate is adopted by the worker loop under the SAME attempt, continuing the same journals", async () => {
+  const gatesLib = require("../lib/shell/gate-runner.js");
+  const loop = require("../lib/shell/work-loop.js");
+  const f = fixture();
+  runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "failed", gate_worker: "old" });
+  const seen = [];
+  const original = gatesLib.runGatePipeline;
+  gatesLib.runGatePipeline = async ({ item }) => {
+    seen.push(item.attempt);
+    return seen.length === 1 ? { state: "interrupted", gates: [], facts: [], reason: "the worker was asked to stop" } : f.gateResult;
+  };
+  const journals = () => fs.readdirSync(runner.runPaths(f.home, f.item.run_id).workflows).filter((n) => n.endsWith(".workflow.jsonl")).sort();
+  try {
+    assert.equal(await cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory: f.factory, factoryId: f.factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home }), 1);
+    const rec = runner.readJson(f.file);
+    const lease = stageProjection.pipelineLease(f.home, rec);
+    assert.equal(lease.attempt, 1, "the re-gate's claim opened attempt 1 on the lease");
+    assert.ok(lease.released_at, "the interrupted re-gate released its lease");
+    assert.deepEqual(seen, [stageProjection.stageAttempt(rec, lease)], "the re-gate judged under the attempt its own claim wrote");
+    const parked = journals();
+    assert.ok(parked.includes(`pipeline-a${seen[0]}.workflow.jsonl`), `the parent journal is keyed on the lease's attempt (${parked.join(", ")})`);
+    // The worker loop's resume scan adopts it off the same lease.
+    const [entry, ...rest] = loop.openPipelines(stageProjection.openPipelineCandidates(f.home, [rec]), { now: () => Date.now() + 3600000, factory: f.factory.id, ownerLive: () => false });
+    assert.equal(rest.length, 0);
+    assert.ok(entry, "the parked re-gate is an adoptable pipeline");
+    assert.equal(entry.attempt, seen[0], "the adopter drives the attempt the re-gate journaled");
+    const res = await cli.runGateAndIntegration(f.cfg, entry, entry.record, { factory: f.factory, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home, workerId: "adopter", log: () => {}, stopping: () => false, sleep: async () => {} });
+    assert.equal(res.state, "passed", res.reason);
+  } finally { gatesLib.runGatePipeline = original; }
+  assert.deepEqual(seen, [seen[0], seen[0]], "the adoption continued the re-gate's attempt");
+  assert.deepEqual(journals().filter((n) => n.startsWith("pipeline-")), [`pipeline-a${seen[0]}.workflow.jsonl`], "one parent journal: the adopter continued it rather than opening a neighbour");
+  assert.equal(stageProjection.pipelineLease(f.home, runner.readJson(f.file)).attempt, 1, "the adoption opened no new attempt");
+});
+
+// ...and the post-settle writers (the attestation node, the propose-mode PR
+// body) are lease-checked immediately before they write: a driver displaced
+// since its settle writes neither over the new holder's attempt.
+test("a displaced driver writes no attestation node and edits no PR body", async () => {
+  const f = fixture();
+  const first = runner.claimPipeline(f.home, f.item.run_id, { workerId: "first" });
+  assert.equal(first.ok, true, first.refused);
+  const second = runner.claimPipeline(f.home, f.item.run_id, { workerId: "second", ownerLive: () => false, nowMs: () => Date.now() + 2 * stageProjection.PIPELINE_LEASE_TTL_MS });
+  assert.equal(second.ok, true, second.refused);
+  const before = fs.readFileSync(f.file, "utf8");
+  let writes = 0;
+  const logs = [];
+  const r = await cli.writeRunAttestation(f.cfg, { item: f.item, factory: f.factory, gateResult: f.gateResult, intResult: null, home: f.home, log: (m) => logs.push(m), settleToken: first.token, built: f.pending.built, origin: f.pending.origin });
+  assert.equal(r.attestation, null);
+  assert.equal(r.owner_lost, true);
+  assert.equal(fs.existsSync(path.join(f.home, "nodes", `${f.pending.built.id}.md`)), false, "no attestation node landed");
+  assert.equal(fs.readFileSync(f.file, "utf8"), before, "nothing stamped on the new holder's record");
+  const intResult = { state: "parked", proposal: { number: 7, repo: "demo/repo", branch: "b" } };
+  const factory = { ...f.factory, integration: { targetRef: "origin/main", mode: "propose" } };
+  const refreshed = await cli.refreshProposalAttestation(f.cfg, { item: f.item, factory, intResult, attestationObject: f.pending.built.attestation, home: f.home, log: (m) => logs.push(m), settleToken: first.token, editBody: () => { writes++; return { ok: true }; } });
+  assert.equal(refreshed.ok, false);
+  assert.equal(writes, 0, "the PR body was not edited");
+  assert.equal(fs.readFileSync(f.file, "utf8"), before);
+  // The holder itself still writes.
+  const mine = await cli.writeRunAttestation(f.cfg, { item: f.item, factory: f.factory, gateResult: f.gateResult, intResult: null, home: f.home, settleToken: second.token, built: f.pending.built, origin: f.pending.origin });
+  assert.equal(mine.attestation, f.pending.built.id);
+});
+
 test("a --regate does not take a pipeline a live worker is DRIVING (its lease held), but it RESUMES one that worker parked (its lease released)", async () => {
   const f = fixture();
   const loop = require("../lib/shell/work-loop.js");

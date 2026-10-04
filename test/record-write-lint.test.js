@@ -81,6 +81,11 @@ const UNOWNED_GATE_STAMP_CALLERS = {
 const PIPELINE_ACTIVITY_WRITERS = new Set(["withdraw", "stampGatesState", "completeAtGates", "integrationStart", "stampIntegrationState", "completeAtIntegration", "reconcileLanded", "leave"]);
 const PIPELINE_ACTIVITY_DRIVERS = new Set(["implementation", "gates", "integration"]);
 const PIPELINE_ACTIVITY_PURE = new Set(["open", "yield", "settled"]);
+// The settle's host-side writers in bin/spor.js that run AFTER the settle
+// (issue-spor-slice5-regate-attempt-mismatch-and-unguarded-attestation): each
+// must call assertPipelineOwner(…) before its durable write — the attestation
+// node and the propose-mode PR body.
+const PIPELINE_HOST_WRITERS = { writeRunAttestation: "writeGateNode", refreshProposalAttestation: "editBody" };
 // The graph-write helpers a gate/integration dep may call only from a dep
 // listed in gate-deps.js PIPELINE_DURABLE_WRITERS (which guardPipelineWriters
 // wraps in the owner guard).
@@ -543,6 +548,17 @@ function pipelineWriterViolations(sources) {
   }
   for (const m of fnBody.matchAll(/(?<![A-Za-z0-9_$.])makeCompletionDeps\s*\(/g)) {
     if (!ownsCall(callText(fnBody, m.index + m[0].length - 1))) out.push(`${BIN}: runGateAndIntegration builds completion deps without \`own\``);
+  }
+  // (c) the post-settle host writers: the owner guard precedes the write.
+  for (const [name, write] of Object.entries(PIPELINE_HOST_WRITERS)) {
+    const at = bin.search(new RegExp(`^async function ${name}\\(`, "m"));
+    if (at < 0) { out.push(`${BIN}: R10 lists post-settle writer '${name}', which is not a top-level async function`); continue; }
+    const end = bin.slice(at + 10).search(/^(?:async\s+)?function\s/m);
+    const body = bin.slice(at, end < 0 ? undefined : at + 10 + end);
+    const guard = body.search(/\bassertPipelineOwner\s*\(/);
+    const first = body.search(new RegExp(`(?<![A-Za-z0-9_$.])${write}\\s*\\(`));
+    if (first < 0) out.push(`${BIN}: ${name} no longer calls ${write}( — update R10's PIPELINE_HOST_WRITERS`);
+    else if (guard < 0 || guard > first) out.push(`${BIN}: ${name} calls ${write}( before assertPipelineOwner(…) — a displaced driver's write would land over the new holder's attempt`);
   }
   return out;
 }

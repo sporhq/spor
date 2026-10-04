@@ -15043,6 +15043,18 @@ function attestationSigning(cfg) {
 // PR body to the graph artifact fails closed on the digest mismatch anyway.
 async function refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject, home, log = () => {}, settleToken, cwd = null, editBody = editProposalBody }) {
   const proposal = intResult.proposal;
+  // The PR body is a durable write of this pipeline: a driver displaced from
+  // the lease since it settled must not overwrite what the new holder's
+  // attempt will put there (issue-spor-slice5-regate-attempt-mismatch-and-
+  // unguarded-attestation). Checked immediately before the edit; a lost lease
+  // edits nothing and stamps nothing (the stamp's own door would refuse it).
+  try {
+    dispatchRuns.assertPipelineOwner(home || cfg.userConfigHome(), item.run_id, settleToken);
+  } catch (e) {
+    if (!dispatchRuns.isPipelineOwnerLost(e)) throw e;
+    log(`work: PR #${proposal.number} for ${item.node_id} is not refreshed — ${e.message}`);
+    return { ok: false, reason: e.message, owner_lost: true };
+  }
   let edited;
   try {
     const base = integrationRunner.splitRemoteRef(factory.integration.targetRef).branch;
@@ -15183,6 +15195,20 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
   try {
     const destination = attestationPublicationConfig(cfg, origin || (!prepared ? attestationGraphOrigin(cfg) : null));
     if (!destination) return missing("publication origin is unknown or its effective credential changed; original evidence remains owed");
+    // The graph write is a durable act of this pipeline: checked against the
+    // lease immediately before it, so a driver displaced since its settle
+    // writes no attestation over the new holder's attempt (issue-spor-slice5-
+    // regate-attempt-mismatch-and-unguarded-attestation). A lost lease records
+    // nothing — not even the missing stamp, which is the new holder's to make.
+    try {
+      dispatchRuns.assertPipelineOwner(home || cfg.userConfigHome(), item.run_id, settleToken);
+    } catch (e) {
+      if (!dispatchRuns.isPipelineOwnerLost(e)) throw e;
+      log(`work: the attestation for ${item.node_id} is not written — ${e.message}`);
+      out.attestation_error = String(e.message).slice(0, 300);
+      out.owner_lost = true;
+      return out;
+    }
     const wrote = await writeGateNode(destination, built.id, built.markdown);
     if (wrote && wrote.ok) out.attestation = built.id;
     else log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(wrote && wrote.reason) || "no response"}) — the verdict still stands`);
@@ -15851,15 +15877,12 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // record: the ledger is no longer a record field.
   const owesEvidence = stageProjection.owesEvidence(home, record);
   const resume = !!openJournal || (owesEvidence && !gatesKernel.SETTLED_GATE_STATES.has(record.gate_state));
-  // Attempt 1 was the pipeline that refused; each re-gate counts up from
-  // there. A resume keeps the attempt it continues — and a pipeline no
-  // --regate ever re-opened (count 0: a work loop's own) ran with NO attempt,
-  // so it resumes as 0, never 1: the gate keys read the two alike, but the
-  // implementation stage's ledger segment and its run names do not.
-  // The attempt's identity is the LEASE's (stage-projection.js
-  // pipelineAttempt; the record's `gate_regate_count` only for a pre-lease run).
+  // The lease's attempt AS READ — the claim's compare-and-swap snapshot only
+  // (a claim that finds it moved is refused). The attempt this re-gate JUDGES
+  // under is never derived from it: it is read off the lease the claim below
+  // writes (stage-projection.js stageAttempt), the same reading a worker's
+  // resume scan adopts the journal by.
   const regateCount = stageProjection.pipelineAttempt(record, lease);
-  const attempt = resume ? (regateCount ? regateCount + 1 : 0) : regateCount + 2;
   // The item's OWN repo stamp, exactly as the loop's slot would carry it --
   // which means AS CLAIMED, not as it reads now. The record carries it since
   // task-spor-factory-no-code-outcome-convention; for a record predating that,
@@ -15882,6 +15905,14 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   const gateClaim = dispatchRuns.claimPipeline(home, record.run_id, { workerId, factory: factory.id || factoryId || null, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), owesEvidence: (fresh) => stageProjection.owesEvidence(home, fresh), reopen: { settleId: lease ? lease.token : record.gate_settle_id != null ? record.gate_settle_id : null, regateCount, state: record.gate_state || null, ...(resume ? { resume: true } : {}) } });
   if (!gateClaim.ok) { err(`spor work --regate: ${gateClaim.refused || gateClaim.reason}`); return 1; }
   if (report) report.claimed = true;
+  // ONE attempt source: the claim line just written (issue-spor-slice5-regate-
+  // attempt-mismatch-and-unguarded-attestation). Attempt 1 was the pipeline
+  // that refused; each re-gate counts up from there; a resume keeps the
+  // attempt it continues — and a pipeline no --regate ever re-opened (a work
+  // loop's own) ran with NO attempt, so it resumes as 0, never 1: the gate
+  // keys read the two alike, but the implementation stage's ledger segment
+  // and its run names do not.
+  const attempt = stageProjection.stageAttempt(gateClaim.record || record, gateClaim.lease);
   // The lease is renewed while this process judges, so a work loop on the box
   // never reads a long re-gate (a human gate's approval wait) as an orphan.
   renewal = setInterval(() => { try { dispatchRuns.renewPipeline(home, record.run_id, { workerId }); } catch { /* bounded by the TTL */ } }, Math.max(60000, Math.floor(stageProjection.PIPELINE_LEASE_TTL_MS / 3)));
