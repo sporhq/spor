@@ -86,7 +86,27 @@ const PIPELINE_ACTIVITY_PURE = new Set(["open", "yield", "settled"]);
 // wraps in the owner guard).
 // `dispatch(` is the injected launcher (dispatchThrough): an agent launched
 // into the run's checkout is a durable act of the pipeline too.
-const GRAPH_WRITE_HELPERS = /(?<![A-Za-z0-9_$.])(writeGateNode|addGateEdge|gateDemoteItem|proposePR|makeCompletionDeps|graphEdgeMutation|dispatch|dispatchThrough)\s*\(|\.landCandidate\s*\(/g;
+// Default-deny: every host function createGateDeps takes (HOST_FUNCTIONS) must
+// be classified here — a WRITER may be called only from a listed guarded dep, an
+// EXEMPT one writes nothing durable the lease must fence (it reads, builds a
+// value, or touches only run-local scratch or the lease's own lock). A new host
+// function fails the suite until it says which it is.
+const HOST_WRITERS = ["writeGateNode", "addGateEdge", "gateDemoteItem", "proposeIntegrationPR", "makeCompletionDeps", "dispatchThrough", "stampReviewerCooldown", "noteReviewerSuccess"];
+const HOST_EXEMPT = new Set([
+  "acquireIntegrationLease", "releaseIntegrationLease", // the lease's own lock, not pipeline state
+  "attestationGraphOrigin", "attestationOriginMatches", "attestationPublicationConfig", "awaitGateRun",
+  "buildGateWorkNode", "buildProposalBody", "buildProposalTrackingNode", "candidateResolverFromReport",
+  "dispatchAgentId", "dispatchResolutionReason", "fenceSafe", "freshRecord", "gateApprovalState", "gateChangeSet",
+  "gateDiffText", "gateFixText", "gateHistoryText", "gateIdSuffix", "gateLeaseBudgetMs", "gateNodeEquivalent",
+  "gateRescueDiagnosis", "gateRunReportText", "gateStem", "gateWorkItemText", "implBudgetStamp", "launchedFixRun",
+  "mainCheckoutOf", "nodeUnreadable", "proposalTrackingId", "readReviewerCooldown", "reportlessReviewReason",
+  "rescueDiagnosisPath", "rescueHarnessAdapter", "rescuePassthrough", "resolveNode", "reviewPassthrough",
+  "reviewerIndependence", "verifyRunResolution", "withoutFlakeEdges", "workerContract", "worktreeDeclaredEnv",
+  // run-local scratch: throwaway trees, the suite's own process, the run's checkout hygiene
+  "excludeRescueDiagnosisDir", "git", "prepareGateTree", "refuseDirtyCandidate", "removeDispatchWorktree",
+  "runGateCommand", "stageThrowawayTree", "teardownThrowawayTree",
+]);
+const GRAPH_WRITE_HELPERS = new RegExp(`(?<![A-Za-z0-9_$.])(${[...HOST_WRITERS, "proposePR", "graphEdgeMutation", "dispatch"].join("|")})\\s*\\(|\\.landCandidate\\s*\\(`, "g");
 // Writers the item named explicitly — they must stay listed.
 const REQUIRED_GUARDED = { gate: ["recordFact", "escalate"], integration: ["recordFact", "parkForReview", "escalate"] };
 
@@ -440,6 +460,9 @@ function pipelineWriterViolations(sources) {
   const listed = require(path.join(ROOT, GD)).PIPELINE_DURABLE_WRITERS;
   for (const [family, names] of Object.entries(REQUIRED_GUARDED)) {
     for (const n of names) if (!listed[family].includes(n)) out.push(`${GD}: PIPELINE_DURABLE_WRITERS.${family} must list ${n}`);
+  }
+  for (const name of require(path.join(ROOT, GD)).HOST_FUNCTIONS) {
+    if (!HOST_WRITERS.includes(name) && !HOST_EXEMPT.has(name)) out.push(`${GD}: host function '${name}' is not classified in R10 (HOST_WRITERS or HOST_EXEMPT) — classify it before it can be called from a pipeline dep`);
   }
   const gateStart = gd.search(/^  function makeGateDeps\(/m);
   const intStart = gd.search(/^  function makeIntegrationDeps\(/m);

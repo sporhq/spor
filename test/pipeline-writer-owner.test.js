@@ -206,6 +206,36 @@ test("the gate deps' graph writers (recordFact, escalate, fileHumanItem, demote)
   assert.deepStrictEqual(callsB.map((c) => c.split(":")[0]), ["write", "write", "demote"]);
 });
 
+test("the reviewer cooldown writers (stampReviewerCooldown, noteReviewerSuccess): A's displaced driver writes nothing, B's land (issue-spor-reviewer-cooldown-stamp-unguarded)", async (t) => {
+  const home = scratchHome(t);
+  const { a, b } = takenOver(home);
+  const make = (gateOwner, calls) =>
+    gateDeps
+      .createGateDeps(
+        fakeHost({
+          gateStem: (id) => id,
+          gateIdSuffix: () => "abc123",
+          stampReviewerCooldown: (_home, stamp) => calls.push(`stamp:${stamp.profile}`),
+          noteReviewerSuccess: (_home, profile) => calls.push(`success:${profile}`),
+        })
+      )
+      .makeGateDeps(cfgFor(home), {
+        record: { cwd: "/tmp/the-run-checkout", run_id: RUN }, entry: { run_id: RUN, node_id: "task-x" },
+        factory: { id: "factory-test", trustedRef: "main", gates: [] },
+        slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home, gateOwner,
+      });
+  const callsA = [];
+  const depsA = make(a, callsA);
+  await assert.rejects(async () => depsA.stampReviewerCooldown({ profile: "p", until: Date.now() + 1000, at: Date.now() }), lost);
+  await assert.rejects(async () => depsA.noteReviewerSuccess({ profile: "p", at: Date.now() }), lost);
+  assert.deepStrictEqual(callsA, []);
+  const callsB = [];
+  const depsB = make(b, callsB);
+  await depsB.stampReviewerCooldown({ profile: "p", until: Date.now() + 1000, at: Date.now() });
+  await depsB.noteReviewerSuccess({ profile: "p", at: Date.now() });
+  assert.deepStrictEqual(callsB, ["stamp:p", "success:p"]);
+});
+
 // --- end to end: a takeover in the middle of a real gate ---------------------
 
 function git(dir, ...args) {
