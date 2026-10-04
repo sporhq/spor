@@ -1447,13 +1447,26 @@ function anySignal(signals) {
   if (live.length <= 1) return live[0];
   if (typeof AbortSignal.any === "function") return AbortSignal.any(live);
   const ctl = new AbortController();
+  const subs = [];
+  const dispose = () => {
+    for (const [sig, fn] of subs.splice(0)) sig.removeEventListener("abort", fn);
+  };
   for (const sig of live) {
     if (sig.aborted) {
       ctl.abort(sig.reason);
+      dispose();
       break;
     }
-    sig.addEventListener("abort", () => ctl.abort(sig.reason), { once: true });
+    const fn = () => {
+      ctl.abort(sig.reason);
+      dispose();
+    };
+    sig.addEventListener("abort", fn, { once: true });
+    subs.push([sig, fn]);
   }
+  // Without AbortSignal.any nothing else detaches from a long-lived caller
+  // signal when the call finishes first, so callers invoke this when done.
+  ctl.signal.dispose = dispose;
   return ctl.signal;
 }
 
@@ -1493,13 +1506,14 @@ async function curl(
     const canRetry = attempt < retry && !(signal && signal.aborted);
     let res;
     let text;
+    const sig = anySignal([AbortSignal.timeout(timeoutMs), signal]);
     try {
       res = await fetch(url, {
         method,
         headers,
         body,
         redirect: "manual",
-        signal: anySignal([AbortSignal.timeout(timeoutMs), signal]),
+        signal: sig,
       });
       text = await res.text().catch(() => "");
     } catch {
@@ -1508,6 +1522,8 @@ async function curl(
         if (!(signal && signal.aborted)) continue;
       }
       return { http: "000", body: "" };
+    } finally {
+      if (sig && sig.dispose) sig.dispose();
     }
     const kind = classifyHttpFailure(res.status);
     const transient = kind === "rate-limit" || res.status >= 500;
@@ -1607,7 +1623,11 @@ async function refreshBearer(sent) {
 }
 async function curlWithRefresh(url, opts = {}) {
   const headers = opts.headers || {};
-  const sentBearer = bearer().Authorization;
+  // The refresh decision keys on the Authorization actually SENT. A caller that
+  // supplies its own can't have it swapped on retry, so it is sent as-is and
+  // never refreshed.
+  const callerAuth = Object.keys(headers).some((k) => k.toLowerCase() === "authorization");
+  const sentBearer = callerAuth ? null : bearer().Authorization;
   // ONE overall deadline covers request + refresh + retry: `timeoutMs` is the
   // caller's budget for the whole call, not per attempt, so a 401 can't stretch
   // it to request + grant + retry (issue-spor-curl-with-refresh-overall-deadline).
@@ -1616,19 +1636,23 @@ async function curlWithRefresh(url, opts = {}) {
   const startedAt = Date.now();
   const totalMs = opts.timeoutMs === undefined ? 6000 : opts.timeoutMs;
   const signal = anySignal([AbortSignal.timeout(totalMs), opts.signal]);
-  const r = await curl(url, { ...opts, signal, headers: { ...bearer(), ...headers } });
-  if (classifyHttpFailure(r.http) !== "auth") return r;
-  // The deadline bounds the refresh too: the token grant has its own 8s timeout
-  // and must not stretch the call past it, after which the retry would only
-  // fail on the aborted signal anyway. The refresh itself is left running, so
-  // the store still gets the fresh token if it lands.
-  if (signal.aborted) return r;
-  // A sibling call in this run may already have refreshed: retry with that
-  // token rather than refreshing again.
-  const fresh =
-    bearer().Authorization !== sentBearer ? true : await untilAborted(refreshBearer(sentBearer.replace(/^Bearer /, "")), signal);
-  if (!fresh || signal.aborted) return r;
-  return curl(url, { ...opts, signal, timeoutMs: Math.max(1, totalMs - (Date.now() - startedAt)), headers: { ...bearer(), ...headers } });
+  try {
+    const r = await curl(url, { ...opts, signal, headers: { ...bearer(), ...headers } });
+    if (callerAuth || classifyHttpFailure(r.http) !== "auth") return r;
+    // The deadline bounds the refresh too: the token grant has its own 8s timeout
+    // and must not stretch the call past it, after which the retry would only
+    // fail on the aborted signal anyway. The refresh itself is left running, so
+    // the store still gets the fresh token if it lands.
+    if (signal.aborted) return r;
+    // A sibling call in this run may already have refreshed: retry with that
+    // token rather than refreshing again.
+    const fresh =
+      bearer().Authorization !== sentBearer ? true : await untilAborted(refreshBearer(sentBearer.replace(/^Bearer /, "")), signal);
+    if (!fresh || signal.aborted) return r;
+    return await curl(url, { ...opts, signal, timeoutMs: Math.max(1, totalMs - (Date.now() - startedAt)), headers: { ...bearer(), ...headers } });
+  } finally {
+    if (signal && signal.dispose) signal.dispose();
+  }
 }
 
 function serverBase() {

@@ -383,3 +383,20 @@ test("link-commits and agents-md: an expired store token is refreshed and the ca
     srv.close();
   }
 });
+
+test("curlWithRefresh: a caller-supplied Authorization is sent as-is and never refreshed", async () => {
+  const { srv, hits, base } = await listen((req, { send }) => (req.url === "/oauth/token" ? send(200, { access_token: "FRESH", refresh_token: "RT2", expires_in: 3600 }) : send(401, {})));
+  try {
+    const home = tmp();
+    const key = `${base}/acme`;
+    auth.writeStore(home, { tenants: { [key]: { server: base, org: "acme", access_token: "STALE", refresh_token: "RT" } }, default: key });
+    u.setConfig(loadAt(home));
+    const r = await u.curlWithRefresh(`${base}/v1/thing`, { headers: { Authorization: "Bearer THEIRS" } });
+    assert.strictEqual(r.http, "401");
+    assert.strictEqual(hits.filter((h) => h.url === "/v1/thing").length, 1, "no retry");
+    assert.ok(!hits.some((h) => h.url === "/oauth/token"), "no refresh grant");
+  } finally {
+    u.clearConfig();
+    srv.close();
+  }
+});

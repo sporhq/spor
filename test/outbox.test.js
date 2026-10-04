@@ -565,3 +565,32 @@ test('a flat env token equal to the stored one refreshes like the store tenant',
     srv.close();
   }
 });
+
+test('anySignal: the AbortSignal.any fallback detaches its listeners on dispose and on abort', () => {
+  const realAny = AbortSignal.any;
+  AbortSignal.any = undefined;
+  try {
+    const counts = () => {
+      const long = new AbortController();
+      let adds = 0;
+      let removes = 0;
+      const add = long.signal.addEventListener.bind(long.signal);
+      const rem = long.signal.removeEventListener.bind(long.signal);
+      long.signal.addEventListener = (...a) => (adds++, add(...a));
+      long.signal.removeEventListener = (...a) => (removes++, rem(...a));
+      return { long, get live() { return adds - removes; } };
+    };
+    const c = counts();
+    const s = u.anySignal([AbortSignal.timeout(60000), c.long.signal]);
+    assert.strictEqual(c.live, 1);
+    s.dispose();
+    assert.strictEqual(c.live, 0);
+    const d = counts();
+    const s2 = u.anySignal([new AbortController().signal, d.long.signal]);
+    d.long.abort();
+    assert.strictEqual(s2.aborted, true);
+    assert.strictEqual(d.live, 0);
+  } finally {
+    AbortSignal.any = realAny;
+  }
+});
