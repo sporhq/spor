@@ -13,6 +13,7 @@ const { test } = require("node:test");
 const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const { hermeticEnv } = require("./helpers/env.js");
 const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
@@ -163,11 +164,7 @@ test("renderReport: summary line, finding blocks, reminders, advisory footer", (
 // ---------- CLI arm ----------
 
 function baseEnv(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
+  const env = hermeticEnv(extra);
   env.SPOR_DISTILLING = "1";
   return Object.assign(env, extra);
 }

@@ -185,11 +185,7 @@ function fixture(briefsMap, nodeFiles = {}) {
 }
 
 function runSessionStart(home, cwd) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
+  const env = hermeticEnv();
   env.SPOR_HOME = home;
   const r = spawnSync(process.execPath, [HOOK, "session-start", "--host", "claude-code"], {
     input: JSON.stringify({ cwd, hook_event_name: "SessionStart" }),

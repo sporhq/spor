@@ -26,6 +26,7 @@ require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
+const { hermeticEnv } = require("./helpers/env.js");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -40,11 +41,7 @@ const graphLib = require("../lib/graph.js");
 // Bare env with no SPOR_*/SUBSTRATE_* leakage — a configured dev box must never
 // flip these writes to remote or point them at the live graph home.
 function bare(home) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
+  const env = hermeticEnv();
   env.SPOR_HOME = home;
   env.XDG_CONFIG_HOME = home;
   return env;

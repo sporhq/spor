@@ -11,6 +11,7 @@ require("./helpers/tmp-cleanup");
 const test = require("node:test");
 const assert = require("node:assert");
 const { spawn, spawnSync } = require("node:child_process");
+const { hermeticEnv } = require("./helpers/env.js");
 const http = require("node:http");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -25,11 +26,7 @@ const { waitFor, awaitJson } = require("./helpers/launch.js");
 const SESSION = "3d168405-2df8-43be-bf82-1b0802e376ce";
 
 function cleanEnv(extra = {}) {
-  const env = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith("SPOR_") || key.startsWith("SUBSTRATE_") || key === "XDG_CONFIG_HOME") continue;
-    env[key] = value;
-  }
+  const env = hermeticEnv(extra);
   return { ...env, ...extra };
 }
 

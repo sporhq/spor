@@ -22,6 +22,7 @@ require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
+const { hermeticEnv } = require("./helpers/env.js");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
@@ -32,11 +33,7 @@ const { pathWithOnlyGitAndNode } = require("./helpers/portable");
 const { scale } = require("./helpers/launch.js");
 
 function cleanEnv(extra = {}) {
-  const env = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith("SPOR_") || key.startsWith("SUBSTRATE_") || key === "XDG_CONFIG_HOME") continue;
-    env[key] = value;
-  }
+  const env = hermeticEnv(extra);
   return { ...env, ...extra };
 }
 

@@ -7,6 +7,7 @@ const test = require('node:test');
 const { gitEnv, scrubbedEnv } = require("./helpers/git.js");
 const assert = require('node:assert');
 const { spawnSync } = require('node:child_process');
+const { hermeticEnv } = require("./helpers/env.js");
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -22,11 +23,7 @@ const LIB = path.join(__dirname, '..', 'lib');
 // pass it via `extra`, which wins (applied last).
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cli-iso-'));
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith('SPOR_') || k.startsWith('SUBSTRATE_') || k === 'XDG_CONFIG_HOME') continue;
-    env[k] = v;
-  }
+  const env = hermeticEnv(extra);
   env.SPOR_HOME = ISO_HOME; // user config: ISO_HOME/config.json (absent) -> local mode
   env.XDG_CONFIG_HOME = ISO_HOME; // global config: ISO_HOME/spor/config.json (absent)
   return Object.assign(env, extra);

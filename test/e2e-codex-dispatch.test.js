@@ -9,6 +9,7 @@ const test = require("node:test");
 const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert");
 const { spawnSync } = require("node:child_process");
+const { hermeticEnv } = require("./helpers/env.js");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -87,11 +88,7 @@ Live test profile.
     dispatch: { capabilities: { declared: { harnesses: ["codex"] } } },
   }, null, 2) + "\n");
 
-  const env = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith("SPOR_") || key.startsWith("SUBSTRATE_") || key === "XDG_CONFIG_HOME") continue;
-    env[key] = value;
-  }
+  const env = hermeticEnv();
   Object.assign(env, {
     SPOR_HOME: home,
     XDG_CONFIG_HOME: home,

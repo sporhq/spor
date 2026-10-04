@@ -13,6 +13,7 @@ require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mk
 const test = require("node:test");
 const assert = require("node:assert");
 const { spawn, spawnSync } = require("node:child_process");
+const { hermeticEnv } = require("./helpers/env.js");
 const http = require("node:http");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -26,11 +27,7 @@ const kernel = require("../lib/kernel/graph.js");
 // --- env helpers (mirror dispatch.test.js) --------------------------------
 const ISO = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-iso-"));
 function localEnv(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
+  const env = hermeticEnv(extra);
   env.SPOR_HOME = ISO;
   env.XDG_CONFIG_HOME = ISO;
   env.SPOR_DISTILLING = "1";

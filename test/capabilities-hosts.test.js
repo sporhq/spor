@@ -12,6 +12,7 @@ require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
+const { hermeticEnv } = require("./helpers/env.js");
 const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
@@ -22,11 +23,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 // Strip ambient SPOR_*/SUBSTRATE_* so a configured dev box can't flip a test to
 // remote or leak a token (mirrors capabilities-publish.test.js / dispatch.test.js).
 function baseEnv(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
+  const env = hermeticEnv(extra);
   env.SPOR_DISTILLING = "1";
   return Object.assign(env, extra);
 }

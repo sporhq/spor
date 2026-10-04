@@ -14,6 +14,7 @@ const { gitEnv } = require("./helpers/git.js");
 const assert = require('node:assert/strict');
 const { spawnSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
+const { hermeticEnv } = require("./helpers/env.js");
 const os = require('node:os');
 const path = require('node:path');
 const { runHook, spawnHook } = require('./helpers/portable');
@@ -512,11 +513,7 @@ test('repoFingerprints: not a git repo -> empty (fail-open)', () => {
 // ---------- session-start engine (black-box via the dispatcher) ----------
 
 function freshEnv(home) {
-  const env = { ...process.env, SPOR_HOME: home };
-  for (const k of Object.keys(env)) {
-    if (k.startsWith('SUBSTRATE_')) delete env[k];
-    if (k.startsWith('SPOR_') && k !== 'SPOR_HOME') delete env[k];
-  }
+  const env = hermeticEnv({ SPOR_HOME: home });
   // Opt these scratch repos in (task-spor-plugin-opt-in-default): the identity
   // tests assert slug/repo-node behavior, which only runs when the hook is active.
   env.SPOR_ENABLED = '1';

@@ -17,6 +17,7 @@ const test = require("node:test");
 const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert");
 const { spawnSync } = require("node:child_process");
+const { hermeticEnv } = require("./helpers/env.js");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -869,11 +870,7 @@ test("status store: a mangled record is skipped, not fatal, and a missing dir re
 const HARNESS = "workfake";
 
 function cleanEnv(extra = {}) {
-  const env = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith("SPOR_") || key.startsWith("SUBSTRATE_") || key === "XDG_CONFIG_HOME") continue;
-    env[key] = value;
-  }
+  const env = hermeticEnv(extra);
   return { ...env, ...extra };
 }
 

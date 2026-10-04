@@ -268,7 +268,7 @@ async function echoBearerOrg() {
   return null;
 }
 
-async function sessionStart(input) {
+async function sessionStartBase(input) {
   const graph = u.graphHome();
   const nodes = path.join(graph, "nodes");
   const cwd = input.cwd ?? "";
@@ -802,6 +802,33 @@ ${pbody}`;
   }
 
   return envelope(ctx);
+}
+
+// Write-nothing nudge: an enabled repo whose slug has no `dispatch.repos` entry
+// can't be a `spor dispatch` target on this machine, and session-start no longer
+// learns the mapping itself (dec-spor-client-config-typed-key-table). Reads
+// config only; the hint rides the existing envelope.
+function registrationHint(input) {
+  try {
+    const cwd = input.cwd ?? "";
+    const slug = u.projectSlug(cwd);
+    if (!slug || !u.config()) return "";
+    const repos = u.cfgObj("dispatch.repos", {});
+    if (repos && typeof repos === "object" && slug in repos) return "";
+    return `This repo ('${slug}') is not registered for dispatch on this machine — run 'spor repos add ${slug} <path>' (or 'spor enable') if you want 'spor dispatch' to target it.`;
+  } catch {
+    return "";
+  }
+}
+
+async function sessionStart(input) {
+  const env = await sessionStartBase(input);
+  if (!env) return env;
+  const hint = registrationHint(input);
+  if (!hint) return env;
+  const h = env.hookSpecificOutput;
+  h.additionalContext = `${h.additionalContext}\n${hint}`;
+  return env;
 }
 
 module.exports = { sessionStart };

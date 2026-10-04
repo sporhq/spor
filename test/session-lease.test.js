@@ -14,6 +14,7 @@ const assert = require('node:assert');
 const { spawnSync } = require('node:child_process');
 const http = require('node:http');
 const fs = require('node:fs');
+const { hermeticEnv } = require("./helpers/env.js");
 const os = require('node:os');
 const path = require('node:path');
 const { spawnHook, runHook } = require('./helpers/portable');
@@ -21,11 +22,7 @@ const { spawnHook, runHook } = require('./helpers/portable');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function freshEnv(home, extra = {}) {
-  const env = { ...process.env, SPOR_HOME: home };
-  for (const k of Object.keys(env)) {
-    if (k.startsWith('SUBSTRATE_')) delete env[k];
-    if (k.startsWith('SPOR_') && k !== 'SPOR_HOME') delete env[k];
-  }
+  const env = hermeticEnv({ SPOR_HOME: home, ...extra });
   // Opt the scratch repo in (task-spor-plugin-opt-in-default); disable the LLM
   // distill call entirely so only the lease branch's requests hit the stub.
   env.SPOR_ENABLED = '1';

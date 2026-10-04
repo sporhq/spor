@@ -83,11 +83,18 @@ function tenantRefused(cfg) {
   const te = cfg.tenantError();
   if (!te) return false;
   try {
-    // Throttled to one line an hour: a refused repo refuses EVERY hook call
-    // (each tool call fires post-tool), and one line says it all.
+    // Throttled to one line an hour PER refusal (kind/org/origin/server): a
+    // refused repo refuses EVERY hook call (each tool call fires post-tool),
+    // and one line says it all — but one stamp per home would let a second,
+    // different refusal hide behind the first.
     const journal = path.join(u.graphHome(), "journal");
     u.ensureDir(journal);
-    const stamp = path.join(journal, "tenant-refused.stamp");
+    const key = require("crypto")
+      .createHash("sha256")
+      .update([te.kind, te.org, te.origin, te.server].map((x) => String(x ?? "")).join("\n"))
+      .digest("hex")
+      .slice(0, 12);
+    const stamp = path.join(journal, `tenant-refused-${key}.stamp`);
     let last = 0;
     try {
       last = fs.statSync(stamp).mtimeMs;

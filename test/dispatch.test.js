@@ -19,6 +19,7 @@ const test = require("node:test");
 const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert");
 const { spawnSync, spawn } = require("node:child_process");
+const { hermeticEnv } = require("./helpers/env.js");
 const http = require("node:http");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -38,11 +39,7 @@ const cli = require(CLI);
 // `extra` is applied last, so SPOR_HOME / SPOR_CLAUDE_CMD passed by a test win.
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-iso-"));
 function bare(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
+  const env = hermeticEnv(extra);
   env.SPOR_HOME = ISO_HOME;
   env.XDG_CONFIG_HOME = ISO_HOME;
   // The launcher tests here run against the SUPERVISED launch (`claude -p
@@ -506,45 +503,12 @@ function readRepos(home) {
   }
 }
 
-test("registerRepo verify: fills an unmapped slug (first contact)", () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-rr-"));
-  const { base, dir } = gitRepoNamed("spor-server");
-  assert.strictEqual(u.registerRepo(home, "spor-server", dir, { verify: true }), true);
-  assert.strictEqual(readRepos(home)["spor-server"], dir);
-  fs.rmSync(base, { recursive: true, force: true });
-});
-
-test("registerRepo verify: does NOT clobber a correct mapping with a foreign checkout", () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-rr-"));
-  const right = gitRepoNamed("spor-server");
-  const wrong = gitRepoNamed("spor-client"); // a foreign repo (projectSlug != spor-server)
-  assert.strictEqual(u.registerRepo(home, "spor-server", right.dir), true); // explicit: establish correct
-  // The passive re-probe tries to point spor-server at the client checkout — refused.
-  assert.strictEqual(u.registerRepo(home, "spor-server", wrong.dir, { verify: true }), false);
-  assert.strictEqual(readRepos(home)["spor-server"], right.dir, "correct mapping preserved");
-  fs.rmSync(right.base, { recursive: true, force: true });
-  fs.rmSync(wrong.base, { recursive: true, force: true });
-});
-
-test("registerRepo verify: self-heals a corrupted mapping from the genuine repo", () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-rr-"));
-  const wrong = gitRepoNamed("spor-client");
-  const right = gitRepoNamed("spor-server");
-  // Map is already corrupt: spor-server -> the client checkout.
-  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { repos: { "spor-server": wrong.dir } } }) + "\n");
-  // A session opening in the genuine spor-server repo heals it (projectSlug(dir) === slug).
-  assert.strictEqual(u.registerRepo(home, "spor-server", right.dir, { verify: true }), true);
-  assert.strictEqual(readRepos(home)["spor-server"], right.dir, "healed to the genuine checkout");
-  fs.rmSync(right.base, { recursive: true, force: true });
-  fs.rmSync(wrong.base, { recursive: true, force: true });
-});
-
-test("registerRepo without verify: keeps last-writer-wins (explicit callers unchanged)", () => {
+test("registerRepo keeps last-writer-wins", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-rr-"));
   const right = gitRepoNamed("spor-server");
   const wrong = gitRepoNamed("spor-client");
   assert.strictEqual(u.registerRepo(home, "spor-server", right.dir), true);
-  // An EXPLICIT registration (no opts) still overwrites, even to a mismatched dir.
+  // An EXPLICIT registration still overwrites, even to a mismatched dir.
   assert.strictEqual(u.registerRepo(home, "spor-server", wrong.dir), true);
   assert.strictEqual(readRepos(home)["spor-server"], wrong.dir, "explicit clobber preserved");
   fs.rmSync(right.base, { recursive: true, force: true });
@@ -2550,11 +2514,7 @@ test("dispatch --template (real asset): agent-prompt-inplace.md renders with --n
 // Env that forces REMOTE mode (SPOR_SERVER + token), isolating the config homes
 // so the dev's real ~/.spor can't leak in. `extra` (e.g. SPOR_CLAUDE_CMD) wins.
 function remoteEnv(home, server, extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
-    env[k] = v;
-  }
+  const env = hermeticEnv({ SPOR_SERVER: server, ...extra });
   env.SPOR_HOME = home;
   env.XDG_CONFIG_HOME = home;
   env.SPOR_SERVER = server;

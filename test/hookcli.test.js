@@ -474,7 +474,7 @@ for (const via of ['SPOR_ORG', 'repo marker']) {
     assert.deepStrictEqual(fs.readdirSync(path.join(home, 'nodes')).sort(), nodesBefore, 'no node written to the local graph');
     assert.ok(!fs.existsSync(marker), 'neither the distiller nor the nudge classifier ran');
     assert.strictEqual(fs.readFileSync(credFile, 'utf8'), credBefore, "the person's store was not touched");
-    assert.deepStrictEqual(fs.readdirSync(path.join(home, 'journal')).sort(), ['remote.log', 'tenant-refused.stamp'], 'no session journal, cache or outbox write');
+    assert.deepStrictEqual(fs.readdirSync(path.join(home, 'journal')).map((f) => f.replace(/^(tenant-refused)-[0-9a-f]{12}\.stamp$/, '$1.stamp')).sort(), ['remote.log', 'tenant-refused.stamp'], 'no session journal, cache or outbox write');
     const log = fs.readFileSync(path.join(home, 'journal', 'remote.log'), 'utf8');
     assert.match(log, via === 'SPOR_ORG' ? /org 'acme' \(from SPOR_ORG\) in a dispatched agent run/ : /org 'acme' \(from .*\.spor\) in a dispatched agent run/);
     assert.match(log, /hook skipped; an agent run never selects the person's stored credential/);
