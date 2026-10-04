@@ -99,3 +99,15 @@ test('describeBackendFailure names how and why, keeping the label as the prefix'
   );
   assert.strictEqual(u.describeBackendFailure('x failed', { spawn_error: 'ENOENT' }), 'x failed (spawn ENOENT)');
 });
+
+test('writeFileAtomic is spool.js\'s writer: one temp-naming scheme, no pid-only .tmp left behind', () => {
+  const { writeFileAtomic } = require('../lib/shell/atomic-write.js');
+  const spool = require('../lib/shell/spool.js');
+  assert.strictEqual(writeFileAtomic, spool.writeSpoolFile);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-atomic-'));
+  const f = path.join(dir, 'sub', 'x.json');
+  writeFileAtomic(f, 'a', { mkdir: true });
+  writeFileAtomic(f, 'b');
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), 'b');
+  assert.deepStrictEqual(fs.readdirSync(path.dirname(f)), ['x.json']);
+});
