@@ -989,6 +989,54 @@ test("a human gate's wait: a refusal and a mismatched commit are delivered as fi
   assert.equal(world.slept, 0);
 });
 
+test("a crash between a `pending` signal and the next marker never blocks on the stale read: an approval given while no worker ran wins over a passed deadline and over a stop, because a stop or a timeout always follows a fresh read", async () => {
+  for (const variant of ["deadline", "stop"]) {
+    const home = scratchHome(`approval-gap-${variant}`);
+    const T0 = 1_700_000_000_000;
+    const clock = fakeClock(T0);
+    const world = humanWorld({ clock, home });
+    assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps })).state, "interrupted");
+    clock.advanceTo(T0 + APPROVAL_POLL);
+    assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps })).state, "interrupted");
+    // The crash: the worker died right after the `pending` signal was
+    // journaled, before round 1's marker — cut the journal back to it.
+    const file = store.workflowJournalPath(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    const cut = lines.findIndex((l) => { const e = JSON.parse(l); return e.kind === "signal" && e.payload && e.payload.state === "pending"; });
+    assert.ok(cut > 0, "the pending signal was journaled");
+    fs.writeFileSync(file, lines.slice(0, cut + 1).join("\n") + "\n");
+    assert.equal(markers(approvalJournal(home)).length, 1, "only round 0's marker survives the crash");
+    // While no worker ran, the person approved — and the deadline passed (or
+    // the next worker to pick it up is already stopping).
+    world.approval = { state: "approved", by: "person-a" };
+    clock.advanceTo(variant === "stop" ? T0 + 2 * APPROVAL_POLL : T0 + APPROVAL_TIMEOUT + 60000);
+    if (variant === "stop") world.stopping = true;
+    const polls = world.polls;
+    const res = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps });
+    assert.equal(res.state, "passed", `${variant}: ${JSON.stringify(res)}`);
+    assert.equal(world.polls, polls + 1, `${variant}: one fresh read decided it`);
+    assert.equal(world.filed, 1);
+    const j = approvalJournal(home);
+    assert.ok(j.some((e) => e.kind === "await" && /\/approval\/r0\/security\/c0\/p1\/final#1$/.test(e.key)), `${variant}: the round awaited a final read`);
+    assert.deepEqual(j.filter((e) => e.kind === "signal").map((e) => e.payload.state), ["pending", "approved"]);
+    // ...and still unanswered, the same gap blocks — after that fresh read.
+    const home2 = scratchHome(`approval-gap-${variant}-unanswered`);
+    const clock2 = fakeClock(T0);
+    const w2 = humanWorld({ clock: clock2, home: home2 });
+    await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: w2.deps });
+    clock2.advanceTo(T0 + APPROVAL_POLL);
+    await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: w2.deps });
+    clock2.advanceTo(variant === "stop" ? T0 + 2 * APPROVAL_POLL : T0 + APPROVAL_TIMEOUT + 60000);
+    if (variant === "stop") w2.stopping = true;
+    const before = w2.polls;
+    const blocked = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: w2.deps });
+    assert.equal(blocked.state, "blocked", `${variant}: ${JSON.stringify(blocked)}`);
+    assert.equal(w2.polls, before + 1, `${variant}: the block followed a fresh read`);
+    const sigs = approvalJournal(home2).filter((e) => e.kind === "signal").map((e) => e.payload.state);
+    assert.deepEqual(sigs, ["pending", variant === "stop" ? "stopped" : "timeout"]);
+  }
+});
+
 test("a journal opened WITHOUT the approval signal (an older one) keeps the in-activity poll it was recorded under", async () => {
   const clock = fakeClock(1_700_000_000_000);
   const world = humanWorld({ clock });
