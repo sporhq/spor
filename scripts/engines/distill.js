@@ -119,9 +119,9 @@ function parseFactBlocks(response) {
 const SESSION_END_ABSENT = new Set(["404", "405", "501"]);
 async function sessionEndDoor({ session, slug, journalPath, timeoutMs }) {
   const resp = await u
-    .curl(`${u.serverBase()}/v1/queue/session-end`, {
+    .curlWithRefresh(`${u.serverBase()}/v1/queue/session-end`, {
       method: "POST",
-      headers: { ...u.bearer(), "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ session }),
       timeoutMs,
     })
@@ -288,7 +288,7 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
   // several claims.
   const convert = async (id) => {
     const get = await u
-      .curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(id)}`, { headers: u.bearer(), timeoutMs })
+      .curlWithRefresh(`${u.serverBase()}/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs })
       .catch(() => null);
     if (!get || get.http !== "200") return; // can't verify -> leave the lease alone
     let parsed;
@@ -324,9 +324,9 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
     const action = finished ? "release" : "reserve";
     const body = action === "reserve" ? JSON.stringify({ session }) : "{}";
     const post = await u
-      .curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(id)}/${action}`, {
+      .curlWithRefresh(`${u.serverBase()}/v1/nodes/${encodeURIComponent(id)}/${action}`, {
         method: "POST",
-        headers: { ...u.bearer(), "content-type": "application/json" },
+        headers: { "content-type": "application/json" },
         body,
         timeoutMs,
       })
@@ -359,9 +359,9 @@ async function fetchRemoteTitleIndex(graph, rlog) {
     const c = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
     if (c && c.server === server && typeof c.etag === "string" && typeof c.index === "string") cached = c;
   } catch {}
-  const headers = { ...u.bearer() };
+  const headers = {};
   if (cached) headers["If-None-Match"] = cached.etag;
-  const resp = await u.curl(`${server}/v1/status?titles=1`, { headers, timeoutMs: 6000 });
+  const resp = await u.curlWithRefresh(`${server}/v1/status?titles=1`, { headers, timeoutMs: 6000 });
   const head = resp.headers?.["x-substrate-head"] || "";
   if (resp.http === "304" && cached) {
     rlog(`index cached (http=304, head=${head})`);
@@ -1162,9 +1162,9 @@ async function distill(input) {
   // Counts only; the transcript stays client-side. Best-effort.
   const reportSweep = async (f, c, sp, r) => {
     if (!remote) return;
-    await u.curl(`${u.serverBase()}/v1/distill/report`, {
+    await u.curlWithRefresh(`${u.serverBase()}/v1/distill/report`, {
       method: "POST",
-      headers: { ...u.bearer(), "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ project: slug, session, facts: f, captured: c, spooled: sp, rejected: r }),
       timeoutMs: 6000,
     }).catch(() => {});

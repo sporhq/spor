@@ -259,8 +259,7 @@ async function writeAgentsBlock({ cwd, briefing = true, noServerLine = false }) 
   let meta = "";
   if (briefing) {
     if (u.serverBase()) {
-      const resp = await u.curl(`${u.serverBase()}/v1/briefing/${slug}`, {
-        headers: u.bearer(),
+      const resp = await u.curlWithRefresh(`${u.serverBase()}/v1/briefing/${slug}`, {
         timeoutMs: 6000,
       });
       try {

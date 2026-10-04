@@ -64,9 +64,9 @@ async function linkCommits(repo) {
   let failed = false;
   for (const sha of shas) {
     for (const nid of trailerNodeIds(top, sha)) {
-      const { http } = await u.curl(`${u.serverBase()}/v1/nodes/${nid}/commits`, {
+      const { http } = await u.curlWithRefresh(`${u.serverBase()}/v1/nodes/${nid}/commits`, {
         method: "POST",
-        headers: { ...u.bearer(), "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repo: slug, sha }),
         timeoutMs: 4000,
       });

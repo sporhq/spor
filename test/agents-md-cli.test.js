@@ -179,7 +179,7 @@ test("agents-md --briefing: a loopback SPOR_SERVER is also omitted from the brie
 // "Standing project briefing (...)" heading's `meta` — so `--briefing
 // --no-server-line` against a PUBLIC server still baked `@ <host>` into the
 // committed heading, breaking flag parity with the tools line. In-process so
-// `u.curl` can be stubbed: a real public hostname isn't network-reachable in
+// `u.curlWithRefresh` can be stubbed: a real public hostname isn't network-reachable in
 // CI, and this is exactly what lets the test set SPOR_SERVER to a public-
 // looking host while the actual fetch never leaves the process.
 test("agents-md --briefing --no-server-line: suppresses the briefing heading host for a public server too", async () => {
@@ -196,8 +196,8 @@ test("agents-md --briefing --no-server-line: suppresses the briefing heading hos
   process.env.SPOR_HOME = home;
   process.env.SPOR_SERVER = "https://spor.example.com";
   u.clearConfig();
-  const realCurl = u.curl;
-  u.curl = async () => ({
+  const realCurl = u.curlWithRefresh;
+  u.curlWithRefresh = async () => ({
     http: "200",
     body: JSON.stringify({ found: true, body: "remote standing briefing body.", version: 4 }),
   });
@@ -216,7 +216,7 @@ test("agents-md --briefing --no-server-line: suppresses the briefing heading hos
     const md2 = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
     assert.match(md2, /spor\.example\.com/);
   } finally {
-    u.curl = realCurl;
+    u.curlWithRefresh = realCurl;
     u.clearConfig();
     delete process.env.SPOR_HOME;
     delete process.env.SPOR_SERVER;

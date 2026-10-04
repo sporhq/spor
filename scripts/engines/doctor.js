@@ -209,8 +209,7 @@ async function doctor() {
       try {
         let resident = null;
         if (u.serverBase()) {
-          const probe = await u.curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(cand.id)}`, {
-            headers: u.bearer(),
+          const probe = await u.curlWithRefresh(`${u.serverBase()}/v1/nodes/${encodeURIComponent(cand.id)}`, {
             timeoutMs: 3000,
           });
           if (probe.http === "200") resident = graphLib.parseFrontmatter(JSON.parse(probe.body).raw, `${cand.id}.md`);

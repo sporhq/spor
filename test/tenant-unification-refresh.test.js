@@ -325,3 +325,30 @@ test("curlWithRefresh: a caller's deadline bounds the refresh — no retry past 
     srv.close();
   }
 });
+
+// task-spor-refresh-coverage-distill-and-remaining-engines: the distill,
+// link-commits, agents-md and doctor-candidate calls refresh once too.
+test("link-commits and agents-md: an expired store token is refreshed and the call retried", async () => {
+  const { srv, hits, base } = await authServer((req) => (req.url.startsWith("/v1/briefing/") ? { found: true, body: "AGENTS-BRIEF", version: 1 } : { ok: true }));
+  try {
+    const s = hookScratch(base);
+    const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@e" };
+    const c = spawnSync("git", ["-C", s.cwd, "commit", "-q", "--allow-empty", "-m", "work\n\nSpor: task-some-node"], { encoding: "utf8", env: gitEnv });
+    assert.strictEqual(c.status, 0, c.stderr);
+    u.setConfig(loadAt(s.home));
+    try {
+      await require("../scripts/engines/link-commits").linkCommits(s.cwd);
+    } finally {
+      u.clearConfig();
+    }
+    assert.ok(retriedFresh(hits, /\/v1\/nodes\/task-some-node\/commits$/), JSON.stringify(hits));
+    hits.length = 0;
+    // a fresh run: the store now holds FRESH, so re-stale it for the agents-md call
+    const key = Object.keys(auth.readStore(s.home).tenants)[0];
+    auth.writeStore(s.home, { tenants: { [key]: { server: base, org: "acme", access_token: "STALE", refresh_token: "RT" } }, default: key });
+    await runHook(["agents-md", "--cwd", s.cwd], "", s.env);
+    assert.ok(retriedFresh(hits, /^\/v1\/briefing\//), JSON.stringify(hits));
+  } finally {
+    srv.close();
+  }
+});
