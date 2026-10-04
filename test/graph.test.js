@@ -2026,6 +2026,71 @@ b
   assert.equal(v.nodes["task-bad"], undefined);
 });
 
+test("validateGraph: a loader-skipped schema file does not register its type — unknown-type still warns", () => {
+  const fx = tmpGraph({
+    "schema-node-widget.md": `---
+id: schema-node-widget
+type: schema
+kind: node-schema
+schema_version: 2026.06.10.3
+title: Widget
+summary: s
+date: 2026-08-08
+status: active
+edges:
+  - this is not an edge entry
+---
+
+\`\`\`json
+{ "node_type": "widget", "prefix": ["widget-"] }
+\`\`\`
+`,
+    "widget-a.md": `---
+id: widget-a
+type: widget
+title: W
+summary: s
+date: 2026-08-08
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.ok(v.errors.some((e) => /schema-node-widget\.md/.test(e) && /SKIPPED by the loader/.test(e)));
+  assert.ok(v.warnings.some((w) => /widget-a\.md: unknown type 'widget'/.test(w)));
+});
+
+test("validateGraph: a loader-skipped repo file claims no slug and aliases nothing", () => {
+  const fx = tmpGraph({
+    "repo-bad.md": `---
+id: repo-bad
+type: repo
+title: R
+summary: s
+date: 2026-08-08
+slugs: [bad-slug]
+edges:
+  - type: relates-to
+---
+b
+`,
+    "norm-n.md": `---
+id: norm-n
+type: norm
+title: N
+summary: s
+date: 2026-08-08
+always_on: true
+applies_to_repos: [bad-slug]
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.ok(v.errors.some((e) => /repo-bad\.md/.test(e) && /SKIPPED by the loader/.test(e)));
+  assert.ok(v.warnings.some((w) => /norm-n\.md: applies_to_repos 'bad-slug' matches no repo or project/.test(w)));
+});
+
 test("validateGraph: block-form and flow-form edges may mix under one 'edges:' key, both recognized", () => {
   const fx = tmpGraph({
     "task-e.md": `---
