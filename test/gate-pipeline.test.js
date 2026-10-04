@@ -1585,6 +1585,62 @@ test("openPipelines re-offers a PARKED journal only when its own timer is due �
   assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf({ released: true }), projection: parkedOn({ due: 0 }) })], { now: () => reset + 3600000, maxAgeMs: 86400000 }).length, 0, "an ordinary yield still ages out as before");
 });
 
+// issue-spor-loop-scan-orphans-legacy-gating-slot. The resume scan's legacy
+// bridge — owedByDeadWorkers over the worker status files, into
+// openPipelineCandidates over a REAL (empty) home, into openPipelines — must
+// still adopt every shape the deleted resumableSlots/orphanedGateRuns join
+// adopted, for a record carrying no lease, no journal and no gate_factory.
+test("the legacy status-file bridge resumes every shape the deleted join did — a dead worker's gating slot even with NO gates tally", (t) => {
+  const stageProjection = require("../lib/shell/stage-projection.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-legacy-owed-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const now = () => ORPHAN_AT + 60000;
+  const rec = (run_id, extra = {}) => ({ ...ORPHAN_RECORD, run_id, node_id: `task-${run_id}`, ...extra });
+  const scan = (statuses, records, opts = {}) => {
+    const owedBy = workLoop.owedByDeadWorkers(statuses);
+    const candidates = stageProjection.openPipelineCandidates(home, records, { owedBy });
+    const ownerLive = (owner) => statuses.some((w) => w.live && w.worker_id === owner);
+    return workLoop.openPipelines(candidates, { now, ownerLive, liveSlots: workLoop.liveWorkerSlots(statuses), records, ...opts }).map((o) => o.run_id);
+  };
+  const dead = (extra) => ({ worker_id: "w-dead", live: false, gating: [], active: [], ...extra });
+
+  // THE BUG: a dead worker's gating slot, its status file carrying no tally.
+  assert.deepStrictEqual(scan([dead({ gating: [{ run_id: "r1", node_id: "task-r1" }] })], [rec("r1")]), ["r1"], "a gating slot is self-evidencing — no tally needed");
+  // ...under a factory-armed scan too, the dead worker having named none.
+  assert.deepStrictEqual(scan([dead({ gating: [{ run_id: "r1", node_id: "task-r1" }] })], [rec("r1")], { factory: "factory-a" }), ["r1"], "a dead worker with no factory id keeps the pre-existing behavior");
+  // A gate-armed dead worker (tally present): gating AND active slots.
+  const armed = dead({ gates: { passed: 0, failed: 0, blocked: 0 }, factory: "factory-a", gating: [{ run_id: "r2", node_id: "task-r2" }], active: [{ run_id: "r3", node_id: "task-r3" }] });
+  assert.deepStrictEqual(scan([armed], [rec("r2"), rec("r3")], { factory: "factory-a" }), ["r2", "r3"]);
+  // A factory renamed from the dead worker's: still adopted.
+  assert.deepStrictEqual(scan([armed], [rec("r2"), rec("r3")], { factory: "factory-b", factoryAliases: ["factory-a"] }), ["r2", "r3"]);
+  // A DIFFERENT factory: reported, never adopted.
+  const foreign = [];
+  assert.deepStrictEqual(scan([armed], [rec("r2")], { factory: "factory-z", onForeign: (o) => foreign.push(o.run_id) }), []);
+  assert.deepStrictEqual(foreign, ["r2"]);
+  // A BARE dead worker's active slot was never owed a gate.
+  assert.deepStrictEqual(scan([dead({ active: [{ run_id: "r4", node_id: "task-r4" }] })], [rec("r4")]), [], "a bare worker's runs are never adopted");
+  assert.deepStrictEqual([...workLoop.owedByDeadWorkers([dead({ active: [{ run_id: "r4", node_id: "task-r4" }] })]).keys()], []);
+  // Legacy transitional stamps: `running` under a dead gate_worker and
+  // `interrupted` are adopted; a settled verdict is not.
+  const g = (run_id) => dead({ gating: [{ run_id, node_id: `task-${run_id}` }] });
+  assert.deepStrictEqual(scan([g("r5")], [rec("r5", { gate_state: "running", gate_worker: "w-dead" })]), ["r5"]);
+  assert.deepStrictEqual(scan([g("r6")], [rec("r6", { gate_state: "interrupted" })]), ["r6"]);
+  assert.deepStrictEqual(scan([g("r7")], [rec("r7", { gate_state: "passed" })]), []);
+  // A legacy reviewer pause ages the run from its wake, not its end.
+  const wake = ORPHAN_AT + 44 * 3600000;
+  assert.deepStrictEqual(scan([g("r8")], [rec("r8", { gate_state: "interrupted", gate_paused_until: new Date(wake).toISOString() })], { now: () => wake + 3600000, maxAgeMs: 86400000 }), ["r8"]);
+  assert.deepStrictEqual(scan([g("r8")], [rec("r8", { gate_state: "interrupted" })], { now: () => wake + 3600000, maxAgeMs: 86400000 }), [], "without the pause it ages out as before");
+  // A LIVE worker's slot is its own while no lease says otherwise — the
+  // record's gate_factory alone makes it a candidate, and the slot defers it.
+  const live = { worker_id: "w-live", live: true, gating: [], active: [{ run_id: "r9", node_id: "task-r9" }] };
+  assert.deepStrictEqual(scan([live], [rec("r9", { gate_factory: "factory-a" })], { factory: "factory-a" }), []);
+  assert.deepStrictEqual(scan([], [rec("r9", { gate_factory: "factory-a" })], { factory: "factory-a" }), ["r9"], "the same record with no live slot naming it is adopted");
+  // A live worker naming the run wins over a dead one that also does.
+  assert.deepStrictEqual(scan([g("r10"), { ...live, active: [{ run_id: "r10", node_id: "task-r10" }] }], [rec("r10")]), []);
+  // A node an agent may still be working defers the orphan.
+  assert.deepStrictEqual(scan([g("r11")], [rec("r11"), { run_id: "fix-1", node_id: "task-r11", state: "running" }], { terminalStates: new Set(["done", "failed"]) }), []);
+});
+
 test("pendingEscalationRetries: picks out settled-but-unescalated runs due for another attempt, and only those", () => {
   const pending = { gateId: "acceptance", attempt: undefined, attempts: [], detail: "the suite failed", evidence: "", findings: [], ledger: [] };
   const base = { run_id: "run-orphan", node_id: "task-orphan", gate_state: "failed", gate_escalation_failed: true, gate_escalation_pending: pending };
