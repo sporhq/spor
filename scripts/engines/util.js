@@ -1622,7 +1622,13 @@ async function refreshBearer(sent) {
   }
 }
 async function curlWithRefresh(url, opts = {}) {
-  const headers = opts.headers || {};
+  // Headers instances and tuple arrays are flattened to a plain object first, so
+  // the Authorization scan and the bearer merge below see every header.
+  const rawHeaders = opts.headers || {};
+  const headers =
+    typeof Headers === "function" && (rawHeaders instanceof Headers || Array.isArray(rawHeaders))
+      ? Object.fromEntries(new Headers(rawHeaders).entries())
+      : rawHeaders;
   // The refresh decision keys on the Authorization actually SENT. A caller that
   // supplies its own can't have it swapped on retry, so it is sent as-is and
   // never refreshed.

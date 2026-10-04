@@ -401,3 +401,25 @@ test("curlWithRefresh: a caller-supplied Authorization is sent as-is and never r
     srv.close();
   }
 });
+
+for (const [shape, mk] of [
+  ["a Headers instance", () => new Headers({ Authorization: "Bearer THEIRS" })],
+  ["tuple-array headers", () => [["Authorization", "Bearer THEIRS"]]],
+]) {
+  test(`curlWithRefresh: a caller Authorization in ${shape} is sent as-is and never refreshed`, async () => {
+    const { srv, hits, base } = await listen((req, { send }) => (req.url === "/oauth/token" ? send(200, { access_token: "FRESH", refresh_token: "RT2", expires_in: 3600 }) : send(401, {})));
+    try {
+      const home = tmp();
+      const key = `${base}/acme`;
+      auth.writeStore(home, { tenants: { [key]: { server: base, org: "acme", access_token: "STALE", refresh_token: "RT" } }, default: key });
+      u.setConfig(loadAt(home));
+      const r = await u.curlWithRefresh(`${base}/v1/thing`, { headers: mk() });
+      assert.strictEqual(r.http, "401");
+      assert.deepStrictEqual(hits.filter((h) => h.url === "/v1/thing").map((h) => h.bearer), ["THEIRS"], "only the caller's bearer is sent");
+      assert.ok(!hits.some((h) => h.url === "/oauth/token"), "no refresh grant");
+    } finally {
+      u.clearConfig();
+      srv.close();
+    }
+  });
+}
