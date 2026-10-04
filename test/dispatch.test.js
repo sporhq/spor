@@ -973,6 +973,31 @@ test("dispatch --worktree (stubbed): creates the worktree + branch and launches 
   assert.strictEqual(g(["rev-parse", "--verify", "--quiet", "refs/heads/dec-x"]).trim().length, 40, "branch dec-x created");
 });
 
+test("dispatch --worktree: warns when the shared root's HEAD is behind main (task-spor-dispatch-worktree-branch-stale-head)", () => {
+  const { home } = fixture();
+  const { repo, g } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  g(["checkout", "-q", "-B", "main"]);
+  const base = g(["rev-parse", "HEAD"]).trim();
+  fs.writeFileSync(path.join(repo, "f.txt"), "y");
+  g(["commit", "-q", "-am", "ahead"]);
+  g(["checkout", "-q", "--detach", base]); // root lags main
+  const stub = pwdStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief", "--worktree"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: path.join(home, "spawn.out") });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /HEAD is 1 commit\(s\) behind main/);
+});
+
+test("dispatch --worktree: no stale warning when HEAD is main", () => {
+  const { home } = fixture();
+  const { repo, g } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  g(["checkout", "-q", "-B", "main"]);
+  const r = run(["dispatch", "dec-x", "--no-brief", "--worktree"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: pwdStub(home), OUTFILE: path.join(home, "spawn.out") });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /behind main/);
+});
+
 test("dispatch worktree setup hook: runs with cwd=worktree + dispatch context env, before launch", () => {
   const { home } = fixture();
   const { repo } = gitTargetRepo();

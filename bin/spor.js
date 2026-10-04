@@ -9523,6 +9523,31 @@ function dispatchWorktreeDir(repoDir, name) {
   return path.join(repoDir, ".claude", "worktrees", worktreeName(name));
 }
 
+// A fresh dispatch branch is cut from the shared root's HEAD, which can sit
+// behind the integration branch (task-spor-dispatch-worktree-branch-stale-head):
+// the agent would then work on stale code. We keep HEAD as the base (the root's
+// checked-out branch is the operator's choice) but name the lag. Returns the
+// warning text, or null when HEAD is current, detached from main's lineage, or
+// no local main/master exists.
+function staleRootWarning(repoDir) {
+  const head = git(repoDir, ["rev-parse", "--verify", "--quiet", "HEAD"]);
+  if (head.status !== 0) return null;
+  for (const target of ["main", "master"]) {
+    const ref = `refs/heads/${target}`;
+    const t = git(repoDir, ["rev-parse", "--verify", "--quiet", ref]);
+    if (t.status !== 0) continue;
+    if (t.stdout.trim() === head.stdout.trim()) return null;
+    if (git(repoDir, ["merge-base", "--is-ancestor", "HEAD", ref]).status !== 0) return null;
+    const n = git(repoDir, ["rev-list", "--count", `HEAD..${ref}`]).stdout.trim();
+    return (
+      `warning: the shared checkout's HEAD is ${n} commit(s) behind ${target}; the dispatch ` +
+      `worktree is cut from that HEAD, so the agent starts on stale code — ` +
+      `fast-forward the shared checkout, or \`git -C <worktree> merge --ff-only ${target}\` in the new worktree`
+    );
+  }
+  return null;
+}
+
 // Create (or reuse) the dispatch worktree and run the optional setup hook.
 // Branches off LOCAL HEAD, never origin (local main is routinely ahead of
 // origin/main — worktree-base-ref-stale-origin). The setup hook runs with
@@ -9548,6 +9573,10 @@ function createDispatchWorktree(repoDir, name, { slug, nodeId } = {}) {
     const r = git(repoDir, addArgs);
     if (r.status !== 0) {
       return { error: (r.stderr || r.stdout || "git worktree add failed").trim() };
+    }
+    if (!branchExists) {
+      const stale = staleRootWarning(repoDir);
+      if (stale) err(stale);
     }
   }
   // Resolve dispatch.worktreeSetup from the WORKTREE'S OWN checkout, never the
