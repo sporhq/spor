@@ -41,7 +41,10 @@ function render(content, blocks, file) {
   const out = [];
   for (let i = 0; i < lines.length; i++) {
     const m = BEGIN.exec(lines[i]);
-    if (!m) { out.push(lines[i]); continue; }
+    if (!m) {
+      if (/<!-- box-safety:begin/.test(lines[i])) throw new Error(`${file}:${i + 1}: malformed box-safety:begin marker (must stand alone on its line, no list prefix)`);
+      out.push(lines[i]); continue;
+    }
     const [, lead, name, rest] = m;
     const a = attrs(rest);
     if (!(name in blocks)) throw new Error(`${file}: unknown box-safety block "${name}"`);
