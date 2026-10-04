@@ -2326,6 +2326,15 @@ paths, and **blocks the resolve** while polling it:
   reports **blocked**, the approval item stands, and the worker moves on rather
   than deciding on the person's behalf.
 
+The wait is durable (task-spor-gate-human-approval-await-signal): filing the
+item is the gate attempt's activity, and the wait is a workflow signal
+(`approval:<id>`) awaited under a deadline read from the journaled clock, which
+the driver delivers by polling the item every `poll_ms`. A worker that dies
+mid-wait resumes the SAME wait under the SAME deadline — the item is not
+re-filed and the clock does not restart — and the deadline's passing is a
+journaled timeout, so a replay settles **blocked** the same way. The worker
+still holds its slot while it polls.
+
 ### 10.6 Every gate outcome is a graph fact
 
 Each gate — passed, skipped, failed, fail-closed or blocking — writes one

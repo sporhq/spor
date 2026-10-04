@@ -795,6 +795,181 @@ test("the activities table and the binding name the same set", () => {
   assert.deepEqual(bound, documented);
   assert.ok(wf.GATE_ACTIVITIES.some(([n]) => n === "signal run:<id>"));
   assert.ok(wf.GATE_ACTIVITIES.some(([n]) => n === "signal rescue-run:<id>"));
+  assert.ok(wf.GATE_ACTIVITIES.some(([n]) => n === "signal approval:<id>"));
   assert.ok(wf.GATE_ACTIVITIES.some(([n]) => n === "timer yield"));
   assert.ok(wf.GATE_ACTIVITIES.some(([n]) => n === "timer wait"));
+});
+
+// THE HUMAN GATE'S WAIT is a signal with a deadline, not a day-long sleep
+// inside the `judge` activity (task-spor-gate-human-approval-await-signal):
+// `judge` files the approval item and reads its answer once, the workflow
+// awaits `approval:<id>` under a deadline from the JOURNALED clock, and the
+// driver polls the item and delivers the answer.
+const APPROVAL_TIMEOUT = 600000;
+const APPROVAL_POLL = 60000;
+const HUMAN = factoryOf({ ...BASE, gates: [{ id: "security", kind: "human", risk: ["touches:auth"], approval_timeout_ms: APPROVAL_TIMEOUT, poll_ms: APPROVAL_POLL }] });
+function humanWorld({ clock, home = null, stage = "gates-a0" } = {}) {
+  const world = makeWorld({ clock, home, stage, script: { factory: HUMAN } });
+  world.filed = 0;
+  world.polls = 0;
+  world.approval = { state: "pending" };
+  world.deps.changedPaths = async () => ({ ok: true, paths: ["lib/auth.js"], head: "a".repeat(40), base: "base0000", trustedRef: "main", trustedSha: "trust000", branch: "task-demo", cwd: "/repo/wt" });
+  world.deps.fileHumanItem = async () => {
+    world.filed += 1;
+    return { ok: true, id: "task-approve-x" };
+  };
+  world.deps.checkApproval = async ({ id, head }) => {
+    world.polls += 1;
+    assert.equal(id, "task-approve-x");
+    assert.equal(head, "a".repeat(40), "the poll asks about the judged head");
+    return world.approval;
+  };
+  return world;
+}
+const approvalKeys = (journal) => journal.filter((j) => typeof j.key === "string" && /\/approval\//.test(j.key));
+
+test("a human gate's wait is a SIGNAL with a journaled deadline: judge files and returns, the driver's poll delivers the answer, and an approval passes", async () => {
+  const home = scratchHome("approval");
+  const T0 = 1_700_000_000_000;
+  const clock = fakeClock(T0);
+  const world = humanWorld({ clock, home });
+  // Approved on the third read (judge's own read, then two driver polls).
+  world.deps.checkApproval = async () => {
+    world.polls += 1;
+    return world.polls >= 3 ? { state: "approved", by: "person-a" } : { state: "pending" };
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps });
+  assert.equal(res.state, "passed", JSON.stringify(res));
+  assert.equal(world.filed, 1);
+  assert.equal(world.polls, 3);
+  assert.equal(world.slept, 2, "one poll interval slept before each driver poll");
+  assert.equal(clock.now() - T0, 2 * APPROVAL_POLL);
+  const j = store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  const judge = j.find((e) => e.kind === "effect" && /\/judge#1$/.test(e.key));
+  assert.equal(judge.result.outcome.verdict, "awaiting-approval", "the activity returned at the filing, it did not wait");
+  const at = j.find((e) => e.kind === "now" && /\/approval\/r0\/security\/c0\/now#1$/.test(e.key));
+  assert.equal(at.at, T0, "the wait's start is a journaled clock read");
+  const sig = j.find((e) => e.kind === "signal");
+  assert.equal(sig.key, "signal:approval:task-approve-x");
+  assert.deepEqual(sig.payload, { state: "approved", by: "person-a", head: null });
+  const awaited = j.find((e) => e.kind === "await");
+  assert.equal(awaited.outcome.received, true);
+
+  // A settled journal replays with nothing filed or polled.
+  const again = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps });
+  assert.deepEqual(again, res);
+  assert.equal(world.filed, 1);
+  assert.equal(world.polls, 3);
+});
+
+test("a worker that dies MID-WAIT resumes the same wait under the SAME deadline: nothing is filed twice, the first poll is immediate, and an unanswered item times out at the original deadline as BLOCKED", async () => {
+  const home = scratchHome("approval-crash");
+  const T0 = 1_700_000_000_000;
+  const clock = fakeClock(T0);
+  const world = humanWorld({ clock, home });
+  // The worker is killed inside its first poll interval.
+  const sleep = world.deps.sleep;
+  world.deps.sleep = async (ms) => {
+    await sleep(ms);
+    throw new Error("worker killed");
+  };
+  await assert.rejects(gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps }), /worker killed/);
+  assert.equal(world.filed, 1);
+  assert.equal(world.polls, 1, "judge read the answer once; the driver died before its poll");
+
+  // Resumed nine minutes in, still unanswered: the wait is the journal's, so it
+  // ends at T0 + the timeout, not a fresh timeout from the resume.
+  world.deps.sleep = sleep;
+  clock.advanceBy(9 * 60000 - APPROVAL_POLL);
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps });
+  assert.equal(res.state, "blocked", JSON.stringify(res));
+  assert.equal(res.escalated_to, "task-approve-x");
+  assert.equal(world.filed, 1, "the approval item is never re-filed");
+  assert.equal(world.polls, 3, "an immediate poll on resume, then one more at the deadline");
+  assert.equal(clock.now(), T0 + APPROVAL_TIMEOUT, "the deadline the first drive journaled");
+  const j = store.readWorkflowJournal(home, "local", "exec-0123456789abcdef", { stage: "gates-a0" });
+  assert.equal(j.filter((e) => e.kind === "effect" && /\/judge#1$/.test(e.key)).length, 1);
+  const awaited = j.find((e) => e.kind === "await");
+  assert.deepEqual(awaited.outcome, { received: true, payload: { state: "timeout" } }, "the timeout is a journaled signal, so a replay settles the same way");
+  assert.equal(j.filter((e) => e.kind === "signal").length, 1);
+
+  // Answered after the fact: the settled journal still replays BLOCKED.
+  world.approval = { state: "approved", by: "person-a" };
+  const replayed = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps });
+  assert.deepEqual(replayed, res);
+  assert.equal(world.polls, 3);
+});
+
+test("a human gate's wait: a refusal and a mismatched commit are delivered as final refusals, and a stop inside the wait blocks as the in-activity poll did", async () => {
+  for (const [approval, re] of [[{ state: "rejected", by: "person-a" }, /was refused by person-a/], [{ state: "mismatch", head: "b".repeat(40) }, /bound to commit bbbbbbbbbbbb/]]) {
+    const clock = fakeClock(1_700_000_000_000);
+    const world = humanWorld({ clock });
+    world.deps.checkApproval = async () => {
+      world.polls += 1;
+      return world.polls >= 2 ? approval : { state: "pending" };
+    };
+    const res = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps });
+    assert.equal(res.state, "failed", JSON.stringify(res));
+    assert.match(res.reason, re);
+    assert.equal(res.escalated_to, "task-approve-x");
+    assert.deepEqual(world.escalations, [], "the approval item IS the human item");
+  }
+  const clock = fakeClock(1_700_000_000_000);
+  const world = humanWorld({ clock });
+  world.deps.stopping = () => world.slept >= 1;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps });
+  assert.equal(res.state, "blocked");
+  assert.equal(world.slept, 1, "the stop is answered at the next poll, not at the deadline");
+});
+
+test("a journal opened WITHOUT the approval signal (an older one) keeps the in-activity poll it was recorded under", async () => {
+  const clock = fakeClock(1_700_000_000_000);
+  const world = humanWorld({ clock });
+  world.deps.checkApproval = async () => {
+    world.polls += 1;
+    return world.polls >= 3 ? { state: "approved", by: "person-a" } : { state: "pending" };
+  };
+  // The input deps lack `checkApproval`, so `open` journals no approvalSignals;
+  // the activities still hold the full deps the in-activity poll reads.
+  const inputDeps = { ...world.deps };
+  delete inputDeps.checkApproval;
+  const journal = [];
+  const e = new Execution(wf.gateWorkflow, { item: ITEM, factory: HUMAN, deps: inputDeps, log: () => {}, driver: { parked: null } }, { journal, clock, activities: world.activities, workflow: wf.WORKFLOW_NAME, version: wf.WORKFLOW_VERSION });
+  const r = await drive(e, { clock });
+  assert.equal(r.status, "completed");
+  assert.equal(r.result.state, "passed", JSON.stringify(r.result));
+  assert.equal(world.slept, 2, "the poll slept inside the activity");
+  assert.deepEqual(approvalKeys(journal), [], "no signal, no journaled deadline");
+  assert.equal(journal.find((j) => j.kind === "effect" && /\/judge#1$/.test(j.key)).result.outcome.verdict, "passed");
+});
+
+test("an approval given while NO worker was running is read on a resume that arrives after the deadline — the answer wins over the deadline, as it did in the in-activity poll", async () => {
+  const home = scratchHome("approval-late");
+  const T0 = 1_700_000_000_000;
+  const clock = fakeClock(T0);
+  const world = humanWorld({ clock, home });
+  const sleep = world.deps.sleep;
+  world.deps.sleep = async (ms) => {
+    await sleep(ms);
+    throw new Error("worker killed");
+  };
+  await assert.rejects(gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps }), /worker killed/);
+  world.deps.sleep = sleep;
+  world.approval = { state: "approved", by: "person-a" };
+  clock.advanceBy(APPROVAL_TIMEOUT * 2);
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps });
+  assert.equal(res.state, "passed", JSON.stringify(res));
+  assert.equal(world.filed, 1);
+  assert.equal(world.polls, 2, "one immediate read on resume settles it");
+  assert.equal(world.slept, 1, "no further sleep");
+});
+
+test("a zero approval timeout blocks on judge's one read, with no wait at all", async () => {
+  const clock = fakeClock(1_700_000_000_000);
+  const factory = factoryOf({ ...BASE, gates: [{ id: "security", kind: "human", risk: ["touches:auth"], approval_timeout_ms: 0 }] });
+  const world = humanWorld({ clock });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: world.deps });
+  assert.equal(res.state, "blocked");
+  assert.equal(world.polls, 1);
+  assert.equal(world.slept, 0);
 });

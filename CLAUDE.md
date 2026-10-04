@@ -1803,8 +1803,14 @@ routes, the dirty-tree round-trip, the gate list with its fix cycles and
 review ledger, the infrastructure pool, the rescue lane, the escalation —
 as `gateWorkflow(ctx, input)`: every deps call a `ctx.run` keyed on run id /
 attempt / pass / gate id / cycle plus a per-key sequence; ONE gate attempt
-(`runOneGate`: the suite, the review dispatch-and-await, the approval poll)
-is ONE activity (`judge`); the fix cycle's and the rescue's run-terminal
+(`runOneGate`: the suite, the review dispatch-and-await, the approval
+filing) is ONE activity (`judge`); a human gate's WAIT is signal
+`approval:<id>` awaited under a deadline from the journaled clock, the driver
+polling the item and delivering its answer (or a stop), the deadline's
+passing the journaled timeout that settles `blocked` — so a crash mid-wait
+resumes the same wait under the same deadline, never re-filing
+(task-spor-gate-human-approval-await-signal; a journal opened without
+`approvalSignals` keeps the in-activity poll it recorded); the fix cycle's and the rescue's run-terminal
 waits are signals (`run:<id>`, `rescue-run:<id>`) when gate-deps wires the
 halves (`dispatchFix`/`dispatchRescue` + `awaitRun` + `rescueReport`; the
 one-shot `fix`/`rescue` are their tagged compositions, and a caller-
@@ -1956,8 +1962,7 @@ it, not mtime), the integration and implementation stages close with a
 unreadable gate journal instead of skipping it, and `claimPipeline` reads
 `owesEvidence` only as a function (a boolean override is ignored). Still open
 on the parent task: the fold of `runGateAndIntegration` into one workflow
-function, and splitting the human gate's in-activity approval wait into a
-signal with a deadline. See
+function. See
 test/workflow-kernel.test.js, test/workflow-journal.test.js,
 test/dispatch-adopt-by-name.test.js, test/integration-workflow.test.js and
 test/gate-workflow.test.js (the crash sweeps: a crash at every activity
