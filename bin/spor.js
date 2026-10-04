@@ -12148,7 +12148,50 @@ async function gateDemoteItem(cfg, id, { blockerId = null } = {}) {
     }
   }
   const isCompletion = completion ? status === completion : GATE_COMPLETION_FALLBACK.has(status);
-  if (!isCompletion || status === GATE_DEMOTED_STATUS) {
+  if (status === GATE_DEMOTED_STATUS) {
+    // The post-demotion state exactly as this call leaves it — and ONLY that
+    // state: the item still CLAIMS completion through a live resolving edge
+    // (the one thing a demotion never retracts, §10.7), its status reads the
+    // demoted value, and the blocker filed to block it carries its `blocks`
+    // edge. That is a demotion that STANDS, reported `demoted: true`: the
+    // activity is journaled at-least-once (integration-workflow.js /
+    // gate-workflow.js `demote`), and a re-run after a crash between the
+    // status write and the journal used to come back `demoted: false`,
+    // recording the verdict as an item that was never rolled back
+    // (issue-spor-integration-lease-random-nonce-and-unscoped-release, folded
+    // item). All three are required: an `open` item that never claimed
+    // completion (an unenforced `reported` run, the common gated shape) has
+    // nothing rolled back, and reading it as demoted would make a later
+    // passing re-gate PROMOTE it to done over nothing (gatePromoteItem is the
+    // mirror). The resolver read is the one resolveNode already fetched
+    // remotely (`resolution`) and the loaded graph's own locally. What
+    // `demoted` then MEANS is "the item stands demoted behind this blocker":
+    // an item whose agent wrote its resolver but never flipped the status (the
+    // lagging shape) reads true on its first demotion too — the same end
+    // state, and a later passing re-gate promoting it to the completion its
+    // live resolver already claims is the right reading of that state.
+    let resolved = !!(node.resolution && node.resolution.by);
+    if (!resolved && graph) {
+      try {
+        const r = resolutionOf(graph, id);
+        resolved = !!(r && r.by);
+      } catch {
+        resolved = false;
+      }
+    }
+    let behindBlocker = false;
+    if (resolved) {
+      try {
+        const blocker = await resolveNode(cfg, blockerId);
+        behindBlocker = !!(blocker && !nodeUnreadable(blocker) && (blocker.edges || []).some((e) => e && e.type === "blocks" && e.to === id));
+      } catch {
+        behindBlocker = false;
+      }
+    }
+    if (resolved && behindBlocker) return { ok: true, demoted: true, note: `${id} already reads '${status}' behind ${blockerId} while still carrying its resolver — the demotion stands` };
+    return { ok: true, demoted: false, note: `${id} reads '${status}', which is not a claim of completion — nothing to roll back; ${blocked}` };
+  }
+  if (!isCompletion) {
     return { ok: true, demoted: false, note: `${id} reads '${status}', which is not a claim of completion — nothing to roll back; ${blocked}` };
   }
 
@@ -12847,6 +12890,34 @@ async function retryOneEscalation(
       /* the worker's scope token stands in */
     }
   }
+  // THE LEASE THIS RETRY WRITES UNDER (task-spor-pipeline-graph-writes-owner-
+  // guard-and-approval-slot, item 6). The deps' durable writers are owner-
+  // guarded on a token; built with no token in hand they would infer whoever
+  // holds the pipeline on disk NOW — which, after a `--regate` opened a newer
+  // attempt, is the re-gate's lease, and a stale retry would then file its
+  // escalation and demote the item against the attempt that superseded it.
+  // So the lease is read HERE: a current attempt other than the refusal's own
+  // (`payload.attempt` is the stage attempt the refusal settled under, the
+  // same reading cmdWorkRegate's reopen clears the pending payload with) means
+  // the refusal no longer owns the pipeline and the retry is refused, nothing
+  // stamped — the re-gate judges the run afresh. Otherwise the token read now
+  // is handed to the deps as `gateOwner`, so every write below is guarded on
+  // exactly this identity and a lease that moves between this read and a
+  // write is refused at the write (PipelineOwnerLost), never written past.
+  let lease = null;
+  try {
+    lease = stageProjection.pipelineLease(home, record);
+  } catch (e) {
+    log(`work: gate escalation retry for ${record.node_id} (run ${String(record.run_id).slice(0, 8)}) skipped this pass — the pipeline lease log could not be read (${(e && e.message) || e})`);
+    return;
+  }
+  const refusedAttempt = Number(payload.attempt) || 0;
+  const currentAttempt = stageProjection.stageAttempt(record, lease);
+  if (currentAttempt !== refusedAttempt) {
+    log(`work: gate escalation retry for ${record.node_id} (run ${String(record.run_id).slice(0, 8)}) refused — the refusal settled under attempt ${refusedAttempt} but the pipeline is now on attempt ${currentAttempt}; the re-gate judges it afresh and nothing is filed for the superseded refusal`);
+    return;
+  }
+  const gateOwner = lease ? lease.token : record.gate_settle_id ?? record.gate_at ?? null;
   const entry = { node_id: record.node_id, run_id: record.run_id, attempt: payload.attempt, project };
   // The same deps the original attempt escalated through — a gate refusal's
   // (makeGateDeps) or the integration stage's (makeIntegrationDeps, whose
@@ -12854,10 +12925,10 @@ async function retryOneEscalation(
   // have filed) — so the id a retry lands is the one the first attempt
   // reached for, and a person reads one escalation shape per refusal kind.
   const deps = fromIntegration
-    ? makeIntegrationDeps(cfg, { record, entry, factory, slug: project, log, warn, home,
+    ? makeIntegrationDeps(cfg, { record, entry, factory, slug: project, log, warn, home, gateOwner,
         completedBeforeIntegration: payload.completedBeforeIntegration === true,
       })
-    : makeGateDeps(cfg, { record, entry, factory, slug: project, log, home });
+    : makeGateDeps(cfg, { record, entry, factory, slug: project, log, home, gateOwner });
   let esc;
   try {
     esc = fromIntegration
@@ -13135,6 +13206,16 @@ async function acquireIntegrationLease(
     slug,
     waitMs = INTEGRATION_LEASE_WAIT_MS,
     budgetMs, // this acquire's own declared run length — stretches the claim past its default TTL up front (see below)
+    // The claim's dispatch nonce (issue-spor-integration-lease-random-nonce-
+    // and-unscoped-release). The integration stage derives it from its
+    // JOURNALED activity key (gate-deps.js acquireLease), so a crash re-run of
+    // the same activity presents the SAME nonce: the server reads a live
+    // same-holder lease under the same nonce as ours and re-grants it
+    // (server/lease-transition.js step 4 refuses only a DIFFERENT nonce), so
+    // the re-run lands serialized instead of waiting 20s on a 409 against its
+    // own orphan and proceeding without the lease. A caller with no key gets a
+    // fresh random one — the pre-fix behaviour, kept for one-shot callers.
+    nonce = null,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     // No default here: local and remote polling are on different clocks (a
     // filesystem stat vs a network round trip) and each picks its OWN default
@@ -13159,10 +13240,18 @@ async function acquireIntegrationLease(
     "",
   ].join("\n");
   const deadline = Date.now() + waitMs;
+  // The nonce is ALSO the lease's session binding: the singular
+  // `POST /v1/nodes/{id}/release` is holder-scoped only (it frees whatever
+  // lease this person holds on the node, whoever's driver took it), while the
+  // bulk `POST /v1/queue/release {session}` releases only the caller's leases
+  // bound to that session — so binding the claim to the nonce is what lets
+  // releaseIntegrationLease release BY NONCE on today's server (its singular
+  // release route forwards no session or nonce; see the issue's server check).
+  const dispatchNonce = nonce || `integration-${crypto.randomUUID()}`;
   try {
     await writeGateNode(cfg, id, markdown);
     for (;;) {
-      const claimed = await claimDispatch(cfg, id, null, `integration-${crypto.randomUUID()}`);
+      const claimed = await claimDispatch(cfg, id, dispatchNonce, dispatchNonce);
       if (claimed.ok) {
         // Nothing else renews this lease against the tenant's claim TTL
         // (issue-spor-serialize-lease-does-not-wait-out-a-long-suite): a
@@ -13183,7 +13272,7 @@ async function acquireIntegrationLease(
             if (attempt < INTEGRATION_LEASE_EXTEND_ATTEMPTS - 1) await sleep(INTEGRATION_LEASE_EXTEND_RETRY_MS);
           }
         }
-        return { kind: "remote", id };
+        return { kind: "remote", id, nonce: dispatchNonce };
       }
       // A non-conflict failure (transport down, 5xx, auth) is not worth
       // waiting out — same fail-open posture as before. Only a live holder
@@ -13196,10 +13285,25 @@ async function acquireIntegrationLease(
   }
 }
 
+// Release BY NONCE (issue-spor-integration-lease-random-nonce-and-unscoped-
+// release): a token carrying the nonce its claim was bound to as `session`
+// releases through the bulk door narrowed to that session, so a lease another
+// driver of ours has since re-claimed under ITS nonce (a later attempt, a
+// different run) is never freed by this release — the singular route would
+// free it, since it scopes on the holder alone. Only a server WITHOUT the
+// bulk door (404/405/501) falls back to the singular, holder-scoped release;
+// any other failure leaves the lease to lapse on its TTL (the safe reading —
+// a release that may have partly run must not be re-driven unscoped). A
+// legacy token with no nonce (an older journal's) takes the singular route as
+// before.
 async function releaseIntegrationLease(cfg, token) {
   if (!token) return;
   if (token.kind === "remote") {
     try {
+      if (token.nonce) {
+        const r = await remote.post(cfg, "/v1/queue/release", { session: token.nonce }, { timeoutMs: 6000 });
+        if (r && (r.ok || ![404, 405, 501].includes(r.status))) return;
+      }
       await remote.post(cfg, `/v1/nodes/${encodeURIComponent(token.id)}/release`, {}, { timeoutMs: 6000 });
     } catch {
       /* lapses on its own TTL */
@@ -14571,6 +14675,18 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // `finally` below). The gate's spawn is async by design (gate-runner.js
   // runGateCommand), so the interval fires through it; the residual is a
   // SYNCHRONOUS step longer than the TTL, which nothing in-process can renew.
+  // That residual is a DOCUMENTED LIMIT, not an extension (task-spor-pipeline-
+  // graph-writes-owner-guard-and-approval-slot; WORKERS.md §10.8 "The lease
+  // TTL and a synchronous step"): every pipeline step that can run long is
+  // already async (a spawn, a poll, a network call), the only synchronous
+  // steps are git reads over a checkout and record/journal writes under the
+  // record lock, and a pre-step extension would have to guess a bound for a
+  // step whose length it cannot know — a guess too short changes nothing and
+  // one too long holds an orphan off its adopter. A synchronous step that
+  // nonetheless outlasts the TTL is then taken over by an adopter, and the
+  // owner guard refuses every durable write the displaced driver makes from
+  // that point (PipelineOwnerLost), so the failure is a visible superseded
+  // pass, never a double write.
   // A lease this token no longer holds renews nothing.
   const renewEvery = Math.max(60000, Math.floor(stageProjection.PIPELINE_LEASE_TTL_MS / 3));
   let renewedAt = 0;
@@ -16002,8 +16118,17 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // regate-stamps-unowned): a re-gate whose lease was taken over between the
   // claim and here must not reopen state under the adopter's attempt, so a
   // refused stamp stops the re-gate before it judges anything.
+  // A NULL result is a refusal too (issue-spor-integration-lease-random-nonce-
+  // and-unscoped-release, folded item): the stampers hand back null when the
+  // write could not be made at all (an unreadable or vanished record, a
+  // contended lock, a mid-write exception), and a re-gate that read that as
+  // "reopened" would judge over state it never reopened.
   const ownedReopen = (after, what) => {
-    if (!after || !after.owner_refused) return true;
+    if (!after) {
+      err(`spor work --regate: ${what} could not be written (the run record could not be read or locked); no judgement started`);
+      return false;
+    }
+    if (!after.owner_refused) return true;
     err(`spor work --regate: ${what} was refused — ${after.owner_refused}; no judgement started`);
     return false;
   };

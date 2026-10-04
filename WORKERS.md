@@ -2332,8 +2332,27 @@ item is the gate attempt's activity, and the wait is a workflow signal
 the driver delivers by polling the item every `poll_ms`. A worker that dies
 mid-wait resumes the SAME wait under the SAME deadline — the item is not
 re-filed and the clock does not restart — and the deadline's passing is a
-journaled timeout, so a replay settles **blocked** the same way. The worker
-still holds its slot while it polls.
+journaled timeout, so a replay settles **blocked** the same way.
+
+**The slot is freed between polls** (task-spor-pipeline-graph-writes-owner-
+guard-and-approval-slot). A person's answer takes hours or days, so the worker
+does not sit on its slot polling for it: each poll round the workflow journals
+an **awaiting-approval marker** — a `yield` entry
+(`…/approval/<rescue>/<gate>/<cycle>/p<n>/yield`) whose result is the stage's
+`interrupted` hand-up, carrying the approval item it waits on
+(`awaiting_approval: {id, gate, head, deadline_at, poll}`) and `paused_until`
+at the next poll — and suspends on a durable timer at that wake. The pipeline
+reports `interrupted`, the loop frees the slot, `spor runs`/`--status` read the
+stage as parked and due at the poll, and the loop re-offers the pipeline when it
+is due (§10.8); the re-driven workflow replays to the `approval:<id>` await,
+where the driver's one immediate read delivers the answer — or `pending`, which
+starts the next round. The wake is `poll_ms` floored at one minute and never
+past the journaled deadline; a wait inside its poll window is time-boxed, so it
+never counts toward the parked re-offer cap (`work.parkedReofferMax`). The
+yield needs a persisted stage journal: a legacy run driven over an in-memory
+journal keeps the in-driver poll and holds its slot, since a yield there would
+lose the deadline it journaled. A journal opened before the marker existed keeps
+the in-driver poll it was recorded under.
 
 ### 10.6 Every gate outcome is a graph fact
 
@@ -2588,7 +2607,20 @@ minted onto the record as `gate_state: running`; it is now this journaled entry
 — `renew` lines once a pass while the worker drives it AND from inside the
 pipeline's own long waits (every wait slice renews by token, throttled to a
 third of the TTL, so a stalled-but-live worker past the TTL is never
-double-driven), and a `release` line when the pipeline yields. The claim line's
+double-driven), and a `release` line when the pipeline yields. **The lease TTL
+and a synchronous step** (task-spor-pipeline-graph-writes-owner-guard-and-
+approval-slot): the renewals above ride async waits — a sleep slice, an awaited
+spawn or poll, an unref'd interval through them — so the one thing nothing
+in-process can renew across is a single SYNCHRONOUS step longer than the
+30-minute TTL. That is a documented limit, not a pre-step extension: every step
+that can run long is already async, the synchronous ones are git reads over a
+checkout and record/journal writes under the record lock, and an extension would
+have to guess a bound for a step whose length it cannot know (too short changes
+nothing; too long holds an orphan off its adopter). A synchronous step that
+nonetheless outlasts the TTL is taken over by an adopter, and every durable write
+the displaced driver makes from then on is refused by the owner guard
+(`PipelineOwnerLost`, §10.10), so the failure is a visible superseded pass,
+never a double write. The claim line's
 `attempt` IS the pipeline attempt's identity (what `gate_regate_count` on the
 record used to say; `regated_at` on the folded lease what `gate_regated_at`
 did) — read everywhere through stage-projection.js `pipelineAttempt`, which

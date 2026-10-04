@@ -11385,3 +11385,53 @@ test("real doors: a yielded pipeline leaves no record stamp, releases its lease,
   assert.ok(described.some((l) => /lease:\s+released/.test(l)), described.join("\n"));
   assert.ok(!lines.some((l) => /REPLAY FAULT|fresh in-memory journal/.test(l)), lines.join("\n"));
 });
+
+// task-spor-pipeline-graph-writes-owner-guard-and-approval-slot, item 6: a
+// retry is bound to the refusal's OWN attempt. After a `--regate` opened a
+// newer attempt (a claim line with a higher attempt on the lease log), the
+// stale pending escalation is refused outright — nothing filed, nothing
+// demoted, nothing stamped — and the deps it would have written through are
+// built on the lease identity it read, not on whoever holds the pipeline now.
+test("retryOneEscalation refuses a pending escalation whose attempt the pipeline has moved past, and writes nothing", async () => {
+  const sporCli = require("../bin/spor.js");
+  const { loadConfig } = require("../lib/config.js");
+  const stageProjection = require("../lib/shell/stage-projection.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-escalation-retry-attempt-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  fs.writeFileSync(path.join(home, "nodes", "task-demo.md"), "---\nid: task-demo\ntype: task\ntitle: Demo\nsummary: A demo task.\nstatus: done\n---\nBody.\n");
+  const runId = "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff";
+  const pending = { gateId: "acceptance", attempt: undefined, attempts: [{ verdict: "failed", detail: "the suite failed" }], detail: "the suite failed", evidence: "", findings: [], ledger: [], factId: gateRunner.gateFactId("acceptance", "task-demo", runId, 0, 0) };
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, {
+    run_id: runId, node_id: "task-demo", state: "done", terminal_state: "resolved", terminal_enforced: true, item_repo: null,
+    gate_state: "failed", gate_escalation_failed: true, gate_escalation_pending: pending, gate_escalation_retry_count: 0,
+  });
+  const record = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  // A re-gate has since claimed the pipeline and opened attempt 1 (the stage
+  // attempt a `--regate` keys its journals on is 2): the refusal, which
+  // settled under attempt 0, no longer owns the pipeline.
+  const log = stageProjection.pipelineLogPath(home, record);
+  fs.mkdirSync(path.dirname(log), { recursive: true });
+  fs.writeFileSync(log, `${JSON.stringify({ kind: "claim", token: "regate-token", worker: "w2", attempt: 1, reopen: true, at: new Date().toISOString(), expires_at: new Date(Date.now() + 1800000).toISOString() })}\n`);
+  assert.strictEqual(stageProjection.stageAttempt(record, stageProjection.pipelineLease(home, record)), 2);
+  const lines = [];
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, { factory: { id: "factory-test", gates: [{ id: "acceptance", kind: "command", command: "npm test" }] }, log: (l) => lines.push(l), home });
+  assert.ok(lines.some((l) => /refused — the refusal settled under attempt 0 but the pipeline is now on attempt 2/.test(l)), lines.join("\n"));
+  const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.deepStrictEqual(after.gate_escalation_pending, JSON.parse(JSON.stringify(pending)), "the payload is left exactly as found");
+  assert.strictEqual(after.gate_escalation_retry_count, 0, "no attempt is charged");
+  assert.strictEqual(after.gate_escalated_to, undefined, "no escalation landed");
+  assert.deepStrictEqual(fs.readdirSync(path.join(home, "nodes")), ["task-demo.md"], "no node was written");
+  assert.match(fs.readFileSync(path.join(home, "nodes", "task-demo.md"), "utf8"), /status: done/, "the item was not demoted");
+
+  // The same record under its OWN lease (attempt 0, the pipeline that
+  // refused) retries as before: the deps are owner-guarded on that token.
+  fs.writeFileSync(log, `${JSON.stringify({ kind: "claim", token: "own-token", worker: "w1", attempt: 0, at: new Date().toISOString(), expires_at: new Date(Date.now() + 1800000).toISOString() })}\n`);
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, { factory: { id: "factory-test", gates: [{ id: "acceptance", kind: "command", command: "npm test" }] }, log: () => {}, home });
+  const landed = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.ok(landed.gate_escalated_to, "under its own lease the retry lands");
+  assert.strictEqual(landed.gate_escalation_pending, null);
+  fs.rmSync(home, { recursive: true, force: true });
+});

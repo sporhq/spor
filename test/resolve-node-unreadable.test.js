@@ -138,3 +138,38 @@ test("makeGateDeps().node: a 2xx with an unparseable body fails the read — nev
     assert.match(r.reason, /could not be read from the graph/);
   });
 });
+
+// issue-spor-integration-lease-random-nonce-and-unscoped-release (folded item):
+// the demote activity is journaled at-least-once, so a RE-RUN finds the item
+// already in the post-demotion state — status rolled back, resolver still
+// live, the blocker's `blocks` edge landed — and must report the demotion as
+// standing, not as "nothing to roll back". An `open` item that never claimed
+// completion is still exactly that.
+test("gateDemoteItem: an item already rolled back behind its blocker while still carrying its resolver reads demoted:true (the re-run); an open item with no resolver reads demoted:false as before", async () => {
+  const cfg = remoteCfg();
+  // resolveNode parses status and edges from the node's markdown (`raw`); the
+  // server's `resolution` enrichment rides beside it as an additive key.
+  const item = (resolution) => ({ id: "task-demote-d", raw: "---\nid: task-demote-d\ntype: task\ntitle: D\nsummary: D.\nstatus: open\n---\n", ...(resolution ? { resolution } : {}) });
+  const blocker = { id: "task-blocker-d", raw: "---\nid: task-blocker-d\ntype: task\ntitle: B\nsummary: B.\nstatus: open\nedges:\n  - {type: blocks, to: task-demote-d}\n---\n" };
+  const unlinked = { id: "task-blocker-d", raw: "---\nid: task-blocker-d\ntype: task\ntitle: B\nsummary: B.\nstatus: open\n---\n" };
+  await withNodeBodies({ "task-demote-d": item({ by: "dec-x" }), "task-blocker-d": blocker }, async () => {
+    const r = await sporCli.gateDemoteItem(cfg, "task-demote-d", { blockerId: "task-blocker-d" });
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.demoted, true, "the post-demotion state is a demotion that stands");
+    assert.match(r.note, /already reads 'open' behind task-blocker-d while still carrying its resolver/);
+  });
+  // Never completed (no resolver): nothing was rolled back.
+  await withNodeBodies({ "task-demote-d": item(null), "task-blocker-d": blocker }, async () => {
+    const r = await sporCli.gateDemoteItem(cfg, "task-demote-d", { blockerId: "task-blocker-d" });
+    assert.strictEqual(r.demoted, false);
+    assert.match(r.note, /not a claim of completion — nothing to roll back; task-blocker-d now blocks task-demote-d/);
+  });
+  // A resolver but a blocker that does not block it (or cannot be read): not
+  // this call's post-state either.
+  await withNodeBodies({ "task-demote-d": item({ by: "dec-x" }), "task-blocker-d": unlinked }, async () => {
+    assert.strictEqual((await sporCli.gateDemoteItem(cfg, "task-demote-d", { blockerId: "task-blocker-d" })).demoted, false);
+  });
+  await withNodeBodies({ "task-demote-d": item({ by: "dec-x" }), "task-blocker-d": "malformed" }, async () => {
+    assert.strictEqual((await sporCli.gateDemoteItem(cfg, "task-demote-d", { blockerId: "task-blocker-d" })).demoted, false);
+  });
+});

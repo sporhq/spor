@@ -5334,3 +5334,221 @@ test("a `ci` candidate suite OUTAGE is handed up INTERRUPTED — no rerun, no fi
   assert.match(res.reason, /an outage, not a verdict on the change/);
   assert.doesNotMatch(res.reason, /run 9/, "the reason is stable across re-offers, so the re-offer cap can count it");
 });
+
+// ---------------------------------------------------------------------------
+// issue-spor-integration-lease-random-nonce-and-unscoped-release (folded into
+// task-spor-pipeline-graph-writes-owner-guard-and-approval-slot): the remote
+// serialize:repo lease claims under a DERIVED nonce bound as the lease's
+// session, and releases BY that nonce through the bulk door.
+{
+  const http = require("node:http");
+  const sporCli = require("../bin/spor.js");
+  const remoteCfg = (base) => ({ mode: () => "remote", server: () => base, token: () => "test-token", tenant: () => null });
+  const serve = (handler) => new Promise((resolve) => {
+    const calls = [];
+    const srv = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const body = raw ? JSON.parse(raw) : {};
+        calls.push({ method: req.method, url: req.url, body });
+        const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+        handler(req, body, j);
+      });
+    });
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, calls, base: `http://127.0.0.1:${srv.address().port}` }));
+  });
+
+  test("acquireIntegrationLease (remote): a caller-derived nonce is the claim's dispatch nonce AND its session binding, rides on the token, and the same nonce re-claims the same lease", async () => {
+    const { srv, calls, base } = await serve((req, body, j) => {
+      if (req.method === "POST" && req.url === "/v1/nodes") return j(200, { results: [{ ok: true }] });
+      if (req.method === "POST" && /\/claim$/.test(req.url)) return j(200, { lease: { node_id: "lock-integration-demo", dispatch: body.dispatch, session: body.session } });
+      if (req.method === "POST" && /\/extend$/.test(req.url)) return j(200, { ok: true });
+      return j(404, { error: { code: "not_found" } });
+    });
+    try {
+      const nonce = "integration-0123456789abcdef0123456789abcdef";
+      const token = await sporCli.acquireIntegrationLease(remoteCfg(base), "/unused-home", "/unused/top", { slug: "demo", nonce, sleep: () => Promise.resolve() });
+      assert.deepStrictEqual(token, { kind: "remote", id: "lock-integration-demo", nonce });
+      const claim = calls.find((c) => /\/claim$/.test(c.url));
+      assert.strictEqual(claim.body.dispatch, nonce, "the derived nonce is the dispatch nonce the server keys duplicate-dispatch exclusivity on");
+      assert.strictEqual(claim.body.session, nonce, "…and the session binding the scoped release narrows to");
+      // A crash re-run under the same activity key presents the same nonce:
+      // the server reads a same-holder same-nonce claim as ours (no 409).
+      const again = await sporCli.acquireIntegrationLease(remoteCfg(base), "/unused-home", "/unused/top", { slug: "demo", nonce, sleep: () => Promise.resolve() });
+      assert.deepStrictEqual(again, token);
+      assert.strictEqual(calls.filter((c) => /\/claim$/.test(c.url)).length, 2);
+      assert.ok(calls.filter((c) => /\/claim$/.test(c.url)).every((c) => c.body.dispatch === nonce));
+      // No nonce handed in: a fresh random one, as before (a one-shot caller).
+      const fresh = await sporCli.acquireIntegrationLease(remoteCfg(base), "/unused-home", "/unused/top", { slug: "demo", sleep: () => Promise.resolve() });
+      assert.match(fresh.nonce, /^integration-[0-9a-f-]{36}$/);
+      assert.notStrictEqual(fresh.nonce, nonce);
+    } finally {
+      srv.close();
+    }
+  });
+
+  test("releaseIntegrationLease (remote): a token with a nonce releases through POST /v1/queue/release narrowed to that session — never the holder-wide singular release; the singular route is only the fallback for a server without the door, and a legacy token takes it as before", async () => {
+    const seen = [];
+    const { srv, calls, base } = await serve((req, body, j) => {
+      seen.push(req.url);
+      if (req.method === "POST" && req.url === "/v1/queue/release") return j(200, { ok: true, status: "released", released: ["lock-integration-demo"], count: 1 });
+      if (req.method === "POST" && /\/release$/.test(req.url)) return j(200, { ok: true, status: "released" });
+      return j(404, { error: { code: "not_found" } });
+    });
+    try {
+      const cfg = remoteCfg(base);
+      await sporCli.releaseIntegrationLease(cfg, { kind: "remote", id: "lock-integration-demo", nonce: "integration-abc" });
+      assert.deepStrictEqual(calls.map((c) => [c.url, c.body]), [["/v1/queue/release", { session: "integration-abc" }]], "scoped to the nonce; the singular route is not touched");
+      calls.length = 0;
+      await sporCli.releaseIntegrationLease(cfg, { kind: "remote", id: "lock-integration-demo" });
+      assert.deepStrictEqual(calls.map((c) => c.url), ["/v1/nodes/lock-integration-demo/release"], "a legacy token (no nonce) releases as before");
+    } finally {
+      srv.close();
+    }
+    // A server WITHOUT the bulk door (404): fall back to the singular release.
+    const noDoor = await serve((req, body, j) => {
+      if (req.method === "POST" && req.url === "/v1/queue/release") return j(404, { error: { code: "not_found" } });
+      if (req.method === "POST" && /\/release$/.test(req.url)) return j(200, { ok: true });
+      return j(404, { error: { code: "not_found" } });
+    });
+    try {
+      await sporCli.releaseIntegrationLease(remoteCfg(noDoor.base), { kind: "remote", id: "lock-integration-demo", nonce: "integration-abc" });
+      assert.deepStrictEqual(noDoor.calls.map((c) => c.url), ["/v1/queue/release", "/v1/nodes/lock-integration-demo/release"]);
+    } finally {
+      noDoor.srv.close();
+    }
+    // Any OTHER failure of the scoped release (a 5xx, a 409) leaves the lease
+    // to lapse on its TTL — a release that may have partly run is never
+    // re-driven through the unscoped route.
+    const failing = await serve((req, body, j) => {
+      if (req.method === "POST" && req.url === "/v1/queue/release") return j(500, { error: { code: "internal" } });
+      return j(200, { ok: true });
+    });
+    try {
+      await sporCli.releaseIntegrationLease(remoteCfg(failing.base), { kind: "remote", id: "lock-integration-demo", nonce: "integration-abc" });
+      assert.deepStrictEqual(failing.calls.map((c) => c.url), ["/v1/queue/release"], "no unscoped fallback on a failure that is not 'door absent'");
+    } finally {
+      failing.srv.close();
+    }
+  });
+
+  test("the integration deps derive the lease nonce from the journaled activity key: the same key yields the same nonce, another key or attempt another, and a key-less call gets a fresh random one", async () => {
+    const { loadConfig } = require("../lib/config.js");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-lease-nonce-"));
+    const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_MODE: "local" } });
+    const nonces = [];
+    const host = { ...sporCli.makeIntegrationDepsHost ? sporCli.makeIntegrationDepsHost() : {} };
+    void host;
+    // Drive the dep through makeIntegrationDeps with acquireIntegrationLease
+    // observed via the local arm: in local mode the nonce is not sent anywhere,
+    // so observe the derivation itself through the gate-deps module.
+    const gateDeps = require("../lib/shell/gate-deps.js");
+    const stubHost = {};
+    for (const k of gateDeps.HOST_FUNCTIONS) stubHost[k] = () => { throw new Error(`unexpected host call ${k}`); };
+    stubHost.GATE_DIFF_CAP_BYTES = 1024;
+    stubHost.acquireIntegrationLease = (c, h, top, opts) => { nonces.push(opts.nonce || null); return { kind: "local", nonce: opts.nonce || null }; };
+    stubHost.mainCheckoutOf = () => "/repo";
+    stubHost.gateStem = () => "demo";
+    stubHost.gateIdSuffix = () => "deadbeef";
+    stubHost.gateLeaseBudgetMs = () => 1000;
+    stubHost.dispatchThrough = async () => ({ ok: false });
+    const { makeIntegrationDeps } = gateDeps.createGateDeps(stubHost);
+    const factory = { id: "factory-test", trustedRef: "main", protectedPaths: [], gates: [], integration: { targetRef: "main", mode: "local", command: "true", strategy: "merge", serialize: "repo", cycles: 0, timeoutMs: 1000 } };
+    const build = (attempt) => makeIntegrationDeps(cfg, { record: { run_id: "run-1", node_id: "task-demo", cwd: "/repo" }, entry: { run_id: "run-1", node_id: "task-demo", attempt }, factory, slug: "demo", log: () => {}, warn: () => {}, home, gateOwner: null });
+    const a = build(0);
+    const k1 = "run-1/integration/lease/0/acquire";
+    await a.acquireLease({ key: k1 });
+    await a.acquireLease({ key: k1 });
+    await a.acquireLease({ key: "run-1/integration/lease/1/acquire" });
+    await build(2).acquireLease({ key: k1 });
+    await a.acquireLease();
+    assert.match(nonces[0], /^integration-[0-9a-f]{32}$/, "a derived nonce");
+    assert.strictEqual(nonces[1], nonces[0], "the same key derives the same nonce (a re-run re-claims its own lease)");
+    assert.notStrictEqual(nonces[2], nonces[0], "another epoch's key is another nonce");
+    assert.notStrictEqual(nonces[3], nonces[0], "another attempt is another nonce");
+    assert.strictEqual(nonces[4], null, "no key: the host mints a fresh one");
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// reconcileCandidateSha stages only the RESTORED protected paths — never the
+// hook-staged residue the candidate suite's setup left (folded item of
+// issue-spor-integration-lease-random-nonce-and-unscoped-release).
+test("reconcileCandidateSha with a protected set stages only the restored protected paths: hook residue outside them is left uncommitted, and a tree whose only dirt is residue is not re-committed", () => {
+  const dir = integrationRepo();
+  const head = git(dir, "rev-parse", "branch").trim();
+  const built = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy: "merge" });
+  assert.strictEqual(built.ok, true, built.reason);
+  try {
+    // Residue a setup hook might leave: a generated file and an edit outside
+    // the protected set.
+    fs.writeFileSync(path.join(built.dir, "generated.lock"), "hook residue\n");
+    fs.appendFileSync(path.join(built.dir, "lib", "sub.js"), "// hook residue\n");
+    // Only residue: nothing to re-commit.
+    const untouched = integrationRunner.reconcileCandidateSha({ dir: built.dir, sha: built.sha, protectedPaths: ["test/**"] });
+    assert.strictEqual(untouched.ok, true, untouched.reason);
+    assert.strictEqual(untouched.amended, false, "residue outside the protected set is not a restoration");
+    assert.strictEqual(untouched.sha, built.sha);
+    // Now a real restoration beside the residue.
+    const forced = gateRunner.forceProtectedPaths({ top: dir, dir: built.dir, trustedRef: "main", protectedPaths: ["test/**"] });
+    assert.strictEqual(forced.ok, true, forced.reason);
+    const reconciled = integrationRunner.reconcileCandidateSha({ dir: built.dir, sha: built.sha, protectedPaths: ["test/**"] });
+    assert.strictEqual(reconciled.ok, true, reconciled.reason);
+    assert.strictEqual(reconciled.amended, true);
+    assert.match(git(dir, "show", `${reconciled.sha}:test/acceptance.js`), /add is broken/, "the restored protected file is in the re-commit");
+    assert.doesNotMatch(git(dir, "show", `${reconciled.sha}:lib/sub.js`), /hook residue/, "the edit outside the protected set is NOT committed");
+    assert.strictEqual(spawnSync("git", ["-C", dir, "cat-file", "-e", `${reconciled.sha}:generated.lock`]).status === 0, false, "the generated file is NOT committed");
+    assert.match(git(built.dir, "status", "--porcelain"), /generated\.lock/, "…it is still sitting in the working tree, untouched");
+  } finally {
+    built.cleanup();
+  }
+});
+
+test("statusPaths reads `git status --porcelain -z` entries, skipping a rename's original path", () => {
+  assert.deepStrictEqual(integrationRunner.statusPaths(" M a.js\0?? gen.lock\0R  new.js\0old.js\0 D test/x.js\0"), ["a.js", "gen.lock", "new.js", "test/x.js"]);
+  assert.deepStrictEqual(integrationRunner.statusPaths(""), []);
+});
+
+// ---------------------------------------------------------------------------
+// buildCandidateTree names its scratch dir after the node and stamps the
+// builder's identity, so a build sweeps the leaked tree of a DEAD builder for
+// the same node — never a live one's, never an unstamped dir.
+test("buildCandidateTree labels its scratch dir, stamps owner.json, and sweeps a dead owner's leaked tree for the same label while leaving a live owner's and an unstamped dir alone", () => {
+  const dir = integrationRepo();
+  const head = git(dir, "rev-parse", "branch").trim();
+  const label = `task-sweep-${process.pid}`;
+  const prefix = `spor-integration-${label}-`;
+  const first = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy: "merge", label });
+  assert.strictEqual(first.ok, true, first.reason);
+  const firstParent = path.dirname(first.dir);
+  try {
+    assert.ok(path.basename(firstParent).startsWith(prefix), `the scratch dir carries the label: ${firstParent}`);
+    const owner = JSON.parse(fs.readFileSync(path.join(firstParent, "owner.json"), "utf8"));
+    assert.strictEqual(owner.pid, process.pid);
+    assert.strictEqual(owner.label, label);
+    // A leaked tree of a DEAD builder: a real worktree under a same-label dir
+    // whose owner stamp names a pid that is not running.
+    const dead = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    const deadTree = path.join(dead, "tree");
+    assert.strictEqual(git(dir, "worktree", "add", "--detach", deadTree, "main").length >= 0, true);
+    fs.writeFileSync(path.join(dead, "owner.json"), JSON.stringify({ pid: 2147483000, started_ticks: 1, label }));
+    // An unstamped same-label dir: never touched.
+    const unstamped = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    fs.mkdirSync(path.join(unstamped, "tree"));
+    const second = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy: "merge", label });
+    assert.strictEqual(second.ok, true, second.reason);
+    try {
+      assert.strictEqual(fs.existsSync(dead), false, "the dead owner's leaked scratch dir is swept");
+      assert.doesNotMatch(git(dir, "worktree", "list", "--porcelain"), new RegExp(deadTree.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "…and its worktree registration pruned");
+      assert.strictEqual(fs.existsSync(first.dir), true, "the LIVE owner's tree (this process) is left alone");
+      assert.strictEqual(fs.existsSync(unstamped), true, "an unstamped dir is never swept");
+    } finally {
+      second.cleanup();
+      fs.rmSync(unstamped, { recursive: true, force: true });
+    }
+  } finally {
+    first.cleanup();
+  }
+});

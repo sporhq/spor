@@ -1532,9 +1532,17 @@ bounded separately (`RACE_RETRY_CAP`) and never charged against the fix-cycle
 cap, since losing a race is nobody's mistake. The `serialize: repo` lease that
 makes the race rare rather than load-bearing is best-effort and fail-open:
 remote mode reuses the SAME server-held claim/lease door dispatch uses
-(`claimDispatch`) against a synthetic per-repo lock node; local mode falls
-back to a machine-local lockfile (dec-cc-task-claim-lease "Local mode" has no
-server pool to lean on there). `mode: propose`
+(`claimDispatch`) against a synthetic per-repo lock node — claimed under a
+nonce DERIVED from the journaled `acquireLease` activity key (run, attempt,
+key; gate-deps.js), never a random one, so a crash re-run of the same activity
+re-claims its own orphaned lease instead of waiting on a 409 against itself and
+landing unserialized, and bound as the lease's `session` so the release goes
+through `POST /v1/queue/release {session: <nonce>}` and frees only that claim
+(the singular `/v1/nodes/{id}/release` is holder-scoped and would free a
+teammate driver's re-claim; it is the fallback only for a server without the
+bulk door — issue-spor-integration-lease-random-nonce-and-unscoped-release);
+local mode falls back to a machine-local lockfile (dec-cc-task-claim-lease
+"Local mode" has no server pool to lean on there). `mode: propose`
 (task-spor-integration-propose-mode) is the fourth: it never mutates
 `target_ref` — it opens a PR from the implementer's own branch through the
 `gh` CLI (a declared capability; `spor work` refuses loudly at startup if it
@@ -1810,7 +1818,17 @@ polling the item and delivering its answer (or a stop), the deadline's
 passing the journaled timeout that settles `blocked` — so a crash mid-wait
 resumes the same wait under the same deadline, never re-filing
 (task-spor-gate-human-approval-await-signal; a journal opened without
-`approvalSignals` keeps the in-activity poll it recorded); the fix cycle's and the rescue's run-terminal
+`approvalSignals` keeps the in-activity poll it recorded) — and the SLOT IS
+FREED between polls (task-spor-pipeline-graph-writes-owner-guard-and-
+approval-slot): under `approvalYield` (journaled in `open`; needs
+`checkApproval` AND a persisted `workflowJournal`, so a legacy in-memory run
+keeps the in-driver poll) each poll round journals an awaiting-approval marker
+(`…/approval/<r>/<gate>/<c>/p<n>/yield`, the stage's `interrupted` hand-up
+with `awaiting_approval` and `paused_until` at the next poll — `poll_ms`
+floored at 60s, never past the deadline) and `yieldUntil`s on it; the
+projection reads it parked-and-due and skips it for the re-offer cap (a
+time-boxed wait), the loop re-offers at the wake, and the driver's one immediate
+read delivers the answer or `pending` for the next round; the fix cycle's and the rescue's run-terminal
 waits are signals (`run:<id>`, `rescue-run:<id>`) when gate-deps wires the
 halves (`dispatchFix`/`dispatchRescue` + `awaitRun` + `rescueReport`; the
 one-shot `fix`/`rescue` are their tagged compositions, and a caller-

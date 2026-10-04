@@ -120,7 +120,7 @@ const HOST_EXEMPT = new Set([
 ]);
 const GRAPH_WRITE_HELPERS = new RegExp(`(?<![A-Za-z0-9_$.])(${[...HOST_WRITERS, "proposePR", "graphEdgeMutation", "dispatch"].join("|")})\\s*\\(|\\.landCandidate\\s*\\(`, "g");
 // Writers the item named explicitly — they must stay listed.
-const REQUIRED_GUARDED = { gate: ["recordFact", "escalate"], integration: ["recordFact", "parkForReview", "escalate"] };
+const REQUIRED_GUARDED = { gate: ["recordFact", "escalate", "pinCandidate", "openSuite"], integration: ["recordFact", "parkForReview", "escalate", "pinCandidate", "runSuite", "cleanupImplementer"] };
 
 // Keys only the writer may spell as an object key: the progress stamp and the
 // revision the versioned put owns.
