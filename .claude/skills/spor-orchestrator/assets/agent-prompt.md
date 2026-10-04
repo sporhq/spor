@@ -36,6 +36,7 @@ from that, and breaking either tangles other agents' work:
    around it. Keep the change scoped to this item — if you trip over unrelated
    problems, don't fold them in; file them (step 5) and move on.
 
+   <!-- box-safety:begin ops-script indent=3 -->
    **Never run a host-mutating ops script against real paths — by hand or from a
    test.** A script that deletes, prunes, gc's, acks, erases or restarts
    (`scripts/*.sh` like `enospc-recover.sh`, `prune-*`, `ack-*`, anything taking
@@ -51,6 +52,7 @@ from that, and breaking either tangles other agents' work:
    (`/tmp/claude-*`): one implementer's early test ran `enospc-recover.sh
    --apply` for real and pruned every Docker image plus other sessions' scratch
    (issue-spor-implementer-ran-destructive-host-script-during-test).
+   <!-- box-safety:end -->
 
 3. **Verify first — the cheap, deterministic gate.** Before spending any review
    budget, get the deterministic checks green: the typecheck and the tests that
@@ -58,17 +60,19 @@ from that, and breaking either tangles other agents' work:
    touched the kernel/schema/store). These are far cheaper than an LLM review and
    catch most regressions — there's no point reviewing code that fails its tests.
    Don't hand back red tests or "should work"; if you can't verify it, say so
-   plainly in your final report rather than claiming success. **Run the full
-   suite in the FOREGROUND — never as a background job, and never end your
-   turn waiting on it or on a completion notification.** You are a one-shot
+   plainly in your final report rather than claiming success.
+
+   <!-- box-safety:begin foreground-suite indent=3 cmd=npm test -->
+   **Run any suite or check in the FOREGROUND — never as a background job, and
+   never end your turn waiting on it or on a completion notification.** You are a one-shot
    supervised run: your turn ending is the run ending, so anything not
    committed and resolved by then is gone, not merely paused (this is exactly
-   how two implementers in this fleet lost their commit). If the suite may run
-   longer than the Bash tool's 600000ms (10min) cap, don't fight the cap with a
-   bigger timeout — launch it detached to a log and poll for completion in the
-   foreground with an until-loop, each poll comfortably under 10 minutes.
-   Give the run its own process group and RECORD it, so "stop my suite" can
-   only ever mean yours, e.g.:
+   how two implementers in this fleet lost their commit). If it may run longer
+   than the Bash tool's 600000ms (10min) cap, don't fight the cap with a bigger
+   timeout — launch it detached to a log and poll for completion in the
+   foreground with an until-loop, each poll comfortably under 10 minutes. Give
+   the run its own process group and RECORD it, so "stop my suite" can only ever
+   mean yours, e.g.:
    ```bash
    LOG=/tmp/{{node}}-test.log
    setsid sh -c 'npm test > "$1" 2>&1; echo "EXIT=$?" >> "$1"' sh "$LOG" & echo $! > "$LOG.pgid"
@@ -77,17 +81,23 @@ from that, and breaking either tangles other agents' work:
    ```bash
    LOG=/tmp/{{node}}-test.log; until grep -q '^EXIT=' "$LOG"; do sleep 30; done; tail -50 "$LOG"
    ```
-   This is the same foreground-only discipline `references/merge.md` holds
-   merge subagents to for a long `npm test`.
+   This is the same foreground-only discipline `references/merge.md` holds merge
+   subagents to for a long `npm test`. To stop that run:
+   `LOG=/tmp/{{node}}-test.log; kill -- -"$(cat "$LOG.pgid")"`.
+   <!-- box-safety:end -->
+
+   <!-- box-safety:begin kill-own indent=3 -->
    **Only ever kill processes you started — by the PID or process group you
-   recorded, never by pattern.** To stop that suite:
-   `LOG=/tmp/{{node}}-test.log; kill -- -"$(cat "$LOG.pgid")"`. Never
-   `pkill -f`, `killall`, `pkill node`, or `kill $(pgrep …)`: this box runs other agents' suites concurrently in their own
-   worktrees, and a pattern like `pkill -f "node --test"` kills theirs too —
-   they then fail as signal-killed runs with no trace back to you
-   (issue-spor-orchestrator-agent-global-pkill-kills-other-agents). A process
-   you did not start that looks hung is the orchestrator's to handle: name it
-   in your final report; don't kill it.
+   recorded, never by pattern.** A suite you detach gets its own process group,
+   recorded: `setsid … & echo $! > "$LOG.pgid"`, and `kill -- -"$(cat "$LOG.pgid")"`
+   stops it. Never `pkill -f`, `killall`, `pkill node`, or `kill $(pgrep …)`: this
+   box runs other agents' suites concurrently in their own worktrees, and a
+   pattern like `pkill -f "node --test"` kills theirs too — they then fail as
+   signal-killed runs with no trace back to you
+   (issue-spor-orchestrator-agent-global-pkill-kills-other-agents). A process you
+   did not start that looks hung is not yours to kill: name it in your final
+   report or verdict; don't kill it.
+   <!-- box-safety:end -->
 
 4. **Review, right-sized — one pass, FOREGROUND, escalate only on signal.** With
    the gates green, get a fresh-context review of your diff (`git diff

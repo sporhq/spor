@@ -3,9 +3,18 @@
 Input: exact node, repo, worktree, branch, report and expected commit SHA.
 One merge at a time. Execute through the final verdict; if a command yields,
 resume waiting for that command's result. A helper must not select more work.
-Only kill processes you started, by the PID or process group you recorded;
-never `pkill -f`, `killall` or `kill $(pgrep …)` — other agents' suites run
-concurrently on this box and a pattern kills theirs too.
+<!-- box-safety:begin kill-own -->
+**Only ever kill processes you started — by the PID or process group you
+recorded, never by pattern.** A suite you detach gets its own process group,
+recorded: `setsid … & echo $! > "$LOG.pgid"`, and `kill -- -"$(cat "$LOG.pgid")"`
+stops it. Never `pkill -f`, `killall`, `pkill node`, or `kill $(pgrep …)`: this
+box runs other agents' suites concurrently in their own worktrees, and a
+pattern like `pkill -f "node --test"` kills theirs too — they then fail as
+signal-killed runs with no trace back to you
+(issue-spor-orchestrator-agent-global-pkill-kills-other-agents). A process you
+did not start that looks hung is not yours to kill: name it in your final
+report or verdict; don't kill it.
+<!-- box-safety:end -->
 
 1. Verify the implementer's reported commit exists in this branch, inspect its
    diff and acceptance evidence, and require a clean worktree. Confirm merge

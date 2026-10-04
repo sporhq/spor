@@ -20,15 +20,22 @@ before this rule, issue-spor-orchestrator-merge-subagent-stall). A long
 ends exactly once, at the tight verdict (`MERGED`/`FAILED`/`ESCALATE`), never
 before.
 
+<!-- box-safety:begin kill-own -->
 **Only ever kill processes you started — by the PID or process group you
-recorded, never by pattern.** If you detach a long suite to a log (step 6),
-give it its own group and record it — `setsid sh -c 'npm test > "$1" 2>&1;
-echo "EXIT=$?" >> "$1"' sh "$LOG" & echo $! > "$LOG.pgid"` — and stop it with
-`kill -- -"$(cat "$LOG.pgid")"`. Never `pkill -f`, `killall`, `pkill node`, or
-`kill $(pgrep …)`: implementers' suites run concurrently on this box in their
-own worktrees, and a pattern like `pkill -f "node --test"` kills theirs too
+recorded, never by pattern.** A suite you detach gets its own process group,
+recorded: `setsid … & echo $! > "$LOG.pgid"`, and `kill -- -"$(cat "$LOG.pgid")"`
+stops it. Never `pkill -f`, `killall`, `pkill node`, or `kill $(pgrep …)`: this
+box runs other agents' suites concurrently in their own worktrees, and a
+pattern like `pkill -f "node --test"` kills theirs too — they then fail as
+signal-killed runs with no trace back to you
 (issue-spor-orchestrator-agent-global-pkill-kills-other-agents). A process you
-did not start that looks hung goes in your verdict, not under your `kill`.
+did not start that looks hung is not yours to kill: name it in your final
+report or verdict; don't kill it.
+<!-- box-safety:end -->
+
+In step 6 the same rule applies to a detached full suite: `LOG` is your own
+per-node log and `npm test` the command, e.g. `setsid sh -c 'npm test > "$1" 2>&1;
+echo "EXIT=$?" >> "$1"' sh "$LOG" & echo $! > "$LOG.pgid"`.
 
 ## Why CAS, and why serialized
 

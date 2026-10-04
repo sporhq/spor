@@ -20,16 +20,24 @@ Remain on the branch selected by dispatch; do not switch branches.
 - Pin acceptance and implement only this item's scope. You are not alone in the
   repository: preserve others' edits. Never modify a shared checkout, create a
   second worktree, merge, push, deploy, or discard work you did not author.
-- Never run a host-mutating ops script (`scripts/*.sh` such as
-  `enospc-recover.sh`, prune/ack/erase scripts, anything that deletes, prunes,
-  gc's, restarts or takes `--apply`) against this box's real paths, by hand or
-  from a test. A test of one points every root it touches at a mkdtemp through
-  an override the script honours, stubs every external binary it calls
-  (`docker`, `fly`, `systemctl`, `sudo`, …) first on `PATH`, passes
-  `--no-restart` where offered, and opts in to `--apply` only inside that
-  sandbox; a root the script hardcodes gets an override or stays untested,
-  stated in your report. The box is shared with other agents
+- Host-mutating ops scripts:
+  <!-- box-safety:begin ops-script indent=2 -->
+  **Never run a host-mutating ops script against real paths — by hand or from a
+  test.** A script that deletes, prunes, gc's, acks, erases or restarts
+  (`scripts/*.sh` like `enospc-recover.sh`, `prune-*`, `ack-*`, anything taking
+  `--apply`) acts on the whole shared box: its `/tmp`, its Docker daemon, its
+  live `SPOR_HOME`, its running server. A test of one must point EVERY root it
+  touches at a `mkdtemp` through an override the script honours, put stubs for
+  every external binary it calls (`docker`, `fly`, `systemctl`, `sudo`, …)
+  first on `PATH`, pass `--no-restart` where offered, and opt in to `--apply`
+  explicitly, only inside that sandbox — including the first red draft of the
+  test. A root the script hardcodes (`enospc-recover.sh` sweeps the real `/tmp`
+  today) has no sandbox: add an override, or leave that path untested and say
+  so in your report. This box also holds other agents' worktrees and scratch
+  (`/tmp/claude-*`): one implementer's early test ran `enospc-recover.sh
+  --apply` for real and pruned every Docker image plus other sessions' scratch
   (issue-spor-implementer-ran-destructive-host-script-during-test).
+  <!-- box-safety:end -->
 - Run the relevant deterministic tests and required checks; include conformance
   goldens for kernel/schema/store changes. Inspect actual dependency paths for
   server tests. Never hardcode another machine's SPOR_LIB. Prepare dependencies
@@ -40,11 +48,19 @@ Remain on the branch selected by dispatch; do not switch branches.
 - Serialize full acceptance suites with other program workers. On Linux run
   the full suite under `flock /tmp/spor-codex-program-acceptance.lock` and save
   complete logs plus exit status. Focused tests can run independently.
-- Only kill processes you started, by the PID or process group you recorded
-  (`setsid … & echo $! > "$LOG.pgid"`, then `kill -- -"$(cat "$LOG.pgid")"`).
-  Never `pkill -f`, `killall` or `kill $(pgrep …)`: other agents' suites run
-  concurrently on this box and a pattern kills theirs too. Report a hung
-  process you did not start; don't kill it.
+- Processes:
+  <!-- box-safety:begin kill-own indent=2 -->
+  **Only ever kill processes you started — by the PID or process group you
+  recorded, never by pattern.** A suite you detach gets its own process group,
+  recorded: `setsid … & echo $! > "$LOG.pgid"`, and `kill -- -"$(cat "$LOG.pgid")"`
+  stops it. Never `pkill -f`, `killall`, `pkill node`, or `kill $(pgrep …)`: this
+  box runs other agents' suites concurrently in their own worktrees, and a
+  pattern like `pkill -f "node --test"` kills theirs too — they then fail as
+  signal-killed runs with no trace back to you
+  (issue-spor-orchestrator-agent-global-pkill-kills-other-agents). A process you
+  did not start that looks hung is not yours to kill: name it in your final
+  report or verdict; don't kill it.
+  <!-- box-safety:end -->
 - Self-review the diff, correct verified defects, and rerun affected checks.
   The supervisor performs a separate Astra review before merging.
 - Commit on this branch with a clear message and `Spor: {{node}}` in the final

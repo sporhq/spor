@@ -41,6 +41,13 @@ follows it to a terminal state (`done`/`failed`/`failed_launch`/`vanished`), and
 child's final message lands in the printed `report:` file regardless of harness —
 Claude and Codex both. You are the loop around it.
 
+> **Box-safety rules are rendered, not hand-copied.** The ops-script sandboxing,
+> kill-only-your-own-processes and foreground/detach-and-poll rules live ONCE in
+> `partials/box-safety.md` and are spliced into every prompt and merge reference
+> between `box-safety:begin/end` markers. Edit the partial, then run
+> `node scripts/render-box-safety.js` (`--check` reports drift;
+> `test/box-safety-partial.test.js` enforces it). Never edit inside a marker pair.
+
 ## Mental model — four things that make this safe
 
 1. **Non-overlap is the lease's job, not yours to guess.** Dispatching a node
