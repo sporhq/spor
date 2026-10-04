@@ -11644,3 +11644,18 @@ test("a crash/resume over a timed-out gate re-judges from the journal without ch
   assert.deepStrictEqual(seen.fixes, []);
   assert.ok(seen.pools.retry.spent <= 1, "the pool is never charged past its declared bound");
 });
+
+test("a completed failure followed by a timed-out rerun is still an actual failure, not an outage", async () => {
+  let call = 0;
+  const { deps, seen } = fakes({
+    changed: ["lib/kernel/queue.js"],
+    suite: () => {
+      call += 1;
+      return call === 1 ? { ok: false, code: 1, output: "lint failed\n" } : TIMED_OUT("");
+    },
+  });
+  const factory = factoryOf({ ...BASE, gates: [{ ...TIMEOUT_GATE, reruns: 1 }] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.notStrictEqual(res.gates[0].verdict, "infrastructure");
+});
