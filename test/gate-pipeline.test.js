@@ -1527,7 +1527,7 @@ const ORPHAN_AT = Date.parse(ORPHAN_RECORD.finished_at);
 // something said started it (task-spor-delete-loop-resume-machinery-after-
 // workflow-stages). The projection shapes below are projectRun's.
 const FAR = "2099-01-01T00:00:00.000Z";
-const leaseOf = ({ worker = "w1", released = false, expires = FAR, factory = null } = {}) => ({ token: `tok-${worker}`, worker, factory, attempt: 0, at: ORPHAN_RECORD.finished_at, expires_at: expires, renewed_at: null, released_at: released ? ORPHAN_RECORD.finished_at : null });
+const leaseOf = ({ worker = "w1", released = false, expires = FAR, factory = null, attempt = 0 } = {}) => ({ token: `tok-${worker}`, worker, factory, attempt, at: ORPHAN_RECORD.finished_at, expires_at: expires, renewed_at: null, released_at: released ? ORPHAN_RECORD.finished_at : null });
 const RUNNING = { stages: [{ stage: "gates-a0", status: "running" }], current: { stage: "gates-a0", kind: "gates", attempt: 0, status: "running", state: null, due: null, reoffers: 0, parked: null }, open: "gates-a0" };
 const parkedOn = ({ due = 0, reoffers = 1, reason = "flake occurrence evidence is pending graph publication", paused_until = null, paused_profile = null } = {}) => ({
   stages: [{ stage: "gates-a0", status: "parked" }],
@@ -1566,7 +1566,10 @@ test("openPipelines adopts an OPEN pipeline — a dead worker's running journal,
   assert.deepStrictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf(), projection: { ...RUNNING, unreadable: [{ path: "x", stage: "gates-a0", error: "corrupt at line 2" }] } })], { now }), [], "a journal nobody can read is nobody's to drive — reported by `spor runs`, never adopted and failed");
   // What an adopted entry carries: the slot the loop opens, and the attempt
   // the open journal belongs to (a --regate's attempt continues ITS journal).
-  const [o] = workLoop.openPipelines([cand({ ...ORPHAN_RECORD, harness: "fake", item_repo: "demo", gate_regate_count: 2 }, { lease: leaseOf({ released: true }), projection: parkedOn({ reoffers: 2 }) })], { now });
+  // The attempt's identity is the LEASE's (task-spor-fold-gate-and-integration-
+  // into-one-workflow): a record's legacy `gate_regate_count` is read only
+  // when the run was never claimed.
+  const [o] = workLoop.openPipelines([cand({ ...ORPHAN_RECORD, harness: "fake", item_repo: "demo", gate_regate_count: 1 }, { lease: leaseOf({ released: true, attempt: 2 }), projection: parkedOn({ reoffers: 2 }) })], { now });
   assert.deepStrictEqual({ ...o, record: undefined }, { run_id: "run-orphan", node_id: "task-orphan", harness: "fake", project: "demo", attempt: 3, record: undefined, stage: "gates-a0", reoffers: 2, reason: "flake occurrence evidence is pending graph publication", escalate: false });
   assert.strictEqual(workLoop.openPipelines([cand(ORPHAN_RECORD, { lease: leaseOf(), projection: RUNNING })], { now })[0].attempt, 0, "a work loop's own pipeline is attempt 0");
 });
@@ -4181,7 +4184,8 @@ test("end to end: a run refused for an external cause is re-judged with --regate
   assert.match(fs.readFileSync(path.join(nodes, regate), "utf8"), new RegExp(`- \\{type: resolves, to: ${escalation}\\}`));
   const after = JSON.parse(fs.readFileSync(recordPath, "utf8"));
   assert.strictEqual(after.gate_state, "passed", "the settled verdict on the record is the re-gate's");
-  assert.strictEqual(after.gate_regate_count, 1);
+  // The attempt's identity is the LEASE's (task-spor-fold-gate-and-integration-into-one-workflow).
+  assert.strictEqual(require("../lib/shell/stage-projection.js").pipelineAttempt(after, require("../lib/shell/stage-projection.js").pipelineLease(home, after)), 1);
   assert.match(after.gate_reason, /gate\(s\) passed/);
   assert.strictEqual(fs.readFileSync(path.join(nodes, "task-ready.md"), "utf8").includes("status: open"), true, "the stub never claimed completion, so nothing is promoted");
   assert.strictEqual(execFileSync("git", ["-C", repo, "worktree", "list"], { encoding: "utf8" }).trim().split("\n").length, 1, "the re-gate's tree is cleaned up");
@@ -4462,7 +4466,7 @@ test("a re-gate that still FAILS keeps the escalation, annotates it, and is neve
   assert.strictEqual(after.gate_flake_regate.state, "failed");
   const again = cli(["work", "--regate-flakes", "--factory", "factory-demo"], f.env);
   assert.match(again.stdout, /already re-gated once against issue-flake-known/);
-  assert.strictEqual(f.record().gate_regate_count, 1, "the same fix is never tried twice");
+  assert.strictEqual(require("../lib/shell/stage-projection.js").pipelineAttempt(f.record(), require("../lib/shell/stage-projection.js").pipelineLease(f.home, f.record())), 1, "the same fix is never tried twice");
 });
 
 test("an EMPTY-diff refusal whose item's resolver cites commits already on the trusted ref is retired without a re-gate", () => {

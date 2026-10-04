@@ -424,3 +424,54 @@ test("the constructor refuses what the model cannot run without", () => {
   const e = new Execution((ctx) => ctx.run("k", "missing", {}), {}, { clock: fakeClock() });
   return e.run().then((r) => assert.match(String(r.error), /no activity missing/));
 });
+
+// task-spor-fold-gate-and-integration-into-one-workflow: a yield must suspend
+// at least once whatever the clock reads, and live driver data rides the
+// Suspend's own detail.
+test("yieldUntil SUSPENDS ONCE: the live call suspends even with the wake already past, the replay continues once the clock is past it, and `meta` rides the Suspend detail", async () => {
+  const clock = fakeClock(1000);
+  const journal = [];
+  let passes = 0;
+  const fn = async (ctx) => {
+    for (let n = 0; ; n += 1) {
+      const r = await ctx.run(`p${n}`, "step", {});
+      passes += 1;
+      if (r.state !== "interrupted") return r;
+      const at = ctx.now(`p${n}/now`);
+      ctx.yieldUntil(`p${n}/timer`, at + 1, { parked: r });
+    }
+  };
+  let calls = 0;
+  const activities = { step: () => ({ state: ++calls === 1 ? "interrupted" : "passed" }) };
+  const e = new Execution(fn, {}, { journal, clock, activities });
+  // The clock moves past the wake inside the drive, as a real clock does.
+  const first = await e.run();
+  assert.equal(first.status, "suspended");
+  assert.equal(first.kind, "timer");
+  assert.equal(first.detail.fireAt, 1001);
+  assert.deepEqual(first.detail.meta, { parked: { state: "interrupted" } });
+  assert.equal(passes, 1, "the live yield suspended: no second pass in the same drive");
+  clock.advanceTo(1000); // not past the wake: a replay still suspends
+  const again = await new Execution(fn, {}, { journal, clock, activities }).run();
+  assert.equal(again.status, "suspended");
+  assert.equal(calls, 1, "nothing executed before the wake");
+  clock.advanceTo(1001);
+  const done = await new Execution(fn, {}, { journal, clock, activities }).run();
+  assert.equal(done.status, "completed");
+  assert.deepEqual(done.result, { state: "passed" });
+  assert.equal(calls, 2);
+  // sleepUntil keeps its contract: a wake already past does not suspend, and
+  // meta rides it too when it does.
+  const sleeper = new Execution((ctx) => { ctx.sleepUntil("s", 5000, { why: "pause" }); return "woke"; }, {}, { journal: [], clock: fakeClock(100), activities: {} });
+  const slept = await sleeper.run();
+  assert.equal(slept.status, "suspended");
+  assert.deepEqual(slept.detail.meta, { why: "pause" });
+  const past = await new Execution((ctx) => { ctx.sleepUntil("s", 50); return "woke"; }, {}, { journal: [], clock: fakeClock(100), activities: {} }).run();
+  assert.equal(past.status, "completed");
+  // awaitSignal: a deadline already past times out WITHOUT suspending; meta rides a live suspend.
+  const timedOut = await new Execution((ctx) => ctx.awaitSignal("a", "approval:x", { deadlineAt: 50 }), {}, { journal: [], clock: fakeClock(100), activities: {} }).run();
+  assert.deepEqual(timedOut.result, { received: false, timeout: true });
+  const waiting = await new Execution((ctx) => ctx.awaitSignal("a", "approval:x", { meta: { id: "x" } }), {}, { journal: [], clock: fakeClock(100), activities: {} }).run();
+  assert.equal(waiting.status, "suspended");
+  assert.deepEqual(waiting.detail.meta, { id: "x" });
+});

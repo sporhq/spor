@@ -2585,8 +2585,21 @@ closes with a `settled` entry. Beside them sits the **pipeline lease log**
 (`pipeline.jsonl` / `<execution>.pipeline.jsonl`): one `claim` line per pipeline
 a worker starts on the run — the ownership nonce `gate_settle_id` used to be
 minted onto the record as `gate_state: running`; it is now this journaled entry
-— `renew` lines once a pass while the worker drives it, and a `release` line
-when the pipeline yields. The run RECORD carries only the FINAL outcome
+— `renew` lines once a pass while the worker drives it AND from inside the
+pipeline's own long waits (every wait slice renews by token, throttled to a
+third of the TTL, so a stalled-but-live worker past the TTL is never
+double-driven), and a `release` line when the pipeline yields. The claim line's
+`attempt` IS the pipeline attempt's identity (what `gate_regate_count` on the
+record used to say; `regated_at` on the folded lease what `gate_regated_at`
+did) — read everywhere through stage-projection.js `pipelineAttempt`, which
+falls back to the record's field only for a run never claimed. Above the three
+stage journals sits the PARENT journal, `pipeline-a<attempt>`
+(lib/shell/pipeline-workflow.js): the pipeline itself as one workflow function
+whose activities are the stage drivers, the split-verdict stamps, the completion
+writes, the landed-work reconcile and the settle-then-attest; a child's
+`interrupted` is a durable yield of the parent (`…/<stage>/p<n>/yield`, a
+suspend-once timer at the child's own wake), and the re-drive runs the stage's
+next pass. The run RECORD carries only the FINAL outcome
 (`gate_state` and the settled verdict's fields, §8); nothing transitional is
 ever written to it, and a worker that dies mid-pipeline leaves nothing there.
 

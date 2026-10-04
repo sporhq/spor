@@ -1960,13 +1960,75 @@ a fallback hand-off resets) and the scan marks the entry `escalate`. Every
 it, not mtime), the integration and implementation stages close with a
 `settled` entry like the gate list, `latestProgress`/`projectRun` REPORT an
 unreadable gate journal instead of skipping it, and `claimPipeline` reads
-`owesEvidence` only as a function (a boolean override is ignored). Still open
-on the parent task: the fold of `runGateAndIntegration` into one workflow
-function. See
+`owesEvidence` only as a function (a boolean override is ignored). See
 test/workflow-kernel.test.js, test/workflow-journal.test.js,
 test/dispatch-adopt-by-name.test.js, test/integration-workflow.test.js and
 test/gate-workflow.test.js (the crash sweeps: a crash at every activity
 boundary resumes to the same result and side effects).
+**Slice 5 — the pipeline IS one workflow function
+(task-spor-fold-gate-and-integration-into-one-workflow):**
+`lib/shell/pipeline-workflow.js` holds what `runGateAndIntegration` in
+bin/spor.js used to do imperatively between the three stages as
+`pipelineWorkflow(ctx, input)` over ONE parent journal, `pipeline-a<attempt>`
+beside the stage journals: the stage drivers are its activities
+(`implementation`, `gates`, `integration`, each still driving its own child
+journal, so a child's at-least-once re-run replays to the same result), and so
+are the split-verdict stamps, the completion writes at either boundary, the
+landed-work reconcile and the settle-then-attest `leave`. A child's
+`interrupted` is a durable YIELD of the parent (`…/<stage>/p<n>/yield` plus a
+timer at the child's own `paused_until`, else one tick — the parent's yield is
+paced by its children's, since the loop re-offers at the latest OPEN stage's
+`due`), after which the re-drive runs that stage's NEXT PASS (`p<n+1>`); a
+passed stage is never re-run. The `open` entry journals the BINDING (controller
+completion, the boundary, which stages the factory declares, `reconcileLanded`,
+the child journal NAMES — the regate child's `{prefix, attempt}` included, so
+the re-gate key is a journaled input of the parent and a resumed parent names
+the same child for the same head) and every branch reads the journaled copy;
+the stages enforce their own definition bindings, and a stage activity whose
+block the live factory no longer declares settles a tagged refusal. A parent
+journal this code cannot continue (another version, a replay fault) is logged
+and driven over a fresh in-memory journal — the children hold the real state.
+Ownership stays OUTSIDE the function: `runGateAndIntegration` still claims the
+pipeline lease and resumes the execution reporter before the drive and releases
+them after it (a yield releases the lease; the reporter leaves in a `finally`).
+**The lease is renewed from INSIDE long waits:** every `sleep` slice the deps
+take (the review and fix-cycle awaits, the outage backoff, the approval poll)
+renews the pipeline lease by TOKEN (`renewPipeline`'s `token` arm — the worker
+id alone would also renew a lease a later claim by the same worker took over),
+throttled to a third of the TTL, each stage activity renews it before it
+starts, and an unref'd interval beats at the same cadence for the whole drive
+(a command gate's suite, a CI wait and the candidate suite are one awaited
+spawn or poll with no slice of ours inside) — so a stalled-but-live worker past
+the 30m TTL is never double-driven. The residual: a single SYNCHRONOUS step
+longer than the TTL still lapses.
+**The attempt's identity is the LEASE's:** `gate_regate_count`/`gate_regated_at`
+are no longer written to the record — the claim line's `attempt` and the
+folded lease's `regated_at` carry them, read everywhere through
+`stageProjection.pipelineAttempt(record, lease)` (which falls back to a
+pre-lease record's own field only while the run has no lease). A published
+worker slot EXPIRES (`liveWorkerSlots`' `staleMs`, the lease TTL, off the
+status file's `updated_at`), so a hung-but-alive worker no longer holds a
+lease-less run forever; a dead worker's `active`-slot inference is no longer
+reported as a foreign pipeline (only a `gating` slot is). The `owedBy` bridge in
+work.js `pendingGates` is DATED (`LEGACY_OWED_BY_BRIDGE_UNTIL`, 2026-10-18 =
+the stamp's ship date + run retention + slack): it stops applying then and is
+to be deleted, not kept dormant. Driver live data (a yield's parked result, an
+approval wait's item) rides the kernel Suspend's `meta` (`sleepUntil(key, at,
+meta)` / `awaitSignal(key, name, {meta})`), never a side slot on the input.
+See test/pipeline-workflow.test.js (the crash sweep over the parent).
+**Journal-format discipline — when to bump a WORKFLOW_VERSION:** a journal is
+bound to the version that recorded it (`WorkflowVersionMismatch`), so bump when
+the change would make a journal recorded yesterday replay DIFFERENTLY or fail
+today: a new REQUIRED entry (a step the function asks for in sequence — a new
+`ctx.run`/`now`/`sleepUntil`/`awaitSignal`, a renamed or re-ordered key), a
+new input the `open` entry BINDS (anything that joins the digest), or a changed
+reading of an existing entry's result that a branch depends on. Do NOT bump for
+an OPTIONAL, backward-readable field on an existing entry's result (`opened_at`
+was one): readers default it, old journals replay unchanged. The kernel's
+`awaitSignal({deadlineAt})` times out WITHOUT suspending when the clock is
+already past the deadline — a workflow that wants one read past the deadline
+(the human approval) must await without a kernel deadline and have the driver
+deliver the timeout as a signal after its own read.
 Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard

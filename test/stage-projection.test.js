@@ -389,7 +389,7 @@ test("the pipeline lease is a journaled claim beside the stage journals: claimed
   }
 });
 
-test("a reopen is a compare-and-swap on the lease token, the attempt and the state, and only a new attempt moves gate_regate_count", () => {
+test("a reopen is a compare-and-swap on the lease token, the attempt and the state, and only a new attempt moves the lease attempt", () => {
   const home = scratch();
   try {
     const file = runs.runPaths(home, RUN).record;
@@ -398,7 +398,10 @@ test("a reopen is a compare-and-swap on the lease token, the attempt and the sta
     assert.equal(runs.claimPipeline(home, RUN, { workerId: "w", reopen: { settleId: "other", regateCount: 0, state: "failed" } }).refused, "the prior judgement changed before re-gate could claim it");
     const re = runs.claimPipeline(home, RUN, { workerId: "w", reopen: { settleId: "settled-nonce", regateCount: 0, state: "failed" } });
     assert.equal(re.ok, true, re.refused);
-    assert.equal(re.record.gate_regate_count, 1, "a new attempt");
+    assert.equal(re.lease.attempt, 1, "a new attempt — its identity is the lease's");
+    assert.equal(sp.pipelineAttempt(re.record, re.lease), 1);
+    assert.equal(re.record.gate_regate_count, 0, "the record's legacy field is never written again");
+    assert.ok(re.lease.regated_at, "the lease carries when the attempt was opened");
     assert.equal(re.record.gate_state, null, "the prior verdict is cleared");
     assert.equal(re.record.gate_settle_id, null, "and so is the prior settle nonce — a stale nonce never stands in for the lease");
     assert.equal(re.lease.attempt, 1);
@@ -409,7 +412,7 @@ test("a reopen is a compare-and-swap on the lease token, the attempt and the sta
     runs.stampGateState(home, RUN, { gate_state: null }, { own: re.token, force: true });
     const resumed = runs.claimPipeline(home, RUN, { workerId: "w", reopen: { settleId: re.token, regateCount: 1, state: null, resume: true } });
     assert.equal(resumed.ok, true, resumed.refused);
-    assert.equal(resumed.record.gate_regate_count, 1, "a resume opens no new attempt");
+    assert.equal(sp.pipelineAttempt(resumed.record, resumed.lease), 1, "a resume opens no new attempt");
     assert.equal(resumed.lease.resume, true);
     // A settled pass/park/superseded is never reopened.
     runs.stampGateState(home, RUN, { gate_state: "passed" }, { own: resumed.token });
@@ -526,4 +529,47 @@ test("openPipelineCandidates: a record is a candidate only when a lease, a stage
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+// task-spor-fold-gate-and-integration-into-one-workflow: the lease carries the
+// attempt's identity, renews by token, and a present-but-null `own` is refused.
+test("the lease is the attempt: pipelineAttempt reads the claim's attempt (the record's legacy count only when never claimed), regated_at marks the reopen, renewPipeline renews by token, and stampGateState refuses `own: null` at runtime", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-lease-attempt-"));
+  const RUN = "run-lease-attempt";
+  const file = runs.runPaths(home, RUN).record;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  runs.atomicJson(file, { run_id: RUN, node_id: "task-demo", gate_regate_count: 3 });
+  const record = runs.readJson(file);
+  assert.equal(sp.pipelineAttempt(record, null), 3, "never claimed: the legacy record field");
+  const t0 = Date.parse("2026-10-04T12:00:00.000Z");
+  const claim = runs.claimPipeline(home, RUN, { workerId: "w1", nowMs: () => t0 });
+  assert.equal(claim.ok, true, claim.refused);
+  assert.equal(claim.lease.attempt, 3, "the first claim carries the attempt it found");
+  assert.equal(claim.lease.regated_at, null);
+  assert.equal(sp.pipelineAttempt(runs.readJson(file), claim.lease), 3);
+  // Renew by token: the holder's token renews, a stranger's does not, and the
+  // worker-id arm still works.
+  assert.equal(runs.renewPipeline(home, RUN, { token: "stranger", nowMs: () => t0 + 1000 }).ok, false);
+  const renewed = runs.renewPipeline(home, RUN, { token: claim.token, nowMs: () => t0 + 1000 });
+  assert.equal(renewed.ok, true);
+  assert.equal(renewed.lease.expires_at, new Date(t0 + 1000 + sp.PIPELINE_LEASE_TTL_MS).toISOString());
+  assert.equal(runs.renewPipeline(home, RUN, { workerId: "w1", token: claim.token, nowMs: () => t0 + 2000 }).ok, true);
+  // A reopen opens attempt 4 ON THE LEASE; the record's count is untouched.
+  runs.stampGateState(home, RUN, { gate_state: "failed", gate_settle_id: claim.token }, { own: claim.token });
+  const re = runs.claimPipeline(home, RUN, { workerId: "w1", nowMs: () => t0 + 5000, now: () => new Date(t0 + 5000).toISOString(), reopen: { settleId: claim.token, regateCount: 3, state: "failed" } });
+  assert.equal(re.ok, true, re.refused);
+  assert.equal(re.lease.attempt, 4);
+  assert.equal(re.lease.regated_at, new Date(t0 + 5000).toISOString());
+  assert.equal(re.record.gate_regate_count, 3, "never written again");
+  assert.equal(re.record.gate_regated_at, undefined);
+  assert.equal(sp.pipelineAttempt(re.record, re.lease), 4);
+  // A reopen whose regateCount is stale against the LEASE is refused.
+  runs.stampGateState(home, RUN, { gate_state: "failed", gate_settle_id: re.token }, { own: re.token });
+  assert.equal(runs.claimPipeline(home, RUN, { workerId: "w1", reopen: { settleId: re.token, regateCount: 3, state: "failed" } }).refused, "the prior judgement changed before re-gate could claim it");
+  // `own: null` is refused outright — not read as the unowned door.
+  assert.equal(runs.stampGateState(home, RUN, { gate_fix_run_id: "x" }, { own: null }), null);
+  const unowned = runs.stampGateState(home, RUN, { gate_fix_run_id: "x" }, { own: undefined });
+  assert.equal(unowned && unowned.gate_fix_run_id, undefined, "an explicit undefined is the unowned door, which declines a settled, claimed record and hands it back as read");
+  assert.equal(runs.readJson(file).gate_fix_run_id, undefined);
+  fs.rmSync(home, { recursive: true, force: true });
 });

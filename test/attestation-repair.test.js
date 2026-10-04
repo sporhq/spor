@@ -350,7 +350,10 @@ test("an interrupted --regate on pending flake evidence is resumed by the next -
     assert.equal(await regate(), 1);
     let rec = runner.readJson(f.file);
     assert.equal(rec.gate_state, null, "nothing settled: the reopened attempt carries no verdict (and no transitional one either)");
-    assert.equal(rec.gate_regate_count, 1);
+    // The attempt's identity is the LEASE's, never written onto the record
+    // (task-spor-fold-gate-and-integration-into-one-workflow).
+    assert.equal(stageProjection.pipelineAttempt(rec, stageProjection.pipelineLease(f.home, rec)), 1);
+    assert.equal(rec.gate_regate_count, 0, "the record's legacy field is left exactly as seeded");
     assert.ok(owed(), "the interrupted attempt owes its evidence");
     assert.ok(!rec.gate_attestation && !rec.gate_attestation_pending, "an interruption attests nothing");
     assert.equal(rec.gate_failing_tests, null, "the refused attempt's failing tests do not stand for an attempt that judged nothing");
@@ -367,7 +370,7 @@ test("an interrupted --regate on pending flake evidence is resumed by the next -
     assert.equal(await regate(), 1, "interrupted again");
     rec = runner.readJson(f.file);
     assert.equal(rec.gate_state, null);
-    assert.equal(rec.gate_regate_count, 1, "a resume does not open another attempt");
+    assert.equal(stageProjection.pipelineAttempt(rec, stageProjection.pipelineLease(f.home, rec)), 1, "a resume does not open another attempt");
     assert.ok(owed(), "still owed, still journaled under the attempt that owes it");
 
     assert.equal(await regate(), 0);
@@ -375,7 +378,7 @@ test("an interrupted --regate on pending flake evidence is resumed by the next -
   assert.deepEqual(seen, [{ attempt: 2, pending: 1 }, { attempt: 2, pending: 1 }], "each resume ran attempt 2 and saw its owed evidence");
   const rec = runner.readJson(f.file);
   assert.equal(rec.gate_state, "passed");
-  assert.equal(rec.gate_regate_count, 1);
+  assert.equal(stageProjection.pipelineAttempt(rec, stageProjection.pipelineLease(f.home, rec)), 1);
   assert.equal(owed(), false, "nothing is left owed");
   assert.ok(rec.gate_attestation, "the real verdict attests");
   assert.equal(rec.gate_attestation_pending || null, null);
@@ -449,7 +452,7 @@ test("a --regate resumes a work loop's interrupted pipeline under the loop's own
   assert.deepEqual(seen, [{ attempt: 0, pending: 1 }]);
   const rec = runner.readJson(f.file);
   assert.equal(rec.gate_state, "passed");
-  assert.equal(rec.gate_regate_count || 0, 0, "no new attempt was opened");
+  assert.equal(stageProjection.pipelineAttempt(rec, stageProjection.pipelineLease(f.home, rec)), 0, "no new attempt was opened");
   assert.equal(Object.values(require("../lib/shell/stage-projection.js").latestProgress(f.home, rec).stamp.gates).some((p) => p.evidence && !p.evidence.complete), false, "nothing is left owed");
 });
 
@@ -497,7 +500,7 @@ test("atomic reopen rejects a stale snapshot and a live settler, while mismatch 
   assert.deepEqual(runner.readJson(f.file), before);
   const winner = runner.claimPipeline(f.home, f.item.run_id, { workerId: "new", reopen });
   assert.equal(winner.ok, true, winner.refused);
-  assert.equal(winner.record.gate_regate_count, 1);
+  assert.equal(winner.lease.attempt, 1, "the attempt's identity is the lease's");
   assert.equal(winner.record.gate_state, null, "the reopened attempt carries no verdict yet");
   assert.equal(runner.claimPipeline(f.home, f.item.run_id, { workerId: "racer", reopen }).ok, false, "the snapshot is stale: the token moved");
   const projection = require("../lib/shell/stage-projection.js");
@@ -521,7 +524,7 @@ test("re-gating cannot overwrite an unpaid signed outbox; matching-origin replay
   await cli.replayAttestationDebts(f.cfg, { home: f.home });
   assert.equal(fs.readFileSync(path.join(f.home, "nodes", `${pending.built.id}.md`), "utf8"), pending.built.markdown);
   assert.equal(tryReopen().ok, true);
-  assert.equal(runner.readJson(f.file).gate_regate_count, 1);
+  assert.equal(stageProjection.pipelineAttempt(runner.readJson(f.file), stageProjection.pipelineLease(f.home, runner.readJson(f.file))), 1);
 });
 
 // task-spor-gate-regate-obligation-semantics: a SETTLED refusal that still
@@ -545,7 +548,7 @@ test("re-gating a settled refusal never clears incomplete flake evidence — it 
   const claim = runner.claimPipeline(f.home, f.item.run_id, { workerId: "new", reopen: { settleId: "prior", regateCount: 0, state: "failed" } });
   assert.equal(claim.ok, true, claim.refused);
   let after = runner.readJson(f.file);
-  assert.equal(after.gate_regate_count, 1);
+  assert.equal(stageProjection.pipelineAttempt(after, stageProjection.pipelineLease(f.home, after)), 1);
   assert.deepEqual(after.gate_progress.gates.acceptance, owedRow, "the claim leaves the obligation exactly as it was");
   // The new attempt's first write rolls the key over and CARRIES the debt —
   // into the gate-progress log (the legacy record stamp is the read-only
@@ -597,7 +600,7 @@ test("a --regate of a settled refusal owing flake evidence pays it first, then j
   assert.deepEqual(seen, [{ attempt: 2, pending: [{ carryKey: `${f.item.run_id}|acceptance`, attempt: 0 }] }], "the new attempt saw the prior attempt's debt, tagged with its origin");
   const rec = runner.readJson(f.file);
   assert.equal(rec.gate_state, "passed");
-  assert.equal(rec.gate_regate_count, 1);
+  assert.equal(stageProjection.pipelineAttempt(rec, stageProjection.pipelineLease(f.home, rec)), 1);
   const ledger = require("../lib/shell/stage-projection.js").latestProgress(f.home, rec);
   assert.equal(ledger.source, "log");
   assert.equal(gatesKernel.owedGateObligations(ledger.stamp, ledger.stamp.key).length, 0, "nothing is left owed");

@@ -98,6 +98,7 @@ const gateDepsLib = lazyModule(path.join(ROOT, "lib", "shell", "gate-deps.js"));
 const ciGate = lazyModule(path.join(ROOT, "lib", "shell", "ci-gate.js"));
 const implementationStage = lazyModule(path.join(ROOT, "lib", "shell", "implementation-stage.js"));
 const stageWorkflow = lazyModule(path.join(ROOT, "lib", "shell", "stage-workflow.js"));
+const pipelineWorkflow = lazyModule(path.join(ROOT, "lib", "shell", "pipeline-workflow.js"));
 const stageProjection = lazyModule(path.join(ROOT, "lib", "shell", "stage-projection.js"));
 const workerContractLib = lazyModule(path.join(ROOT, "lib", "shell", "worker-contract.js"));
 // workerContractLib is lazy, so this can't be a destructure (that would force
@@ -12669,7 +12670,7 @@ async function escalateParkedPipeline(cfg, { run_id: runId, node_id: nodeId, pro
   const ownerLive = (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner);
   const claim = dispatchRuns.claimPipeline(home, runId, { workerId: worker, factory, ownerLive });
   if (claim.refused) return { ok: false, reason: `the pipeline is ${claim.refused}`, superseded: true };
-  const attemptKey = Number(rec.gate_regate_count) || 0;
+  const attemptKey = stageProjection.pipelineAttempt(rec, claim.lease || null);
   const short = gateRunner.shortRunAttempt(runId);
   const id = `task-gate-parked-${gateStem(nodeId)}-${short}-${gateIdSuffix("parked", nodeId, runId, `${attemptKey}\n${reason}`)}`.toLowerCase();
   const body = [
@@ -14511,135 +14512,85 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       return { state: "blocked", reason, facts: [], gates: [], demoted: false, noRescue: true };
     }
   }
-  const gateDeps = reportingGateDeps(makeGateDeps(cfg, dctx), reporter);
-  // THE IMPLEMENTATION STAGE (task-spor-factory-implementation-stage-runner,
-  // §4.2 I3-I11): before any gate, read what the implementer's run produced,
-  // settle its attempt on the ledger, and re-dispatch while the budget or the
-  // retry pool allow. Only a CANDIDATE reaches the gates; every other verdict
-  // is a refusal of the stage — escalated (the hold stays, T1), or
-  // `unroutable`, which clears the hold since nothing is judging the item.
-  // Gated on a DECLARED stage under controller completion, so a factory
-  // without an `implementation:` block is byte-identical.
-  if (controller && ctx.factory.implementation) {
-    // The stage's durable journal (task-spor-implementation-stage-as-
-    // workflow-function): beside the execution record, keyed on the execution
-    // the claim opened and this gate ATTEMPT, exactly as the integration
-    // stage's is — or beside the RUN record for a legacy run or a pre-adapter
-    // claim (stageWorkflowJournal).
-    const implJournal = stageWorkflowJournal(home, record, item, "implementation");
-    const stage = await implementationStage.runImplementationStage({ item, factory: ctx.factory, record, log: ctx.log, deps: { ...gateDeps, ...(implJournal ? { workflowJournal: implJournal } : {}) } });
-    if (stage.state !== "candidate") {
-      if (stage.state === "unroutable") {
-        // Through the same outcome door as a refused first dispatch: end the
-        // execution (under the fence the record holds NOW — a resumed
-        // pipeline may have advanced it), then clear the exact hold.
-        const claim = record.impl_claim;
-        let fresh = null;
-        try {
-          fresh = dispatchRuns.readJson(dispatchRuns.runPaths(home, record.run_id).record);
-        } catch {
-          fresh = null;
-        }
-        const fence = fresh && fresh.impl_claim && fresh.impl_claim.execution_id === claim.execution_id && fresh.impl_claim.fence != null ? fresh.impl_claim.fence : claim.fence;
-        const withdrawn = await withdrawHeldExecution(cfg, { nodeId: entry.node_id, executionId: claim.execution_id, fence, store: claim.store || null, reason: stage.reason || "the implementer could not be re-dispatched", home, log: ctx.log });
-        if (!withdrawn.ok && !withdrawn.preserved) ctx.log(`work: ${entry.node_id} — the implementer could not be re-dispatched and its execution hold ${claim.execution_id} was not released: ${withdrawn.reason}${withdrawn.pending ? "" : `; release it with 'spor release ${entry.node_id} --execution ${claim.execution_id}'`}`);
-      }
-      // `interrupted` is left UNSETTLED on the record (not in the settled gate
-      // states), so the resume scan re-offers it and the ledger picks up where
-      // it stopped; everything else settles the pipeline as a refusal.
-      const state = stage.state === "interrupted" ? "interrupted" : "failed";
-      // The reporter leaves the heartbeat set on EVERY return from this pass,
-      // the interrupted one included (issue-spor-impl-stage-interrupted-skips-
-      // reporter-leave): a stage parked on a stop or a backoff yield used to
-      // return here with the reporter still in LIVE_EXECUTIONS, renewing its
-      // lease until the process exited. The execution itself stays live in
-      // the store (the hold is kept, T1); what leaves is this pass's beat.
-      if (reporter) reporter.leave();
-      return (state === "interrupted" ? yielded : (r) => r)({
-        state,
-        gates: [],
-        facts: [],
-        reason: `implementation stage ${stage.state}: ${stage.reason || ""}`.trim(),
-        stage: stage.state,
-        escalated_to: stage.escalated_to || null,
-        demoted: false,
-        demote_reason: null,
-        ...(stage.escalation_failed ? { escalation_failed: true } : {}),
-        // The replayable payload the bounded escalation auto-retry re-files
-        // from (retryOneEscalation's `stage: "implementation"` arm), so a
-        // held item whose blocker never landed is not left for `--regate`.
-        ...(stage.escalation_retry ? { escalation_retry: stage.escalation_retry } : {}),
-        // A REFUSED attempt's tags (definition_mismatch / journal_version_
-        // mismatch / refusal_tombstoned / refusal_replayed) ride the pipeline
-        // result so the run record and `--status` read them for this stage
-        // exactly as for the integration stage's (stage-workflow.js).
-        ...stageWorkflow.carryRefusalTags(stage),
-      });
+  // THE PIPELINE LEASE IS RENEWED FROM INSIDE EVERY LONG WAIT (task-spor-fold-
+  // gate-and-integration-into-one-workflow): the loop renews it once a pass,
+  // but a pass is the loop's, not the pipeline's — a review await, a fix-cycle
+  // await, an outage backoff or an approval poll inside this pipeline can run
+  // for hours while the loop's own pass is blocked behind it, so a stalled-
+  // but-live worker past the 30m TTL read as an orphan and was double-driven.
+  // Every `sleep` slice the deps take renews the lease by TOKEN (throttled to
+  // a third of the TTL), each stage activity renews it before it starts, and —
+  // because a command gate's suite, a CI wait and the candidate suite are ONE
+  // awaited spawn or poll with no slice of ours inside — an unref'd interval
+  // beats at the same cadence for as long as the drive runs (cleared in the
+  // `finally` below). The gate's spawn is async by design (gate-runner.js
+  // runGateCommand), so the interval fires through it; the residual is a
+  // SYNCHRONOUS step longer than the TTL, which nothing in-process can renew.
+  // A lease this token no longer holds renews nothing.
+  const renewEvery = Math.max(60000, Math.floor(stageProjection.PIPELINE_LEASE_TTL_MS / 3));
+  let renewedAt = 0;
+  const renewLease = (force = false) => {
+    if (!ownToken) return;
+    const at = Date.now();
+    if (!force && at - renewedAt < renewEvery) return;
+    renewedAt = at;
+    try {
+      dispatchRuns.renewPipeline(home, item.run_id, { workerId: ctx.workerId || null, token: ownToken });
+    } catch {
+      /* bounded by the TTL */
     }
-    if (stage.handoff) ctx.log(`work: ${entry.node_id} — implementation stage hands the run to the gates: ${stage.handoff}`);
-  }
-  // The gate list's durable journal (task-spor-gate-list-as-workflow-function):
-  // beside the execution record, keyed on the execution the claim opened and
-  // this gate ATTEMPT, exactly as the integration stage's is below — or beside
-  // the RUN record for a legacy run or a pre-adapter claim (stageWorkflowJournal):
-  // every gated run has a durable journal, since it is the only resume.
-  const gateJournal = stageWorkflowJournal(home, record, item, "gates");
-  let gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: { ...gateDeps, ...(gateJournal ? { workflowJournal: gateJournal } : {}) } });
-  // An `interrupted` pipeline settled nothing — a stop that caught it waiting
-  // out a dispatch OUTAGE (issue-spor-review-gate-reviewer-outage-read-as-
-  // rejection), or evidence it could not yet publish (flake occurrence
-  // evidence pending, issue-spor-gate-evidence-pending-interrupted-drops-
-  // slot-and-attests): it is not a verdict to settle or attest, and an
-  // attestation written now would occupy the run's one attestation id before
-  // the resumed pipeline reaches its real verdict. It returns UNSETTLED, like
-  // the implementation stage's own `interrupted` above; the loop stamps it
-  // and keeps its slot.
-  if (gateResult.state === "interrupted") {
-    if (reporter) reporter.leave();
-    return yielded(gateResult);
-  }
-  const gateFacts = [...(gateResult.facts || [])];
-  let intResult = null;
-  // The SPLIT verdict of the gate list alone (task-spor-factory-controller-
-  // completion-boundary, §6.5): `gates_state` says what the gates said, and
-  // `integration_state` below what the integration stage said, so the
-  // completion predicate can read WHICH boundary was passed — the fold into
-  // one `gate_state` the caller stamps afterwards stays for every legacy
-  // reader. Stamped for every gated run, controller or not, so the record is
-  // one shape.
-  if (completionKernel.GATES_STATES.includes(gateResult.state)) {
-    dispatchRuns.stampCompletionState(home, entry.run_id, { gates_state: gateResult.state, ...(gateResult.facts && gateResult.facts.length ? { completion_facts: gateResult.facts } : {}) });
-  }
-  // The completion at the `gates` boundary (C1): edge, then the CAS that
-  // writes the terminal status and clears the hold in one write. A refusal
-  // writes nothing and clears nothing — the item stays held, open, blocked by
-  // the escalation the gate filed (§4.4).
-  // The reporter leaves the heartbeat set when the pass returns: a completion
-  // still owed is re-driven by reconcileCompletions under its own resume.
-  const leave = async (result) => {
-    if (reporter) reporter.leave();
+  };
+  const baseSleep = typeof ctx.sleep === "function" ? ctx.sleep : (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  dctx.sleep = async (ms) => {
+    renewLease();
+    return baseSleep(ms);
+  };
+  const gateDeps = reportingGateDeps(makeGateDeps(cfg, dctx), reporter);
+  // The code repo the land moves, resolved BEFORE the stage: its
+  // cleanupImplementer removes the dispatch worktree record.cwd names, and the
+  // post-land reconcile below reads the main checkout that outlives it.
+  const landRepoDir = (() => {
+    const dir = record && record.cwd;
+    if (!dir) return null;
+    try {
+      const common = (git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout || "").trim();
+      return common ? path.dirname(common) : null;
+    } catch {
+      return null;
+    }
+  })();
+  // THE PIPELINE AS ONE WORKFLOW FUNCTION (lib/shell/pipeline-workflow.js,
+  // task-spor-fold-gate-and-integration-into-one-workflow): the glue between
+  // the three stages — the stamps, the completion writes, the settle and the
+  // attestation — is itself a deterministic function over ONE journal
+  // (`pipeline-a<attempt>` beside the stage journals), so a worker that dies
+  // between two stages resumes at the step it died on instead of re-deriving
+  // the record's state. Every activity below is idempotent under its key:
+  // the stage drivers replay their own child journals, the record stamps are
+  // compare-and-swaps, the completion write is debt-stamped first.
+  const binding = {
+    controller,
+    boundary,
+    hasImplementation: !!(controller && ctx.factory.implementation),
+    hasIntegration: !!ctx.factory.integration,
+    reconcileLanded: cfg.getBool("work.reconcileLanded", true),
+    factoryDigest: (ctx.factory.definition && ctx.factory.definition.factory && ctx.factory.definition.factory.digest) || null,
+  };
+  // The live pipeline verdicts the `leave` activity settles and attests —
+  // what the gates said, as it stands after any re-gate.
+  const leave = async ({ result, gateResult, gateFacts, intResult }) => {
     const gateAsStands = { ...gateResult, facts: gateFacts };
-    // Persist the verdict AND its signed publication outbox atomically.
-    // A crash before graph publication leaves replayable evidence debt.
     // SETTLE FIRST, ATTEST SECOND (review finding 5): the verdict is written to
     // the run record — the durable, read-back-verified `gate_state` the resume
     // scan and `spor runs` key on — BEFORE the attestation node exists, so no
     // window has a graph artifact claiming a verdict the record does not yet
-    // hold (a worker dying in that window would leave evidence a resumed
-    // pipeline could later be pointed at). The loop's own settle stamp after
-    // this is a no-op against an already-settled verdict, by stampGateState's
-    // contract; the `--regate` path retains the same ownership fence for final bookkeeping.
-    //
-    // The evidence fields (gate_head/gate_base/trusted sha/factory digest/landed
-    // sha) ride IN the settle stamp — one write, one writer — and the settle
-    // reports whether it LANDED. When it did not (another pipeline for the same
-    // run — a duplicate adopter, a resumed orphan — settled first and the guard
-    // yielded to it), this pipeline's verdict is not the record's, so it writes
-    // NO attestation and touches NO evidence field (cross-model review, blocking
+    // hold. The evidence fields ride IN the settle stamp — one write, one
+    // writer — and the settle reports whether it LANDED. When it did not
+    // (another pipeline for the same run settled first and the guard yielded
+    // to it), this pipeline's verdict is not the record's, so it writes NO
+    // attestation and touches NO evidence field (cross-model review, blocking
     // finding 1): the graph and the record must describe one verdict at one
-    // head, and that is the winner's. The result still reports what this
-    // pipeline found (`superseded` says the record disagrees) so the loop's own
-    // bookkeeping stays honest.
+    // head, and that is the winner's.
     const pending = prepareRunAttestation(cfg, { item, factory: ctx.factory, gateResult: gateAsStands, intResult, workerId: ctx.workerId || null, cwd: record && record.cwd });
     const settled = settleRunRecord(home, item.run_id, result, ctx.workerId || null, { gateResult: gateAsStands, factory: ctx.factory, intResult, token: ownToken, pending });
     if (!settled.landed) {
@@ -14647,157 +14598,180 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
         `work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) was already settled${settled.record && settled.record.gate_state ? ` as '${settled.record.gate_state}'` : ""}${settled.record && settled.record.gate_worker ? ` by ${settled.record.gate_worker}` : ""} — this pipeline's '${result.state}' verdict is not recorded and no attestation is written for it`
       );
       const rec = settled.record || null;
-      return {
-        ...result,
-        attestation: null,
-        superseded: true,
-        // What the record DOES hold — the winner's verdict — so the loop's status
-        // surface publishes that, never this pipeline's losing head and verdict
-        // (cross-model review, major finding 4).
-        settled: rec ? settledGateSummary(rec) : null,
-    };
-
-  }
-  // ONE attestation per run (piece 4): the evidence chain over everything
-  // above, written as a graph artifact and stamped onto the run record
-  // (`gate_attestation`) through the settler's OWN door (`own: gate_at`), so
-  // it can never land on a record another writer settled. Fail-soft like
-  // every fact write — the verdict is the enforcement, the attestation is its
-  // record.
-  const { attestationObject, ...attested } = await writeRunAttestation(cfg, {
-    item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token, built: pending.built, origin: pending.origin,
-  });
-  // Propose mode: the PR body written at propose time predates the graph
-  // artifact it must be bound to (the artifact is minted only after the run
-  // settles, above), so the PR is refreshed with the final, digest-bound copy
-  // the graph holds — the copy a CI validate-attestation job compares against.
-  if (attested.attestation && attestationObject && intResult && intResult.state === "parked" && intResult.proposal && intResult.proposal.number && ctx.factory.integration && ctx.factory.integration.mode === "propose") {
-    const refreshed = await refreshProposalAttestation(cfg, {
-      item, factory: ctx.factory, intResult, attestationObject, home, log: ctx.log, settleToken: settled.token,
-      cwd: (record && record.cwd) || null, editBody: ctx.editProposalBody || editProposalBody,
+      return { ...result, attestation: null, superseded: true, settled: rec ? settledGateSummary(rec) : null };
+    }
+    // ONE attestation per run (piece 4): the evidence chain over everything
+    // above, written as a graph artifact and stamped onto the run record
+    // (`gate_attestation`) through the settler's OWN door, so it can never land
+    // on a record another writer settled. Fail-soft like every fact write —
+    // the verdict is the enforcement, the attestation is its record.
+    const { attestationObject, ...attested } = await writeRunAttestation(cfg, {
+      item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token, built: pending.built, origin: pending.origin,
     });
-    attested.proposal_attestation_stale = !refreshed.ok;
-    if (!refreshed.ok) attested.proposal_attestation_error = String(refreshed.reason || "no response").slice(0, 300);
-  }
-  return { ...result, ...attested };
+    // Propose mode: the PR body written at propose time predates the graph
+    // artifact it must be bound to, so the PR is refreshed with the final,
+    // digest-bound copy the graph holds.
+    if (attested.attestation && attestationObject && intResult && intResult.state === "parked" && intResult.proposal && intResult.proposal.number && ctx.factory.integration && ctx.factory.integration.mode === "propose") {
+      const refreshed = await refreshProposalAttestation(cfg, {
+        item, factory: ctx.factory, intResult, attestationObject, home, log: ctx.log, settleToken: settled.token,
+        cwd: (record && record.cwd) || null, editBody: ctx.editProposalBody || editProposalBody,
+      });
+      attested.proposal_attestation_stale = !refreshed.ok;
+      if (!refreshed.ok) attested.proposal_attestation_error = String(refreshed.reason || "no response").slice(0, 300);
+    }
+    return { ...result, ...attested };
   };
-
-
-  let completed = null;
-  if (controller && boundary === "gates" && gateResult.state === "passed") {
-    completed = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: makeCompletionDeps(cfg, { home, runId: entry.run_id, execution: executionCompletionDeps(reporter) }), log: ctx.log, facts: gateResult.facts || [], boundary: "gates" });
-    if (!completed.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the gates boundary (${completed.reason}); the debt stands and the next pass retries it`);
-  }
-  if (gateResult.state !== "passed" || !ctx.factory.integration) return leave(gateResult);
-  // Post-completion integration (C2-C4): the item is already completed by
-  // declaration, so a failure here files a `relates-to` item and never
-  // demotes — the operator chose `after: gates` with integration declared.
-  // `consumed` counts too: the item was already completed (by a person, or an
-  // earlier pass) and stays so — a landing failure must not demote it.
-  const intCtx = completed && completed.ok && (completed.settled === "written" || completed.settled === "consumed") ? { ...dctx, completedBeforeIntegration: true } : dctx;
-  dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: "running" });
-  if (reporter) await reporter.integrationStarted();
-    // Whether a re-gate RAN in this process this pass — the one case the
-    // adoption below must not touch (the closure's own merge is the truth).
-    let regateRan = false;
-    // The facts of the LAST re-gate run here, and the gate list's own facts
-    // before any re-gate: a later re-gate's facts REPLACE the previous
-    // re-gate's on gateFacts (a superseded re-gate judged a head that is not
-    // the one being landed), the mirror of the stage's own `regate_facts`
-    // reset, so the live arm and the resumed adoption below attest the same
-    // list (task-spor-integration-workflow-merge-gate-fixes).
-    const originalFacts = gateFacts.slice();
-    let lastRegateFacts = [];
-    const regate = async ({ head }) => {
-      regateRan = true;
-      // The re-gate's OWN durable journal (issue-spor-gate-workflow-
-      // unjournaled-regate-and-provenance): a child gate journal beside the
-      // stage journals, keyed on the head it judges, so a worker that dies
-      // mid-re-gate resumes the nested pipeline from where it stopped — the
-      // integration workflow re-calls `regate` for the same head (its own
-      // `regate` activity never journaled) and the child journal replays what
-      // already landed instead of re-judging it from scratch. A later re-gate
-      // of a DIFFERENT head (a further fix cycle moved it) opens its own.
-      const regateJournal = stageWorkflowJournal(home, record, item, regateStageName(head));
-      const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, pinHead: head || null, deps: { ...makeGateDeps(cfg, dctx), ...(regateJournal ? { workflowJournal: regateJournal } : {}) } });
-      for (const f of lastRegateFacts) {
-        if (originalFacts.includes(f)) continue;
-        const i = gateFacts.indexOf(f);
-        if (i >= 0) gateFacts.splice(i, 1);
+  const completionDeps = () => makeCompletionDeps(cfg, { home, runId: entry.run_id, execution: executionCompletionDeps(reporter) });
+  const pipelineDeps = {
+    open: (args) => ({ ...args, opened_at: new Date().toISOString() }),
+    implementation: async ({ stage }) => {
+      renewLease(true);
+      if (!ctx.factory.implementation) return { state: "escalated", reason: "the factory no longer declares an implementation block; the attempt opened under one", definition_mismatch: { runId: item.run_id, journaled: "implementation", live: "none" }, refusal_tombstoned: false };
+      // The stage's durable journal (task-spor-implementation-stage-as-
+      // workflow-function): the child the `open` entry named.
+      const implJournal = stageWorkflowJournal(home, record, item, stage.replace(/-a\d+$/, ""));
+      return implementationStage.runImplementationStage({ item, factory: ctx.factory, record, log: ctx.log, deps: { ...gateDeps, ...(implJournal ? { workflowJournal: implJournal } : {}) } });
+    },
+    withdraw: async ({ reason }) => {
+      // Through the same outcome door as a refused first dispatch: end the
+      // execution (under the fence the record holds NOW — a resumed pipeline
+      // may have advanced it), then clear the exact hold.
+      const claim = record.impl_claim;
+      if (!claim) return { ok: false, reason: "no claim" };
+      const fresh = freshRecord(home, record);
+      const fence = fresh && fresh.impl_claim && fresh.impl_claim.execution_id === claim.execution_id && fresh.impl_claim.fence != null ? fresh.impl_claim.fence : claim.fence;
+      const withdrawn = await withdrawHeldExecution(cfg, { nodeId: entry.node_id, executionId: claim.execution_id, fence, store: claim.store || null, reason: reason || "the implementer could not be re-dispatched", home, log: ctx.log });
+      if (!withdrawn.ok && !withdrawn.preserved) ctx.log(`work: ${entry.node_id} — the implementer could not be re-dispatched and its execution hold ${claim.execution_id} was not released: ${withdrawn.reason}${withdrawn.pending ? "" : `; release it with 'spor release ${entry.node_id} --execution ${claim.execution_id}'`}`);
+      return { ok: !!withdrawn.ok, preserved: !!withdrawn.preserved, pending: !!withdrawn.pending, reason: withdrawn.reason || null };
+    },
+    gates: async ({ stage }) => {
+      renewLease(true);
+      // The gate list's durable journal (task-spor-gate-list-as-workflow-
+      // function): the child the `open` entry named.
+      const gateJournal = stageWorkflowJournal(home, record, item, stage.replace(/-a\d+$/, ""));
+      return gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: { ...gateDeps, ...(gateJournal ? { workflowJournal: gateJournal } : {}) } });
+    },
+    // The SPLIT verdict of the gate list alone (task-spor-factory-controller-
+    // completion-boundary, §6.5): `gates_state` says what the gates said, and
+    // `integration_state` below what the integration stage said, so the
+    // completion predicate can read WHICH boundary was passed.
+    stampGatesState: ({ state, facts }) => {
+      if (completionKernel.GATES_STATES.includes(state)) dispatchRuns.stampCompletionState(home, entry.run_id, { gates_state: state, ...(facts && facts.length ? { completion_facts: facts } : {}) });
+      return { ok: true };
+    },
+    // The completion at the `gates` boundary (C1): edge, then the CAS that
+    // writes the terminal status and clears the hold in one write. A refusal
+    // writes nothing and clears nothing — the item stays held, open, blocked by
+    // the escalation the gate filed (§4.4).
+    completeAtGates: async ({ facts }) => {
+      const completed = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: completionDeps(), log: ctx.log, facts: facts || [], boundary: "gates" });
+      if (!completed.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the gates boundary (${completed.reason}); the debt stands and the next pass retries it`);
+      return { ok: !!completed.ok, settled: completed.settled || null, reason: completed.reason || null };
+    },
+    integrationStart: async () => {
+      dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: "running" });
+      if (reporter) await reporter.integrationStarted();
+      return { ok: true };
+    },
+    integration: async ({ stage, regate: regateKey, completedBeforeIntegration, gateResult: gateIn, gateFacts: factsIn }) => {
+      renewLease(true);
+      if (!ctx.factory.integration) {
+        return { intResult: { state: "failed", reason: "the factory no longer declares an integration block; the attempt opened under one", facts: [], definition_mismatch: { runId: item.run_id, journaled: "integration", live: "none" } }, gateResult: gateIn, gateFacts: factsIn };
       }
-      lastRegateFacts = (again.facts || []).filter((f) => !originalFacts.includes(f));
-      for (const f of lastRegateFacts) if (!gateFacts.includes(f)) gateFacts.push(f);
-      gateResult = again;
-      if (again.state === "passed" && again.head !== head) ctx.log(`work: the re-gate of ${item.node_id} judged ${String(again.head || "an unknown head").slice(0, 12)}, not the moved head ${String(head).slice(0, 12)}`);
-      return again;
-    };
-  // The code repo the land moves, resolved BEFORE the stage: its
-  // cleanupImplementer removes the dispatch worktree record.cwd names, and the
-  // post-land reconcile below reads the main checkout that outlives it.
-  const landRepoDir = (() => {
-    const dir = record && record.cwd;
-    if (!dir) return null;
-    const common = (git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout || "").trim();
-    return common ? path.dirname(common) : null;
-  })();
-  // The stage's durable journal (task-spor-integration-stage-as-workflow-
-  // function): beside the execution record, keyed on the execution the claim
-  // opened and this gate ATTEMPT (an explicit --regate opens a fresh attempt
-  // and judges afresh; the loop's orphan resume and --regate --resume keep
-  // the attempt and continue from the journal). A legacy run or a pre-adapter
-  // claim has no execution to key on and keeps the journal beside its RUN
-  // record instead (stageWorkflowJournal).
-  const integrationJournal = stageWorkflowJournal(home, record, item, "integration");
-  intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null, deps: { ...makeIntegrationDeps(cfg, { ...intCtx, gateResult: () => gateResult, regate }), ...(integrationJournal ? { workflowJournal: integrationJournal } : {}) } });
-  // A passing re-gate the stage REPLAYED (a resumed worker: the journal holds
-  // the re-gate's result, so the `regate` closure above — whose merge into
-  // gateResult/gateFacts is a side effect of running it — never ran here):
-  // adopt what the result carries, so the settle, the attestation and the
-  // fact list describe the re-gated head exactly as the live pass did.
-  // `regate_facts` is the CARRIED re-gate's facts only — the stage resets it
-  // whenever a later re-gate supersedes the carried one — so what is adopted
-  // here is the evidence of the re-gate that judged the head being landed,
-  // never a superseded re-gate's (task-spor-integration-workflow-merge-gate-fixes).
-  // Only when NO re-gate ran here: a live pass merged its own result (and a
-  // live re-gate that FAILED after an earlier pass must not be clobbered by
-  // the earlier pass the result still carries).
-  if (!regateRan && intResult.regate_result && intResult.regate_result.state === "passed" && gateResult.head !== intResult.regate_result.head) {
-    gateResult = intResult.regate_result;
-    for (const f of intResult.regate_facts || []) if (!gateFacts.includes(f)) gateFacts.push(f);
-  }
-  // The same unsettled interruption as the gate list's own (above), reached
-  // through the integration stage's re-gate of a moved head: nothing is
-  // stamped, settled or attested, and the resume re-runs the pipeline.
-  if (intResult.state === "interrupted") {
+      let gateResult = gateIn;
+      const gateFacts = [...(factsIn || [])];
+      const intCtx = completedBeforeIntegration ? { ...dctx, completedBeforeIntegration: true } : dctx;
+      // Whether a re-gate RAN in this process this pass — the one case the
+      // adoption below must not touch (the closure's own merge is the truth).
+      let regateRan = false;
+      // The facts of the LAST re-gate run here, and the gate list's own facts
+      // before any re-gate: a later re-gate's facts REPLACE the previous
+      // re-gate's on gateFacts (a superseded re-gate judged a head that is not
+      // the one being landed), the mirror of the stage's own `regate_facts`
+      // reset (task-spor-integration-workflow-merge-gate-fixes).
+      const originalFacts = gateFacts.slice();
+      let lastRegateFacts = [];
+      const regate = async ({ head }) => {
+        regateRan = true;
+        renewLease(true);
+        // The re-gate's OWN durable journal (issue-spor-gate-workflow-
+        // unjournaled-regate-and-provenance): a child gate journal keyed on the
+        // head it judges, under the prefix and attempt the parent's `open`
+        // entry JOURNALED (`regateKey`), so a resumed parent names the same
+        // child for the same head whatever the live entry says.
+        const regateJournal = stageWorkflowJournal(home, record, { ...item, attempt: regateKey ? regateKey.attempt : item.attempt }, regateStageName(head, regateKey && regateKey.prefix));
+        const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, pinHead: head || null, deps: { ...makeGateDeps(cfg, dctx), ...(regateJournal ? { workflowJournal: regateJournal } : {}) } });
+        for (const f of lastRegateFacts) {
+          if (originalFacts.includes(f)) continue;
+          const i = gateFacts.indexOf(f);
+          if (i >= 0) gateFacts.splice(i, 1);
+        }
+        lastRegateFacts = (again.facts || []).filter((f) => !originalFacts.includes(f));
+        for (const f of lastRegateFacts) if (!gateFacts.includes(f)) gateFacts.push(f);
+        gateResult = again;
+        if (again.state === "passed" && again.head !== head) ctx.log(`work: the re-gate of ${item.node_id} judged ${String(again.head || "an unknown head").slice(0, 12)}, not the moved head ${String(head).slice(0, 12)}`);
+        return again;
+      };
+      // The stage's durable journal (task-spor-integration-stage-as-workflow-
+      // function): the child the `open` entry named.
+      const integrationJournal = stageWorkflowJournal(home, record, item, stage.replace(/-a\d+$/, ""));
+      const intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null, deps: { ...makeIntegrationDeps(cfg, { ...intCtx, gateResult: () => gateResult, regate }), ...(integrationJournal ? { workflowJournal: integrationJournal } : {}) } });
+      // A passing re-gate the stage REPLAYED (a resumed worker: the journal
+      // holds the re-gate's result, so the `regate` closure above never ran
+      // here): adopt what the result carries, so the settle, the attestation
+      // and the fact list describe the re-gated head exactly as the live pass
+      // did. `regate_facts` is the CARRIED re-gate's facts only.
+      if (!regateRan && intResult.regate_result && intResult.regate_result.state === "passed" && gateResult.head !== intResult.regate_result.head) {
+        gateResult = intResult.regate_result;
+        for (const f of intResult.regate_facts || []) if (!gateFacts.includes(f)) gateFacts.push(f);
+      }
+      return { intResult, gateResult, gateFacts };
+    },
+    stampIntegrationState: async ({ intResult, facts }) => {
+      const intState = completionKernel.INTEGRATION_STATES.includes(intResult.state) ? intResult.state : intResult.state === "passed" ? "landed" : "failed";
+      dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: intState, ...(facts && facts.length ? { completion_facts: facts } : {}) });
+      // The store's integration verdict: landed and parked are its own words; a
+      // failure or a refusal is `failed` (a fix cycle or a refusal follows).
+      if (reporter) await reporter.integrationSettled(intState === "landed" || intState === "parked" ? intState : "failed", { ref: intResult.ref || (ctx.factory.integration && ctx.factory.integration.targetRef) || null, commit: intResult.commit || null });
+      return { state: intState };
+    },
+    // The completion at the `integration` boundary (N7): only a LANDED
+    // candidate completes; a parked proposal completes when checkProposals
+    // sees the merge (N8), a refusal never does.
+    completeAtIntegration: async ({ facts }) => {
+      const written = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: completionDeps(), log: ctx.log, facts: facts || [], boundary: "integration" });
+      if (!written.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the integration boundary (${written.reason}); the debt stands and the next pass retries it`);
+      return { ok: !!written.ok, settled: written.settled || null, reason: written.reason || null };
+    },
+    // Landed work detection (task-spor-landing-detect-shipped-resolver-draft):
+    // the landed range may carry `Spor:` trailers naming OTHER open items, so
+    // each gets a draft resolver and a confirm-close finding now, never an
+    // automatic close. This run's own item is excluded. Fail-open.
+    reconcileLanded: async ({ ref, targetSha, landedSha }) => {
+      await reconcileAfterLand(cfg, { dir: landRepoDir, ref, targetSha, landedSha, itemId: entry.node_id, log: ctx.log });
+      return { ok: true };
+    },
+    leave,
+    workflowJournal: stageWorkflowJournal(home, record, item, "pipeline") || undefined,
+  };
+  let res;
+  // Created beside the try that clears it, so no setup throw can leave it beating.
+  const renewal = ownToken ? setInterval(() => renewLease(true), renewEvery) : null;
+  if (renewal && typeof renewal.unref === "function") renewal.unref();
+  try {
+    res = await pipelineWorkflow.drivePipeline({ item, binding, deps: pipelineDeps, log: ctx.log });
+  } finally {
+    if (renewal) clearInterval(renewal);
+    // The reporter leaves the heartbeat set on EVERY return from this pass,
+    // the interrupted one included (issue-spor-impl-stage-interrupted-skips-
+    // reporter-leave). The execution itself stays live in the store (the hold
+    // is kept, T1); what leaves is this pass's beat.
     if (reporter) reporter.leave();
-    return yielded({ state: "interrupted", ...(intResult.outage_interrupted ? { outage_interrupted: true } : {}), ...(intResult.paused_until ? { paused_until: intResult.paused_until, paused_profile: intResult.paused_profile || null } : {}), ...(intResult.fallback_route ? { fallback_route: true } : {}), gates: gateResult.gates || [], facts: [...gateFacts, ...(intResult.facts || [])], reason: intResult.reason });
   }
-  const intState = completionKernel.INTEGRATION_STATES.includes(intResult.state) ? intResult.state : intResult.state === "passed" ? "landed" : "failed";
-  const allFacts = [...gateFacts, ...(intResult.facts || [])];
-  dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: intState, ...(allFacts.length ? { completion_facts: allFacts } : {}) });
-  // The store's integration verdict: landed and parked are its own words; a
-  // failure or a refusal is `failed` (a fix cycle or a refusal follows).
-  if (reporter) await reporter.integrationSettled(intState === "landed" || intState === "parked" ? intState : "failed", { ref: intResult.ref || (ctx.factory.integration && ctx.factory.integration.targetRef) || null, commit: intResult.commit || intResult.sha || null });
-  // The completion at the `integration` boundary (N7): only a LANDED
-  // candidate completes; a parked proposal completes when checkProposals sees
-  // the merge (N8), a refusal never does.
-  if (controller && boundary === "integration" && intState === "landed") {
-    const written = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: makeCompletionDeps(cfg, { home, runId: entry.run_id, execution: executionCompletionDeps(reporter) }), log: ctx.log, facts: allFacts, boundary: "integration" });
-    if (!written.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the integration boundary (${written.reason}); the debt stands and the next pass retries it`);
-  }
-  // Landed work detection (task-spor-landing-detect-shipped-resolver-draft):
-  // the landed range may carry `Spor:` trailers naming OTHER open items — a
-  // drive-by fix, a follow-up folded in — so each gets a draft resolver and a
-  // confirm-close finding now, never an automatic close. This run's own item
-  // is excluded — its completion is the runner's (written above, or still
-  // owed). Fail-open.
-  if (intState === "landed" && cfg.getBool("work.reconcileLanded", true)) {
-    await reconcileAfterLand(cfg, { dir: landRepoDir, ref: intResult.target_ref, targetSha: intResult.target_sha, landedSha: intResult.landed_sha, itemId: entry.node_id, log: ctx.log });
-  }
-  if (intCtx.completedBeforeIntegration && intResult.state !== "passed" && intResult.state !== "parked") {
-    return leave({ ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: allFacts, demoted: false, demote_reason: null, reason: `${intResult.reason || intResult.state} (the item was completed at the 'gates' boundary and stays completed; the landing is a person's to finish)` });
-  }
-  return leave({ ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: allFacts });
+  // An `interrupted` pipeline settled nothing: it is not a verdict to settle
+  // or attest, and it hands its lease back (`yielded`) for the resume scan to
+  // re-offer when its journal's timer is due.
+  return res && res.state === "interrupted" ? yielded(res) : res;
 }
 
 // The integration stage's workflow journal for a run, or null when the run
@@ -14831,10 +14805,14 @@ function stageWorkflowJournal(home, record, item, stageName) {
 // beside the stage's. A gated re-gate always has a real sha, so a missing or
 // non-hex head THROWS rather than keying a shared, unpinned journal that a
 // later head could replay from (task-spor-run-surfaces-read-stage-journal).
-function regateStageName(head) {
+// `prefix` is the parent pipeline journal's JOURNALED spelling of the child's
+// key (pipeline-workflow.js stageNames().regate), so a resumed parent names
+// the same child whatever this code spells today; the shipped prefix is the
+// default.
+function regateStageName(head, prefix = "gates-regate-") {
   const h = typeof head === "string" ? head.trim().toLowerCase() : "";
   if (!/^[0-9a-f]{7,64}$/.test(h)) throw new Error(`the integration re-gate has no commit to key its journal on (head: ${head == null ? "none" : JSON.stringify(String(head)).slice(0, 60)}); a gated re-gate always judges a real sha`);
-  return `gates-regate-${h}`;
+  return `${prefix || "gates-regate-"}${h}`;
 }
 
 // The run record as it reads NOW — the pipeline's captured copy predates every
@@ -15795,7 +15773,9 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // --regate ever re-opened (count 0: a work loop's own) ran with NO attempt,
   // so it resumes as 0, never 1: the gate keys read the two alike, but the
   // implementation stage's ledger segment and its run names do not.
-  const regateCount = Number(record.gate_regate_count) || 0;
+  // The attempt's identity is the LEASE's (stage-projection.js
+  // pipelineAttempt; the record's `gate_regate_count` only for a pre-lease run).
+  const regateCount = stageProjection.pipelineAttempt(record, lease);
   const attempt = resume ? (regateCount ? regateCount + 1 : 0) : regateCount + 2;
   // The item's OWN repo stamp, exactly as the loop's slot would carry it --
   // which means AS CLAIMED, not as it reads now. The record carries it since
@@ -15816,7 +15796,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   if (!workLoop.writeWorkerStatus(home, status)) { err("spor work --regate: could not publish worker liveness; no judgement started"); return 1; }
   let renewal = null;
   try {
-  const gateClaim = dispatchRuns.claimPipeline(home, record.run_id, { workerId, factory: factory.id || factoryId || null, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), owesEvidence: (fresh) => stageProjection.owesEvidence(home, fresh), reopen: { settleId: lease ? lease.token : record.gate_settle_id != null ? record.gate_settle_id : null, regateCount: Number(record.gate_regate_count) || 0, state: record.gate_state || null, ...(resume ? { resume: true } : {}) } });
+  const gateClaim = dispatchRuns.claimPipeline(home, record.run_id, { workerId, factory: factory.id || factoryId || null, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), owesEvidence: (fresh) => stageProjection.owesEvidence(home, fresh), reopen: { settleId: lease ? lease.token : record.gate_settle_id != null ? record.gate_settle_id : null, regateCount, state: record.gate_state || null, ...(resume ? { resume: true } : {}) } });
   if (!gateClaim.ok) { err(`spor work --regate: ${gateClaim.refused || gateClaim.reason}`); return 1; }
   if (report) report.claimed = true;
   // The lease is renewed while this process judges, so a work loop on the box
@@ -16227,7 +16207,16 @@ function flakeSweepPlan(records, graph, { trustedRef, scope = null, isController
 
 async function writeSweepNote(cfg, { kind, record, factoryId, escalations, related = [], title, summary, body, resolves = false }) {
   const stem = gateStem(record.node_id);
-  const attempt = (Number(record.gate_regate_count) || 0) + 1;
+  // The attempt the note is keyed on is the LEASE's; a lease log nobody can
+  // read leaves it unknown, and a note minted under a guessed attempt would
+  // break the write-once id — refused, like every other reader of the lease.
+  let sweepLease = null;
+  try {
+    sweepLease = stageProjection.pipelineLease(cfg.userConfigHome(), record);
+  } catch (e) {
+    return { ok: false, id: null, reason: `the pipeline lease log for run ${record.run_id} is unreadable (${(e && e.message) || e}); the attempt the note would be keyed on is unknown` };
+  }
+  const attempt = stageProjection.pipelineAttempt(record, sweepLease) + 1;
   const short = gateRunner.shortRunAttempt(record.run_id, attempt);
   const id = `art-${kind}-${stem}-${short}-${gateIdSuffix(kind, factoryId || "factory", record.node_id, gateRunner.gateRunKey(record.run_id, attempt))}`.toLowerCase();
   const flat = (t, cap) => {

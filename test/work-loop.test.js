@@ -3441,3 +3441,31 @@ test("pollWorkRuns: a run record's `impl_budget.run_max_ms` replaces the worker-
     delete process.env.SPOR_FAKE_AGENTS_JSON;
   }
 });
+
+// task-spor-fold-gate-and-integration-into-one-workflow: a published slot
+// expires with its worker's heartbeat, a dead worker's `active` slot is an
+// inference that names its kind, and the legacy owedBy bridge is DATED.
+test("liveWorkerSlots honors a live worker's slots only while its status heartbeat is fresh; owedByDeadWorkers names which slot kind was the evidence; the owedBy bridge has a deletion date", () => {
+  const now = Date.parse("2026-10-04T12:00:00.000Z");
+  const fresh = { worker_id: "w-fresh", live: true, updated_at: new Date(now - 60000).toISOString(), gating: [{ run_id: "r1", node_id: "task-r1" }], active: [{ run_id: "r2", node_id: "task-r2" }] };
+  const hung = { worker_id: "w-hung", live: true, updated_at: new Date(now - workLoop.SLOT_HEARTBEAT_STALE_MS - 1000).toISOString(), gating: [{ run_id: "r3", node_id: "task-r3" }], active: [] };
+  const beatless = { worker_id: "w-old", live: true, gating: [{ run_id: "r4", node_id: "task-r4" }] };
+  const slots = workLoop.liveWorkerSlots([fresh, hung, beatless], { now: () => now });
+  assert.deepStrictEqual([...slots].sort(), ["r1", "r2", "r4"], "a hung-but-alive worker's slots expire with its heartbeat; a status file with no stamp at all is honored as before");
+  assert.strictEqual(workLoop.SLOT_HEARTBEAT_STALE_MS, require("../lib/shell/stage-projection.js").PIPELINE_LEASE_TTL_MS, "a slot lives as long as a lease would");
+  assert.ok(workLoop.liveWorkerSlots([hung], { now: () => now, staleMs: 0 }).has("r3"), "staleMs 0 disables the expiry");
+
+  const dead = { worker_id: "w-dead", live: false, factory: "factory-a", gates: { passed: 0 }, gating: [{ run_id: "g1", node_id: "task-g1" }], active: [{ run_id: "a1", node_id: "task-a1" }] };
+  const owed = workLoop.owedByDeadWorkers([dead]);
+  assert.deepStrictEqual(owed.get("g1"), { factory: "factory-a", slot: "gating" });
+  assert.deepStrictEqual(owed.get("a1"), { factory: "factory-a", slot: "active" });
+  // The scan reports a foreign pipeline only for a `gating` slot; an `active`
+  // slot's inference is skipped in silence.
+  const foreign = [];
+  const cand = (run_id, owedSlot) => ({ record: { run_id, node_id: `task-${run_id}`, state: "done", terminal_state: "resolved", terminal_enforced: true, finished_at: new Date(now).toISOString() }, lease: null, projection: { stages: [], open: null, current: null }, factory: "factory-a", ...(owedSlot ? { owedSlot } : {}) });
+  workLoop.openPipelines([cand("g1", "gating"), cand("a1", "active")], { now: () => now, factory: "factory-z", onForeign: (o) => foreign.push(o.run_id), terminalStates: new Set(["done"]) });
+  assert.deepStrictEqual(foreign, ["g1"]);
+
+  const workLib = require("../lib/shell/work.js");
+  assert.strictEqual(workLib.LEGACY_OWED_BY_BRIDGE_UNTIL, Date.parse("2026-10-18T00:00:00Z"), "the bridge's deletion date: the gate_factory stamp's ship date + run retention + slack");
+});
