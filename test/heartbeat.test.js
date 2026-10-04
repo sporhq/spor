@@ -7,6 +7,7 @@
 // is disabled (SPOR_CLAIM_NUDGE=0) so the ONLY POST under test is the heartbeat,
 // and edits target a `.js` file so the LLM capture nudge never fires.
 const test = require('node:test');
+const { gitEnv } = require("./helpers/git.js");
 const assert = require('node:assert');
 const { spawnSync } = require('node:child_process');
 const http = require('node:http');
@@ -42,7 +43,7 @@ function scratch() {
     const r = spawnSync('git', ['-C', cwd, ...args], {
       encoding: 'utf8',
       env: {
-        ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com',
+        ...gitEnv(), GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com',
         GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.com',
       },
     });

@@ -10,6 +10,7 @@
 // framing — we script the response) + the on-disk frontmatter in local mode.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const { hermeticEnv } = require("./helpers/env.js");
+const { scrubbedEnv } = require("./helpers/git.js");
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -47,7 +48,7 @@ function fixtureGraph() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-sse-"));
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
-  spawnSync("git", ["init", "-q", home]);
+  spawnSync("git", ["init", "-q", home], { env: scrubbedEnv() });
   fs.writeFileSync(path.join(nodes, "task-x.md"), `---
 id: task-x
 type: task
@@ -86,11 +87,11 @@ const remoteEnv = (base, extra = {}) => bare({ SPOR_SERVER: base, SPOR_TOKEN: "t
 function ancestryRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-sse-ancestry-"));
   const git = (args) => {
-    const r = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+    const r = spawnSync("git", ["-C", dir, ...args], { env: scrubbedEnv(), encoding: "utf8" });
     assert.strictEqual(r.status, 0, `git ${args.join(" ")} failed: ${r.stderr}`);
     return r.stdout;
   };
-  assert.strictEqual(spawnSync("git", ["init", "-q", dir]).status, 0, "git init failed");
+  assert.strictEqual(spawnSync("git", ["init", "-q", dir], { env: scrubbedEnv() }).status, 0, "git init failed");
   git(["checkout", "-q", "-b", "main"]);
   git(["config", "user.email", "t@example.com"]);
   git(["config", "user.name", "T"]);

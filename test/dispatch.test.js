@@ -16,6 +16,7 @@
 // Give a paired run the same headroom you'd give a full suite.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
+const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert");
 const { spawnSync, spawn } = require("node:child_process");
 const http = require("node:http");
@@ -213,7 +214,7 @@ function gitRepoWithWorktree() {
     const r = spawnSync("git", ["-C", cwd, ...args], {
       encoding: "utf8",
       env: {
-        ...process.env,
+        ...gitEnv(),
         GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com",
         GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com",
       },
@@ -397,7 +398,7 @@ function gitRepoNamed(name) {
     const r = spawnSync("git", ["-C", dir, ...args], {
       encoding: "utf8",
       env: {
-        ...process.env,
+        ...gitEnv(),
         GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com",
         GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com",
       },
@@ -695,7 +696,7 @@ test("dispatch: unknown slug exits 1 with actionable guidance", () => {
 function namedRepo(name) {
   const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-named-")), name);
   fs.mkdirSync(dir);
-  const r = spawnSync("git", ["-C", dir, "init", "-q"], { encoding: "utf8" });
+  const r = spawnSync("git", ["-C", dir, "init", "-q"], { env: gitEnv(), encoding: "utf8" });
   assert.strictEqual(r.status, 0, r.stderr);
   return { dir, real: fs.realpathSync(dir) };
 }
@@ -741,7 +742,7 @@ function gitTargetRepo(name = "demo") {
     const r = spawnSync("git", ["-C", repo, ...args], {
       encoding: "utf8",
       env: {
-        ...process.env,
+        ...gitEnv(),
         GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com",
         GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com",
       },
@@ -792,7 +793,7 @@ fs.writeFileSync(process.env.OUTFILE, [process.cwd(), process.env.PWD || ""].joi
 // A linked worktree of `repo`, checked out to its own branch off HEAD.
 function addLinkedWorktree(repo, branch = "wt1") {
   const dir = path.join(path.dirname(repo), `${branch}-checkout`);
-  const r = spawnSync("git", ["-C", repo, "worktree", "add", dir, "-b", branch, "HEAD"], { encoding: "utf8" });
+  const r = spawnSync("git", ["-C", repo, "worktree", "add", dir, "-b", branch, "HEAD"], { env: gitEnv(), encoding: "utf8" });
   assert.strictEqual(r.status, 0, r.stderr);
   return fs.realpathSync(dir);
 }
@@ -871,7 +872,7 @@ test("dispatch --dir: a git SUBMODULE is NOT mistaken for a linked worktree", ()
   const { repo: inner } = gitTargetRepo("inner");
   const r = spawnSync("git", ["-c", "protocol.file.allow=always", "-C", outer, "submodule", "add", "-q", inner, "sub"], {
     encoding: "utf8",
-    env: { ...process.env, GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com" },
+    env: { ...gitEnv(), GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com" },
   });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.strictEqual(u.linkedWorktreeMainRoot(path.join(outer, "sub")), null);
@@ -922,7 +923,7 @@ test("repos add: a git SUBMODULE path is NOT refused", () => {
   const { repo: inner } = gitTargetRepo("inner");
   const r = spawnSync("git", ["-c", "protocol.file.allow=always", "-C", outer, "submodule", "add", "-q", inner, "sub"], {
     encoding: "utf8",
-    env: { ...process.env, GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com" },
+    env: { ...gitEnv(), GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com" },
   });
   assert.strictEqual(r.status, 0, r.stderr);
   const sub = path.join(outer, "sub");
@@ -1051,7 +1052,7 @@ test("dispatch worktree setup hook failure: aborts, removes the worktree + branc
   assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", "dec-x")), "half-prepped worktree removed");
   // rev-parse --verify --quiet exits non-zero (no output) once the branch is gone
   // — a raw call, since the asserting g() would throw on that expected miss.
-  const branchCheck = spawnSync("git", ["-C", repo, "rev-parse", "--verify", "--quiet", "refs/heads/dec-x"], { encoding: "utf8" });
+  const branchCheck = spawnSync("git", ["-C", repo, "rev-parse", "--verify", "--quiet", "refs/heads/dec-x"], { env: gitEnv(), encoding: "utf8" });
   assert.notStrictEqual(branchCheck.status, 0, "branch removed (rev-parse misses)");
 });
 
@@ -1145,7 +1146,7 @@ test("dispatch worktree setup hook symlinks into an ignored path then fails: the
   assert.ok(!fs.existsSync(mark), "agent never launched");
   const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
   assert.ok(!fs.existsSync(wtDir), "worktree removed despite the ignored node_modules symlink");
-  const branchCheck = spawnSync("git", ["-C", repo, "rev-parse", "--verify", "--quiet", "refs/heads/dec-x"], { encoding: "utf8" });
+  const branchCheck = spawnSync("git", ["-C", repo, "rev-parse", "--verify", "--quiet", "refs/heads/dec-x"], { env: gitEnv(), encoding: "utf8" });
   assert.notStrictEqual(branchCheck.status, 0, "branch removed too");
 });
 

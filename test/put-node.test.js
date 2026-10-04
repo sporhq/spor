@@ -3,6 +3,7 @@
 // mode writes nodes/<id>.md only after validation and revision/collision checks.
 require("./helpers/tmp-cleanup");
 const { hermeticEnv } = require("./helpers/env.js");
+const { scrubbedEnv } = require("./helpers/git.js");
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -35,7 +36,7 @@ function fixtureGraph() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-put-node-"));
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
-  spawnSync("git", ["init", "-q", home]);
+  spawnSync("git", ["init", "-q", home], { env: scrubbedEnv() });
   fs.writeFileSync(path.join(nodes, "dec-old.md"), nodeMd("dec-old", "Old decision", "Old summary."));
   return { home, nodes };
 }
@@ -449,8 +450,8 @@ test("put-node (local) --dir writes a batch, and a skip re-run is an auditable n
 
 test("put-node (local) multi-document stdin stamps priority at create like `spor priority`", () => {
   const { home, nodes } = fixtureGraph();
-  spawnSync("git", ["-C", home, "config", "user.name", "Batch Tester"]);
-  spawnSync("git", ["-C", home, "config", "user.email", "batch@example.com"]);
+  spawnSync("git", ["-C", home, "config", "user.name", "Batch Tester"], { env: scrubbedEnv() });
+  spawnSync("git", ["-C", home, "config", "user.email", "batch@example.com"], { env: scrubbedEnv() });
   const input = taskMd("task-p1", "priority: P1\n") + taskMd("task-plain");
   const r = runStdin(["put-node", "-"], input, { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
@@ -762,8 +763,8 @@ test("put-node (local) a CRLF node with no priority is written byte-identical", 
 
 test("put-node (local) stamps a priority on a CRLF node while preserving CRLF line endings", () => {
   const { home, nodes } = fixtureGraph();
-  spawnSync("git", ["-C", home, "config", "user.name", "Batch Tester"]);
-  spawnSync("git", ["-C", home, "config", "user.email", "batch@example.com"]);
+  spawnSync("git", ["-C", home, "config", "user.name", "Batch Tester"], { env: scrubbedEnv() });
+  spawnSync("git", ["-C", home, "config", "user.email", "batch@example.com"], { env: scrubbedEnv() });
   const r = run(["put-node", tmpNodeFile(taskMd("task-crlf", "priority: p2\n").replace(/\n/g, "\r\n"))], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
   const written = readNode(nodes, "task-crlf");

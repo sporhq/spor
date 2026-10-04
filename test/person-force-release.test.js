@@ -1,5 +1,6 @@
 require('./helpers/tmp-cleanup');
 const test = require('node:test');
+const { scrubbedEnv } = require("./helpers/git.js");
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -74,8 +75,8 @@ test('explicit retry after unapplied transport loss reuses its original intent',
 test('local CLI needs person binding and no dispatch agent, but no local dispatch record', async t => {
   const { home, args, engine } = setup(t);
   fs.mkdirSync(path.join(home, 'nodes'));
-  execFileSync('git', ['init', '-q', home]);
-  execFileSync('git', ['-C', home, 'config', 'user.email', 'operator@example.com']);
+  execFileSync('git', ['init', '-q', home], { env: scrubbedEnv() });
+  execFileSync('git', ['-C', home, 'config', 'user.email', 'operator@example.com'], { env: scrubbedEnv() });
   fs.writeFileSync(path.join(home, 'nodes', 'person-operator.md'), '---\nid: person-operator\ntype: person\ntitle: Operator\nsummary: Bound local person.\nemail: operator@example.com\n---\n');
   const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
   const id = (await engine().open(args)).execution.execution_id;
@@ -84,16 +85,16 @@ test('local CLI needs person binding and no dispatch agent, but no local dispatc
   await assert.rejects(forceReleaseFromCli(agentCfg, input), /dispatch.agent/);
   assert.equal((await forceReleaseFromCli(cfg, input)).ok, true);
   assert.equal(fs.existsSync(path.join(home, 'journal', 'dispatch')), false);
-  execFileSync('git', ['-C', home, 'config', 'user.email', 'unknown@example.com']);
+  execFileSync('git', ['-C', home, 'config', 'user.email', 'unknown@example.com'], { env: scrubbedEnv() });
   await assert.rejects(forceReleaseFromCli(cfg, input), /bound to a person/);
 });
 
 test('actual local CLI enforces explicit flags and releases a foreign hold without a dispatch record', async t => {
   const { home, args } = setup(t);
   fs.mkdirSync(path.join(home, 'nodes'));
-  execFileSync('git', ['init', '-q', home]);
-  execFileSync('git', ['-C', home, 'config', 'user.email', 'operator@example.com']);
-  execFileSync('git', ['-C', home, 'config', 'user.name', 'Operator']);
+  execFileSync('git', ['init', '-q', home], { env: scrubbedEnv() });
+  execFileSync('git', ['-C', home, 'config', 'user.email', 'operator@example.com'], { env: scrubbedEnv() });
+  execFileSync('git', ['-C', home, 'config', 'user.name', 'Operator'], { env: scrubbedEnv() });
   fs.writeFileSync(path.join(home, 'nodes', 'person-operator.md'), '---\nid: person-operator\ntype: person\ntitle: Operator\nsummary: Bound local person.\nemail: operator@example.com\n---\n');
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('SPOR_') && !key.startsWith('SUBSTRATE_')));
   Object.assign(env, { SPOR_HOME: home, XDG_CONFIG_HOME: home, HOME: home });

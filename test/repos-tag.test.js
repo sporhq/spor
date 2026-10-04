@@ -9,6 +9,7 @@
 // PUTs in remote mode (never the server's framing — we script the responses).
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const { hermeticEnv } = require("./helpers/env.js");
+const { scrubbedEnv } = require("./helpers/git.js");
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -47,7 +48,7 @@ function fixtureGraph() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-repos-tag-"));
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
-  spawnSync("git", ["init", "-q", home]);
+  spawnSync("git", ["init", "-q", home], { env: scrubbedEnv() });
   fs.writeFileSync(path.join(nodes, "repo-foo.md"), `---
 id: repo-foo
 type: repo
@@ -189,7 +190,7 @@ Body.
 test("repos tags (local) on a graph with no repo nodes prints the empty contract", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-repos-tag-"));
   fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
-  spawnSync("git", ["init", "-q", home]);
+  spawnSync("git", ["init", "-q", home], { env: scrubbedEnv() });
   const r = run(["repos", "tags"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /no repo identity nodes yet/);

@@ -1,6 +1,7 @@
 "use strict";
 require("./helpers/tmp-cleanup");
 const test = require("node:test");
+const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -530,7 +531,7 @@ test("proposal push and trusted-ref merge never execute repository hooks with ju
   const bare = path.join(f.home, "remote.git");
   const bin = path.join(f.home, "bin");
   fs.mkdirSync(repo); fs.mkdirSync(bin);
-  const git = (cwd, ...args) => { const r = spawnSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd, encoding: "utf8" }); assert.equal(r.status, 0, r.stderr); return r.stdout.trim(); };
+  const git = (cwd, ...args) => { const r = spawnSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { env: gitEnv(), cwd, encoding: "utf8" }); assert.equal(r.status, 0, r.stderr); return r.stdout.trim(); };
   git(repo, "init", "-q", "-b", "main"); git(repo, "config", "user.name", "test"); git(repo, "config", "user.email", "test@example.com");
   fs.writeFileSync(path.join(repo, "base"), "base"); git(repo, "add", "."); git(repo, "commit", "-qm", "base");
   git(f.home, "init", "--bare", "-q", bare);

@@ -12,6 +12,7 @@
 // script the server's responses, never assert its framing). Never the live graph.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const { hermeticEnv } = require("./helpers/env.js");
+const { gitEnv } = require("./helpers/git.js");
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -143,7 +144,7 @@ test("get (local) --json revision equals git hash-object", () => {
   const j = JSON.parse(run(["get", "dec-x", "--json"], { SPOR_HOME: dir }).stdout);
   let viaGit;
   try {
-    viaGit = execFileSync("git", ["hash-object", path.join(nodes, "dec-x.md")], { encoding: "utf8" }).trim();
+    viaGit = execFileSync("git", ["hash-object", path.join(nodes, "dec-x.md")], { env: gitEnv(), encoding: "utf8" }).trim();
   } catch {
     return; // no git binary — the pure-Node path is still asserted above
   }

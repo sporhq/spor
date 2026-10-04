@@ -5,6 +5,7 @@
 // AMBIENT org selectors (issue-spor-ambient-org-selector-silent-fallback).
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const test = require("node:test");
+const { scrubbedEnv } = require("./helpers/git.js");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -322,7 +323,7 @@ test("session-start never writes dispatch.repos; `spor enable` registers the che
   const home = tmp();
   const repo = path.join(tmp("spor-keys-reg-"), "myrepo");
   fs.mkdirSync(repo, { recursive: true });
-  spawnSync("git", ["init", "-q"], { cwd: repo });
+  spawnSync("git", ["init", "-q"], { env: scrubbedEnv(), cwd: repo });
   write(path.join(repo, ".spor.json"), { enabled: true });
   const env = hermeticEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home });
   spawnSync(process.execPath, [HOOK, "session-start", "--host", "claude-code"], { input: JSON.stringify({ cwd: repo, session_id: "s", hook_event_name: "SessionStart" }), env, encoding: "utf8" });

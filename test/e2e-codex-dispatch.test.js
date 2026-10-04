@@ -6,6 +6,7 @@
 // skips it; `npm run test:e2e:codex` opts in explicitly.
 require("./helpers/tmp-cleanup");
 const test = require("node:test");
+const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert");
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -31,7 +32,7 @@ function skipReason() {
 }
 
 function git(repo, args) {
-  const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+  const result = spawnSync("git", args, { env: gitEnv(), cwd: repo, encoding: "utf8" });
   assert.strictEqual(result.status, 0, result.stderr);
 }
 

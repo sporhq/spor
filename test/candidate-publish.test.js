@@ -9,6 +9,7 @@
 // everything that is not portable.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const test = require("node:test");
+const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -32,8 +33,8 @@ function scratch(t, stem) {
 // A producer repo with a trusted `main` and one commit of work on a branch.
 function producerRepo(t) {
   const dir = scratch(t, "cand-pub-repo");
-  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
-  const g = (...args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim();
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { env: gitEnv(), stdio: "ignore" });
+  const g = (...args) => execFileSync("git", ["-C", dir, ...args], { env: gitEnv(), encoding: "utf8" }).trim();
   g("config", "user.email", "t@t");
   g("config", "user.name", "Test");
   fs.writeFileSync(path.join(dir, "a.txt"), "one\n");
@@ -70,8 +71,8 @@ function mintFor(repo, over = {}) {
 // reference's own locator, in a repository that has never seen the producer.
 function readerObtains(t, reference, { candidateId, base = null, from = null }) {
   const dir = scratch(t, "cand-reader");
-  const g = (...args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim();
-  execFileSync("git", ["init", "-q", "--bare", dir], { stdio: "ignore" });
+  const g = (...args) => execFileSync("git", ["-C", dir, ...args], { env: gitEnv(), encoding: "utf8" }).trim();
+  execFileSync("git", ["init", "-q", "--bare", dir], { env: gitEnv(), stdio: "ignore" });
   const locator = reference.locator.startsWith("file://") ? fileURLToPath(reference.locator) : reference.locator;
   // A reader has the trusted ref's history, which is what makes the bundle's
   // prerequisite present. `from` stands in for that history.
@@ -106,8 +107,8 @@ test("a bundle publish is fetchable and verifies from the locator alone, after t
   // A SECOND repository, holding only the trusted ref's history, obtains the
   // commit from the reference — the producer's own branch is deleted first, so
   // nothing but the store can be answering.
-  execFileSync("git", ["-C", repo.dir, "checkout", "-q", "main"]);
-  execFileSync("git", ["-C", repo.dir, "branch", "-q", "-D", "impl"]);
+  execFileSync("git", ["-C", repo.dir, "checkout", "-q", "main"], { env: gitEnv() });
+  execFileSync("git", ["-C", repo.dir, "branch", "-q", "-D", "impl"], { env: gitEnv() });
   const got = readerObtains(t, ref, { candidateId: cand.candidate_id, base: "main", from: repo.dir });
   assert.strictEqual(got.commit, repo.commit);
   assert.strictEqual(got.tree, repo.tree);
@@ -259,7 +260,7 @@ test("an unwritable store is an outage — re-attemptable from the workspace, ch
 test("a branch publish records the RESOLVED url, never the remote name, and is create-only", async (t) => {
   const repo = producerRepo(t);
   const remoteDir = scratch(t, "cand-remote");
-  execFileSync("git", ["init", "-q", "--bare", remoteDir], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "--bare", remoteDir], { env: gitEnv(), stdio: "ignore" });
   const remoteUrl = pathToFileURL(remoteDir).href;
   repo.g("remote", "add", "origin", remoteUrl);
   const cand = mintFor(repo);
@@ -272,7 +273,7 @@ test("a branch publish records the RESOLVED url, never the remote name, and is c
   assert.strictEqual(ref.ref, `refs/spor/candidates/${cand.candidate_id}`);
   assert.ok(ref.verified_at);
 
-  const listed = execFileSync("git", ["ls-remote", remoteDir, ref.ref], { encoding: "utf8" }).trim();
+  const listed = execFileSync("git", ["ls-remote", remoteDir, ref.ref], { env: gitEnv(), encoding: "utf8" }).trim();
   assert.match(listed, new RegExp(`^${repo.commit}\\s`));
 
   // Replay: the ref is already ours.
@@ -280,12 +281,12 @@ test("a branch publish records the RESOLVED url, never the remote name, and is c
   assert.strictEqual(again.ok, true, again.reason);
 
   // A DIFFERENT commit under the same id is corruption, never a force.
-  execFileSync("git", ["-C", remoteDir, "update-ref", ref.ref, repo.base]);
+  execFileSync("git", ["-C", remoteDir, "update-ref", ref.ref, repo.base], { env: gitEnv() });
   const conflict = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "branch", remote: "origin" });
   assert.strictEqual(conflict.ok, false);
   assert.strictEqual(conflict.classification, "publish-conflict");
   assert.strictEqual(
-    execFileSync("git", ["ls-remote", remoteDir, ref.ref], { encoding: "utf8" }).trim().split(/\s/)[0],
+    execFileSync("git", ["ls-remote", remoteDir, ref.ref], { env: gitEnv(), encoding: "utf8" }).trim().split(/\s/)[0],
     repo.base,
     "a conflicting ref is never overwritten"
   );
@@ -303,7 +304,7 @@ test("publish 'both' carries the bundle as `reference` and both doors in `refere
   const repo = producerRepo(t);
   const store = pathToFileURL(scratch(t, "cand-store")).href;
   const remoteDir = scratch(t, "cand-remote");
-  execFileSync("git", ["init", "-q", "--bare", remoteDir], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "--bare", remoteDir], { env: gitEnv(), stdio: "ignore" });
   repo.g("remote", "add", "origin", pathToFileURL(remoteDir).href);
 
   const r = await publisher.publishCandidate(mintFor(repo), { cwd: repo.dir, publish: "both", bundleStore: store, remote: "origin" });
@@ -488,7 +489,7 @@ test("the default store is file://<SPOR_HOME>/candidates and is created on deman
 
 test("a git-tracked default home gets its own /candidates/ .gitignore line", (t) => {
   const home = scratch(t, "cand-home");
-  execFileSync("git", ["init", "-q", home], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", home], { env: gitEnv(), stdio: "ignore" });
   const f = factoryWith({});
   const v = publisher.publishSatisfiability(f, { graphHome: home, mode: "local" });
   assert.deepStrictEqual(v.errors, []);
@@ -507,7 +508,7 @@ test("a NON-git-tracked home is left with no .gitignore at all", (t) => {
 test("an operator-declared store elsewhere is gitignored in ITS OWN home, not the default graphHome", (t) => {
   const home = scratch(t, "cand-home"); // never touched by the store
   const shared = scratch(t, "cand-shared"); // the marker-resolved shared graph home, stands in
-  execFileSync("git", ["init", "-q", shared], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", shared], { env: gitEnv(), stdio: "ignore" });
   const f = factoryWith({ publish: "bundle", bundle_store: pathToFileURL(path.join(shared, "candidates")).href });
   const v = publisher.publishSatisfiability(f, { graphHome: home, mode: "local" });
   assert.deepStrictEqual(v.errors, []);
@@ -531,7 +532,7 @@ test("ensureStoreGitignore refuses a store inside the checkout the module runs f
 
 test("a store nested several directories below the git root is found by walking up, and the ignore line is RELATIVE to the root", (t) => {
   const shared = scratch(t, "cand-shared-nested");
-  execFileSync("git", ["init", "-q", shared], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", shared], { env: gitEnv(), stdio: "ignore" });
   const f = factoryWith({ publish: "bundle", bundle_store: pathToFileURL(path.join(shared, "data", "nested", "candidates")).href });
   const v = publisher.publishSatisfiability(f, { graphHome: scratch(t, "cand-home-unused"), mode: "local" });
   assert.deepStrictEqual(v.errors, []);
@@ -774,7 +775,7 @@ test("a publish that failed and then SUCCEEDS on a re-pin settles the stage — 
   // The outage clears — the remote appears — and the publish is re-attempted
   // FROM THE WORKSPACE on the next pin, with no second implementer dispatch.
   const remoteDir = scratch(t, "cand-remote");
-  execFileSync("git", ["init", "-q", "--bare", remoteDir], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "--bare", remoteDir], { env: gitEnv(), stdio: "ignore" });
   repo.g("remote", "add", "origin", pathToFileURL(remoteDir).href);
 
   assert.ok((await wired.deps.changedPaths({ trustedRef: "main" })).ok);
@@ -811,7 +812,7 @@ for (const transport of ["environment", "repository", "environment-over-reposito
   test(`branch publication preserves ${transport} SSH transport through push and isolated verification`, { skip: process.platform === "win32" }, async t => {
     const repo = producerRepo(t);
     const remote = scratch(t, "candidate-ssh-remote");
-    execFileSync("git", ["init", "--bare", "-q", remote]);
+    execFileSync("git", ["init", "--bare", "-q", remote], { env: gitEnv() });
     repo.g("remote", "add", "origin", "ssh://probe.invalid/remote.git");
     const log = path.join(scratch(t, "candidate-ssh-wrapper"), "calls.jsonl");
     const wrapper = path.join(path.dirname(log), "ssh wrapper");
@@ -846,9 +847,9 @@ for (const transport of ["environment", "repository", "environment-over-reposito
     const replayed = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "branch", remote: "origin", git });
     assert.equal(replayed.ok, true, replayed.reason);
     assert.equal(replayed.candidate.reference.commit, repo.commit);
-    const landed = execFileSync("git", ["-C", remote, "rev-parse", publisher.candidateRef(cand.candidate_id)], { encoding: "utf8" }).trim();
+    const landed = execFileSync("git", ["-C", remote, "rev-parse", publisher.candidateRef(cand.candidate_id)], { env: gitEnv(), encoding: "utf8" }).trim();
     assert.equal(landed, repo.commit);
-    execFileSync("git", ["-C", remote, "update-ref", publisher.candidateRef(cand.candidate_id), repo.base]);
+    execFileSync("git", ["-C", remote, "update-ref", publisher.candidateRef(cand.candidate_id), repo.base], { env: gitEnv() });
     const conflict = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "branch", remote: "origin", git });
     assert.equal(conflict.ok, false); assert.equal(conflict.classification, "publish-conflict");
     const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);

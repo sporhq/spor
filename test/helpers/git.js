@@ -31,6 +31,12 @@ function gitEnv(extra = {}, base = process.env) {
   return { ...envWithoutRepoLocalVars(base), ...IDENTITY, ...extra };
 }
 
+// Same scrub with NO fixed identity, for a fixture whose commits must take
+// their author from the repo's own `git config user.*` (or from none at all).
+function scrubbedEnv(extra = {}, base = process.env) {
+  return { ...envWithoutRepoLocalVars(base), ...extra };
+}
+
 const GIT_ENV = gitEnv();
 
 // Creates `dir` (recursively) and runs `git init` in it, returning a `g`
@@ -48,4 +54,4 @@ function gitInit(dir) {
   return g;
 }
 
-module.exports = { gitInit, gitEnv };
+module.exports = { gitInit, gitEnv, scrubbedEnv };

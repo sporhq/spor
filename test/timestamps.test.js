@@ -9,6 +9,7 @@
 
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
+const { scrubbedEnv } = require("./helpers/git.js");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -111,7 +112,7 @@ test("coldInHotNeighborhood: counts strictly-newer neighbors; 0 without an index
 // ---------- integration: loadGraph over a real git repo ----------
 
 function tmpHome() { return fs.mkdtempSync(path.join(os.tmpdir(), "spor-ts-")); }
-function git(dir, ...args) { execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" }); }
+function git(dir, ...args) { execFileSync("git", ["-C", dir, ...args], { env: scrubbedEnv(), stdio: "ignore" }); }
 function initGraph() {
   const home = tmpHome();
   fs.mkdirSync(path.join(home, "nodes"));
@@ -127,7 +128,7 @@ function node(home, id, type, body = "body", extra = "") {
 function commit(home, when, msg) {
   git(home, "add", "-A");
   execFileSync("git", ["-C", home, "commit", "-q", "-m", msg],
-    { stdio: "ignore", env: { ...process.env, GIT_COMMITTER_DATE: when, GIT_AUTHOR_DATE: when } });
+    { stdio: "ignore", env: { ...scrubbedEnv(), GIT_COMMITTER_DATE: when, GIT_AUTHOR_DATE: when } });
 }
 const ISO = (s) => new Date(s).toISOString();
 
@@ -143,7 +144,7 @@ test("loadGraph: cold build derives created_at/updated_at and writes the HEAD-ke
   assert.equal(g.timestamps["task-a"].updated_at, ISO("2026-03-01T00:00:00Z"));
 
   const cache = JSON.parse(fs.readFileSync(path.join(home, "cache", "timestamps.json"), "utf8"));
-  assert.equal(cache.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+  assert.equal(cache.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { env: scrubbedEnv(), encoding: "utf8" }).trim());
   assert.ok(cache.ts["task-a"]); // PURE git values cached (no override layer)
 });
 
@@ -152,7 +153,7 @@ test("loadGraph: fast-forward reload folds only OLD..NEW (created_at preserved, 
   node(home, "task-a", "task");
   commit(home, "2026-01-10T00:00:00Z", "create A");
   void graphLib.loadGraph(path.join(home, "nodes")).timestamps; // access -> seed the cache at OLD head
-  const oldHead = execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const oldHead = execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { env: scrubbedEnv(), encoding: "utf8" }).trim();
 
   fs.appendFileSync(path.join(home, "nodes", "task-a.md"), "\nmore");
   commit(home, "2026-05-01T00:00:00Z", "update A");
@@ -193,7 +194,7 @@ test("loadGraph: a stale (non-ancestor) cache head forces a full rebuild", () =>
   const g = graphLib.loadGraph(path.join(home, "nodes"));
   assert.equal(g.timestamps["task-a"].created_at, ISO("2026-01-10T00:00:00Z")); // rebuilt from git, not the bogus cache
   const cache = JSON.parse(fs.readFileSync(cf, "utf8"));
-  assert.equal(cache.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+  assert.equal(cache.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { env: scrubbedEnv(), encoding: "utf8" }).trim());
 });
 
 test("loadGraph: explicit frontmatter created_at overrides the git-derived value", () => {

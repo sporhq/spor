@@ -8,6 +8,7 @@
 // Scratch git repos + scratch graph homes only — never the live graph.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const { hermeticEnv } = require("./helpers/env.js");
+const { gitEnv } = require("./helpers/git.js");
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -38,7 +39,7 @@ function runAsync(home, args, extra = {}) {
   });
 }
 function git(dir, ...args) {
-  return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  return execFileSync("git", ["-C", dir, ...args], { env: gitEnv(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 function commit(dir, subject, trailer = null) {
   const args = ["commit", "-q", "--allow-empty", "-m", subject];
@@ -54,7 +55,7 @@ function scratch() {
   fs.mkdirSync(nodes, { recursive: true });
   const repo = path.join(root, "demo-repo");
   fs.mkdirSync(repo);
-  execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "-b", "main", repo], { env: gitEnv(), stdio: "ignore" });
   git(repo, "config", "user.email", "t@t");
   git(repo, "config", "user.name", "Test");
   commit(repo, "init");

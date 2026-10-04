@@ -11,6 +11,7 @@
 // Every home is a mkdtemp scratch dir; every server a port-0 stub.
 require("./helpers/tmp-cleanup");
 const test = require("node:test");
+const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -185,9 +186,9 @@ function hookScratch(base) {
   fs.mkdirSync(home, { recursive: true });
   const cwd = path.join(root, "projx");
   fs.mkdirSync(cwd);
-  const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@e" };
+  const fixtureGitEnv = gitEnv({ GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_EMAIL: "t@e" });
   for (const args of [["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "init"]]) {
-    const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", env: gitEnv });
+    const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", env: fixtureGitEnv });
     assert.strictEqual(r.status, 0, r.stderr);
   }
   const key = `${base}/acme`;
@@ -270,14 +271,14 @@ test("infer-commits: a proposal capture refreshes an expired store token and ret
     fs.mkdirSync(home, { recursive: true });
     const repo = path.join(root, "repo");
     fs.mkdirSync(repo);
-    const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@e" };
+    const fixtureGitEnv = gitEnv({ GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_EMAIL: "t@e" });
     // A branch named after the candidate id is a confident link on its own
     // (the same seam test/infer-commits.test.js uses).
     for (const args of [["init", "-q", "-b", "task-test-node"], ["commit", "-q", "--allow-empty", "-m", "wip"]]) {
-      const r = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8", env: gitEnv });
+      const r = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8", env: fixtureGitEnv });
       assert.strictEqual(r.status, 0, r.stderr);
     }
-    const sha = spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+    const sha = spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], { env: fixtureGitEnv, encoding: "utf8" }).stdout.trim();
     const journal = path.join(root, "journal.jsonl");
     fs.writeFileSync(journal, JSON.stringify({ tool: "git-commit", sha, nodes: [] }) + "\n");
     const key = `${base}/acme`;
@@ -362,8 +363,8 @@ test("link-commits and agents-md: an expired store token is refreshed and the ca
   const { srv, hits, base } = await authServer((req) => (req.url.startsWith("/v1/briefing/") ? { found: true, body: "AGENTS-BRIEF", version: 1 } : { ok: true }));
   try {
     const s = hookScratch(base);
-    const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@e" };
-    const c = spawnSync("git", ["-C", s.cwd, "commit", "-q", "--allow-empty", "-m", "work\n\nSpor: task-some-node"], { encoding: "utf8", env: gitEnv });
+    const fixtureGitEnv = gitEnv({ GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_EMAIL: "t@e" });
+    const c = spawnSync("git", ["-C", s.cwd, "commit", "-q", "--allow-empty", "-m", "work\n\nSpor: task-some-node"], { encoding: "utf8", env: fixtureGitEnv });
     assert.strictEqual(c.status, 0, c.stderr);
     u.setConfig(loadAt(s.home));
     try {

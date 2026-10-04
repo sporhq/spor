@@ -10,6 +10,7 @@
 
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
+const { gitEnv } = require("./helpers/git.js");
 const assert = require('node:assert/strict');
 const { spawnSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
@@ -475,7 +476,7 @@ function gitRepo() {
     const r = spawnSync('git', ['-C', cwd, ...args], {
       encoding: 'utf8',
       env: {
-        ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com',
+        ...gitEnv(), GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com',
         GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.com',
       },
     });

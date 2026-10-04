@@ -12,6 +12,7 @@
 
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const { test } = require("node:test");
+const { scrubbedEnv } = require("./helpers/git.js");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -25,7 +26,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 // ---------- scratch git graph ----------
 
 function tmpHome() { return fs.mkdtempSync(path.join(os.tmpdir(), "spor-ch-")); }
-function git(dir, ...args) { execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" }); }
+function git(dir, ...args) { execFileSync("git", ["-C", dir, ...args], { env: scrubbedEnv(), stdio: "ignore" }); }
 function initGraph() {
   const home = tmpHome();
   fs.mkdirSync(path.join(home, "nodes"));
@@ -42,7 +43,7 @@ function rmNode(home, id) { git(home, "rm", "-q", path.join("nodes", `${id}.md`)
 function commit(home, when, msg) {
   git(home, "add", "-A");
   execFileSync("git", ["-C", home, "commit", "-q", "-m", msg],
-    { stdio: "ignore", env: { ...process.env, GIT_COMMITTER_DATE: when, GIT_AUTHOR_DATE: when } });
+    { stdio: "ignore", env: { ...scrubbedEnv(), GIT_COMMITTER_DATE: when, GIT_AUTHOR_DATE: when } });
 }
 const nodesOf = (home) => path.join(home, "nodes");
 
@@ -62,7 +63,7 @@ test("collect: newest change per node, newest-first, with the git LETTER as chan
   assert.equal(r.changes[0].change, "M"); // task-a's NEWEST change is the modify
   assert.equal(r.changes[1].change, "A"); // dec-b only ever added
   assert.deepEqual(r.node_ids, ["task-a", "dec-b"]);
-  assert.equal(r.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+  assert.equal(r.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { env: scrubbedEnv(), encoding: "utf8" }).trim());
 });
 
 test("collect: decorates from the CURRENT node frontmatter (type/title/authored_via/author/agent/session)", () => {
@@ -98,7 +99,7 @@ test("collect: --since <sha> bounds to sha..HEAD", () => {
   const home = initGraph();
   writeNode(home, "task-a", "task");
   commit(home, "2026-06-19T08:00:00Z", "c1");
-  const first = execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const first = execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { env: scrubbedEnv(), encoding: "utf8" }).trim();
   writeNode(home, "dec-b", "decision");
   commit(home, "2026-06-21T09:00:00Z", "c2");
   const r = changesLib.collect({ nodesDir: nodesOf(home), since: first });

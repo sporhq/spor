@@ -8,6 +8,7 @@
 // framing — we script the response) + the on-disk node in local mode.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const { hermeticEnv } = require("./helpers/env.js");
+const { scrubbedEnv } = require("./helpers/git.js");
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -46,9 +47,9 @@ function fixtureGraph() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-ask-"));
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
-  spawnSync("git", ["init", "-q", home]);
-  spawnSync("git", ["-C", home, "config", "user.email", "alice@example.com"]);
-  spawnSync("git", ["-C", home, "config", "user.name", "Alice"]);
+  spawnSync("git", ["init", "-q", home], { env: scrubbedEnv() });
+  spawnSync("git", ["-C", home, "config", "user.email", "alice@example.com"], { env: scrubbedEnv() });
+  spawnSync("git", ["-C", home, "config", "user.name", "Alice"], { env: scrubbedEnv() });
   fs.writeFileSync(path.join(nodes, "dec-x.md"), `---
 id: dec-x
 type: decision

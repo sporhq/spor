@@ -16,6 +16,7 @@
 //      that declares no `implementation:` block pins nothing at all.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const test = require("node:test");
+const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -409,8 +410,8 @@ test("candidateSummary leads with the tree, and says so when nothing is publishe
 
 function realRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cand-repo-"));
-  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
-  const g = (...args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim();
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { env: gitEnv(), stdio: "ignore" });
+  const g = (...args) => execFileSync("git", ["-C", dir, ...args], { env: gitEnv(), encoding: "utf8" }).trim();
   g("config", "user.email", "t@t");
   g("config", "user.name", "Test");
   fs.writeFileSync(path.join(dir, "a.txt"), "one\n");

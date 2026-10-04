@@ -23,6 +23,7 @@
 // routing cleared (norm-cc-scratch-home-for-tests).
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const { hermeticEnv } = require("./helpers/env.js");
+const { scrubbedEnv } = require("./helpers/git.js");
 const test = require("node:test");
 const assert = require("node:assert");
 const { spawnSync, spawn } = require("node:child_process");
@@ -456,7 +457,7 @@ function fixture({ repoSporJson = null, profileHarness = "claude-code", dispatch
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-preflight-repo-"));
-  const git = (...args) => spawnSync("git", ["-C", repo, ...args], { encoding: "utf8", env: bare() });
+  const git = (...args) => spawnSync("git", ["-C", repo, ...args], { encoding: "utf8", env: scrubbedEnv({}, bare()) });
   git("init", "-q", "-b", "main");
   git("config", "user.email", "t@example.com");
   git("config", "user.name", "T");

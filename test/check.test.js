@@ -10,6 +10,7 @@
 //      exit codes, --json shape, and the remote arm over a stub /v1/export.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const { test } = require("node:test");
+const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -189,7 +190,7 @@ function scratch() {
   fs.mkdirSync(path.join(cwd, "src"), { recursive: true });
   const g = (...args) => execFileSync("git", ["-C", cwd, ...args], {
     stdio: "ignore",
-    env: { ...process.env, GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@t" },
+    env: { ...gitEnv(), GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@t" },
   });
   g("init", "-q");
   fs.writeFileSync(path.join(cwd, "src", "a.js"), "1\n");

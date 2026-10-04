@@ -20,6 +20,7 @@
 //      gate pipeline alone.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const test = require("node:test");
+const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -670,7 +671,7 @@ test("a park WITH a tracking item demotes naming it, as before", async () => {
 // while every other git command still runs for real.
 function proposeRepo(branchName) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-repo-"));
-  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { env: gitEnv(), stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
   git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
@@ -684,7 +685,7 @@ function proposeRepo(branchName) {
   // `git` on PATH (a PATH shim cannot intercept a bare `git` spawn on
   // Windows, where only .exe/.com resolve).
   const bare = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-origin-"));
-  execFileSync("git", ["init", "-q", "--bare", bare], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "--bare", bare], { env: gitEnv(), stdio: "ignore" });
   git(dir, "remote", "set-url", "--push", "origin", bare);
   git(dir, "checkout", "-q", "-b", branchName);
   fs.writeFileSync(path.join(dir, "f.txt"), "base\nbranch work\n");
@@ -787,7 +788,7 @@ test("proposeIntegrationPR pushes the COMMIT it is given, not the checked-out br
   // The bare origin's branch ref is the PINNED commit — never the tip that
   // was checked out when this ran.
   const bareUrl = git(dir, "remote", "get-url", "--push", "origin").trim();
-  const landed = execFileSync("git", ["ls-remote", bareUrl, "refs/heads/task-demo-pin"], { encoding: "utf8" }).trim().split(/\s+/)[0];
+  const landed = execFileSync("git", ["ls-remote", bareUrl, "refs/heads/task-demo-pin"], { env: gitEnv(), encoding: "utf8" }).trim().split(/\s+/)[0];
   assert.strictEqual(landed, pinned, "the pushed branch ref is the pinned commit, not the checked-out tip");
 });
 
@@ -1130,9 +1131,9 @@ test("task-spor-propose-mode-post-land-reconcile: checkProposals reconciles the 
   // be by the time checkProposals gets around to checking a parked proposal.
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-reconcile-"));
   const bare = path.join(parent, "origin.git");
-  execFileSync("git", ["init", "-q", "--bare", "-b", "main", bare], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "--bare", "-b", "main", bare], { env: gitEnv(), stdio: "ignore" });
   const seed = path.join(parent, "seed");
-  execFileSync("git", ["init", "-q", "-b", "main", seed], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "-b", "main", seed], { env: gitEnv(), stdio: "ignore" });
   git(seed, "config", "user.email", "t@t");
   git(seed, "config", "user.name", "Test");
   fs.writeFileSync(path.join(seed, "a.txt"), "a\n");
@@ -1141,7 +1142,7 @@ test("task-spor-propose-mode-post-land-reconcile: checkProposals reconciles the 
   git(seed, "remote", "add", "origin", bare);
   git(seed, "push", "-q", "origin", "main");
   const mainCheckout = path.join(parent, "main-checkout");
-  execFileSync("git", ["clone", "-q", bare, mainCheckout], { stdio: "ignore" });
+  execFileSync("git", ["clone", "-q", bare, mainCheckout], { env: gitEnv(), stdio: "ignore" });
   const targetSha = git(mainCheckout, "rev-parse", "main").trim();
 
   // The merge itself: a SEPARATE push, naming another open item in a `Spor:`
@@ -1993,7 +1994,7 @@ test("issue-spor-restore-proposal-closes-tracking-item-with-bare-done-no-resolve
 // ---------------------------------------------------- the git plumbing, for real --
 
 function git(dir, ...args) {
-  return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  return execFileSync("git", ["-C", dir, ...args], { env: gitEnv(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
 // A repo with `main` and a `branch` that add a NEW file (no textual conflict)
@@ -2002,7 +2003,7 @@ function git(dir, ...args) {
 // forces the protected path back to main's copy before anything runs.
 function integrationRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-repo-"));
-  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { env: gitEnv(), stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
   git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
@@ -2054,7 +2055,7 @@ test("buildCandidateTree really is merge(target_ref, branch), and forceProtected
 
 test("buildCandidateTree reports a real merge conflict, aborts cleanly, and leaves no worktree behind", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-conflict-"));
-  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { env: gitEnv(), stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
   git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
@@ -3599,7 +3600,7 @@ test("ghPrStatus: refuses directly when gh is not on PATH — the backstop check
 
 function reconcileRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-reconcile-repo-"));
-  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { env: gitEnv(), stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
   git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
@@ -3764,9 +3765,9 @@ test("the candidate suite is told what it is judging: SPOR_GATE_BASE/HEAD are th
 function pushModeFixture() {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-push-"));
   const bare = path.join(parent, "origin.git");
-  execFileSync("git", ["init", "-q", "--bare", "-b", "main", bare], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "--bare", "-b", "main", bare], { env: gitEnv(), stdio: "ignore" });
   const seed = path.join(parent, "seed");
-  execFileSync("git", ["init", "-q", "-b", "main", seed], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "-b", "main", seed], { env: gitEnv(), stdio: "ignore" });
   git(seed, "config", "user.email", "t@t");
   git(seed, "config", "user.name", "Test");
   fs.writeFileSync(path.join(seed, "a.txt"), "a\n");
@@ -3776,7 +3777,7 @@ function pushModeFixture() {
   git(seed, "push", "-q", "origin", "main");
   // The worker's checkout: a clone with origin/main at the seed tip and a branch.
   const worker = path.join(parent, "worker");
-  execFileSync("git", ["clone", "-q", bare, worker], { stdio: "ignore" });
+  execFileSync("git", ["clone", "-q", bare, worker], { env: gitEnv(), stdio: "ignore" });
   git(worker, "config", "user.email", "t@t");
   git(worker, "config", "user.name", "Test");
   git(worker, "checkout", "-q", "-b", "impl");
@@ -5500,7 +5501,7 @@ test("reconcileCandidateSha with a protected set stages only the restored protec
     assert.strictEqual(reconciled.amended, true);
     assert.match(git(dir, "show", `${reconciled.sha}:test/acceptance.js`), /add is broken/, "the restored protected file is in the re-commit");
     assert.doesNotMatch(git(dir, "show", `${reconciled.sha}:lib/sub.js`), /hook residue/, "the edit outside the protected set is NOT committed");
-    assert.strictEqual(spawnSync("git", ["-C", dir, "cat-file", "-e", `${reconciled.sha}:generated.lock`]).status === 0, false, "the generated file is NOT committed");
+    assert.strictEqual(spawnSync("git", ["-C", dir, "cat-file", "-e", `${reconciled.sha}:generated.lock`], { env: gitEnv() }).status === 0, false, "the generated file is NOT committed");
     assert.match(git(built.dir, "status", "--porcelain"), /generated\.lock/, "…it is still sitting in the working tree, untouched");
   } finally {
     built.cleanup();

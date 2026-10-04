@@ -9,6 +9,7 @@
 // git-init'd graph homes — never the live graph.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const { hermeticEnv } = require("./helpers/env.js");
+const { scrubbedEnv } = require("./helpers/git.js");
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -35,10 +36,10 @@ function run(args, extra) {
 // with NO git identity (the bootstrap-not-yet-done case).
 function freshHome(identity = { name: "Jo Diaz", email: "jo@example.io" }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-person-"));
-  spawnSync("git", ["init", "-q", home]);
+  spawnSync("git", ["init", "-q", home], { env: scrubbedEnv() });
   if (identity) {
-    spawnSync("git", ["-C", home, "config", "user.name", identity.name]);
-    spawnSync("git", ["-C", home, "config", "user.email", identity.email]);
+    spawnSync("git", ["-C", home, "config", "user.name", identity.name], { env: scrubbedEnv() });
+    spawnSync("git", ["-C", home, "config", "user.email", identity.email], { env: scrubbedEnv() });
   }
   return home;
 }

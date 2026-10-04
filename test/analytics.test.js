@@ -9,6 +9,7 @@
 
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
+const { scrubbedEnv } = require("./helpers/git.js");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -277,7 +278,7 @@ test("computeAnalytics: type filter + WIP-by-type + bottlenecks (oldest open fir
 // ---------- integration: the façade over a real scratch git repo ----------
 
 function tmpHome() { return fs.mkdtempSync(path.join(os.tmpdir(), "spor-an-")); }
-function git(dir, ...args) { execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" }); }
+function git(dir, ...args) { execFileSync("git", ["-C", dir, ...args], { env: scrubbedEnv(), stdio: "ignore" }); }
 function initGraph() {
   const home = tmpHome();
   fs.mkdirSync(path.join(home, "nodes"));
@@ -294,7 +295,7 @@ function writeNode(home, id, type, status, extra = "", date = "2026-01-01") {
 function commit(home, when, msg) {
   git(home, "add", "-A");
   execFileSync("git", ["-C", home, "commit", "-q", "-m", msg],
-    { stdio: "ignore", env: { ...process.env, GIT_COMMITTER_DATE: when, GIT_AUTHOR_DATE: when } });
+    { stdio: "ignore", env: { ...scrubbedEnv(), GIT_COMMITTER_DATE: when, GIT_AUTHOR_DATE: when } });
 }
 
 test("analyze: completion is the status-TRANSITION commit, immune to a later edge append", () => {
@@ -502,7 +503,7 @@ test("analyze: a cold run writes the HEAD + fp keyed status-transition cache", (
 
   assert.ok(fs.existsSync(closedPath(home)));
   const c = readClosed(home);
-  assert.equal(c.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+  assert.equal(c.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { env: scrubbedEnv(), encoding: "utf8" }).trim());
   assert.equal(c.fp, FP);                       // the terminal-vocabulary fingerprint
   assert.equal(c.state["task-a"].terminal, true); // the per-node fold STATE is cached, not the closed-at output
   assert.ok(c.state["task-a"].runStart > 0);
@@ -540,7 +541,7 @@ test("analyze: a terminal-vocabulary fingerprint change forces a full rebuild", 
 test("analyze: a fast-forward incremental fold == a full rebuild (byte-identical report)", () => {
   const home = closedGraph();
   analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 }); // seed cache at OLD head
-  const oldHead = execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const oldHead = execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { env: scrubbedEnv(), encoding: "utf8" }).trim();
   // New commits after the cached head: a reopen→reclose of A (run reset) + a brand-new closed node.
   writeNode(home, "task-a", "task", "open");
   commit(home, "2026-05-18T00:00:00Z", "reopen A");   // W21
@@ -552,7 +553,7 @@ test("analyze: a fast-forward incremental fold == a full rebuild (byte-identical
   const ff = analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 }); // fast-forward
   const cache = readClosed(home);
   assert.notEqual(cache.head, oldHead);                 // re-keyed to the new head
-  assert.equal(cache.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+  assert.equal(cache.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { env: scrubbedEnv(), encoding: "utf8" }).trim());
 
   // Force a full rebuild from scratch at the SAME head and compare the whole report.
   fs.rmSync(closedPath(home));
@@ -611,10 +612,10 @@ test("analyze: an UNCOMMITTED retype (HEAD unchanged) also invalidates an exact-
 
   // Retype on disk WITHOUT committing: HEAD stays exactly where the cache left it.
   writeNode(home, "task-mistyped", "artifact", "released");
-  const headBefore = execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const headBefore = execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { env: scrubbedEnv(), encoding: "utf8" }).trim();
 
   const r = analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 });
-  assert.equal(execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), headBefore); // still uncommitted
+  assert.equal(execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { env: scrubbedEnv(), encoding: "utf8" }).trim(), headBefore); // still uncommitted
   assert.equal(r.totals.completed, 1);              // `released` IS artifact-terminal under the new (uncommitted) type
   assert.equal(r.coverage.fromGitTransition, 1);    // dated at the release commit, not a created_at fallback
 });
@@ -629,7 +630,7 @@ test("analyze: a non-ancestor cached head (history rewrite) forces a full rebuil
   }));
   const r = analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 });
   assert.equal(r.totals.completed, 1);                   // rebuilt from git, not the bogus non-ancestor cache
-  assert.equal(readClosed(home).head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+  assert.equal(readClosed(home).head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { env: scrubbedEnv(), encoding: "utf8" }).trim());
 });
 
 test("analyze: a non-git home writes no cache and degrades to the fallback (fail-open)", () => {

@@ -8,6 +8,7 @@
 // framing — we script the response) + the on-disk frontmatter in local mode.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const { hermeticEnv } = require("./helpers/env.js");
+const { scrubbedEnv } = require("./helpers/git.js");
 const { test } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -46,9 +47,9 @@ function fixtureGraph(email = "alice@example.com", name = "Alice") {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-ready-"));
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
-  spawnSync("git", ["init", "-q", home]);
-  spawnSync("git", ["-C", home, "config", "user.email", email]);
-  spawnSync("git", ["-C", home, "config", "user.name", name]);
+  spawnSync("git", ["init", "-q", home], { env: scrubbedEnv() });
+  spawnSync("git", ["-C", home, "config", "user.email", email], { env: scrubbedEnv() });
+  spawnSync("git", ["-C", home, "config", "user.name", name], { env: scrubbedEnv() });
   fs.writeFileSync(path.join(nodes, "task-x.md"), `---
 id: task-x
 type: task
@@ -158,9 +159,9 @@ function traversalFixture() {
   const home = path.join(root, "home");
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
-  spawnSync("git", ["init", "-q", home]);
-  spawnSync("git", ["-C", home, "config", "user.email", "alice@example.com"]);
-  spawnSync("git", ["-C", home, "config", "user.name", "Alice"]);
+  spawnSync("git", ["init", "-q", home], { env: scrubbedEnv() });
+  spawnSync("git", ["-C", home, "config", "user.email", "alice@example.com"], { env: scrubbedEnv() });
+  spawnSync("git", ["-C", home, "config", "user.name", "Alice"], { env: scrubbedEnv() });
   const plant = (file, id) => {
     const md = `---\nid: ${id}\ntype: task\ntitle: Outside file\nsummary: A markdown file outside the nodes dir.\ndate: 2026-06-01\n---\nOutside body.\n`;
     fs.writeFileSync(file, md);

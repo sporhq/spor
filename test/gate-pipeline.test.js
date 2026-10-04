@@ -21,6 +21,7 @@
 //      outcome lands in the graph as a node.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const test = require("node:test");
+const { gitEnv } = require("./helpers/git.js");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -1112,7 +1113,7 @@ test("a pipeline with no demote dep at all still settles — the step is optiona
 // ------------------------------------------------ the command gate, for real --
 
 function git(dir, ...args) {
-  return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  return execFileSync("git", ["-C", dir, ...args], { env: gitEnv(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
 // A repo whose `test/acceptance.js` is a real (tiny) acceptance suite, and a
@@ -1120,7 +1121,7 @@ function git(dir, ...args) {
 // anyway — the exact shape a command gate exists to catch.
 function repoWithBranch({ weakenTest = true, regress = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-repo-"));
-  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { env: gitEnv(), stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
   fs.mkdirSync(path.join(dir, "test"), { recursive: true });
@@ -3543,7 +3544,7 @@ test("end to end: a dispatched run is gated, and the gate outcome lands in the g
   assert.match(body, /passed/);
   assert.ok(fs.existsSync(path.join(repo, "test", "acceptance.js")), "the gate left the repo alone");
   assert.strictEqual(
-    execFileSync("git", ["-C", repo, "worktree", "list"], { encoding: "utf8" }).trim().split("\n").length,
+    execFileSync("git", ["-C", repo, "worktree", "list"], { env: gitEnv(), encoding: "utf8" }).trim().split("\n").length,
     1,
     "and cleaned up its gate worktree"
   );
@@ -4201,7 +4202,7 @@ test("end to end: a run refused for an external cause is re-judged with --regate
   const second = cli(["work", "--regate", runId.slice(0, 8), "--factory", "factory-demo"], env);
   assert.strictEqual(second.status, 0, `${second.stderr}\n${second.stdout}`);
   assert.match(second.stdout, /merged main \([0-9a-f]{8}\) into .* before re-gating/);
-  assert.ok(execFileSync("git", ["-C", repo, "merge-base", "--is-ancestor", "main", "impl"], { encoding: "utf8" }) === "", "the branch now contains the trusted ref");
+  assert.ok(execFileSync("git", ["-C", repo, "merge-base", "--is-ancestor", "main", "impl"], { env: gitEnv(), encoding: "utf8" }) === "", "the branch now contains the trusted ref");
   assert.match(second.stdout, /re-gating task-ready — run [0-9a-f]{8}, attempt 2, under factory-demo \(previously failed/);
   assert.match(second.stdout, /gate acceptance passed on task-ready/);
   assert.match(second.stdout, new RegExp(`re-gate of task-ready passed — .*closed ${escalation} with art-regate-ready-[0-9a-f]{8}-r2-`));
@@ -4217,7 +4218,7 @@ test("end to end: a run refused for an external cause is re-judged with --regate
   assert.strictEqual(require("../lib/shell/stage-projection.js").pipelineAttempt(after, require("../lib/shell/stage-projection.js").pipelineLease(home, after)), 1);
   assert.match(after.gate_reason, /gate\(s\) passed/);
   assert.strictEqual(fs.readFileSync(path.join(nodes, "task-ready.md"), "utf8").includes("status: open"), true, "the stub never claimed completion, so nothing is promoted");
-  assert.strictEqual(execFileSync("git", ["-C", repo, "worktree", "list"], { encoding: "utf8" }).trim().split("\n").length, 1, "the re-gate's tree is cleaned up");
+  assert.strictEqual(execFileSync("git", ["-C", repo, "worktree", "list"], { env: gitEnv(), encoding: "utf8" }).trim().split("\n").length, 1, "the re-gate's tree is cleaned up");
 
   // A passed run is not re-judged again.
   const again = cli(["work", "--regate", runId.slice(0, 8), "--factory", "factory-demo"], env);
@@ -4533,7 +4534,7 @@ test("an EMPTY-diff refusal whose item's resolver cites commits already on the t
 // factory.
 function emptyDiffOnMainFixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-emptydiff-"));
-  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { env: gitEnv(), stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
   fs.writeFileSync(path.join(dir, "f.txt"), "x\n");
@@ -5183,7 +5184,7 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
     "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-03\n---\n\nAcceptance: reading N items yields N.\n"
   );
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-repo-"));
-  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   g("init", "-q", "-b", "main");
   fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
   g("add", "."); g("commit", "-q", "-m", "base");
@@ -5473,7 +5474,7 @@ test("a legacy native-background reviewer is report-less — its transcript is n
     "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-05\n---\n\nAcceptance: reading N items yields N.\n"
   );
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-native-repo-"));
-  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   g("init", "-q", "-b", "main");
   fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
   g("add", "."); g("commit", "-q", "-m", "base");
@@ -5544,7 +5545,7 @@ test("a report-less reviewer that HAD a report channel is refused on its own end
     "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-05\n---\n\nAcceptance: reading N items yields N.\n"
   );
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-reportless-repo-"));
-  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   g("init", "-q", "-b", "main");
   fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
   g("add", "."); g("commit", "-q", "-m", "base");
@@ -6101,7 +6102,7 @@ test("the rescue's early diagnosis block survives a final message that overwrote
   fs.writeFileSync(path.join(home, "nodes", "profile-claude-fable.md"), "---\nid: profile-claude-fable\ntype: profile\ntitle: The strong-model rescue profile\nharness: claude-code\nsummary: The strong-model rescue profile.\ndate: 2026-09-03\n---\n\nThe rescue lane's profile.\n");
   fs.writeFileSync(path.join(home, "nodes", "profile-codex-sol.md"), "---\nid: profile-codex-sol\ntype: profile\ntitle: The Codex rescue profile\nharness: codex\nsummary: The Codex rescue profile.\ndate: 2026-09-03\n---\n\nA rescue lane profile on a harness that writes its own report.\n");
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-early-repo-"));
-  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   g("init", "-q", "-b", "main");
   fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
   g("add", "."); g("commit", "-q", "-m", "base");
@@ -6195,7 +6196,7 @@ test("the rescue's diagnosis file is read when the final report has no block and
   fs.writeFileSync(path.join(home, "nodes", "task-fix-me.md"), "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-03\n---\n\nAcceptance: reading N items yields N.\n");
   fs.writeFileSync(path.join(home, "nodes", "profile-claude-fable.md"), "---\nid: profile-claude-fable\ntype: profile\ntitle: The strong-model rescue profile\nharness: claude-code\nsummary: The strong-model rescue profile.\ndate: 2026-09-03\n---\n\nThe rescue lane's profile.\n");
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-file-repo-"));
-  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   g("init", "-q", "-b", "main");
   fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
   g("add", "."); g("commit", "-q", "-m", "base");
@@ -6296,7 +6297,7 @@ test("the real rescue dispatch runs under the rescue profile in the run's own ch
   fs.writeFileSync(path.join(home, "nodes", "task-fix-me.md"), "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-03\n---\n\nAcceptance: reading N items yields N.\n");
   fs.writeFileSync(path.join(home, "nodes", "profile-claude-fable.md"), "---\nid: profile-claude-fable\ntype: profile\ntitle: The strong-model rescue profile\nharness: claude-code\nmodel: fable\nsummary: The strong-model rescue profile.\ndate: 2026-09-03\n---\n\nThe rescue lane's profile.\n");
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-repo-"));
-  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   g("init", "-q", "-b", "main");
   fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
   g("add", "."); g("commit", "-q", "-m", "base");
@@ -6884,7 +6885,7 @@ test("the resumed flag rides the gate call only for an adopted orphan", async ()
 
 test("gateChangeSet marks a missing checkout `gone`, and gateHeadLanded reads the run's head from the checkout or, once it is removed, from the dispatch worktree's branch", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "spor-landed-"));
-  const g = (dir, args) => execFileSync("git", args, { cwd: dir, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  const g = (dir, args) => execFileSync("git", args, { cwd: dir, encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   const repo = path.join(root, "repo");
   fs.mkdirSync(repo);
   g(repo, ["init", "-q", "-b", "main"]);
@@ -6926,7 +6927,7 @@ test("gateChangeSet marks a missing checkout `gone`, and gateHeadLanded reads th
 
 test("gateCommitsLanded checks an item's recorded commit stamps against the trusted ref, scoped to its own repo", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "spor-commits-landed-"));
-  const g = (dir, args) => execFileSync("git", args, { cwd: dir, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  const g = (dir, args) => execFileSync("git", args, { cwd: dir, encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   const repo = path.join(root, "repo");
   fs.mkdirSync(repo);
   g(repo, ["init", "-q", "-b", "main"]);

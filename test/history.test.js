@@ -11,6 +11,7 @@
 // never the server's framing (remote responses are scripted).
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const { hermeticEnv } = require("./helpers/env.js");
+const { gitEnv } = require("./helpers/git.js");
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
@@ -47,7 +48,7 @@ function runAsync(args, env) {
 // back so the per-revision arm can target a known commit. Deterministic dates so
 // the rendered "when" column is stable.
 function gitc(dir, args, env = {}) {
-  const r = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", env: { ...process.env, ...env } });
+  const r = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", env: { ...gitEnv(), ...env } });
   if (r.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr}`);
   return r.stdout;
 }
@@ -219,7 +220,7 @@ function fixtureMergeGraph() {
 
   // conflicts by construction; resolve to a THIRD content so the merge differs
   // from both parents and git reports it in the combined diff.
-  spawnSync("git", ["-C", dir, "merge", "-q", "side"], { encoding: "utf8" });
+  spawnSync("git", ["-C", dir, "merge", "-q", "side"], { env: gitEnv(), encoding: "utf8" });
   fs.writeFileSync(decX, node("Merged.", "Body merged."));
   gitc(dir, ["add", "-A"]);
   gitc(dir, ["commit", "-qm", "merge: reconcile dec-x"], at("2026-06-03T10:00:00Z"));

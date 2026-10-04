@@ -4,6 +4,7 @@
 // runs against a throwaway graph home — never the live graph.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
+const { gitEnv, scrubbedEnv } = require("./helpers/git.js");
 const assert = require('node:assert');
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
@@ -200,19 +201,19 @@ function gpgSignFailEnv() {
 test('init sets a fallback identity + initial commit when git has none, so the graph can commit', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-id-'));
   fs.rmSync(home, { recursive: true, force: true }); // start absent
-  const gitEnv = noGitIdentityEnv();
-  const r = run(['init'], { SPOR_HOME: home, ...gitEnv });
+  const gitCfg = noGitIdentityEnv();
+  const r = run(['init'], { SPOR_HOME: home, ...gitCfg });
   assert.strictEqual(r.status, 0, r.stderr);
-  const local = (k) => spawnSync('git', ['-C', home, 'config', '--local', k], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  const local = (k) => spawnSync('git', ['-C', home, 'config', '--local', k], { encoding: 'utf8', env: scrubbedEnv({}, bare(gitCfg)) }).stdout.trim();
   assert.strictEqual(local('user.name'), 'spor', 'fallback user.name set locally');
   assert.strictEqual(local('user.email'), 'spor@localhost', 'fallback user.email set locally');
   // HEAD is born (an initial commit) so future auto-commits have a parent
-  const count = spawnSync('git', ['-C', home, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  const count = spawnSync('git', ['-C', home, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8', env: scrubbedEnv({}, bare(gitCfg)) }).stdout.trim();
   assert.strictEqual(count, '1', 'exactly one initial commit');
   // the actual failure mode: a distiller-style plain `git commit` now succeeds
   fs.writeFileSync(path.join(home, 'nodes', 'dec-q.md'), `---\nid: dec-q\ntype: decision\nproject: demo\ntitle: t\nsummary: s\ndate: 2026-06-01\n---\nb\n`);
-  spawnSync('git', ['-C', home, 'add', '-A'], { env: bare(gitEnv) });
-  const c = spawnSync('git', ['-C', home, 'commit', '-qm', 'distill: session t1'], { encoding: 'utf8', env: bare(gitEnv) });
+  spawnSync('git', ['-C', home, 'add', '-A'], { env: scrubbedEnv({}, bare(gitCfg)) });
+  const c = spawnSync('git', ['-C', home, 'commit', '-qm', 'distill: session t1'], { encoding: 'utf8', env: scrubbedEnv({}, bare(gitCfg)) });
   assert.strictEqual(c.status, 0, `plain commit must succeed after init: ${c.stderr}`);
   // the committing identity is surfaced, with a hint to override the fallback
   assert.match(r.stdout, /commits:\s+spor <spor@localhost>/);
@@ -225,23 +226,23 @@ test('init still commits when global commit.gpgsign=true but signing is broken (
   // onboarding reports success.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-gpg-home-'));
   fs.rmSync(home, { recursive: true, force: true }); // start absent
-  const gitEnv = gpgSignFailEnv();
+  const gitCfg = gpgSignFailEnv();
   // sanity: in this env a plain (signed) commit genuinely fails, so a green
   // assertion below proves the bypass, not a no-op env.
   const probe = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-gpg-probe-'));
-  spawnSync('git', ['-C', probe, 'init', '-q'], { env: bare(gitEnv) });
+  spawnSync('git', ['-C', probe, 'init', '-q'], { env: scrubbedEnv({}, bare(gitCfg)) });
   fs.writeFileSync(path.join(probe, 'f'), 'x');
-  spawnSync('git', ['-C', probe, 'add', '-A'], { env: bare(gitEnv) });
-  const bad = spawnSync('git', ['-C', probe, 'commit', '-qm', 'x'], { encoding: 'utf8', env: bare(gitEnv) });
+  spawnSync('git', ['-C', probe, 'add', '-A'], { env: scrubbedEnv({}, bare(gitCfg)) });
+  const bad = spawnSync('git', ['-C', probe, 'commit', '-qm', 'x'], { encoding: 'utf8', env: scrubbedEnv({}, bare(gitCfg)) });
   assert.notStrictEqual(bad.status, 0, 'sanity: a signed commit must fail in this env');
 
-  const r = run(['init'], { SPOR_HOME: home, ...gitEnv });
+  const r = run(['init'], { SPOR_HOME: home, ...gitCfg });
   assert.strictEqual(r.status, 0, r.stderr);
   // HEAD is born despite the broken signing config — the commit was not lost
-  const count = spawnSync('git', ['-C', home, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  const count = spawnSync('git', ['-C', home, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8', env: scrubbedEnv({}, bare(gitCfg)) }).stdout.trim();
   assert.strictEqual(count, '1', 'initial commit lands despite broken gpgsign');
   // and it is genuinely unsigned — signing was bypassed, not somehow satisfied
-  const sig = spawnSync('git', ['-C', home, 'log', '-1', '--format=%G?'], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  const sig = spawnSync('git', ['-C', home, 'log', '-1', '--format=%G?'], { encoding: 'utf8', env: scrubbedEnv({}, bare(gitCfg)) }).stdout.trim();
   assert.strictEqual(sig, 'N', 'commit is unsigned (gpgsign bypassed)');
 });
 
@@ -253,13 +254,13 @@ test("init prefers the user's own git identity and does not shadow it", () => {
   fs.writeFileSync(gcfg, '[user]\n\tname = Real Dev\n\temail = real@dev.example\n');
   const empty = path.join(cfgDir, 'empty');
   fs.writeFileSync(empty, '');
-  const gitEnv = { GIT_CONFIG_GLOBAL: gcfg, GIT_CONFIG_SYSTEM: empty };
-  const r = run(['init'], { SPOR_HOME: home, ...gitEnv });
+  const gitCfg = { GIT_CONFIG_GLOBAL: gcfg, GIT_CONFIG_SYSTEM: empty };
+  const r = run(['init'], { SPOR_HOME: home, ...gitCfg });
   assert.strictEqual(r.status, 0, r.stderr);
   // no local user.* override was written — the real (global) identity stands
-  const localList = spawnSync('git', ['-C', home, 'config', '--local', '--list'], { encoding: 'utf8', env: bare(gitEnv) }).stdout;
+  const localList = spawnSync('git', ['-C', home, 'config', '--local', '--list'], { encoding: 'utf8', env: scrubbedEnv({}, bare(gitCfg)) }).stdout;
   assert.doesNotMatch(localList, /user\.(name|email)=/, 'must not shadow the user identity');
-  const author = spawnSync('git', ['-C', home, 'log', '--format=%an <%ae>', '-1'], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  const author = spawnSync('git', ['-C', home, 'log', '--format=%an <%ae>', '-1'], { encoding: 'utf8', env: scrubbedEnv({}, bare(gitCfg)) }).stdout.trim();
   assert.strictEqual(author, 'Real Dev <real@dev.example>');
   assert.match(r.stdout, /commits:\s+Real Dev <real@dev\.example>/);
   assert.doesNotMatch(r.stdout, /git config --global/, 'no fallback hint when git has an identity');
@@ -268,10 +269,10 @@ test("init prefers the user's own git identity and does not shadow it", () => {
 test('init is idempotent — a second run adds no second commit', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-id3-'));
   fs.rmSync(home, { recursive: true, force: true });
-  const gitEnv = noGitIdentityEnv();
-  assert.strictEqual(run(['init'], { SPOR_HOME: home, ...gitEnv }).status, 0);
-  assert.strictEqual(run(['init'], { SPOR_HOME: home, ...gitEnv }).status, 0);
-  const count = spawnSync('git', ['-C', home, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  const gitCfg = noGitIdentityEnv();
+  assert.strictEqual(run(['init'], { SPOR_HOME: home, ...gitCfg }).status, 0);
+  assert.strictEqual(run(['init'], { SPOR_HOME: home, ...gitCfg }).status, 0);
+  const count = spawnSync('git', ['-C', home, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8', env: scrubbedEnv({}, bare(gitCfg)) }).stdout.trim();
   assert.strictEqual(count, '1');
 });
 
@@ -280,12 +281,12 @@ test('init refuses to rewrite identity or commit into the code repo when the gra
   // layout, dec-spor-local-mode-sharing-boundary): no commits, no identity.
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-nested-'));
   fs.mkdirSync(path.join(repo, 'nodes'), { recursive: true });
-  const gitEnv = noGitIdentityEnv(); // no global identity, so the fallback WOULD fire if unguarded
-  const G = (args) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', env: bare(gitEnv) });
+  const gitCfg = noGitIdentityEnv(); // no global identity, so the fallback WOULD fire if unguarded
+  const G = (args) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', env: scrubbedEnv({}, bare(gitCfg)) });
   G(['init', '-q']);
   fs.writeFileSync(path.join(repo, 'secret.env'), 'TOKEN=shhh\n'); // an untracked working-tree file `-A` would have swept in
   // run `spor init` from INSIDE the repo with the graph home pointed at it
-  const r = spawnSync(process.execPath, [CLI, 'init'], { encoding: 'utf8', cwd: repo, env: bare({ SPOR_HOME: repo, ...gitEnv }) });
+  const r = spawnSync(process.execPath, [CLI, 'init'], { encoding: 'utf8', cwd: repo, env: bare({ SPOR_HOME: repo, ...gitCfg }) });
   assert.strictEqual(r.status, 0, r.stderr);
   // the guard fires: no spor identity written onto the code repo, no spor commit
   // injected onto its branch (HEAD stays unborn — the human PR flow owns it)
@@ -313,9 +314,9 @@ function muteStatusGraph(email) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cli-mute-'));
   const nodes = path.join(dir, 'nodes');
   fs.mkdirSync(nodes, { recursive: true });
-  spawnSync('git', ['init', '-q', dir]);
-  spawnSync('git', ['-C', dir, 'config', 'user.email', email]);
-  spawnSync('git', ['-C', dir, 'config', 'user.name', 'Test']);
+  spawnSync('git', ['init', '-q', dir], { env: gitEnv() });
+  spawnSync('git', ['-C', dir, 'config', 'user.email', email], { env: gitEnv() });
+  spawnSync('git', ['-C', dir, 'config', 'user.name', 'Test'], { env: gitEnv() });
   fs.writeFileSync(path.join(nodes, 'person-me.md'), `---\nid: person-me\ntype: person\ntitle: Me\nsummary: The muter person node.\nemail: me@test.dev\nqueue_mute: [repo-beta]\ndate: 2026-06-01\n---\nBody.\n`);
   fs.writeFileSync(path.join(nodes, 'task-x.md'), `---\nid: task-x\ntype: task\nproject: repo-alpha\ntitle: A task\nsummary: A task for the mute-status test.\nstatus: open\ndate: 2026-06-01\n---\nBody.\n`);
   return { dir, nodes };
@@ -1015,15 +1016,15 @@ test('migrate commits the graph and pushes to a user-owned remote', () => {
   fs.writeFileSync(path.join(nodes, 'dec-x.md'), `---\nid: dec-x\ntype: decision\nproject: demo\ntitle: t\nsummary: s\ndate: 2026-06-01\n---\nbody\n`);
   // a bare repo stands in for the remote the user owns (no network)
   const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-'));
-  spawnSync('git', ['init', '--bare', '-q', remote]);
+  spawnSync('git', ['init', '--bare', '-q', remote], { env: gitEnv() });
   const r = run(['migrate', remote], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /pushed 1 nodes/);
   // the node landed on the remote's pushed branch
-  const refs = spawnSync('git', ['-C', remote, 'for-each-ref', '--format=%(refname:short)', 'refs/heads'], { encoding: 'utf8' })
+  const refs = spawnSync('git', ['-C', remote, 'for-each-ref', '--format=%(refname:short)', 'refs/heads'], { env: gitEnv(), encoding: 'utf8' })
     .stdout.trim().split('\n').filter(Boolean);
   assert.ok(refs.length >= 1, 'a branch was pushed to the remote');
-  const ls = spawnSync('git', ['-C', remote, 'ls-tree', '-r', '--name-only', refs[0]], { encoding: 'utf8' });
+  const ls = spawnSync('git', ['-C', remote, 'ls-tree', '-r', '--name-only', refs[0]], { env: gitEnv(), encoding: 'utf8' });
   assert.match(ls.stdout, /nodes\/dec-x\.md/);
 });
 
@@ -1032,7 +1033,7 @@ test('migrate remembers origin, so a second run needs no url', () => {
   fs.mkdirSync(path.join(home, 'nodes'), { recursive: true });
   fs.writeFileSync(path.join(home, 'nodes', 'dec-y.md'), `---\nid: dec-y\ntype: decision\nproject: demo\ntitle: t\nsummary: s\ndate: 2026-06-01\n---\nb\n`);
   const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote2-'));
-  spawnSync('git', ['init', '--bare', '-q', remote]);
+  spawnSync('git', ['init', '--bare', '-q', remote], { env: gitEnv() });
   assert.strictEqual(run(['migrate', remote], { SPOR_HOME: home }).status, 0);
   // second run with no url reuses the stored origin
   const r2 = run(['push'], { SPOR_HOME: home });
@@ -1075,9 +1076,9 @@ test('disable/enable merge enabled into .spor.json at the cwd', () => {
 // so cwd's own repo wins.
 test('enable under an ambient GIT_DIR: .spor.json lands in the cwd repo, not the ambient one', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-scope-gitdir-'));
-  spawnSync('git', ['init', '-q'], { cwd: dir });
+  spawnSync('git', ['init', '-q'], { env: gitEnv(), cwd: dir });
   const decoy = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-scope-decoy-'));
-  spawnSync('git', ['init', '-q'], { cwd: decoy });
+  spawnSync('git', ['init', '-q'], { env: gitEnv(), cwd: decoy });
   const r = spawnSync(process.execPath, [CLI, 'enable'], {
     cwd: dir,
     encoding: 'utf8',
