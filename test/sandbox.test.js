@@ -9,7 +9,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("path");
 
-const { createSandbox, sandboxFor } = require(path.join(__dirname, "..", "lib", "sandbox.js"));
+const { createSandbox, sandboxFor, defaultTimeoutMs, DEFAULT_TIMEOUT_MS } = require(path.join(__dirname, "..", "lib", "sandbox.js"));
 
 // issue-104: the vm timeout is a wall-clock watchdog, and the full suite runs
 // test files in parallel processes — under that load the 100ms default can
@@ -108,6 +108,23 @@ test("sandbox: SPOR_SANDBOX_TIMEOUT_MS overrides the default cap; invalid keeps 
     assert.ok(Date.now() - t0 < 90, "the 30ms override applies, not the 100ms default");
     process.env.SPOR_SANDBOX_TIMEOUT_MS = "nope";
     assert.throws(() => createSandbox(spin).call("spin", [], {}), /timed out/);
+  } finally {
+    if (prev === undefined) delete process.env.SPOR_SANDBOX_TIMEOUT_MS;
+    else process.env.SPOR_SANDBOX_TIMEOUT_MS = prev;
+  }
+});
+
+test("sandbox: SPOR_SANDBOX_TIMEOUT_MS accepts only an integer in 1..10000", () => {
+  const prev = process.env.SPOR_SANDBOX_TIMEOUT_MS;
+  try {
+    for (const [v, want] of [["1", 1], ["30", 30], ["10000", 10000], ["0.5", DEFAULT_TIMEOUT_MS],
+      ["1e12", DEFAULT_TIMEOUT_MS], ["Infinity", DEFAULT_TIMEOUT_MS], ["0", DEFAULT_TIMEOUT_MS],
+      ["-5", DEFAULT_TIMEOUT_MS], ["10001", DEFAULT_TIMEOUT_MS], ["", DEFAULT_TIMEOUT_MS], ["nope", DEFAULT_TIMEOUT_MS]]) {
+      process.env.SPOR_SANDBOX_TIMEOUT_MS = v;
+      assert.equal(defaultTimeoutMs(), want, `SPOR_SANDBOX_TIMEOUT_MS=${JSON.stringify(v)}`);
+    }
+    process.env.SPOR_SANDBOX_TIMEOUT_MS = "0.5";
+    assert.equal(createSandbox(`export function f() { return 1; }`).call("f", [], {}), 1, "a fractional value no longer throws at call time");
   } finally {
     if (prev === undefined) delete process.env.SPOR_SANDBOX_TIMEOUT_MS;
     else process.env.SPOR_SANDBOX_TIMEOUT_MS = prev;
