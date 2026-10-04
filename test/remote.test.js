@@ -234,3 +234,37 @@ test("end-to-end: a request after a spawnSync block past the server's keepAliveT
     srv.close();
   }
 });
+
+// issue-spor-remote-refresh-ignores-caller-signal: a fast 401 followed by a
+// token refresh that never settles must not hold the call past the caller's
+// shared deadline (post-tool's one 6s budget), and must not retry once aborted.
+test("request()/download(): a 401 with a stalled refresh returns within the caller's signal and does not retry", async () => {
+  const auth = require("../lib/auth.js");
+  const cfg = remoteCfg();
+  cfg.tenant = () => ({ server: "http://127.0.0.1:1", org: "o", token: "t", refresh_token: "r" });
+  const originalRefresh = auth.refreshTenant;
+  auth.refreshTenant = () => new Promise(() => {}); // never settles
+  try {
+    for (const call of [
+      (signal) => remoteLib.request(cfg, "GET", "/v1/x", { signal }),
+      (signal) => remoteLib.download(cfg, "/v1/export", { signal }),
+    ]) {
+      let fetches = 0;
+      await withFetch(
+        async () => {
+          fetches++;
+          return { ...fakeResponse(401, {}), arrayBuffer: async () => new ArrayBuffer(0) };
+        },
+        async () => {
+          const started = Date.now();
+          const r = await call(AbortSignal.timeout(300));
+          assert.ok(Date.now() - started < 2000, "returned near the signal's deadline, not after the stalled refresh");
+          assert.strictEqual(r.status, 401);
+          assert.strictEqual(fetches, 1, "no retry after the refresh was abandoned");
+        }
+      );
+    }
+  } finally {
+    auth.refreshTenant = originalRefresh;
+  }
+});
