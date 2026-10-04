@@ -118,6 +118,22 @@ test("priority (local) on a CRLF node file succeeds and keeps CRLF endings", () 
   assert.match(md, /Body about the demo task\.\r\n/);
 });
 
+test("priority (local) on CRLF frontmatter + LF body keeps the body's LF byte-for-byte", () => {
+  const { home, nodes } = fixtureGraph();
+  const file = path.join(nodes, "task-x.md");
+  const raw = fs.readFileSync(file, "utf8");
+  const end = raw.indexOf("\n---\n", 4) + "\n---\n".length;
+  const body = raw.slice(end);
+  fs.writeFileSync(file, raw.slice(0, end).replace(/\n/g, "\r\n") + body);
+  const r = run(["priority", "task-x", "p1"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(file, "utf8");
+  assert.ok(md.endsWith(body), "LF body untouched");
+  const head = md.slice(0, md.length - body.length);
+  assert.doesNotMatch(head, /[^\r]\n/, "frontmatter stays CRLF");
+  assert.match(head, /priority: p1\r\n/);
+});
+
 test("priority (local) clear removes the priority and all its stamps", () => {
   const { home, nodes } = fixtureGraph();
   run(["priority", "task-x", "p2"], { SPOR_HOME: home });

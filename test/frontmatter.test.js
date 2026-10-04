@@ -18,11 +18,22 @@ test("graph.parseFrontmatter IS the kernel grammar's parseFrontmatter (one parse
 
 test("splitDocument/joinDocument: the fence read once, CRLF style remembered and restored", () => {
   const lf = doc("id: a\ntype: task");
-  assert.deepEqual(fm.splitDocument(lf), { frontmatter: "id: a\ntype: task", body: "\nBody.\n", crlf: false });
+  assert.deepEqual(fm.splitDocument(lf), { frontmatter: "id: a\ntype: task", body: "\nBody.\n", crlf: false, fenceEol: "\n", bodyRaw: "\nBody.\n" });
   const crlf = lf.replace(/\n/g, "\r\n");
   const d = fm.splitDocument(crlf);
   assert.equal(d.crlf, true);
   assert.equal(fm.joinDocument(d), crlf);
+  // mixed: CRLF frontmatter + LF body keeps each segment's own endings
+  const mixed = crlf.split("\r\n").slice(0, 4).join("\r\n") + "\r\n" + "\nBody line\nmore\n";
+  const md = fm.splitDocument(mixed);
+  assert.equal(md.crlf, true);
+  assert.equal(fm.joinDocument(md), mixed);
+  // edge shapes the fence/body split must round-trip byte-for-byte
+  for (const raw of ["---\r\nid: x\r\n---\nbody\nline\n", "---\r\nid: x\r\n---\n", "---\nid: x\n---\r\nbody\r\n",
+    "---\nid: x\n---\nbody\r\nmixed\nx", "---\r\nid: x\r\n---"]) {
+    assert.equal(fm.joinDocument(fm.splitDocument(raw)), raw, JSON.stringify(raw));
+  }
+  assert.equal(fm.withStamp("---\r\nid: x\r\n---\nbody\nline\n", ["s"], ["s: 1"]), "---\r\nid: x\r\ns: 1\r\n---\nbody\nline\n");
   assert.equal(fm.splitDocument("no fence\n---\nid: x\n---\n"), null);
 });
 
