@@ -544,11 +544,12 @@ test('selector: on a multi-org server a bearer is matched to ITS tenant by token
   assert.strictEqual(agent.org, 'beta');
   assert.strictEqual(agent.key, null);
   assert.strictEqual(agent.refresh_token, null);
-  // no token supplied: the first same-server entry, byte-identical to before
+  // no token supplied: the store default when it is on this server (the one
+  // same-server pick rule, task-spor-client-config-tenant-unification-and-refresh)
   const none = loadAt(home, { env: { SPOR_SERVER: 'https://s' } }).tenant();
-  assert.strictEqual(none.key, 'https://s/acme');
-  assert.strictEqual(none.token, 'ACME');
-  assert.strictEqual(none.refresh_token, 'RT-acme');
+  assert.strictEqual(none.key, 'https://s/beta');
+  assert.strictEqual(none.token, 'BETA');
+  assert.strictEqual(none.refresh_token, 'RT-beta');
 });
 
 test('remote.request: an agent 401 never refreshes into the person credential', async () => {

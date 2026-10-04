@@ -152,8 +152,7 @@ async function nudge({ input, graph, slug, session, file, remote }) {
       mtime = Math.floor(fs.statSync(idx).mtimeMs / 1000);
     } catch {}
     if (Math.floor(Date.now() / 1000) - mtime > 3600) {
-      const resp = await u.curl(`${u.serverBase()}/v1/status?titles=1`, {
-        headers: u.bearer(),
+      const resp = await u.curlWithRefresh(`${u.serverBase()}/v1/status?titles=1`, {
         timeoutMs: 3000,
       });
       if (resp.http === "200") {
@@ -487,9 +486,9 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
     let skippedOtherProject = 0;
     if (inProgress.length > 0) {
       const hb = await u
-        .curl(`${u.serverBase()}/v1/queue/renew`, {
+        .curlWithRefresh(`${u.serverBase()}/v1/queue/renew`, {
           method: "POST",
-          headers: { ...u.bearer(), "content-type": "application/json" },
+          headers: { "content-type": "application/json" },
           // `touch_session` (task-split-spor-411451419762): never a filter and
           // never a re-stamp of the lease's session binding — it records this
           // session on each renewed lease's server-side `touched` list, which
@@ -567,8 +566,7 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
   // Top eligible items to offer. The full project pool (NOT assignee-scoped, so
   // teammates' live claims are correctly hidden) — the items anyone here can
   // grab. Empty pool -> nothing worth nudging about; stay silent.
-  const pool = await u.curl(`${u.serverBase()}/v1/queue?project=${encodeURIComponent(slug)}&limit=3`, {
-    headers: u.bearer(),
+  const pool = await u.curlWithRefresh(`${u.serverBase()}/v1/queue?project=${encodeURIComponent(slug)}&limit=3`, {
     timeoutMs,
   });
   if (pool.http !== "200") return null;
@@ -840,9 +838,8 @@ async function agentHeartbeat({ graph, session, remote }) {
     } catch {}
 
     const timeoutMs = u.cfgNum("dispatch.heartbeatTimeoutMs", "HEARTBEAT_TIMEOUT", 3000);
-    const r = await u.curl(`${u.serverBase()}/v1/agents/${encodeURIComponent(agent)}/heartbeat`, {
+    const r = await u.curlWithRefresh(`${u.serverBase()}/v1/agents/${encodeURIComponent(agent)}/heartbeat`, {
       method: "POST",
-      headers: u.bearer(),
       timeoutMs,
     });
     // Journal the tick (best-effort) so the operability log can correlate

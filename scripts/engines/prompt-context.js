@@ -936,9 +936,9 @@ async function computeDigest(input, graph, slug, meta = {}) {
     // it is byte-identical to the prior project-blind POST, and an older
     // server simply ignores the field (it stays the default), so this is safe
     // either way.
-    const resp = await u.curl(`${u.serverBase()}/v1/digest`, {
+    const resp = await u.curlWithRefresh(`${u.serverBase()}/v1/digest`, {
       method: "POST",
-      headers: { ...u.bearer(), "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),
       timeoutMs: 4000,
     });

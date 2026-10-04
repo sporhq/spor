@@ -235,9 +235,9 @@ async function publishCapabilities(probed, rlog, signal) {
     const rawCap = (cfg ? cfg.get("dispatch.capabilities", {}) : {}) || {};
     const eff = sat.effectiveCapabilities(probed ? { ...rawCap, probed } : rawCap);
     const timeoutMs = u.cfgNum("dispatch.capabilitiesPublishTimeoutMs", "CAPABILITIES_PUBLISH_TIMEOUT", 3000);
-    const r = await u.curl(`${u.serverBase()}/v1/agents/${encodeURIComponent(agent)}/capabilities`, {
+    const r = await u.curlWithRefresh(`${u.serverBase()}/v1/agents/${encodeURIComponent(agent)}/capabilities`, {
       method: "POST",
-      headers: { ...u.bearer(), "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(eff),
       timeoutMs,
       signal,
@@ -253,6 +253,17 @@ async function publishCapabilities(probed, rlog, signal) {
     }
   } catch {
     /* fail open — auto-publish must never cost the session */
+  }
+  return null;
+}
+
+// Fail-open: bounded, and never costs the session.
+async function echoBearerOrg() {
+  try {
+    const cfg = u.config();
+    if (cfg) await require(path.join(u.ROOT, "lib", "remote.js")).echoBearerOrg(cfg, { timeoutMs: 3000 });
+  } catch {
+    /* fail open */
   }
   return null;
 }
@@ -418,20 +429,23 @@ async function sessionStart(input) {
     // of it and the call's own timeout fires first ends that call.
     const deadline = AbortSignal.timeout(SESSION_START_DEADLINE_MS);
     const [brief, qresp] = await Promise.all([
-      u.curl(
+      u.curlWithRefresh(
         `${u.serverBase()}/v1/briefing/${slug}${fp.length ? `?fp=${encodeURIComponent(fp.join(","))}` : ""}`,
         {
-          headers: u.bearer(),
           timeoutMs: 6000,
           signal: deadline,
         }
       ),
-      u.curl(`${u.serverBase()}/v1/queue?limit=1`, {
-        headers: u.bearer(),
+      u.curlWithRefresh(`${u.serverBase()}/v1/queue?limit=1`, {
         timeoutMs: 3000,
         signal: deadline,
       }),
       publishCapabilities(probedCaps, rlog, deadline),
+      // An opaque foreign bearer on a multi-org server learns its org from the
+      // server's /v1/me echo, cached for every later engine's synchronous
+      // tenant read (origin.json, the spool sweep) — a no-op, no request, in
+      // every other shape (task-spor-client-config-tenant-unification-and-refresh).
+      echoBearerOrg(),
     ]);
     const host = u.serverHost();
 

@@ -1556,6 +1556,11 @@ function bearer() {
 const STORE_TENANT_SOURCES = new Set(["store-default", "cli-org", "env-org", "repo-marker"]);
 let _refreshed = null; // { config, token } — the fresh bearer for this run
 let _refreshTried = null; // the config a refresh was already attempted under
+// The refresh in flight, so CONCURRENT auth failures in one run (session-start
+// fires its briefing/queue/capabilities calls in one Promise.all) all wait on
+// the one refresh and retry with its token, instead of the losers seeing
+// `_refreshTried` set and giving up on a 401 the winner is about to fix.
+let _refreshInflight = null; // { config, promise }
 function sentIsStoreToken(sent) {
   try {
     const t = _config.tenant();
@@ -1569,29 +1574,66 @@ function sentIsStoreToken(sent) {
   }
 }
 async function refreshBearer(sent) {
+  if (_refreshInflight && _refreshInflight.config === _config) return _refreshInflight.promise;
   if (!_config || _refreshTried === _config) return null;
   if (!sentIsStoreToken(sent)) return null;
-  _refreshTried = _config;
-  let fresh = null;
+  const cfg = _config;
+  _refreshTried = cfg;
+  const promise = (async () => {
+    let fresh = null;
+    try {
+      fresh = await require(path.join(ROOT, "lib", "remote.js")).refreshAfterAuthFailure(cfg);
+    } catch {
+      fresh = null;
+    }
+    if (fresh) _refreshed = { config: cfg, token: fresh };
+    return fresh;
+  })();
+  _refreshInflight = { config: cfg, promise };
   try {
-    fresh = await require(path.join(ROOT, "lib", "remote.js")).refreshAfterAuthFailure(_config);
-  } catch {
-    fresh = null;
+    return await promise;
+  } finally {
+    if (_refreshInflight && _refreshInflight.promise === promise) _refreshInflight = null;
   }
-  if (fresh) _refreshed = { config: _config, token: fresh };
-  return fresh;
 }
 async function curlWithRefresh(url, opts = {}) {
   const headers = opts.headers || {};
   const sentBearer = bearer().Authorization;
   const r = await curl(url, { ...opts, headers: { ...bearer(), ...headers } });
   if (classifyHttpFailure(r.http) !== "auth") return r;
+  // A caller's DEADLINE (`opts.signal`, session-start's one budget over its
+  // batch) bounds the refresh too: the token grant has its own 8s timeout and
+  // must not stretch a bounded batch past its deadline, after which the retry
+  // would only fail on the aborted signal anyway. The refresh itself is left
+  // running, so the store still gets the fresh token if it lands.
+  const signal = opts.signal;
+  if (signal && signal.aborted) return r;
   // A sibling call in this run may already have refreshed: retry with that
   // token rather than refreshing again.
   const fresh =
-    bearer().Authorization !== sentBearer ? true : await refreshBearer(sentBearer.replace(/^Bearer /, ""));
-  if (!fresh) return r;
+    bearer().Authorization !== sentBearer ? true : await untilAborted(refreshBearer(sentBearer.replace(/^Bearer /, "")), signal);
+  if (!fresh || (signal && signal.aborted)) return r;
   return curl(url, { ...opts, headers: { ...bearer(), ...headers } });
+}
+
+// `promise`, or null as soon as `signal` aborts (whichever is first).
+function untilAborted(promise, signal) {
+  if (!signal) return promise;
+  return new Promise((resolve) => {
+    const onAbort = () => resolve(null);
+    if (signal.aborted) return resolve(null);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      () => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(null);
+      }
+    );
+  });
 }
 
 function serverBase() {
@@ -1608,8 +1650,7 @@ function serverBase() {
 // trusted — non-200, dead/slow server, unparseable body — so every caller
 // fails open the exact same way instead of re-deriving the same try/catch.
 async function fetchAssigneeMineItems(slug, timeoutMs) {
-  const mine = await curl(`${serverBase()}/v1/queue?project=${encodeURIComponent(slug)}&assignee=me`, {
-    headers: bearer(),
+  const mine = await curlWithRefresh(`${serverBase()}/v1/queue?project=${encodeURIComponent(slug)}&assignee=me`, {
     timeoutMs,
   });
   if (mine.http !== "200") return null;

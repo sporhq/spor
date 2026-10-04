@@ -19905,6 +19905,11 @@ async function main() {
   // Checked after help/version (asking what a verb does needs no tenant) and
   // before any verb runs, so an unknown `--org` can neither read nor write.
   if (refuseUnknownOrg(cfg, canon, args)) return 1;
+  // An opaque foreign bearer on a multi-org server asks the server's /v1/me
+  // which org it routes to, once (cached), so the verb's tenant carries the
+  // server's answer instead of an unknown org; no request in any other shape
+  // (task-spor-client-config-tenant-unification-and-refresh).
+  if (cfg.mode() === "remote") await remote.echoBearerOrg(cfg).catch(() => null);
 
   if (entry.parse === "raw") return await entry.run(cfg, args, verb);
 

@@ -100,9 +100,9 @@ async function inferCommits({ repo, journal, indexFile = "", index = "", slug = 
       const ev = p?.evidence;
       if (!ev) continue;
       const body = JSON.stringify({ text: ev, context: { project: slug, project_explicit: false }, source: "infer" });
-      const { http } = await u.curl(`${u.serverBase()}/v1/capture`, {
+      const { http } = await u.curlWithRefresh(`${u.serverBase()}/v1/capture`, {
         method: "POST",
-        headers: { ...u.bearer(), "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json" },
         body,
         timeoutMs: 90000,
       });
