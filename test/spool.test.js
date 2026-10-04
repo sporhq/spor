@@ -69,8 +69,9 @@ test('claimAndReadJson: exactly one taker, and the result is consumed', () => {
 
 test('claimAndReadJson leaves a live owner\'s held claim alone', () => {
   const dir = scratch();
-  // pid 1 is always alive; a fresh stamp makes it a live hold.
-  const held = `1-1.claim-1-${Date.now()}.out.json`;
+  // Our parent is alive on every platform (pid 1 is not on Windows) and is not
+  // our own pid, which claimHeldByLiveOwner treats as ours to retake.
+  const held = `1-1.claim-${process.ppid}-${Date.now()}.out.json`;
   fs.writeFileSync(path.join(dir, held), JSON.stringify({ digest: 'd' }));
   assert.strictEqual(spool.claimAndReadJson(dir, held), null);
   assert.deepStrictEqual(fs.readdirSync(dir), [held]);

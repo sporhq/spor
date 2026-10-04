@@ -78,6 +78,7 @@ test("gitToplevelAndCommonDir does not cache a probe that could not answer", () 
   g(["add", "a.txt"]);
   g(["commit", "-q", "-m", "one"]);
   const { top, common } = gitToplevelAndCommonDir(dir);
-  assert.equal(fs.realpathSync(top), fs.realpathSync(dir));
+  // .native expands a Windows 8.3 short name (RUNNER~1) that git reports long
+  assert.equal(fs.realpathSync.native(top), fs.realpathSync.native(dir));
   assert.ok(common && common.endsWith(".git"), `common dir: ${common}`);
 });

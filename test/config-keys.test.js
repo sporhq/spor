@@ -336,7 +336,10 @@ test("session-start never writes dispatch.repos; `spor enable` registers the che
   assert.deepStrictEqual(repos(), {}, "the hook registered nothing");
   const r = spawnSync(process.execPath, [CLI, "enable", "--no-agents"], { cwd: repo, env, encoding: "utf8" });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.deepStrictEqual(repos(), { myrepo: fs.realpathSync(repo) });
+  // git reports a long, forward-slash path on Windows; realpath.native expands 8.3 names
+  const registered = repos();
+  if (registered.myrepo) registered.myrepo = fs.realpathSync.native(path.normalize(registered.myrepo));
+  assert.deepStrictEqual(registered, { myrepo: fs.realpathSync.native(repo) });
   assert.match(r.stdout, /registered myrepo -> /);
 });
 

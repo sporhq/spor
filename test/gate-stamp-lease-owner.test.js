@@ -229,7 +229,7 @@ test("everClaimed is the one copy of the no-owner predicate", () => {
   const hits = [];
   for (const f of files) {
     const src = fs.readFileSync(f, "utf8");
-    for (const m of src.matchAll(/\bgate_at\s*!==?\s*(?:null|undefined)|\blease\s*!==?\s*null\s*\?\s*null\b/g)) hits.push(`${path.relative(root, f)}: ${m[0]}`);
+    for (const m of src.matchAll(/\bgate_at\s*!==?\s*(?:null|undefined)|\blease\s*!==?\s*null\s*\?\s*null\b/g)) hits.push(`${path.relative(root, f).split(path.sep).join("/")}: ${m[0]}`);
   }
   assert.deepStrictEqual(hits, ["lib/shell/agent-dispatch-runner.js: gate_at != null"], "the no-owner predicate is spelled only in everClaimed");
 });

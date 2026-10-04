@@ -13312,7 +13312,7 @@ function proposeIntegrationPR({ top, head, targetRef, body = null, editBody = ed
 // propose time predates that artifact, so it is refreshed with the final,
 // digest-bound copy). {ok} | {ok:false, reason}.
 function editProposalBody({ top = null, repo, number, body, gh = runGh }) {
-  if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH" };
+  if (gh === runGh && !hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH" };
   if (!repo || !number) return { ok: false, reason: "no pull request repo/number to edit" };
   const viewed = gh(["pr", "view", String(number), "--repo", repo, "--json", "body"], top ? { cwd: top } : {});
   if (viewed.status !== 0) return { ok: false, reason: (viewed.stderr || viewed.stdout || "gh pr view failed").trim() };

@@ -226,6 +226,11 @@ test('drain: a failed file rotates behind the untried ones under a file cap of 1
   fs.writeFileSync(path.join(graph, 'outbox', 'a.json'), JSON.stringify({ id: 'n-a' }));
   fs.utimesSync(path.join(graph, 'outbox', 'a.json'), old, old);
   fs.writeFileSync(path.join(graph, 'outbox', 'b.json'), JSON.stringify({ id: 'n-b' }));
+  // b is older than "now" so a's re-stamp after its failure lands strictly later
+  // than b's mtime — written back to back they can tie on a coarse-mtime fs and
+  // the name tiebreak would hand a the head again.
+  const mid = new Date(Date.now() - 30000);
+  fs.utimesSync(path.join(graph, 'outbox', 'b.json'), mid, mid);
   await withServer(responder, () => drainOutbox(graph, 'test', 2, 1));
   await withServer(responder, () => drainOutbox(graph, 'test', 2, 1));
   assert.match(seen[0], /n-a/);

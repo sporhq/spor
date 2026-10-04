@@ -250,6 +250,10 @@ test("withCrashReporter adds the reporter pair unless the caller chose a reporte
   assert.deepStrictEqual(withCrashReporter(own, "/tmp/x"), own);
 });
 
+// process.kill(pid, "SIGKILL") on Windows is a plain TerminateProcess: the child exits
+// with a code, never a signal, so there is no "killed by SIGKILL" crash to name.
+const NO_SIGKILL = process.platform === "win32" && "no SIGKILL signal exit on Windows";
+
 function runCrashFixture(env) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "test-run-crash-"));
   const file = path.join(dir, "crash.test.js");
@@ -264,7 +268,7 @@ function runCrashFixture(env) {
   return r;
 }
 
-test("a file killed outside a test is named, re-run once together, and passes as FLAKY", () => {
+test("a file killed outside a test is named, re-run once together, and passes as FLAKY", { skip: NO_SIGKILL }, () => {
   const r = runCrashFixture({});
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stderr, /crashed outside a test: .*crash\.test\.js — killed by SIGKILL/);
@@ -272,7 +276,7 @@ test("a file killed outside a test is named, re-run once together, and passes as
   assert.match(r.stderr, /test-run: FLAKY/);
 });
 
-test("SPOR_TEST_RERUN_CRASHED=0 is strict: the crash stays red and is still named", () => {
+test("SPOR_TEST_RERUN_CRASHED=0 is strict: the crash stays red and is still named", { skip: NO_SIGKILL }, () => {
   const r = runCrashFixture({ SPOR_TEST_RERUN_CRASHED: "0" });
   assert.strictEqual(r.status, 1, r.stderr);
   assert.match(r.stderr, /killed by SIGKILL/);
@@ -303,7 +307,7 @@ test("a leaf test named after its file that throws an exit-code error is a faili
   assert.doesNotMatch(r.stderr, /re-running|FLAKY|crashed outside/);
 });
 
-test("the crash re-run gets a fresh TMPDIR, removed afterwards", () => {
+test("the crash re-run gets a fresh TMPDIR, removed afterwards", { skip: NO_SIGKILL }, () => {
   const dir = scratch("test-run-tmpdir-");
   const file = path.join(dir, "tmp.test.js");
   const seen = path.join(dir, "seen.txt");
