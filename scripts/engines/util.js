@@ -16,6 +16,7 @@ const CODEX_NUDGE_MODEL = "gpt-5.4-mini";
 const home = require(path.join(ROOT, "lib", "shell", "home.js"));
 const { writeFileAtomic } = require(path.join(ROOT, "lib", "shell", "atomic-write.js"));
 const spool = require(path.join(ROOT, "lib", "shell", "spool.js"));
+const { untilAborted } = require(path.join(ROOT, "lib", "shell", "abort.js"));
 const { gitEnv, gitSpawn, gitToplevelAndCommonDir } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 // The harness vocabulary the capability probe emits — owned by the pure matcher
 // so the probe, the matcher, and the future fleet scheduler agree on one set of
@@ -1620,26 +1621,6 @@ async function curlWithRefresh(url, opts = {}) {
     bearer().Authorization !== sentBearer ? true : await untilAborted(refreshBearer(sentBearer.replace(/^Bearer /, "")), signal);
   if (!fresh || signal.aborted) return r;
   return curl(url, { ...opts, signal, timeoutMs: Math.max(1, totalMs - (Date.now() - startedAt)), headers: { ...bearer(), ...headers } });
-}
-
-// `promise`, or null as soon as `signal` aborts (whichever is first).
-function untilAborted(promise, signal) {
-  if (!signal) return promise;
-  return new Promise((resolve) => {
-    const onAbort = () => resolve(null);
-    if (signal.aborted) return resolve(null);
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(
-      (v) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(v);
-      },
-      () => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(null);
-      }
-    );
-  });
 }
 
 function serverBase() {

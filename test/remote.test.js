@@ -268,3 +268,38 @@ test("request()/download(): a 401 with a stalled refresh returns within the call
     auth.refreshTenant = originalRefresh;
   }
 });
+
+// issue-spor-remote-proactive-refresh-ignores-caller-signal: a near-expiry
+// token's PROACTIVE refresh (before the first attempt) is raced against the
+// caller's signal too, falling back to the current token when it aborts.
+test("request()/download(): a stalled proactive refresh of a near-expiry token honors the caller's signal", async () => {
+  const auth = require("../lib/auth.js");
+  const cfg = remoteCfg();
+  cfg.tenant = () => ({ server: "http://127.0.0.1:1", org: "o", token: "t", exp: 1, refresh_token: "r" });
+  cfg.userConfigHome = () => "/nonexistent";
+  const originalRefresh = auth.refreshTenant;
+  auth.refreshTenant = () => new Promise(() => {}); // never settles
+  try {
+    for (const call of [
+      (signal) => remoteLib.request(cfg, "GET", "/v1/x", { signal }),
+      (signal) => remoteLib.download(cfg, "/v1/export", { signal }),
+    ]) {
+      const sent = [];
+      await withFetch(
+        async (url, init) => {
+          sent.push(init.headers.Authorization);
+          return { ...fakeResponse(200, {}), arrayBuffer: async () => new ArrayBuffer(0) };
+        },
+        async () => {
+          const started = Date.now();
+          const r = await call(AbortSignal.timeout(300));
+          assert.ok(Date.now() - started < 2000, "returned near the signal's deadline, not after the stalled refresh");
+          assert.ok(r.transport || r.ok, "settled");
+          for (const a of sent) assert.strictEqual(a, "Bearer t", "fell back to the current token");
+        }
+      );
+    }
+  } finally {
+    auth.refreshTenant = originalRefresh;
+  }
+});
