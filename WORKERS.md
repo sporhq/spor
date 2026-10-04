@@ -1670,6 +1670,25 @@ outside git (a database on a fixed port, a `db reset`):
   failure's outcome — flake telemetry aggregatable by file, where before the
   record said only that `npm test` exited 1.
 
+  **A timed-out suite is not a failed one**
+  (task-spor-gate-runner-timeout-isolates-on-diff-tests,
+  dec-spor-timeout-diagnosis-never-substitutes-completed-acceptance). The
+  off-diff pass above is for a suite that COMPLETED and failed. A suite that hit
+  `timeout_ms` never completed, so isolation never runs as a pass over it and
+  a green isolated run cannot turn the gate green — the configured command must
+  finish successfully on the judged candidate. A timeout also spends no
+  `reruns` (a rerun is another full budget on the same silence). What it is
+  depends on the partial output: if it named NO failure, the gate returns an
+  `infrastructure` outage (the same door a CI outage uses) — the shared
+  `implementation.retry` pool pays a bounded, backed-off re-ask, exhaustion is a
+  durable infrastructure refusal, and no fix cycle or rescue is charged. The
+  outage reason records the timeout, command, candidate head and box load; when
+  the gate declares `isolate`, the change's own touched test files are re-run
+  as a DIAGNOSTIC whose result rides the detail and evidence and never the
+  verdict. If the partial output DID name an actual failure, that is separate
+  evidence and takes the ordinary charged-defect path (no isolation pass),
+  with the timeout stated beside it.
+
 The suite's environment says what it is judging: `SPOR_GATE_BASE` and
 `SPOR_GATE_HEAD` (the shas), `SPOR_TRUSTED_REF`, `SPOR_GATE_STAGE` (`gate`,
 or `integration` for the candidate suite, where base/head are the target

@@ -11545,3 +11545,102 @@ test("retryOneEscalation refuses a pending escalation whose attempt the pipeline
   assert.strictEqual(landed.gate_escalation_pending, null);
   fs.rmSync(home, { recursive: true, force: true });
 });
+
+// --- a TIMED-OUT command gate (task-spor-gate-runner-timeout-isolates-on-diff-tests,
+// dec-spor-timeout-diagnosis-never-substitutes-completed-acceptance) ---
+//
+// A suite that did not finish is neither a pass nor, on its own, a verdict on
+// the change. Isolated tests are diagnostic and never turn it green; a bare
+// timeout is an infrastructure outage (pool-funded retry, no fix cycle, no
+// rescue); an actual failure in the partial output is charged as ever.
+
+const TIMEOUT_GATE = { id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" };
+const TIMED_OUT = (output = "") => ({ ok: false, code: null, timedOut: true, reason: "`npm test` did not finish within 900s", output });
+const TIMEOUT_FACTORY = (extra = {}) => factoryOf({ ...BASE, gates: [TIMEOUT_GATE], implementation: { profile: "profile-impl", retry: { attempts: 1, backoff_ms: 1000 } }, rescue: { profile: "profile-rescue" }, ...extra });
+
+test("a timeout with all-green partial output and unrun tests is an OUTAGE: not a pass, no fix cycle, no rescue, one pool-funded retry that must finish", async () => {
+  let call = 0;
+  const { deps, seen } = fakes({
+    pools: { retry: { spent: 0 } },
+    changed: ["lib/kernel/queue.js"],
+    suite: () => {
+      call += 1;
+      return call === 1 ? TIMED_OUT("✔ a.test.js (12ms)\n✔ b.test.js (9ms)\n") : { ok: true };
+    },
+  });
+  deps.rescue = async () => { throw new Error("a timeout must never reach the rescue lane"); };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY(), deps });
+  assert.strictEqual(res.state, "passed", "only the retry that COMPLETED green passes");
+  assert.strictEqual(seen.suites.length, 2, "the full suite ran again, in full");
+  assert.deepStrictEqual(seen.fixes, []);
+  assert.strictEqual(seen.pools.retry.spent, 1, "the shared infrastructure pool paid");
+});
+
+test("a timeout is never a pass from green isolated tests: the diagnostic result is recorded, and exhaustion is a durable infrastructure refusal", async () => {
+  const { deps, seen } = fakes({
+    pools: { retry: { spent: 0 } },
+    changed: ["lib/kernel/queue.js", "lib/queue-mine.test.js"],
+    suite: (args) => (args && args.command ? { ok: true } : TIMED_OUT("✔ a.test.js (12ms)\n")),
+  });
+  deps.rescue = async () => { throw new Error("no rescue for a timeout"); };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY(), deps });
+  assert.strictEqual(res.state, "failed", "isolated green cannot flip the required full suite to passed");
+  assert.strictEqual(res.gates[0].verdict, "infrastructure");
+  assert.deepStrictEqual(seen.fixes, [], "no code-fix cycle");
+  assert.strictEqual(seen.pools.retry.spent, 1, "bounded: the one declared retry, then a hold");
+  assert.match(seen.escalations[0].detail, /did not finish within 900s/);
+  assert.match(seen.escalations[0].detail, /diagnostic only/);
+  assert.match(seen.escalations[0].detail, /passed, which does not make the suite pass/);
+  assert.strictEqual(seen.escalations[0].outage.outcome, "infrastructure");
+  assert.match(seen.facts[0].markdown, /infrastructure/);
+});
+
+test("an isolated diagnostic FAILURE is evidence only: the verdict is still the timeout outage", async () => {
+  const { deps, seen } = fakes({
+    changed: ["lib/kernel/queue.js", "lib/queue-mine.test.js"],
+    suite: (args) => (args && args.command ? { ok: false, code: 1, output: "✖ nope\n" } : TIMED_OUT("✔ a.test.js\n")),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY(), deps });
+  assert.strictEqual(res.gates[0].verdict, "infrastructure");
+  assert.match(seen.escalations[0].detail, /FAILED, which does not make the suite pass/);
+  assert.deepStrictEqual(seen.fixes, []);
+});
+
+test("a timeout with no touched test files runs no diagnostic and is still the outage", async () => {
+  const { deps, seen } = fakes({ changed: ["lib/kernel/queue.js"], suite: () => TIMED_OUT("") });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY(), deps });
+  assert.strictEqual(res.gates[0].verdict, "infrastructure");
+  assert.strictEqual(seen.suites.length, 1, "no isolated command was run");
+  assert.doesNotMatch(seen.escalations[0].detail, /diagnostic only/);
+});
+
+test("a timeout whose partial output names an ACTUAL failure is charged on the ordinary defect path, never isolation-passed", async () => {
+  const dir = flakeTree();
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js", "API.md"],
+    run: (attempt, command) => (command ? { ok: true } : TIMED_OUT(FAILED_OFF_DIFF)),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY({ rescue: undefined }), deps });
+  assert.strictEqual(res.state, "failed", "an isolated green over an unfinished suite is not a pass");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "no isolation pass substitutes for the suite");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.notStrictEqual(res.gates[0].verdict, "infrastructure");
+  assert.match(seen.escalations[0].detail, /did not finish within 900s, and its partial output named an actual failure/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a timeout does not spend a declared rerun: it is not a flaky verdict to sample again", async () => {
+  const { deps, seen } = fakes({ changed: ["lib/kernel/queue.js"], suite: () => TIMED_OUT("") });
+  const factory = factoryOf({ ...BASE, gates: [{ ...TIMEOUT_GATE, reruns: 2 }] });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(seen.suites.length, 1);
+});
+
+test("a crash/resume over a timed-out gate re-judges from the journal without charging a fix cycle", async () => {
+  const { deps, seen } = fakes({ pools: { retry: { spent: 0 } }, changed: ["lib/kernel/queue.js"], suite: () => TIMED_OUT("") });
+  const first = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY(), deps });
+  assert.strictEqual(first.state, "failed");
+  assert.deepStrictEqual(seen.fixes, []);
+  assert.ok(seen.pools.retry.spent <= 1, "the pool is never charged past its declared bound");
+});
