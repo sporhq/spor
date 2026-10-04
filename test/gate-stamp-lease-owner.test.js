@@ -161,3 +161,69 @@ test("the gate deps' fix-launch stamp (stampLaunch) under A's displaced token is
   // A run with no record at all has no holder to protect: a no-op, never a throw.
   assert.strictEqual(gateDeps.stampPipelineLaunch(home, "no-such-run", a, { gate_fix_run_id: "x" }), null);
 });
+
+// A record claimed before the lease log existed carries only its legacy claim
+// (`gate_settle_id`, or older still `gate_at`) and no pipeline.jsonl. Every
+// no-owner door reads it through the ONE predicate, everClaimed
+// (task-spor-extract-shared-unowned-lease-check): claimed, so refused — while a
+// genuinely unclaimed record still takes its first settle.
+function legacyClaimed(home, runId, claim) {
+  const file = dispatchRuns.runPaths(home, runId).record;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ run_id: runId, node_id: "task-x", state: "done", ...claim }));
+  assert.strictEqual(sp.pipelineLease(home, { run_id: runId }), null, "no lease log");
+  return file;
+}
+
+for (const [label, claim] of [["gate_settle_id", { gate_settle_id: "legacy-nonce" }], ["gate_at", { gate_at: "2026-01-01T00:00:00.000Z" }]]) {
+  test(`a legacy-claimed record (${label}, no lease log) is refused by every no-token door`, (t) => {
+    const home = scratchHome(t);
+    const file = legacyClaimed(home, RUN, claim);
+    const before = GATE_FIELDS(read(file));
+    work.stampLoopVerdict(home, RUN, { gate_state: "failed", gate_reason: "stale no-token driver" }, null);
+    assert.deepStrictEqual(GATE_FIELDS(read(file)), before, "stampLoopVerdict refused");
+    const sporCli = require("../bin/spor.js");
+    const settled = sporCli.settleRunRecord(home, RUN, { state: "failed", reason: "stale no-token settle" }, "worker-stale");
+    assert.strictEqual(settled.landed, false);
+    assert.deepStrictEqual(GATE_FIELDS(read(file)), before, "settleRunRecord's no-token settle refused");
+    assert.throws(() => gateDeps.stampPipelineLaunch(home, RUN, null, { gate_fix_run_id: "fix-unowned" }), /owner changed/);
+    const ledger = dispatchRuns.appendGateProgress(home, RUN, () => ({ fixes: 1 }), { key: "gate-x" });
+    assert.strictEqual(ledger.ok, false);
+    assert.match(ledger.reason, /owner changed/);
+    assert.deepStrictEqual(GATE_FIELDS(read(file)), before);
+  });
+}
+
+test("a genuinely unclaimed record takes settleRunRecord's no-token first settle", (t) => {
+  const home = scratchHome(t);
+  const file = legacyClaimed(home, RUN, {});
+  const sporCli = require("../bin/spor.js");
+  const settled = sporCli.settleRunRecord(home, RUN, { state: "failed", reason: "the pass threw before any claim" }, "worker-x");
+  assert.strictEqual(settled.landed, true);
+  assert.strictEqual(read(file).gate_state, "failed");
+});
+
+test("everClaimed is the one copy of the no-owner predicate", () => {
+  assert.strictEqual(dispatchRuns.everClaimed({}, null), false);
+  assert.strictEqual(dispatchRuns.everClaimed({}, { token: "t" }), true);
+  assert.strictEqual(dispatchRuns.everClaimed({ gate_settle_id: "n" }, null), true);
+  assert.strictEqual(dispatchRuns.everClaimed({ gate_at: "2026-01-01T00:00:00.000Z" }, null), true);
+  // The lint half: no spelled-out copy of the legacy-claim test lives anywhere
+  // but everClaimed itself, so the three no-owner doors cannot drift apart.
+  const root = path.join(__dirname, "..");
+  const files = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith(".js")) files.push(p);
+    }
+  };
+  for (const d of ["lib", "bin", "scripts"]) walk(path.join(root, d));
+  const hits = [];
+  for (const f of files) {
+    const src = fs.readFileSync(f, "utf8");
+    for (const m of src.matchAll(/\bgate_at\s*!==?\s*(?:null|undefined)|\blease\s*!==?\s*null\s*\?\s*null\b/g)) hits.push(`${path.relative(root, f)}: ${m[0]}`);
+  }
+  assert.deepStrictEqual(hits, ["lib/shell/agent-dispatch-runner.js: gate_at != null"], "the no-owner predicate is spelled only in everClaimed");
+});
