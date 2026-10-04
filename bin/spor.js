@@ -14749,7 +14749,10 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     renewLease();
     return baseSleep(ms);
   };
-  const gateDeps = reportingGateDeps(makeGateDeps(cfg, dctx), reporter);
+  // The withdraw is the pipeline's own (defined below, read at call time);
+  // the gate deps list it in PIPELINE_DURABLE_WRITERS.gate, so it runs under
+  // the owner guard like every other durable gate write.
+  const gateDeps = reportingGateDeps(makeGateDeps(cfg, { ...dctx, withdrawHold: (args) => pipelineDeps.withdraw(args) }), reporter);
   // The code repo the land moves, resolved BEFORE the stage: its
   // cleanupImplementer removes the dispatch worktree record.cwd names, and the
   // post-land reconcile below reads the main checkout that outlives it.
@@ -14911,7 +14914,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       // The gate list's durable journal (task-spor-gate-list-as-workflow-
       // function): the child the `open` entry named.
       const gateJournal = ownedJournal(stageWorkflowJournal(home, record, item, stage.replace(/-a\d+$/, "")));
-      return gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: { ...gateDeps, withdrawHold: (args) => (record.impl_claim ? pipelineDeps.withdraw(args) : { ok: true, skipped: true }), ...(gateJournal ? { workflowJournal: gateJournal } : {}) } });
+      return gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: { ...gateDeps, ...(gateJournal ? { workflowJournal: gateJournal } : {}) } });
     },
     // The SPLIT verdict of the gate list alone (task-spor-factory-controller-
     // completion-boundary, §6.5): `gates_state` says what the gates said, and

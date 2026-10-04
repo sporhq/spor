@@ -236,6 +236,37 @@ test("the reviewer cooldown writers (stampReviewerCooldown, noteReviewerSuccess)
   assert.deepStrictEqual(callsB, ["stamp:p", "success:p"]);
 });
 
+test("the gate deps' T1 withdraw (withdrawHold): A's displaced driver withdraws nothing, B's lands; a record with no claim skips (issue-spor-gate-withdraw-hold-outside-durable-writer-lint)", async (t) => {
+  const home = scratchHome(t);
+  const { a, b } = takenOver(home);
+  const make = (gateOwner, calls, record = { cwd: "/tmp/the-run-checkout", run_id: RUN, impl_claim: { execution_id: "exec-a" } }) =>
+    gateDeps
+      .createGateDeps(fakeHost({ gateStem: (id) => id, gateIdSuffix: () => "abc123" }))
+      .makeGateDeps(cfgFor(home), {
+        record, entry: { run_id: RUN, node_id: "task-x" },
+        factory: { id: "factory-test", trustedRef: "main", gates: [] },
+        slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home, gateOwner,
+        withdrawHold: async ({ reason }) => (calls.push(`withdraw:${reason}`), { ok: true }),
+      });
+  const callsA = [];
+  await assert.rejects(async () => make(a, callsA).withdrawHold({ reason: "refused" }), lost);
+  assert.deepStrictEqual(callsA, []);
+  const callsB = [];
+  assert.strictEqual((await make(b, callsB).withdrawHold({ reason: "refused" })).ok, true);
+  assert.deepStrictEqual(callsB, ["withdraw:refused"]);
+  const unclaimed = [];
+  assert.deepStrictEqual(await make(b, unclaimed, { cwd: "/tmp/the-run-checkout", run_id: RUN }).withdrawHold({ reason: "refused" }), { ok: true, skipped: true });
+  assert.deepStrictEqual(unclaimed, []);
+  // Unwired (a standalone caller, the integration stage's re-gate): no dep, so
+  // the gate workflow's `has.withdrawHold` is false and the hold is kept.
+  const bare = gateDeps.createGateDeps(fakeHost({ gateStem: (id) => id, gateIdSuffix: () => "abc123" })).makeGateDeps(cfgFor(home), {
+    record: { cwd: "/tmp/the-run-checkout", run_id: RUN }, entry: { run_id: RUN, node_id: "task-x" },
+    factory: { id: "factory-test", trustedRef: "main", gates: [] },
+    slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home, gateOwner: b,
+  });
+  assert.strictEqual(typeof bare.withdrawHold, "undefined");
+});
+
 // --- end to end: a takeover in the middle of a real gate ---------------------
 
 function git(dir, ...args) {

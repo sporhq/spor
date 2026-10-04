@@ -11113,6 +11113,54 @@ test("real doors: every gated run drives a durable file journal through runGateA
   assert.deepStrictEqual(fs.readdirSync(nodes2).filter((f) => f.startsWith("art-gate-")).length, 1, "one gate fact");
 });
 
+// issue-spor-gate-withdraw-hold-outside-durable-writer-lint: the T1
+// withdraw on an UNROUTABLE review dispatch through the REAL wiring — the
+// makeGateDeps dep (a listed, owner-guarded durable writer) bound to the
+// pipeline's own withdraw in runGateAndIntegration, a real local execution
+// store and a real hold on the node. The pipeline settles `failed`, which is
+// what the work loop cools the node on.
+test("real doors: a review dispatch refused by satisfiability under controller completion ENDS the execution and clears the hold, and the run settles failed", async () => {
+  const executionStoreLib = require("../lib/shell/execution-store.js");
+  const dispatchRunsLib = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-unroutable-withdraw-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_MODE: "local" } });
+  fs.writeFileSync(path.join(nodes, "task-demo.md"), "---\nid: task-demo\ntype: task\nproject: demo\ntitle: Benign work\nsummary: Benign work whose reviewer cannot be routed.\nstatus: open\ndate: 2026-09-06\n---\n\nBody.\n");
+  const repo = repoWithBranch({ weakenTest: false, regress: false });
+  const factory = factoryOf({ ...OUTAGE_BASE, completion: { by: "controller" } });
+  factory.id = "factory-test";
+  sporCli.LIVE_EXECUTIONS.clear();
+  const held = await sporCli.claimExecutionHold(cfg, { id: "task-demo", project: "demo" }, factory, { home });
+  assert.strictEqual(held.ok, true, held.reason);
+  assert.match(fs.readFileSync(path.join(nodes, "task-demo.md"), "utf8"), new RegExp(`^execution: ${held.executionId}$`, "m"), "the hold is on the node before the gates");
+  const runId = "run-gate-unroutable-1";
+  const record = { run_id: runId, node_id: "task-demo", name: "task-demo", harness: "fake", cwd: repo, state: "exited", termination_class: "completed", terminal_state: "reported", terminal_enforced: true, started_at: "2026-09-06T00:00:00.000Z", finished_at: "2026-09-06T00:10:00.000Z", ...held.recordFields };
+  dispatchRunsLib.atomicJson(dispatchRunsLib.runPaths(home, runId).record, record);
+  const dispatched = [];
+  const dispatch = async (_cfg, values) => {
+    dispatched.push(values.profile);
+    return { ok: false, reason: "cannot dispatch: this box cannot satisfy profile-review (harness codex is not available here)" };
+  };
+  const lines = [];
+  const res = await sporCli.runGateAndIntegration(cfg, { run_id: runId, node_id: "task-demo", project: "demo" }, record, { factory, slug: "demo", passthrough: {}, warn: () => {}, runMaxMs: 1000, home, log: (l) => lines.push(l), stopping: () => false, sleep: async () => {}, workerId: "w-1", dispatch });
+  sporCli.LIVE_EXECUTIONS.clear();
+  assert.deepStrictEqual(dispatched, ["profile-review"], "the review dispatch was asked for, and refused");
+  assert.strictEqual(res.state, "failed", lines.join("\n"));
+  assert.doesNotMatch(fs.readFileSync(path.join(nodes, "task-demo.md"), "utf8"), /^execution:/m, "nothing is judging the item: the hold is cleared (T1)");
+  const store = executionStoreLib.openExecutionStore(cfg, { home, mode: "local" });
+  const read = await store.get(held.executionId);
+  assert.strictEqual(read.ok, true);
+  assert.strictEqual(read.execution.terminal, true, "the execution was ENDED in its store, not merely un-pointed on the graph");
+  const after = JSON.parse(fs.readFileSync(dispatchRunsLib.runPaths(home, runId).record, "utf8"));
+  assert.strictEqual(after.gate_state, "failed", "the settled verdict the work loop cools the node on");
+  const debts = fs.existsSync(path.join(home, "journal", "work-outcome")) ? fs.readdirSync(path.join(home, "journal", "work-outcome")) : [];
+  assert.deepStrictEqual(debts, [], "no withdrawal debt left owed");
+  const escalation = fs.readdirSync(nodes).find((f) => f.startsWith("task-gate-review-"));
+  assert.ok(escalation, "the refusal still escalates to a person");
+  assert.doesNotMatch(fs.readFileSync(path.join(nodes, escalation), "utf8"), /is HELD by execution/, "the escalation does not claim a hold that was withdrawn");
+});
+
 test("real doors: a gate journal this worker cannot continue is REFUSED through runGateAndIntegration — the record settles `failed` carrying `gate_refusal`, the §10.7 escalation lands with its blocks edge, the fact names the refusal, the journal is tombstoned, and a re-drive re-settles from the tombstone under the same ids", async () => {
   const executionStoreLib = require("../lib/shell/execution-store.js");
   const dispatchRunsLib = require("../lib/shell/agent-dispatch-runner.js");
