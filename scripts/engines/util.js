@@ -992,8 +992,16 @@ function editRepoMap(graphHomeDir, mutate) {
 // Explicit callers only (`spor repos add`, the dispatch self-register, `spor
 // enable`) — session-start no longer registers passively
 // (dec-spor-client-config-typed-key-table).
-function registerRepo(graphHomeDir, slug, dir) {
+//
+// The write door itself refuses a dir inside a linked git worktree
+// (issue-spor-dispatch-repos-map-clobbered-by-worktree-path): a worktree is
+// ephemeral, so mapping a slug at one leaves every later dispatch failing with
+// "target dir does not exist" once it is removed. Callers hold the main
+// checkout when they mean it; `opts.allowWorktree` (spor repos add --force) is
+// the one deliberate override.
+function registerRepo(graphHomeDir, slug, dir, opts = {}) {
   if (!slug || !dir || !/^[a-z0-9][a-z0-9-]*$/.test(slug)) return false;
+  if (!opts.allowWorktree && linkedWorktreeMainRoot(dir)) return false;
   return editRepoMap(graphHomeDir, (repos) => {
     if (repos[slug] === dir) return false;
     repos[slug] = dir;

@@ -515,6 +515,21 @@ test("registerRepo keeps last-writer-wins", () => {
   fs.rmSync(wrong.base, { recursive: true, force: true });
 });
 
+test("registerRepo refuses a linked worktree path unless allowWorktree", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-rrwt-"));
+  const main = gitRepoNamed("spor");
+  const wt = path.join(main.base, "wt");
+  const g = (...a) => require("node:child_process").execFileSync("git", a, { cwd: main.dir, stdio: "pipe" });
+  g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "i");
+  g("worktree", "add", wt, "-b", "wtb");
+  assert.strictEqual(u.registerRepo(home, "spor", wt), false);
+  assert.deepStrictEqual(readRepos(home), {});
+  assert.strictEqual(u.registerRepo(home, "spor", main.dir), true);
+  assert.strictEqual(u.registerRepo(home, "spor", wt, { allowWorktree: true }), true);
+  fs.rmSync(main.base, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 // --from-queue must SKIP items already in flight on this machine and advance to
 // the next genuinely-free one (task-spor-dispatch-from-queue-skip-in-flight). The
 // queue's lease filter is viewer-relative, so the dispatcher's own in-progress

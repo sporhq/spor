@@ -17289,7 +17289,7 @@ async function cmdRepos(cfg, args) {
       err(`  re-run with --force to map the linked worktree path anyway.`);
       return 1;
     }
-    u.registerRepo(home, slug, abs);
+    u.registerRepo(home, slug, abs, { allowWorktree: !!force });
     out(`mapped ${slug} -> ${abs}`);
     return 0;
   }
