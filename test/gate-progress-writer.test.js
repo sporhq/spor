@@ -247,3 +247,14 @@ test('a fix launch stamp from UNOWNED deps lands only on a record nobody has cla
   assert.equal(after.gate_settle_id, undefined, 'the claim is a lease entry, never a record stamp');
   assert.equal(projection.pipelineLease(home, after).token, claim.token);
 });
+
+test('the last-known retry count survives independently of the pool head, only rises, and is keyed to the attempt', async (t) => {
+  const f = fixture(t);
+  const deps = f.deps();
+  assert.equal(await deps.lastKnownRetry(), 0, 'nothing charged yet');
+  await deps.saveGatePools({ pools: { retry: { spent: 2 } } });
+  await deps.saveGatePools({ pools: { retry: { paused_until: 0 } } });
+  assert.equal(await deps.lastKnownRetry(), 2);
+  fs.writeFileSync(runs.runPaths(f.home, f.runId).dir + `/${f.runId}.gate-progress.jsonl`, 'garbage\n');
+  assert.equal(await deps.lastKnownRetry(), 2, 'a destroyed pool head does not take the count with it');
+});

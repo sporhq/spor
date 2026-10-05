@@ -56,7 +56,7 @@ const BASE = {
 // A fake world: what the diff says, what the suite does, what a review answers,
 // what the graph accepts. Every write is captured so the tests can assert on
 // the FACTS, which is the deliverable, not just on the verdict.
-function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok: true }), review = () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }), fix = () => ({ ok: true }), approval = () => ({ state: "approved", by: "person-a" }), demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }), writes = null, pools = null, savePools = null, poolsUnreadable = false } = {}) {
+function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok: true }), review = () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }), fix = () => ({ ok: true }), approval = () => ({ state: "approved", by: "person-a" }), demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }), writes = null, pools = null, savePools = null, poolsUnreadable = false, lastRetry = null } = {}) {
   const seen = { facts: [], lane: [], human: [], escalations: [], demotions: [], suites: [], reviews: [], fixes: [], approvals: 0, slept: 0, reads: 0, pools: pools ? { ...pools } : null, flakes: [], poolSaves: 0, reviewRetries: [] };
   let clock = 1_700_000_000_000;
   const deps = {
@@ -130,6 +130,7 @@ function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok:
             if (savePools) savePools(seen);
             seen.pools = next;
           },
+          ...(lastRetry != null ? { lastKnownRetry: async () => lastRetry } : {}),
         }
       : {}),
   };
@@ -7485,6 +7486,16 @@ test("an UNREADABLE pool is spent for headroom but names retry 0, so a resumed w
   assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: out.deps })).state, "failed", "no headroom: an outage read under the sentinel refuses, never re-asks");
   assert.strictEqual(out.seen.reviews.length, 1);
   assert.deepStrictEqual(out.seen.reviewRetries, [0]);
+});
+
+test("an UNREADABLE pool names the review by the LAST-KNOWN durable retry count, so a resumed worker adopts a reviewer the dead one launched at retry >= 1", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 3, backoff_ms: 60000 } } });
+  const resumed = fakes({ poolsUnreadable: true, lastRetry: 1 });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: resumed.deps })).state, "passed");
+  assert.deepStrictEqual(resumed.seen.reviewRetries, [1], "the dead worker's t1 name, not a retry-0 duplicate");
+  const none = fakes({ poolsUnreadable: true, lastRetry: 0 });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: none.deps });
+  assert.deepStrictEqual(none.seen.reviewRetries, [0], "no recorded retry: the original name");
 });
 
 test("an UNROUTABLE review dispatch spends neither pool and is never waited on", async () => {
