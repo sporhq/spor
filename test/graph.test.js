@@ -2431,6 +2431,38 @@ Ordinary body about pricing envelopes and recovery.
   assert.ok(ranked[0].sim > 0, "match must score a nonzero cosine, not vanish as junk fragments");
 });
 
+// task-spor-fold-nordic-atomic-letters: ø/æ/ß have no NFD decomposition, so the
+// accent strip alone left them as word separators; the tokenizer's explicit
+// transliteration table must carry them (ø->o, æ->ae, ß->ss).
+test("rankAgainst folds atomic Nordic/German letters (ø æ ß) so ASCII spellings match", () => {
+  const fx = tmpGraph({
+    "dec-da.md": `---
+id: dec-da
+type: decision
+title: Sørensen på Straße
+summary: Sørensen mødes i Straße om Ærø.
+date: 2026-10-05
+---
+Sørensen og Straße.
+`,
+    "dec-unrelated.md": `---
+id: dec-unrelated
+type: decision
+title: Unrelated pricing catalogue
+summary: An ordinary decision about pricing and recovery objectives.
+date: 2026-10-05
+---
+Ordinary body about pricing envelopes and recovery.
+`,
+  });
+  const g = fx.load();
+  for (const q of ["sorensen", "strasse", "aero"]) {
+    const ranked = graph.rankAgainst(g, q, new Set());
+    assert.equal(ranked[0]?.id, "dec-da", `ASCII query "${q}" must rank the accented doc`);
+    assert.ok(ranked[0].sim > 0);
+  }
+});
+
 // ---------- neighborhood-search project controls (dec-spor-client-config-cascade) ----------
 
 function twoProjectFixture() {
