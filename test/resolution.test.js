@@ -303,3 +303,125 @@ test("isNodeInertOffline: a non-boolean explicit value (defensive) is treated as
   assert.equal(isNodeInertOffline("true", "released", "artifact"), true, "falls back to the offline check, which happens to agree here");
   assert.equal(isNodeInertOffline("true", "released", "task"), false, "falls back to the offline check, not truthy-coerced");
 });
+
+// ---------- the per-graph reverse index (task-spor-kernel-inbound-resolvers-reverse-index) ----------
+//
+// inboundResolvers and resolutionOf read a lazily-built, Symbol-keyed index
+// of resolving edges instead of scanning every node per call. The oracle is
+// the full scan they replaced: resolutionMap for resolutionOf, and a
+// verbatim reference scan for inboundResolvers, over a graph exercising
+// every filter (supersession, non-resolving status, answers onto a
+// non-question, the hold, duplicate edges, dangling targets).
+
+const resolution = require("../lib/kernel/resolution.js");
+const INBOUND_INDEX = Symbol.for("spor.resolution.inbound-index");
+
+function scanInbound(graph, id) {
+  const target = graph.nodes[id];
+  if (!target) return [];
+  const nonResolving = resolution.fallbackRegistry().nonResolvingStatuses();
+  const out = [];
+  for (const r of Object.values(graph.nodes)) {
+    if (graph.supersededBy[r.id]) continue;
+    if (nonResolving.has((r.status || "").toLowerCase())) continue;
+    for (const e of r.edges ?? []) {
+      if (e.type !== "resolves" && e.type !== "answers") continue;
+      if (e.to !== id) continue;
+      if (e.type === "answers" && target.type !== "question") continue;
+      out.push({ by: r.id, edge: e.type, type: r.type ?? null, status: r.status ?? null });
+    }
+  }
+  return out;
+}
+
+function busyFixture() {
+  const n = (id, type, status, edges = [], extra = {}) => ({ id, type, status, date: "2026-09-01", title: `T ${id}`, summary: `S ${id}`, edges, ...extra });
+  return {
+    supersededBy: { "dec-old": "dec-new" },
+    nodes: {
+      "task-a": n("task-a", "task", "open"),
+      "task-held": n("task-held", "task", "open", [], { execution: "exec-1" }),
+      "question-q": n("question-q", "question", "open"),
+      "dec-old": n("dec-old", "decision", "active", [{ type: "resolves", to: "task-a" }]),
+      "art-review": n("art-review", "artifact", "in-review", [{ type: "resolves", to: "task-a" }]),
+      "dec-ans-task": n("dec-ans-task", "decision", "active", [{ type: "answers", to: "task-a" }]),
+      "dec-new": n("dec-new", "decision", "active", [{ type: "supersedes", to: "dec-old" }, { type: "resolves", to: "task-a" }, { type: "resolves", to: "task-a" }]),
+      "art-b": n("art-b", "artifact", "done", [{ type: "resolves", to: "task-a" }, { type: "answers", to: "question-q" }, { type: "resolves", to: "task-held" }, { type: "resolves", to: "task-gone" }]),
+      "dec-c": n("dec-c", "decision", "active", [{ type: "relates-to", to: "task-a" }, { type: "answers", to: "question-q" }]),
+    },
+  };
+}
+
+test("reverse index: inboundResolvers and resolutionOf match the full scan for every id", () => {
+  const g = busyFixture();
+  const full = resolutionMap(g);
+  for (const id of [...Object.keys(g.nodes), "task-gone", "nope"]) {
+    assert.deepEqual(resolution.inboundResolvers(g, id), scanInbound(g, id), `inboundResolvers(${id})`);
+    assert.deepEqual(resolutionOf(g, id), full[id] ?? null, `resolutionOf(${id})`);
+  }
+  // Spot-check the filters actually bit, so the parity above is not vacuous.
+  assert.deepEqual(resolution.inboundResolvers(g, "task-a").map((r) => r.by), ["dec-new", "dec-new", "art-b"]);
+  assert.equal(resolutionOf(g, "task-held"), null, "a held target has no resolution");
+  assert.deepEqual(resolution.inboundResolvers(g, "task-held").map((r) => r.by), ["art-b"], "...but its inert resolver is listed");
+  assert.equal(resolutionOf(g, "question-q").by, "art-b");
+});
+
+test("reverse index: built once per graph, read live for status, invisible to spread views", () => {
+  const g = busyFixture();
+  resolution.inboundResolvers(g, "task-a");
+  const idx = g[INBOUND_INDEX];
+  assert.ok(idx, "first call builds the index");
+  assert.ok(!Object.keys(g).includes(INBOUND_INDEX) && !Object.getOwnPropertyDescriptor(g, INBOUND_INDEX).enumerable);
+  resolutionOf(g, "question-q");
+  assert.equal(g[INBOUND_INDEX], idx, "reused, not rebuilt");
+  // A status flip is not an edge change: it is read live, no rebuild needed.
+  g.nodes["art-b"].status = "rejected";
+  assert.deepEqual(resolution.inboundResolvers(g, "task-a"), scanInbound(g, "task-a"));
+  assert.equal(resolutionOf(g, "question-q").by, "dec-c");
+  // A narrowed `{...graph, nodes}` view must not inherit the full index.
+  const view = { ...g, nodes: { "task-a": g.nodes["task-a"], "dec-new": g.nodes["dec-new"] } };
+  assert.equal(view[INBOUND_INDEX], undefined);
+  assert.deepEqual(resolution.inboundResolvers(view, "task-a").map((r) => r.by), ["dec-new", "dec-new"]);
+  // Swapping `nodes` wholesale on the same graph object rebuilds.
+  g.nodes = { "task-a": g.nodes["task-a"] };
+  assert.deepEqual(resolution.inboundResolvers(g, "task-a"), []);
+});
+
+test("reverse index: applyNode invalidates it, so a new resolves edge is seen", () => {
+  const fs = require("fs"), os = require("os"), path = require("path");
+  const graph = require("../lib/graph.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-inbound-idx-"));
+  const md = (id, type, extra = "") => `---\nid: ${id}\ntype: ${type}\ntitle: T ${id}\nsummary: S ${id}\ndate: 2026-09-01\nstatus: open\n${extra}---\nBody.\n`;
+  try {
+    fs.writeFileSync(path.join(dir, "task-z.md"), md("task-z", "task"));
+    const g = graph.loadGraph(dir);
+    assert.equal(resolutionOf(g, "task-z"), null);
+    assert.ok(g[INBOUND_INDEX]);
+    graph.applyNode(g, md("dec-z", "decision", "edges:\n  - {type: resolves, to: task-z}\n").replace("status: open", "status: active"), "dec-z.md");
+    assert.equal(g[INBOUND_INDEX], undefined, "applyNode cleared the index");
+    assert.equal(resolutionOf(g, "task-z").by, "dec-z");
+    assert.deepEqual(resolution.inboundResolvers(g, "task-z").map((r) => r.by), ["dec-z"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("validateGraphSteps yields per unit of work and returns exactly validateGraph's result", () => {
+  const fs = require("fs"), os = require("os"), path = require("path");
+  const graph = require("../lib/graph.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-validate-steps-"));
+  const md = (id, type, extra = "") => `---\nid: ${id}\ntype: ${type}\ntitle: T ${id}\nsummary: S ${id}\n${extra}---\nBody.\n`;
+  try {
+    fs.writeFileSync(path.join(dir, "task-a.md"), md("task-a", "task", "date: 2026-09-01\nedges:\n  - {type: blocks, to: task-missing}\n"));
+    fs.writeFileSync(path.join(dir, "task-b.md"), md("task-b", "task"));
+    fs.writeFileSync(path.join(dir, "task-c.md"), md("task-wrong", "task", "date: 2026-09-01\n"));
+    const it = graph.validateGraphSteps(dir);
+    let r, steps = 0;
+    while (!(r = it.next()).done) { assert.equal(r.value, undefined); steps++; }
+    assert.ok(steps >= 3 * 2, `yields at least per file read and per file lint (got ${steps})`);
+    assert.deepEqual(r.value, graph.validateGraph(dir));
+    assert.ok(r.value.errors.length && r.value.warnings.length, "the fixture exercises both severities");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
