@@ -1,0 +1,58 @@
+name: ChatGPT Plugin
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python3 test/package-chatgpt.test.py
+      - name: Build and check release version
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            python3 scripts/package-chatgpt.py --tag "$RELEASE_TAG"
+          else
+            python3 scripts/package-chatgpt.py
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-plugin
+          path: dist/chatgpt/plugin.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: chatgpt-plugin
+          path: dist/chatgpt
+      - name: Attach plugin.zip to the tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          # release.js may create the release concurrently; accept that race.
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 ||
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes ||
+            gh release view "$RELEASE_TAG" >/dev/null
+          gh release upload "$RELEASE_TAG" dist/chatgpt/plugin.zip --clobber

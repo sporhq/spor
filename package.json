@@ -47,6 +47,7 @@
   ],
   "scripts": {
     "release": "node scripts/release.js",
+    "package:chatgpt": "python3 scripts/package-chatgpt.py",
     "test": "node scripts/test-run.js",
     "test:shard": "node scripts/test-run.js --shard",
     "test:e2e": "node --require ./test/helpers/tmp-cleanup.js --test test/e2e-claude.test.js",

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "spor",
+  "description": "Shared team memory: find decisions, brief work, capture discoveries, and manage the decision queue through the Spor knowledge graph.",
+  "author": { "name": "Spor", "url": "https://sporhq.io" },
+  "license": "Apache-2.0",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Spor",
+        "shortDescription": "Shared memory for your team",
+        "longDescription": "Connect to your Spor team graph to find prior decisions, prepare task briefings, capture follow-up work, and inspect the decision queue. Requires a Spor account and access to a team graph.",
+        "developerName": "Spor",
+        "category": "Productivity",
+        "defaultPrompt": [
+          "Brief this Spor task before I start work.",
+          "Capture this follow-up in the graph.",
+          "Show me what is next in the Spor queue."
+        ],
+        "brandColor": "#3B82F6"
+      }
+    }
+  }
+}

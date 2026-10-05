@@ -950,3 +950,9 @@ keeps its lock regardless of elapsed time; a verifiably dead process can be
 recovered. Malformed ownership or an abandoned breaker fails closed. Stop all
 local execution writers before manually removing such a lock from the execution
 item index directory; ordinary execution reads never repair or delete it.
+
+### ChatGPT plugin ZIP
+
+Each tagged release includes an installable `plugin.zip` GitHub Release asset.
+Build it locally with `npm run package:chatgpt` (Python 3 required). See the
+[ChatGPT adapter](adapters/chatgpt/README.md) for packaging and connection details.

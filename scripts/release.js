@@ -16,7 +16,7 @@
 //     -y, --yes        skip the confirmation prompt before the push
 //     --dry-run        print the plan, change nothing
 //     --no-push        commit + tag locally, then stop (print push commands)
-//     --no-release     skip creating the GitHub release
+//     --no-release     skip local release creation (tag CI still attaches plugin.zip)
 //     --skip-tests     don't run `npm test` locally before releasing
 //
 // Zero-dependency, plain Node + git/gh binaries — runs anywhere the plugin does.
@@ -223,8 +223,13 @@ async function main() {
     ? `\n\n**Full Changelog**: https://github.com/sporhq/spor/compare/${lastTag}...${tag}`
     : '';
   const notes = `${log || 'Release.'}${compare}\n`;
-  run('gh', ['release', 'create', tag, '--title', tag, '--notes', notes]);
-  ok(`GitHub release ${tag} created`);
+  // The ChatGPT ZIP workflow can create this release as soon as the tag lands.
+  if (!run('gh', ['release', 'view', tag, '--json', 'tagName'], { capture: true, allowFail: true })) {
+    run('gh', ['release', 'create', tag, '--title', tag, '--notes', notes], { allowFail: true });
+  }
+  // Verify even after a failed create: a concurrent CI creation is harmless.
+  run('gh', ['release', 'view', tag, '--json', 'tagName'], { capture: true });
+  ok(`GitHub release ${tag} ready; CI attaches the ChatGPT plugin.zip`);
   info('\nDone. Watch the publish run:  gh run watch --workflow=publish.yaml');
 }
 

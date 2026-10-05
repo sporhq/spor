@@ -11,3 +11,7 @@
 # `npm test` there and in every worktree beneath it
 # (issue-spor-npm-test-exit-216-non-tty).
 /node_modules
+
+# Generated ChatGPT release archives and Python bytecode.
+dist/chatgpt/
+__pycache__/
