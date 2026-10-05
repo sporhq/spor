@@ -4187,12 +4187,15 @@ async function cmdAdd(cfg, { values, positionals }) {
   // edge (the provenance the distiller would draw), --blocks -> a blocks edge,
   // --needed-by -> the needed_by deadline field. So the same `spor add` line the
   // /spor:defer skill runs lands the same lineage locally as remote.
-  const edgeLines = [];
-  if (during) edgeLines.push(`  - {type: derived-from, to: ${during}}`);
-  if (blocks) edgeLines.push(`  - {type: blocks, to: ${blocks}}`);
-  const edgesBlock = edgeLines.length ? `edges:\n${edgeLines.join("\n")}\n` : "";
-  const neededByLine = neededBy ? `needed_by: ${neededBy}\n` : "";
-  const md = `---\nid: ${id}\ntype: ${type}\nrepo: ${localProject}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(/\n/g, " ")}\n${neededByLine}${edgesBlock}date: ${today()}\n---\n\n${prose}\n`;
+  const addEdges = [];
+  if (during) addEdges.push({ type: "derived-from", to: during });
+  if (blocks) addEdges.push({ type: "blocks", to: blocks });
+  const md = frontmatter.serializeNode({
+    id, type, repo: localProject,
+    title: title.replace(/\n/g, " "), summary: summary.replace(/\n/g, " "),
+    ...(neededBy ? { needed_by: neededBy } : {}),
+    date: today(), edges: addEdges, body: prose,
+  });
   // validate before writing (parse, then the same rules lib/validate enforces)
   let node;
   try {
@@ -4355,9 +4358,12 @@ async function cmdAsk(cfg, { values, positionals }) {
   // Local mode has no router (and no capability to probe), so --to still
   // folds in as a mention here regardless of what a remote call would do.
   const localMentions = [...new Set([...toTargets, ...mentionIds])];
-  const edgeLines = localMentions.map((m) => `  - {type: mentions, to: ${m}}`);
-  const edgesBlock = edgeLines.length ? `edges:\n${edgeLines.join("\n")}\n` : "";
-  const md = `---\nid: ${id}\ntype: question\nrepo: ${slug}\ntitle: ${titleText.replace(/\n/g, " ")}\nsummary: ${summary.replace(/\n/g, " ")}\nstatus: open\n${edgesBlock}date: ${today()}\n---\n\n${text}\n`;
+  const md = frontmatter.serializeNode({
+    id, type: "question", repo: slug,
+    title: titleText.replace(/\n/g, " "), summary: summary.replace(/\n/g, " "),
+    status: "open", date: today(),
+    edges: localMentions.map((m) => ({ type: "mentions", to: m })), body: text,
+  });
   let node;
   try {
     node = graphLib.parseFrontmatter(md, `${id}.md`);
@@ -6393,7 +6399,11 @@ async function cmdInvite(cfg, { values }) {
     }
     person = values.id || personIdForEmail(email);
     const safeName = name.replace(/\n/g, " ");
-    const md = `---\nid: ${person}\ntype: person\ntitle: ${safeName}\nname: ${safeName}\nsummary: Team member ${safeName}.\nemail: ${email}\ndate: ${today()}\n---\n\nTeam member ${safeName} <${email}>.\n`;
+    const md = frontmatter.serializeNode({
+      id: person, type: "person", title: safeName, name: safeName,
+      summary: `Team member ${safeName}.`, email, date: today(),
+      body: `Team member ${safeName} <${email}>.`,
+    });
     const pr = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: md, if_exists: "skip" }] });
     if (pr.transport) {
       err(`offline — could not reach server (${pr.error})`);
@@ -6544,12 +6554,12 @@ async function cmdPersonCreate(cfg, { name, email, id }) {
   // can't inject an extra frontmatter line (the parser is line-based key: value).
   const safeName = name.replace(/\n/g, " ");
   const safeEmail = email.replace(/\n/g, " ");
-  const md =
-    `---\nid: ${id}\ntype: person\ntitle: ${safeName}\n` +
-    `name: ${safeName}\n` +
-    `summary: Org member ${safeName} <${safeEmail}> — the local $viewer identity anchor for this graph's queue.\n` +
-    `email: ${safeEmail}\ndate: ${today()}\n---\n\n` +
-    `Org member ${safeName} <${safeEmail}>. Created locally by \`spor person create\`; the git-identity ($viewer) anchor the local queue and queue_mute bind to (lib/queue.js viewerFor).\n`;
+  const md = frontmatter.serializeNode({
+    id, type: "person", title: safeName, name: safeName,
+    summary: `Org member ${safeName} <${safeEmail}> — the local $viewer identity anchor for this graph's queue.`,
+    email: safeEmail, date: today(),
+    body: `Org member ${safeName} <${safeEmail}>. Created locally by \`spor person create\`; the git-identity ($viewer) anchor the local queue and queue_mute bind to (lib/queue.js viewerFor).`,
+  });
   let node;
   try {
     node = graphLib.parseFrontmatter(md, `${id}.md`);
@@ -6869,12 +6879,13 @@ async function cmdAgentCreateLocal(cfg, { label, owner, pubkey }) {
   const personLabel = ownerId.replace(/^person-/, "") || ownerId;
   const ownerName = personLabelFromGraph(g, ownerId);
   const spiffe = `spiffe://spor.${org}/person/${personLabel}/agent/${kebab(label)}`;
-  const md =
-    `---\nid: ${id}\ntype: agent\ntitle: ${label.replace(/\n/g, " ")}\n` +
-    `summary: Automation principal ${label}, owned by ${ownerId} — its dispatched-session writes read "agent on behalf of person".\n` +
-    `spiffe: ${spiffe}\npubkey: ${pubkey.replace(/\n/g, " ")}\nstatus: active\ndate: ${today()}\n` +
-    `edges:\n  - {type: owned-by, to: ${ownerId}}\n---\n\n` +
-    `Person-owned automation principal (dec-spor-agent-identity-nodes). Created by \`spor agent create\`; reused across dispatches as this machine's durable identity.\n`;
+  const md = frontmatter.serializeNode({
+    id, type: "agent", title: label.replace(/\n/g, " "),
+    summary: `Automation principal ${label}, owned by ${ownerId} — its dispatched-session writes read "agent on behalf of person".`,
+    spiffe, pubkey: pubkey.replace(/\n/g, " "), status: "active", date: today(),
+    edges: [{ type: "owned-by", to: ownerId }],
+    body: "Person-owned automation principal (dec-spor-agent-identity-nodes). Created by `spor agent create`; reused across dispatches as this machine's durable identity.",
+  });
   let node;
   try {
     node = graphLib.parseFrontmatter(md, `${id}.md`);

@@ -16,6 +16,7 @@ const u = require("./util");
 const { drainOutbox } = require("./drain-outbox");
 const { inferCommits } = require("./infer-commits");
 const graphLib = require(path.join(u.ROOT, "lib", "graph.js"));
+const { serializeNode } = require(path.join(u.ROOT, "lib", "kernel", "frontmatter.js"));
 
 // The nested-repo guard (graph home === code repo) now lives in util so the
 // `spor init` path can share it (task-spor-onboard-cli-init-git-identity).
@@ -718,10 +719,11 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
     const firstFact = facts.split("\n")[0] || title;
     const summary = firstFact.length > 497 ? `${firstFact.slice(0, 497)}...` : firstFact;
     const mdFor = (id) =>
-      `---\nid: ${id}\ntype: ${type}\nrepo: ${stamp}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(
-        /\n/g,
-        " "
-      )}\ndate: ${u.localDate()}\nauthored_via: capture\ncapture_key: ${key}\n---\n\n${text}\n`;
+      serializeNode({
+        id, type, repo: stamp,
+        title: title.replace(/\n/g, " "), summary: summary.replace(/\n/g, " "),
+        date: u.localDate(), authored_via: "capture", capture_key: key, body: text,
+      });
 
     // Settled | free | torn | taken, decided by READING the occupant rather
     // than by its existence. Unreadable is none of those — it is transient, so
@@ -752,7 +754,7 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
       // The BODY specifically, not the raw file: the frontmatter's `summary`
       // is the finding's own first line, so a whole-file match would call an
       // empty body settled on any single-fact capture.
-      return String(parsed.body || "").includes(facts) ? "settled" : "torn";
+      return String(parsed.body || "").includes(facts.trim()) ? "settled" : "torn";
     };
 
     let settledAs = null;
