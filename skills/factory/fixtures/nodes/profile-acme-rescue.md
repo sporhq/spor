@@ -16,9 +16,8 @@ converge — reviewer drift, a real defect it kept patching around, a stale
 premise, the environment — and that reading is worth a strong model exactly
 once per refusal, not on every item.
 
-Supervised and write-capable by requirement: the runner reads the diagnosis
-off the run's final report (a native-background launch would have no report
-to read, and the worker refuses to start on one), and the rescue commits in
+Write-capable by requirement: the runner reads the diagnosis off the run's
+final report (every dispatch is supervised), and the rescue commits in
 the same checkout, runs the suite, and files its factory-improvement tasks
 with `spor put-node`. It never marks a gate passed — the gates re-run on
 whatever it leaves.

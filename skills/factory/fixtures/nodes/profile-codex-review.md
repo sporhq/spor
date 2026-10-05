@@ -10,10 +10,8 @@ status: active
 ---
 
 Deliberately a different model from the lane that writes the code: a reviewer
-that shares the implementer's blind spots is a rubber stamp. Supervised by
-requirement, not preference — an agent-review gate reads its verdict off the
-run's final report, so a native-background launch would have no verdict channel
-and the gate would fail every time.
+that shares the implementer's blind spots is a rubber stamp. Supervised, like every
+dispatch — an agent-review gate reads its verdict off the run's final report.
 
 This node names a harness and nothing else. What `codex` actually executes is
 bound on each machine (`dispatch.harness.codex`), never here: a graph write must
