@@ -493,3 +493,16 @@ test("a stopping worker records the fallback route but dispatches nothing under 
 // test/stage-projection.test.js (consecutiveYields) and acted on by the loop in
 // test/gate-pipeline.test.js ("re-offer cap"). Nothing here stamps a count.
 
+
+test("a LIVE loss of the pipeline lease raised by noteReviewerSuccess stops the pipeline — it is not a best-effort failure (issue-spor-note-reviewer-success-swallowed-owner-lost)", async () => {
+  const factory = reviewFactory();
+  const w = world({ review: () => PASS });
+  const lost = Object.assign(new Error("this driver no longer owns the gate pipeline"), { code: "PIPELINE_OWNER_LOST" });
+  w.deps.noteReviewerSuccess = async () => { throw lost; };
+  await assert.rejects(gateRunner.runGatePipeline({ item: ITEM, factory, deps: w.deps }), (e) => e === lost);
+  assert.strictEqual(w.seen.facts.length, 0, "a displaced driver walks on to no further step");
+  // An ordinary failure of the same dep is still best-effort.
+  const ok = world({ review: () => PASS });
+  ok.deps.noteReviewerSuccess = async () => { throw new Error("disk full"); };
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: ok.deps })).state, "passed");
+});
