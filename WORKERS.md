@@ -2256,6 +2256,44 @@ takes the retry already paid for rather than a fresh, uncharged one. A pool
 already spent, or a charge that will not land, still refuses as above — a stop
 does not turn an exhausted budget into a pause.
 
+#### A review gate's own ladder: `reviewer_retries`
+
+The pool above is the factory's, and a factory that declares no
+`implementation.retry` — or no `implementation:` block at all — authorizes no
+re-ask, so its review gates page a person at the first outage. An agent-review
+gate may declare its OWN allowance instead
+(dec-spor-review-gate-no-verdict-is-an-outage-not-a-rejection):
+`reviewer_retries` (0..3). After a no-verdict reading the gate waits the next
+step of a 5m / 15m / 45m ladder and asks the SAME reviewer at the SAME cycle
+again; `0` escalates on the first reading. The declaration replaces the pool's
+CAP and BACKOFF for that gate's re-asks — never the pool itself: each re-ask is
+still charged to the shared count (a review is named by it, so a re-ask never
+adopts the dead reviewer), and the gate's own count
+(`gate_progress.pools.ladder.<gate>`) rides the same owe-before-clear write.
+The factory pool's headroom is the shared count LESS every ladder-paid charge,
+so one gate's ladder never spends the re-asks budgeted for the others. It
+counts no-verdict re-asks per gate per pipeline attempt, across fix cycles; a
+`--regate` starts it fresh. An unreadable pool reads the ladder as spent. A
+stated reset (below) still pauses, and a declared fallback is still routed to —
+both are paid from the ladder in place of the pool.
+
+While the ladder waits, `spor work --status` shows the gating slot as
+`reviewer unavailable: <gate> under <profile> — no verdict n/N, asking again at
+<time>` (`--json`: `gating[].reviewer_unavailable`). It reads a display stamp
+the charge writes (`gate_progress.pools.reviewer_unavailable`) that nothing
+decides from and that renders only while its time is still ahead. An exhausted
+ladder escalates like a spent pool, but the gate's verdict is
+`reviewer-unavailable`, not `infrastructure`: the `art-gate-*` fact and the
+escalation carry the reviewer's log tail as evidence, and `spor work --regate
+<run>` is the way back.
+
+A review that ended with NO verdict the classifier does not recognize as an
+outage — report-less, an unfamiliar wording — is not an outage reading, but it
+is still no verdict. With no earlier finding open it refuses without a fix
+cycle, as it always has. With earlier findings open it does too: it confirmed
+none of them, so the prior set rides the escalation still OPEN, no fix cycle is
+charged and the rescue lane is not entered.
+
 #### A reviewer outage that names its end: pause, cooldown, fallback
 
 A usage-limit outage usually says when it ends — Codex's `turn.failed` reads

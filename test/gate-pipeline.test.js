@@ -7401,7 +7401,7 @@ test("an exhausted infrastructure pool refuses naming the OUTAGE, never the code
   assert.strictEqual(seen.reviews.length, 2, "the initial ask plus exactly one pool-funded retry");
   assert.strictEqual(seen.fixes.length, 0);
   assert.strictEqual(seen.pools.retry.spent, 1);
-  assert.strictEqual(res.gates[0].verdict, "infrastructure");
+  assert.strictEqual(res.gates[0].verdict, "reviewer-unavailable", "a review outage is named for what it is, not `infrastructure`");
   assert.match(seen.escalations[0].detail, /never answered/);
   assert.match(seen.escalations[0].detail, /not a verdict on the change/);
   assert.match(seen.facts[0].markdown, /infrastructure/);
@@ -7596,28 +7596,45 @@ test("a review that produced NO verdict and carries no prior finding charges no 
   assert.match(seen.escalations[0].detail, /nothing for a fix cycle to fix/);
 });
 
-// The mirror half, and the one that must stay byte-identical: a review that
-// never answered cleared nothing, so where prior findings ARE open the fixer
-// has real, named work and the cycle is charged exactly as before.
-test("a review that produced no verdict still spends its cycles while a PRIOR finding is open", async () => {
+// The mirror half (task-spor-no-verdict-ladder-not-on-main-land-before-worker-
+// restart, item 5). A review that never answered cleared nothing — but it
+// CONFIRMED nothing either: whether the last fix closed the prior finding is
+// exactly what it never said. So an UNRECOGNIZED report-less ending after a
+// findings cycle charges no further fix cycle and is never rescued; the prior
+// set rides the escalation still open, so a person sees what is unconfirmed.
+// (This test used to pin the opposite — two cycles spent re-sending a fixer at
+// a finding no reviewer had looked at since the fix.)
+test("a review that produced no verdict after a findings cycle charges no fix cycle and no rescue, carrying the prior finding open", async () => {
   const factory = factoryOf({
     ...OUTAGE_BASE,
     gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }],
+    rescue: { profile: "profile-rescue" },
   });
   const raise = { ok: true, text: '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"lib/x.js","summary":"the bound over-reads","evidence":"ran npm test -- x.test.js, it failed"}]}\n```' };
   let call = 0;
   const { deps, seen } = fakes({
     review: () => {
       call += 1;
-      return call === 1 ? raise : { ok: false, reason: "the review run under profile-review left no final report to read a verdict from" };
+      // The ending the signature table does NOT recognize: classified
+      // `failed`, so `outageOf` declines it and only this rule stands.
+      return call === 1
+        ? raise
+        : { ok: false, reason: "the review run under profile-review wrote no final report to read a verdict from", classification: { outcome: "failed", pool: "implementation", reason: "the supervised child exited 1 (nonzero-exit)" } };
     },
   });
+  deps.rescue = async () => {
+    throw new Error("a reviewer that never answered refused nothing a rescue could diagnose");
+  };
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
   assert.strictEqual(res.state, "failed");
-  assert.strictEqual(seen.reviews.length, 3, "the declared cycles are spent, as they were before");
-  assert.strictEqual(seen.fixes.length, 2);
-  assert.strictEqual(seen.fixes[1].findings.length, 1, "the fixer is sent back at the finding the reviewer never got to clear");
-  assert.strictEqual(seen.fixes[1].findings[0].origin, "prior");
+  assert.strictEqual(seen.reviews.length, 2, "the initial review, then the one review after the one fix — no further cycle");
+  assert.strictEqual(seen.fixes.length, 1, "only the fix the readable verdict earned; none for the absent reviewer");
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.strictEqual(seen.escalations[0].findings.length, 1, "the prior finding rides the escalation");
+  assert.strictEqual(seen.escalations[0].findings[0].origin, "prior");
+  assert.strictEqual(seen.escalations[0].findings[0].status, "open", "still open — nobody confirmed it fixed");
+  assert.match(seen.escalations[0].detail, /none of the 1 earlier finding\(s\) still open was confirmed/);
+  assert.match(seen.escalations[0].detail, /no fix cycle is charged/);
 });
 
 test("a FIX dispatch refused before any run record is unroutable: no rescue, and the refusal says so", async () => {
@@ -11774,4 +11791,247 @@ test("a timeout whose output cannot be read as text is an actual failure, not an
   const { deps } = fakes({ changed: ["lib/kernel/queue.js"], suite: () => ({ ...TIMED_OUT(), output: { garbled: true } }) });
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory: TIMEOUT_FACTORY({ rescue: undefined }), deps });
   assert.notStrictEqual(res.gates[0].verdict, "infrastructure");
+});
+
+// --- the reviewer LADDER (`reviewer_retries`) ---------------------------------
+// task-spor-no-verdict-ladder-not-on-main-land-before-worker-restart,
+// dec-spor-review-gate-no-verdict-is-an-outage-not-a-rejection: an agent-review
+// gate may declare its own allowance of re-asks after a no-verdict reading —
+// 0..3, waited out on a 5m/15m/45m ladder — so a gate on a factory whose
+// `implementation.retry` pool is zero (or absent: factory-spor declares no
+// implementation block) still asks again instead of paging a person at the
+// first outage. Each re-ask stays on the shared count (a review is NAMED by it).
+
+const LADDER_BASE = { ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-codex-sol", cycles: 3, reviewer_retries: 3 }] };
+
+test("reviewer_retries parses 0..3 on an agent-review gate, declared-only, and refuses anything else", () => {
+  const ok = (v) => gates.parseFactory(["```json", JSON.stringify({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-r", reviewer_retries: v }] }), "```"].join("\n"), { id: "factory-test" });
+  assert.strictEqual(ok(0).factory.gates[0].reviewerRetries, 0);
+  assert.strictEqual(ok(3).factory.gates[0].reviewerRetries, 3);
+  for (const bad of [4, -1, 1.5, "two", true]) assert.match(ok(bad).errors.join("; "), /reviewer_retries must be an integer from 0 to 3/, String(bad));
+  const none = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-r" }] });
+  assert.ok(!("reviewerRetries" in none.gates[0]), "an undeclared ladder never lands on the parsed gate, so no factory's digest moves");
+  assert.deepStrictEqual(gates.GATE_DEFAULTS.reviewerBackoffMs, [300000, 900000, 2700000]);
+});
+
+test("a gate's reviewer ladder asks again after 5m then 15m on a factory with NO retry pool — no fix cycle, and the second answer passes", async () => {
+  const factory = factoryOf(LADDER_BASE);
+  assert.strictEqual(gates.executionPoolCap(factory.implementation, "retry"), 0, "the factory itself authorizes no re-ask");
+  let call = 0;
+  const asked = [];
+  const { deps, seen } = fakes({
+    pools: { retry: { spent: 0 } },
+    review: () => {
+      call += 1;
+      asked.push(deps.now());
+      return call <= 2 ? outageReview() : { ok: true, text: '```json\n{"verdict":"pass"}\n```' };
+    },
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(seen.reviews.length, 3);
+  assert.deepStrictEqual(seen.reviews.map((r) => r.cycle), [0, 0, 0], "the same reviewer at the same cycle");
+  assert.strictEqual(seen.fixes.length, 0);
+  assert.ok(asked[1] - asked[0] >= 300000 && asked[1] - asked[0] < 900000, `the first re-ask waited the ladder's 5m step (${asked[1] - asked[0]}ms)`);
+  assert.ok(asked[2] - asked[1] >= 900000 && asked[2] - asked[1] < 2700000, `the second waited 15m (${asked[2] - asked[1]}ms)`);
+  assert.deepStrictEqual(seen.reviewRetries, [0, 1, 2], "each re-ask is a fresh launch identity on the shared count");
+  assert.strictEqual(seen.pools.retry.spent, 2);
+  assert.deepStrictEqual(seen.pools.ladder, { review: 2 }, "the gate's own count rides the same write");
+});
+
+test("an exhausted reviewer ladder escalates as reviewer-unavailable, carrying the reviewer's log tail — no fix cycle, no rescue", async () => {
+  const factory = factoryOf({ ...LADDER_BASE, gates: [{ ...LADDER_BASE.gates[0], reviewer_retries: 2 }], rescue: { profile: "profile-rescue" } });
+  const tail = '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit."}}';
+  const { deps, seen } = fakes({ pools: { retry: { spent: 0 } }, review: () => ({ ...outageReview(), logTail: tail }) });
+  deps.rescue = async () => {
+    throw new Error("an unavailable reviewer is never rescued");
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.reviews.length, 3, "the first reading plus the two declared re-asks");
+  assert.strictEqual(seen.fixes.length, 0);
+  assert.strictEqual(res.gates[0].verdict, "reviewer-unavailable");
+  assert.match(seen.escalations[0].outage.notRetried, /produced no verdict 3 times — gate review's reviewer ladder \(`reviewer_retries: 2`\) is spent/);
+  assert.strictEqual(seen.escalations[0].evidence, tail, "the reviewer's own channel is the evidence");
+  assert.match(seen.facts[0].markdown, /reviewer unavailable/);
+  assert.match(seen.facts[0].markdown, /usage limit/, "the fact carries the log tail too");
+});
+
+test("a gate's ladder pays for its own re-asks — it never spends the pool the factory budgeted for its other gates", async () => {
+  const factory = factoryOf({
+    ...BASE,
+    implementation: { profile: "profile-impl", retry: { attempts: 1, backoff_ms: 1000 } },
+    gates: [
+      { id: "laddered", kind: "agent-review", profile: "profile-codex-sol", cycles: 1, reviewer_retries: 2 },
+      { id: "pooled", kind: "agent-review", profile: "profile-review", cycles: 1 },
+    ],
+  });
+  const calls = { laddered: 0, pooled: 0 };
+  const { deps, seen } = fakes({
+    pools: { retry: { spent: 0 } },
+    review: ({ gate }) => {
+      calls[gate.id] += 1;
+      const outages = gate.id === "laddered" ? 2 : 1;
+      return calls[gate.id] <= outages ? outageReview() : { ok: true, text: '```json\n{"verdict":"pass"}\n```' };
+    },
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.deepStrictEqual(calls, { laddered: 3, pooled: 2 }, "the undeclared gate still got the factory's one retry after the ladder spent two re-asks");
+  assert.strictEqual(seen.pools.retry.spent, 3, "every re-ask is on the shared count — it names the launches");
+});
+
+test("reviewer_retries: 0 escalates on the first no-verdict reading, still charging no fix cycle", async () => {
+  const factory = factoryOf({
+    ...LADDER_BASE,
+    implementation: { profile: "profile-impl", retry: { attempts: 3, backoff_ms: 1000 } },
+    gates: [{ ...LADDER_BASE.gates[0], reviewer_retries: 0 }],
+  });
+  const { deps, seen } = fakes({ pools: { retry: { spent: 0 } }, review: () => outageReview() });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.reviews.length, 1, "the gate's own declaration wins over the factory pool");
+  assert.strictEqual(seen.fixes.length, 0);
+  assert.match(seen.escalations[0].outage.notRetried, /declares `reviewer_retries: 0`/);
+});
+
+test("a stop inside the ladder's backoff is interrupted, settles nothing, and leaves the asking-again stamp for --status", async () => {
+  const factory = factoryOf(LADDER_BASE);
+  const { deps, seen } = fakes({ pools: { retry: { spent: 0 } }, review: () => outageReview() });
+  deps.stopping = () => seen.slept >= 1;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "interrupted");
+  assert.match(res.reason, /reviewer re-ask 1\/3/);
+  assert.strictEqual(seen.escalations.length + seen.facts.length + seen.demotions.length, 0, "nothing settled");
+  assert.strictEqual(seen.pools.retry.due_at, 1_700_000_000_000 + 300000, "the resume waits out the rest of the 5m step");
+  assert.deepStrictEqual(seen.pools.reviewer_unavailable, {
+    gate: "review", profile: "profile-codex-sol", node_id: "task-demo", reading: 1, of: 4, due_at: 1_700_000_000_000 + 300000,
+    reason: "the harness ended on an environment failure (credit-exhausted)",
+  });
+});
+
+// The acceptance's end-to-end: a REAL Codex `turn.failed` stream — the ending of
+// run 57a6143f, a usage-limit refusal with no stated reset — through the real
+// review door (makeGateDeps: record classification, report read, log tail),
+// the ladder, the escalation node it writes, and `spor work --status`.
+test("a Codex turn.failed review drives the ladder, the reviewer-unavailable escalation and the --status line end to end", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-ladder-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, "nodes", "task-fix-me.md"),
+    "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-05\n---\n\nAcceptance: reading N items yields N.\n"
+  );
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-ladder-repo-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
+  g("add", "."); g("commit", "-q", "-m", "base");
+  g("checkout", "-q", "-b", "task-fix-me");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n + 1;\n");
+  g("commit", "-q", "-am", "implement");
+
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const harnesses = require("../lib/shell/dispatch-harnesses.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const factory = factoryOf({ ...BASE, gates: [{ id: "adversarial-review", kind: "agent-review", profile: "profile-codex-sol", cycles: 3, reviewer_retries: 2 }], rescue: { profile: "profile-rescue" } });
+  const gate = factory.gates[0];
+  const fixture = fs.readFileSync(path.join(__dirname, "fixtures", "codex-turn-failed.jsonl"), "utf8");
+  // What the supervisor stamps from that stream: the adapter's own reading of
+  // the `turn.failed` event, classified by the same signature table.
+  const failed = fixture.split("\n").filter(Boolean).map((l) => JSON.parse(l)).map((e) => harnesses.getHarness("codex").failureFromEvent(e)).find(Boolean);
+  const known = dispatchRuns.classifyTerminalText(failed.reason);
+  assert.strictEqual(known.signal, "usage-limit");
+  assert.ok(!known.reset_hint, "this ending states no reset, so it is the ladder's, not a pause's");
+
+  const runId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0001";
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, { run_id: runId, node_id: "task-fix-me", state: "done", cwd: repo });
+  let launches = 0;
+  const real = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-fix-me", cwd: repo },
+    entry: { run_id: runId, node_id: "task-fix-me", project: null },
+    factory, slug: null, passthrough: {},
+    warn: () => {}, log: () => {}, stopping: () => false, home,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    dispatch: async () => {
+      launches += 1;
+      const reviewRun = `ladder-review-run-${launches}`;
+      const p = dispatchRuns.runPaths(home, reviewRun);
+      const logPath = path.join(home, `${reviewRun}.log`);
+      fs.writeFileSync(logPath, fixture);
+      dispatchRuns.atomicJson(p.record, {
+        run_id: reviewRun, node_id: null, name: "gate-adversarial-review", harness: "codex",
+        launch_mode: "supervised-jsonl", state: "failed", terminal_state: "failed", created_at: new Date().toISOString(), finished_at: new Date().toISOString(),
+        report_path: path.join(home, `${reviewRun}.report.md`), log_path: logPath, exit_code: 1,
+        termination_class: known.class, termination_signal: known.signal, termination_reason: known.reason,
+      });
+      return { ok: true, run: { run_id: reviewRun, harness: "codex" } };
+    },
+  });
+  assert.ok((await real.changedPaths({ trustedRef: "main" })).ok);
+
+  // The pipeline over fakes for everything but the review door, on a clock
+  // anchored at NOW so the --status line's "asking again at" is ahead of it.
+  const item = { node_id: "task-fix-me", run_id: runId, project: null };
+  const drive = (stopAfterFirst) => {
+    const f = fakes({ pools: { retry: { spent: 0 } } });
+    let clock = Date.now();
+    f.deps.now = () => clock;
+    f.deps.sleep = async (ms) => { clock += ms; f.seen.slept += 1; };
+    f.deps.review = async (args) => {
+      f.seen.reviews.push({ gate: args.gate.id, cycle: args.cycle });
+      return real.review(args);
+    };
+    f.deps.rescue = async () => {
+      throw new Error("an unavailable reviewer is never rescued");
+    };
+    if (stopAfterFirst) f.deps.stopping = () => f.seen.slept >= 1;
+    return f;
+  };
+
+  // 1-3, first half: a stop inside the first 5m step — interrupted, and the
+  // stamp the ladder wrote is what `spor work --status` renders.
+  const stopped = drive(true);
+  const first = await gateRunner.runGatePipeline({ item, factory, deps: stopped.deps });
+  assert.strictEqual(first.state, "interrupted");
+  assert.strictEqual(stopped.seen.facts.length + stopped.seen.escalations.length, 0);
+  const wait = stopped.seen.pools.reviewer_unavailable;
+  assert.strictEqual(wait.reading, 1);
+  assert.strictEqual(wait.of, 3);
+  await real.saveGatePools({ item, pools: stopped.seen.pools });
+  workLoop.writeWorkerStatus(home, {
+    worker_id: "w-ladder", pid: process.pid, started_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    active: [], gating: [{ run_id: runId, node_id: "task-fix-me", harness: "codex", started_at: new Date().toISOString() }], recent: [], skipped: [],
+  });
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home };
+  const text = cli(["work", "--status"], env);
+  assert.strictEqual(text.status, 0, text.stderr);
+  const at = new Date(wait.due_at).toISOString();
+  assert.match(text.stdout, new RegExp(`^ {12}reviewer unavailable: adversarial-review under profile-codex-sol — no verdict 1/3, asking again at ${at.replace(/\./g, "\\.")}$`, "m"));
+  const json = JSON.parse(cli(["work", "--status", "--json"], env).stdout);
+  assert.strictEqual(json.workers[0].gating[0].reviewer_unavailable.asking_again_at, at);
+
+  // 1-3, second half: left to run, the ladder asks twice more, then escalates
+  // as reviewer-unavailable carrying the reviewer's own log tail.
+  const full = drive(false);
+  const res = await gateRunner.runGatePipeline({ item, factory, deps: full.deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(full.seen.reviews.length, 3, "the first reading and the two declared re-asks");
+  assert.strictEqual(full.seen.fixes.length, 0, "an outage charges no fix cycle");
+  assert.strictEqual(res.gates[0].verdict, "reviewer-unavailable");
+  const esc = full.seen.escalations[0];
+  assert.match(esc.outage.reason, /environment failure \(usage-limit\)/);
+  assert.match(esc.outage.notRetried, /reviewer ladder \(`reviewer_retries: 2`\) is spent/);
+  assert.match(esc.evidence, /"type":"turn\.failed"/, "the log tail is the evidence");
+  assert.match(full.seen.facts[0].markdown, /reviewer unavailable/);
+  // ...and the escalation node the real door writes from it.
+  const written = await real.escalate({ ...esc, gate });
+  assert.ok(written && written.ok, written && written.reason);
+  const node = fs.readFileSync(path.join(home, "nodes", `${written.id}.md`), "utf8");
+  assert.match(node, /could not review task-fix-me \(reviewer unavailable\)/);
+  assert.match(node, /Evidence:/);
+  assert.match(node, /hit your usage limit/);
+  assert.match(node, /spor work --regate/);
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(repo, { recursive: true, force: true });
 });

@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a07746-5c1e-7f0b-9d3e-57a6143f0001"}
+{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits.)"}
+{"type":"error","message":"Reconnecting... 2/5 (stream disconnected before completion: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits.)"}
+{"type":"error","message":"You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits."}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits."}}

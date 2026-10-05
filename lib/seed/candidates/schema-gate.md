@@ -2,7 +2,7 @@
 id: schema-gate
 type: schema
 kind: node-schema
-schema_version: 2026.09.29.1
+schema_version: 2026.10.05.1
 title: Shareable factory gate
 summary: One reusable gate — command, agent-review or human — that any factory definition can reference by id, so an org vets a gate once (a `gate-security-review`) and reuses it product-wide instead of copying it into every factory.
 date: 2026-08-26
@@ -103,6 +103,15 @@ Keys by kind:
   `implementation.retry.attempts` pool (a pool of zero authorizes none), and
   every verdict it gives names it on the gate fact and the attested step.
   Omitted, none of the three changes the gate's definition digest.
+  `reviewer_retries` (2026.10.05.1, 0..3, dec-spor-review-gate-no-verdict-is-
+  an-outage-not-a-rejection) is the gate's OWN allowance of re-asks after a
+  no-verdict reading, in place of that pool's cap and backoff: it waits 5m,
+  15m, then 45m and asks the same reviewer at the same cycle again (`0`
+  escalates on the first reading). Each re-ask still lands on the shared
+  count, but is paid by the ladder, never from the pool's headroom. An exhausted ladder escalates with the verdict `reviewer-unavailable`
+  and the reviewer's log tail as evidence, and `spor work --status` shows
+  "no verdict n/N, asking again at <time>" while it waits. Omitted, the pool
+  alone decides, as before, and the digest does not move.
 - **human** — `approval_timeout_ms`, `poll_ms`, `instructions`, and `risk`.
 
 `risk` is common to all three kinds: the factory-declared risk classes that ARM

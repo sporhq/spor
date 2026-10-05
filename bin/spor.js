@@ -11597,6 +11597,33 @@ function gatingSlotHold(home, runId) {
   };
 }
 
+// A review gate WAITING OUT its reviewer ladder (`reviewer_retries`,
+// dec-spor-review-gate-no-verdict-is-an-outage-not-a-rejection): the display
+// stamp the ladder writes beside its charge, read back off the pipeline's
+// ledger. Only while its re-ask is still ahead — once `due_at` passes the
+// re-ask is in flight and the stamp says nothing true. A display, never a
+// debt: nothing decides anything from it.
+function gatingReviewerWait(home, runId, nowMs = Date.now()) {
+  let stamp = null;
+  try {
+    const record = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+    stamp = record ? stageProjection.latestProgress(home, record).stamp : null;
+  } catch {
+    return null;
+  }
+  const w = stamp && stamp.pools && stamp.pools.reviewer_unavailable;
+  const due = w && Number(w.due_at);
+  if (!w || !Number.isFinite(due) || due <= nowMs) return null;
+  return {
+    gate: String(w.gate || ""),
+    profile: String(w.profile || ""),
+    reading: Number(w.reading) || 0,
+    of: Number(w.of) || 0,
+    asking_again_at: new Date(due).toISOString(),
+    ...(w.reason ? { reason: String(w.reason) } : {}),
+  };
+}
+
 function cmdWorkStatus(cfg, { json }) {
   const home = cfg.userConfigHome();
   const workers = workLoop.readWorkerStatuses(home, { alive: workerAlive });
@@ -11610,6 +11637,8 @@ function cmdWorkStatus(cfg, { json }) {
     for (const g of w.gating || []) {
       const hold = g && g.run_id ? gatingSlotHold(home, g.run_id) : null;
       if (hold) g.hold = hold;
+      const waiting = g && g.run_id ? gatingReviewerWait(home, g.run_id) : null;
+      if (waiting) g.reviewer_unavailable = waiting;
     }
   }
   if (json) {
@@ -11663,6 +11692,10 @@ function cmdWorkStatus(cfg, { json }) {
       // live/STALE reading `spor get`'s note and `spor runs`' completion line
       // use, so an operator staring at a stuck gating slot sees why nothing
       // is retiring the item without a second command.
+      if (g.reviewer_unavailable) {
+        const ru = g.reviewer_unavailable;
+        out(`            reviewer unavailable: ${ru.gate} under ${ru.profile} — no verdict ${ru.reading}/${ru.of}, asking again at ${ru.asking_again_at}`);
+      }
       if (g.hold) {
         out(`            execution: ${g.hold.execution}${g.hold.boundary ? ` (boundary '${g.hold.boundary}')` : ""}${g.hold.since ? `, held since ${g.hold.since}` : ""} — ${g.hold.where}`);
       }
@@ -14441,6 +14474,10 @@ const GATE_VERDICT_TO_STATE = Object.freeze({
   // box refused the dispatch before it started — neither charges the code.
   infrastructure: "infrastructure",
   unroutable: "infrastructure",
+  // A review gate's outage carries its own word (gate-runner.js
+  // REVIEWER_UNAVAILABLE) on the fact and escalation; to the store it is the
+  // same infrastructure settlement it always was.
+  "reviewer-unavailable": "infrastructure",
 });
 
 // The executions this process holds, keyed by execution id — the per-pass

@@ -553,6 +553,30 @@ test("bin/spor.js, remote mode against a server that does not serve /v1/executio
   }
 });
 
+test("reporter: a review gate's `reviewer-unavailable` verdict settles in the store as the infrastructure outage it is, never a skipped report", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const home = tmp("reviewer-unavailable");
+    const cfg = remoteCfg(home, fake.base);
+    const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "review", kind: "agent-review", profile: "profile-r", reviewer_retries: 1 }], completion: { by: "controller", after: "gates" } });
+    const held = await spor.claimExecutionHold(cfg, { id: "task-x" }, factory, { home });
+    assert.equal(held.ok, true, held.reason);
+    const record = { run_id: "run-ru", node_id: "task-x", ...held.recordFields };
+    const p = dispatchRuns.runPaths(home, "run-ru");
+    fs.mkdirSync(path.dirname(p.record), { recursive: true });
+    fs.writeFileSync(p.record, JSON.stringify(record));
+    const reporter = spor.executionReporter(cfg, record, { home });
+    assert.equal((await reporter.resume()).ok, true);
+    await reporter.candidateSubmitted(CAND);
+    const sent = await reporter.gateSettled("review", "reviewer-unavailable");
+    assert.ok(!sent || !sent.skipped, "the settlement is sent, not skipped as an unknown verdict");
+    assert.equal(fake.record(reporter.id).gate_results[0].state, "infrastructure");
+    reporter.leave();
+  } finally {
+    await fake.close();
+  }
+});
+
 test("reporter: attempt keys advance on every settlement of one gate and every integration pass — offline too — so a fix-cycle pass or a re-gate's landing is never dropped as a replay of the first attempt's key", async () => {
   const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
   try {
