@@ -675,6 +675,40 @@ test("the one-shot `fix` and `rescue` are still honored when a caller wires them
   assert.deepEqual(fixes.slice(1), ["override-0"]);
 });
 
+test("a rescue whose LAUNCH is refused is read like a refused fix launch: an infrastructure refusal spends the retry pool and re-dispatches under -t<n>, an unroutable one stands, on the signal and the one-shot path alike", async () => {
+  const script = { ...SCRIPTS.rescued, factory: factoryOf({ ...BASE, gates: [GATES[0], { ...GATES[1], cycles: 0 }], rescue: { profile: "profile-rescue", attempts: 1 }, implementation: { profile: "profile-impl", retry: { attempts: 1 } } }) };
+  const infra = { outcome: "infrastructure", pool: "retry", reason: "credit-exhausted" };
+  const unroutable = { outcome: "unroutable", pool: null, reason: "profile refused" };
+  for (const shape of ["signal", "one-shot"]) {
+    for (const [classification, state, spent, seen] of [[infra, "passed", 1, ["n1", "n1-t1"]], [unroutable, "failed", 0, ["n1"]]]) {
+      const clock = fakeClock(1_700_000_000_000);
+      const world = makeWorld({ clock, script });
+      const attempts = [];
+      const inner = world.deps.dispatchRescue;
+      const refuse = async (args) => {
+        attempts.push(`n${args.attempt}${args.retry ? `-t${args.retry}` : ""}`);
+        if (attempts.length === 1) return { ok: false, reason: "the rescue could not be dispatched", classification };
+        return inner(args);
+      };
+      const deps = world.deps;
+      deps.dispatchRescue = refuse;
+      if (shape === "one-shot") {
+        delete deps.dispatchRescue;
+        deps.rescue = async (args) => {
+          const l = await refuse(args);
+          if (!l.ok) return l;
+          return { ok: true, runId: l.runId, diagnosis: "d", category: "real-defect", fixed: true, filed: [], unread: false };
+        };
+      }
+      const r = await drive(exec(world, clock, { factory: script.factory }), { clock, signals: world.signals });
+      assert.equal(r.status, "completed", JSON.stringify(r));
+      assert.equal(r.result.state, state, `${shape}/${classification.outcome}`);
+      assert.deepEqual(attempts, seen, `${shape}/${classification.outcome}`);
+      assert.equal(world.pools.retry.spent, spent, `${shape}/${classification.outcome}`);
+    }
+  }
+});
+
 test("a RESUMED drive (the loop marks every adopted orphan and parked re-offer `resumed`) continues a yielded journal — the flag is journaled per pass, so the next pass runs the supersession check a resumed pipeline owes, with no fallback", async () => {
   const home = scratchHome("resumed-yield");
   const clock = fakeClock(1_700_000_000_000);

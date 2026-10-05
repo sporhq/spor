@@ -679,6 +679,8 @@ test("a rescue already launched under its name is adopted, and a refused dispatc
   const shape = { launchedFixRun: () => null, rescueHarnessAdapter: async () => ({}), rescuePassthrough: () => ({ values: {}, dropped: [], applied: [], translated: null }), excludeRescueDiagnosisDir: () => {} };
   const refused = depsFor(t, { ...common, ...shape }, { ...ctx, dispatch: async () => ({ ok: false, reason: "no host" }) });
   assert.match((await refused.deps.rescue({ gate: reviewGate, attempt: 1 })).reason, /rescue under profile-strong could not be dispatched: no host/);
+  const refusal = await refused.deps.dispatchRescue({ gate: reviewGate, attempt: 1 });
+  assert.strictEqual(refusal.classification.outcome, "unroutable", "a refused launch carries the same classification a refused fix launch does");
 
   const waited = depsFor(t, { ...common, ...shape, awaitGateRun: async () => ({ ok: false, reason: "stuck" }) }, { ...ctx, dispatch: async () => ({ ok: true, run: { run_id: "r9" } }) });
   assert.deepStrictEqual(await waited.deps.rescue({ gate: reviewGate, attempt: 1 }), { ok: false, reason: "stuck" });
