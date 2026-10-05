@@ -2,7 +2,7 @@
 id: schema-question
 type: schema
 kind: node-schema
-schema_version: 2026.09.06.1
+schema_version: 2026.10.05.1
 title: Seed schema for question nodes
 summary: Node schema for the question type — a routed ask that the graph could not answer; queueable so open questions join the decision queue, routed-to a steward, answered by nodes carrying answers edges. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -16,7 +16,8 @@ side-channels (dec-cc-inter-session-graph-coordination).
 
 Lifecycle: `status: open` while waiting; an answer is any node carrying an
 `answers` edge to the question, after which the asker or answerer flips
-`status: answered` (terminal — leaves the queue). The `asker` frontmatter
+`status: answered` (terminal — leaves the queue). The flip is gated: see
+`transitions()` (2026.10.05.1) below. The `asker` frontmatter
 field records the asking person node; attribution still comes only from
 the token. `routed-to` edges carry the routing result; an unrouted
 question (no steward matched) surfaces to everyone.
@@ -64,10 +65,8 @@ registry behavior only, backward-readable, no upgrade chain.
 the status vocabulary `validate()` enforces is now also DECLARED as registry
 data (`status.vocabulary`), alongside `status.completion: answered` — the
 single success terminal value a mechanical "make the record honest" remedy
-should name. No `resolver_required`: a question's `answered` carries no
-completion-resolver gate (any live `answers` edge, from any type, suffices),
-which is exactly the asymmetry with task/issue this declaration makes readable
-instead of hand-mirrored. Enforcement is unchanged — the hook is still the
+should name. (It originally declared no `resolver_required`; 2026.10.05.1
+below gates `answered` on a live answering node.) Enforcement is unchanged — the hook is still the
 write door; `test/seed-declarative-status-policy.test.js` drives it through the
 sandbox and fails if the hook and this payload disagree. Backward-readable:
 declaration only, no stored-shape change, no upgrade chain.
@@ -83,6 +82,22 @@ would have reclassified any type adopting one for an unrelated purpose.
 Declaration only — enforcement stays in the hooks — no stored-shape change, no
 upgrade chain.
 
+`transitions()` + `status` (2026.10.05.1,
+issue-spor-set-status-answered-without-answers-edge): `answered` now requires a
+live inbound answer on the graph, read off `view.resolvers` exactly as
+schema-task/schema-issue gate `done`/`resolved` — a question is retired by an
+answering node, never by its status alone, which is what the `get()` hook and
+`resolution.verified_by: edge` already say. Before this a bare open→answered flip
+with no `answers` edge in place was accepted. The gate counts a resolver only when
+its status is not in the host's `view.non_resolving_statuses` partition, and
+accepts the answerer types declared as `status.resolver_types` (any node type that
+can carry an `answers` edge; the host passes the declared list as
+`view.resolver_types`, absent → the seed list). `status.resolver_required: true`
+now declares it. Write-time only, so existing `answered` nodes are unaffected;
+backward-readable, no stored-shape change, no upgrade chain. The server's
+`server/test/questions.test.js` asserts the old bare flip and is updated with the
+next `@sporhq/spor` pin bump (task-spor-server-questions-test-answered-needs-answers-edge).
+
 ```json
 {
   "node_type": "question",
@@ -96,7 +111,18 @@ upgrade chain.
       "open",
       "answered"
     ],
-    "completion": "answered"
+    "completion": "answered",
+    "resolver_required": true,
+    "resolver_types": [
+      "decision",
+      "artifact",
+      "finding",
+      "spec",
+      "norm",
+      "task",
+      "issue",
+      "question"
+    ]
   },
   "resolution": {
     "verified_by": "edge"
@@ -148,15 +174,39 @@ export function validate(node) {
   return errors;
 }
 
-// transitions(current, proposed, view) — question status vocabulary gate
-// (dec-cc-status-enforcement-via-transitions). Runs on every UPDATE in the
-// §2.4 sandbox, JSON boundary, pure. Empty status (status-less = live) and the
-// create path are always allowed; the SHARED check above also enforces this on
-// create now, and transitions() keeps it as the update-path guard.
+// transitions(current, proposed, view) — question status vocabulary gate plus
+// the answered-needs-an-answer gate (dec-cc-status-enforcement-via-transitions,
+// issue-spor-set-status-answered-without-answers-edge). Runs on every UPDATE in
+// the §2.4 sandbox, JSON boundary, pure. Empty status (status-less = live) is
+// always allowed; the SHARED check above also enforces the vocabulary on create.
+// view.resolvers = live inbound answering nodes; view.non_resolving_statuses =
+// the registry's non-resolving partition; view.resolver_types = this type's
+// status.resolver_types (absent → the seed list).
 export function transitions(current, proposed, view) {
   const next = ((proposed && proposed.status) || "").toLowerCase();
-  if (next === "" || VALID.indexOf(next) !== -1) return { allow: true };
-  return { allow: false, reason: statusReason(next) };
+  if (next === "") return { allow: true };
+  if (VALID.indexOf(next) === -1) return { allow: false, reason: statusReason(next) };
+  if (next === "answered") {
+    const rs = (view && view.resolvers) || [];
+    const nonResolving = (view && view.non_resolving_statuses) || [];
+    const types = ((view && view.resolver_types) || []).map(function (t) { return String(t); });
+    const accepted = types.length ? types : ["decision", "artifact", "finding", "spec", "norm", "task", "issue", "question"];
+    let ok = false;
+    for (let i = 0; i < rs.length; i++) {
+      const st = ((rs[i] && rs[i].status) || "").toLowerCase();
+      if (accepted.indexOf(String(rs[i].type)) !== -1 && nonResolving.indexOf(st) === -1) { ok = true; break; }
+    }
+    if (!ok) {
+      return {
+        allow: false,
+        reason: "answered requires a node in a RESOLVING state carrying an answers " +
+          "edge to this question — write the answer on the graph (put_node with " +
+          "an answers edge, or add_edge answers) first, then flip the status. " +
+          "(issue-spor-set-status-answered-without-answers-edge)",
+      };
+    }
+  }
+  return { allow: true };
 }
 ```
 

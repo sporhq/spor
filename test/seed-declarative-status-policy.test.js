@@ -232,11 +232,11 @@ test("the registry accessors expose the seed completion policy the gardener deri
   assert.equal(reg.completionStatus("question"), "answered");
   assert.equal(reg.requiresCompletionResolver("task"), true);
   assert.equal(reg.requiresCompletionResolver("issue"), true);
-  assert.equal(reg.requiresCompletionResolver("question"), false,
-    "a question's `answered` takes any live answers edge — no completion-resolver gate");
+  assert.equal(reg.requiresCompletionResolver("question"), true,
+    "a question's `answered` requires a live answering node (issue-spor-set-status-answered-without-answers-edge)");
   assert.deepEqual([...reg.resolverTypes("task")].sort(), ["artifact", "decision"]);
   assert.deepEqual([...reg.resolverTypes("issue")].sort(), ["artifact", "decision"]);
-  assert.equal(reg.resolverTypes("question").size, 0);
+  assert.ok(reg.resolverTypes("question").has("decision"));
 
   // The types whose closed vocabulary has no single mechanical success value:
   // a reader must get null here rather than a generic fallback its door refuses
@@ -340,4 +340,17 @@ test("the seed pack's declarations reproduce the four edge-verified types exactl
   assert.deepEqual(edge, ["incident", "issue", "question", "task"]);
   assert.equal(graph.isEdgeVerifiedOffline("decision"), false);
   assert.equal(graph.isEdgeVerifiedOffline("task"), true);
+});
+
+test("question: answered is refused without a live answering node, accepted with one (issue-spor-set-status-answered-without-answers-edge)", () => {
+  const s = nodeSchemas().find((x) => x.key === "question");
+  const h = hooks(s);
+  const proposed = { id: "question-probe", status: "answered" };
+  const bare = h.transitions({ status: "open" }, proposed, BARE_VIEW);
+  assert.equal(bare.allow, false);
+  assert.match(bare.reason, /answers/);
+  assert.equal(h.transitions({ status: "open" }, proposed, RESOLVER_VIEW).allow, true);
+  const withdrawn = { resolvers: [{ id: "dec-x", type: "decision", status: "withdrawn" }], non_resolving_statuses: ["withdrawn"] };
+  assert.equal(h.transitions({ status: "open" }, proposed, withdrawn).allow, false);
+  assert.equal(h.transitions({ status: "open" }, { id: "question-probe", status: "open" }, BARE_VIEW).allow, true);
 });

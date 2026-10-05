@@ -157,7 +157,7 @@ Rules:
 | norm       | `norm-`   | a standing convention or constraint (rides along in every project-relevant compile) |
 | briefing   | `brief-`  | a compiled briefing (output of this system; never traversed) |
 | correction | `corr-`   | standing fix to a briefing: pin/exclude/guidance (never traversed) |
-| question   | `question-` | a routed ask the graph could not answer (queueable; status `open`/`answered`, gated) |
+| question   | `question-` | a routed ask the graph could not answer (queueable; status `open`/`answered`, gated — `answered` needs a live answering node) |
 | person     | `person-` | a member of the org — mutable display name plus the identity anchor for `$viewer` binding and Tier-2 question routing (team mode; see "People, routing, and onboarding") |
 | organization | `org-` | a durable organization identity anchor; people connect with `member-of-org` for membership and `stewards` for org-admin authority (`org-root` remains the virtual graph-wide operator anchor) |
 | agent      | `agent-`  | a person-owned automation principal — a dispatched session's durable identity, owned by a person via an `owned-by` edge; its writes attribute "agent on behalf of person" (see "Agents") |
@@ -468,7 +468,7 @@ the full set *including* the give-up outcomes `abandoned`/`superseded`/
 `rejected`), and `status.resolver_required` (whether reaching that value also
 demands a live resolving `decision`/`artifact`, the completion-resolver
 invariant), with `status.resolver_types` naming WHICH node types count as that
-resolver (task/issue: `["decision", "artifact"]`; only legal beside
+resolver (task/issue: `["decision", "artifact"]`; question: any answering type; only legal beside
 `resolver_required: true`; read as `registry.resolverTypes(type)`,
 task-spor-registry-sole-terminal-status-source). **Declaring them gates nothing** — the hooks are still the only
 write door, and this is exactly why they are not a field list or an enforced

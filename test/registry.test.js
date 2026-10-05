@@ -714,7 +714,7 @@ test("seed pack: the completion policy is readable off the registry, per type", 
   assert.equal(reg.completionStatus("issue"), "resolved");
   assert.equal(reg.completionStatus("question"), "answered");
   assert.equal(reg.requiresCompletionResolver("task"), true);
-  assert.equal(reg.requiresCompletionResolver("question"), false);
+  assert.equal(reg.requiresCompletionResolver("question"), true);
   // several distinct outcomes, no single success -> no mechanical close
   assert.equal(reg.completionStatus("decision"), null);
   assert.equal(reg.completionStatus("artifact"), null);
