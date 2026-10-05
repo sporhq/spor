@@ -167,6 +167,105 @@ test("walkProgram: --max-depth stops expansion past the cap and sets truncated",
   assert.equal(full.truncated, false);
 });
 
+// ---------- kernel: member-of-program (dec-spor-program-membership-per-node-preference) ----------
+
+test("walkProgram: a blocks-only graph carries no membership fields (envelope unchanged)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-hub", "task"),
+    node("task-a", "task", { edges: [["blocks", "task-hub"]] }),
+  ])).load();
+  const r = walkProgram(g, "task-hub");
+  assert.deepEqual(Object.keys(r), ["found", "root_id", "root", "progress", "count", "truncated", "node_ids", "tree"]);
+  assert.deepEqual(Object.keys(r.tree[0]), ["id", "type", "title", "depth", "parent", "bucket", "repeat"]);
+});
+
+test("walkProgram: declared member-of-program edges are preferred over blocks at that node", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-hub", "task"),
+    // a member that does not gate the hub — invisible to a blocks-only walk
+    node("task-member", "task", { edges: [["member-of-program", "task-hub"]] }),
+    // a member that also gates it
+    node("task-both", "task", { status: "active", edges: [["member-of-program", "task-hub"], ["blocks", "task-hub"]] }),
+    // a prerequisite of the hub that is NOT part of the program
+    node("task-prereq", "task", { edges: [["blocks", "task-hub"]] }),
+  ])).load();
+  const r = walkProgram(g, "task-hub");
+  assert.deepEqual([...r.node_ids].sort(), ["task-both", "task-member"]);
+  assert.equal(r.root_edge, "member-of-program");
+  assert.ok(r.tree.every((t) => t.edge === "member-of-program"));
+  assert.equal(r.outside, 1);
+  assert.deepEqual(r.outside_ids, ["task-prereq"]);
+  // gating stays blocks-only: a member gating nothing is open, not blocked
+  assert.equal(r.tree.find((t) => t.id === "task-member").bucket, "open");
+  assert.equal(r.tree.find((t) => t.id === "task-both").bucket, "active");
+});
+
+test("walkProgram: the preference is per node — an unmigrated sub-hub falls back to blocks", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-hub", "task"),
+    node("task-sub", "task", { edges: [["member-of-program", "task-hub"]] }),
+    node("task-leaf", "task", { edges: [["blocks", "task-sub"]] }),
+  ])).load();
+  const r = walkProgram(g, "task-hub");
+  assert.deepEqual(r.node_ids, ["task-sub", "task-leaf"]);
+  const leaf = r.tree.find((t) => t.id === "task-leaf");
+  assert.equal(leaf.parent, "task-sub");
+  assert.equal(leaf.depth, 2);
+  assert.equal(leaf.edge, undefined); // reached over blocks
+  assert.equal(r.tree.find((t) => t.id === "task-sub").edge, "member-of-program");
+  // task-leaf blocks task-sub, which is undeclared — never "outside"
+  assert.equal(r.outside, undefined);
+  // and task-sub is blocked by its live gate
+  assert.equal(r.tree.find((t) => t.id === "task-sub").bucket, "blocked");
+});
+
+test("walkProgram: a blocker that is a member elsewhere in the tree is not outside", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-hub", "task"),
+    node("task-sub", "task", { edges: [["member-of-program", "task-hub"]] }),
+    // a member of the sub-milestone that ALSO blocks the top umbrella
+    node("task-x", "task", { edges: [["member-of-program", "task-sub"], ["blocks", "task-hub"]] }),
+  ])).load();
+  const r = walkProgram(g, "task-hub");
+  assert.deepEqual(r.node_ids, ["task-sub", "task-x"]);
+  assert.equal(r.outside, undefined);
+  assert.equal(r.outside_ids, undefined);
+});
+
+test("walkProgram: a truncated walk never names capped members as outside", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-hub", "task"),
+    node("task-sub", "task", { edges: [["member-of-program", "task-hub"]] }),
+    node("task-x", "task", { edges: [["member-of-program", "task-sub"], ["blocks", "task-hub"]] }),
+  ])).load();
+  for (const opts of [{ maxDepth: 1 }, { maxNodes: 1 }]) {
+    const r = walkProgram(g, "task-hub", opts);
+    assert.equal(r.truncated, true);
+    assert.equal(r.outside, undefined);
+    assert.equal(r.outside_ids, undefined);
+  }
+});
+
+test("walkProgram: a member-of-program cycle back to the root terminates", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-hub", "task", { edges: [["member-of-program", "task-a"]] }),
+    node("task-a", "task", { edges: [["member-of-program", "task-hub"]] }),
+  ])).load();
+  const r = walkProgram(g, "task-hub");
+  assert.deepEqual(r.node_ids, ["task-a"]);
+});
+
+test("renderReport: names blocking items outside a declared program", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-hub", "task"),
+    node("task-member", "task", { edges: [["member-of-program", "task-hub"]] }),
+    node("task-prereq", "task", { edges: [["blocks", "task-hub"]] }),
+  ])).load();
+  const text = programLib.renderReport(walkProgram(g, "task-hub"));
+  assert.match(text, /^ {2}open {4}task-member {2}Title of task-member$/m);
+  assert.match(text, /^ {2}1 blocking item outside the program: task-prereq$/m);
+});
+
 // ---------- façade: renderReport ----------
 
 test("renderReport: unknown root reports the attempted id", () => {
@@ -179,7 +278,7 @@ test("renderReport: an empty program says how to model one", () => {
   const g = tmpGraph(Object.fromEntries([node("task-hub", "task")])).load();
   const text = programLib.renderReport(walkProgram(g, "task-hub"));
   assert.match(text, /^program task-hub — Title of task-hub/);
-  assert.match(text, /nothing blocks this node yet/);
+  assert.match(text, /nothing hangs under this node yet/);
 });
 
 test("renderReport: a progress bar header plus an indented gating tree", () => {
@@ -412,7 +511,7 @@ test("program (remote): an explicit --nodes forces the local path even under a s
   try {
     const r = await runAsync(["program", "task-hub", "--nodes", g.nodesDir], remoteEnv(freshHome(), base));
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /nothing blocks this node yet/);
+    assert.match(r.stdout, /nothing hangs under this node yet/);
     assert.equal(hits.length, 0); // never reached the server
   } finally { srv.close(); }
 });

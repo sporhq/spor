@@ -144,8 +144,8 @@ spor compile --query "<text>"  # the full form → compiled neighborhood (--dige
 spor brief <id>                # a briefing for one node (compile --root <id>)
 spor analytics --type task,issue      # created-vs-completed metrics (local git history / GET /v1/analytics)
 spor changes [--since <sha|date>]     # recent-activity feed: what changed lately (local git log / GET /v1/changes)
-spor program <id> [--max-depth N] [--max-nodes N]   # birds-eye program/progress view over blocks topology
-                               #   (local walk of inbound blocks edges / GET /v1/program/{id}, render_program's CLI twin)
+spor program <id> [--max-depth N] [--max-nodes N]   # birds-eye program/progress view: member-of-program per
+                               #   node, falling back to blocks (local walk / GET /v1/program/{id}, render_program's CLI twin)
 spor query --type task --where status=open --ids   # structured node/edge enumeration (local nodes dir / GET /v1/export then query locally)
 spor check [--staged|--range <a..b>|--files <f...>] [--strict]   # coupling-drift report over a diff: coupling
                                #   norms (couples_when/couples_also, see concepts.md) whose triggers are

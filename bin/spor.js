@@ -3461,15 +3461,15 @@ function changesLocal(cfg, args) {
   return 0;
 }
 
-// program — the birds-eye program/progress view over `blocks` topology
-// (task-spor-cli-program-verb): given a root node other work `blocks` (an
-// umbrella task, a milestone), show the gating tree of everything that blocks
-// it with resolution-derived progress. Dual-mode, but NOT byte-shared like
+// program — the birds-eye program/progress view (task-spor-cli-program-verb):
+// given a root node (an umbrella task, a milestone), show the membership tree
+// of everything under it — inbound `member-of-program` edges per node, falling
+// back to `blocks` where a node declares none — with resolution-derived
+// progress. Dual-mode, but NOT byte-shared like
 // changes/analytics: remote mode dispatches to GET /v1/program/{id} and prints
 // the SERVER's own rendering straight through (like `spor lens`), since
 // render_program's view-tree shape is a separate, private server-side kernel;
-// local mode walks the local graph's inbound `blocks` edges itself
-// (lib/program.js) and renders through its own text renderer. An explicit
+// local mode walks the local graph itself (lib/program.js) and renders through its own text renderer. An explicit
 // --nodes names a local checkout, so it always takes the local path even under
 // a server.
 // The naive `args.find((a) => !a.startsWith("--"))` (cmdLens's convention) picks
@@ -3531,7 +3531,7 @@ async function programRemote(cfg, id, args) {
   return 0;
 }
 
-// The local arm: the `blocks`-edge gating-tree walk over the local nodes dir
+// The local arm: the membership-tree walk over the local nodes dir
 // (lib/program.js). --nodes overrides the resolved home; --json stamps
 // generated_at (the kernel stays time-free for deterministic tests). An
 // unknown root exits 1 with the same message the remote 404 arm uses.
@@ -18772,12 +18772,12 @@ const COMMANDS = {
   },
   program: {
     group: "Graph", parse: "raw", args: "<id> [--max-depth N] [--max-nodes N] [--json]",
-    summary: "birds-eye program/progress view over blocks topology",
+    summary: "birds-eye program/progress view over member-of-program/blocks topology",
     help:
-      "Show the program/progress view for a workstream: given a root node other\n" +
-      "work `blocks` (an umbrella task, a milestone), the gating tree of everything\n" +
-      "that blocks it — transitively over inbound `blocks` edges — with resolution-\n" +
-      "derived progress. `next` answers \"what's next\"; `program` answers \"how far\n" +
+      "Show the program/progress view for a workstream: given a root node (an\n" +
+      "umbrella task, a milestone), the tree of everything under it — transitively\n" +
+      "over inbound `member-of-program` edges at each node that declares any, else\n" +
+      "its inbound `blocks` edges — with resolution-derived progress. `next` answers \"what's next\"; `program` answers \"how far\n" +
       "along is the whole thing\". The shell front-door for the render_program MCP\n" +
       "tool / GET /v1/program/{id} (API.md §3).\n" +
       "\n" +
@@ -18786,14 +18786,15 @@ const COMMANDS = {
       "live node has its own unresolved live blocker; otherwise `active` (status:\n" +
       "active) or `open`. Remote mode dispatches to GET /v1/program/{id} and prints\n" +
       "the server's own rendering straight through; local mode walks the local\n" +
-      "graph's `blocks` edges itself. A shared blocker renders once per occurrence\n" +
-      "but counts once in the totals; an unknown root is an error. A root nothing\n" +
-      "blocks is a successful empty result — add `blocks` edges from the gating\n" +
-      "tasks to model the program (see /spor:spor \"Grouping work under an umbrella\n" +
-      "node\").\n" +
+      "graph itself. A shared member renders once per occurrence but counts once\n" +
+      "in the totals; an unknown root is an error. Blockers of a declared node that\n" +
+      "are nowhere in the tree are named as outside the program. A root with\n" +
+      "nothing under it is a successful empty result — add `member-of-program` (or\n" +
+      "`blocks`) edges from the work under it (see /spor:spor \"Grouping work under\n" +
+      "an umbrella node\").\n" +
       "\n" +
       "  <id>              the root node id (an umbrella task, a milestone)\n" +
-      "  --max-depth <N>   bound how many `blocks` hops out from the root are walked\n" +
+      "  --max-depth <N>   bound how many hops out from the root are walked\n" +
       "  --max-nodes <N>   bound the total distinct nodes visited\n" +
       "  --json            machine-readable envelope\n" +
       "  --nodes <dir>     read this local graph dir instead of the resolved home",
