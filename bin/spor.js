@@ -17242,7 +17242,7 @@ function codeWatchRef(loaded, { root = ROOT, targetRef = null } = {}) {
 // checkout, or a ref that has not moved, says nothing (byte-identical to
 // before the notice existed). Returns the new tip on the pass that says so,
 // undefined otherwise.
-function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {}, ref = null } = {}) {
+function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {}, ref = null, requireCodeChange = false } = {}) {
   let noticed = loaded ? loaded.commit : null;
   const watch = ref || codeWatchRef(loaded, { root });
   return () => {
@@ -17265,6 +17265,11 @@ function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {}, ref = null }
     noticed = now;
     if (!moved) return;
     log(`work: ${watch} in ${root} moved to ${now} — this worker still runs the code it loaded at ${loaded.commit}; restart it to pick the new code up`);
+    // A defaulted `--restart-on-land` (`requireCodeChange`) acts only on a land
+    // that changed the PUBLISHED code paths — the same `codePathsChanged` read
+    // `--status` uses — so a docs-only land never drains the worker. Only a
+    // definitive "identical" withholds it; an unanswerable read still drains.
+    if (requireCodeChange && codePathsChanged(loaded.commit, now, root) === false) return;
     // The tip moved past, for a caller that acts on it (`--restart-on-land`);
     // every other return above is undefined, so a caller that ignores it
     // sees nothing new.

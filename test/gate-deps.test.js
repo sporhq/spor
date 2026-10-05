@@ -838,7 +838,7 @@ test("a gate escalation carries worker_code and the Judged-by line; a host witho
   };
   const stamped = await file({ workerCodeIdentity: () => code }, "gate");
   assert.match(stamped.markdown, /\nworker_code: spor@1d3c104\n/);
-  assert.match(stamped.markdown, /Judged by `spor work` running `spor@1d3c104` \(main\) from \/srv\/spor/);
+  assert.match(stamped.markdown, /Judged by `spor work` running `spor@1d3c104` \(main\) —/);
   assert.strictEqual(stamped.deps.code, code, "the deps expose the loaded identity for the fact builders");
   const bare = await file({}, "gate");
   assert.doesNotMatch(bare.markdown, /worker_code|Judged by/);

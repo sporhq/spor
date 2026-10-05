@@ -2520,7 +2520,16 @@ not part of any node id and the occupant comparison ignores it, so a pipeline
 resumed on newer code adopts the facts older code already wrote. A caller with
 no code identity writes byte-identical nodes. The stamp is a label, not a
 signed claim: the attestation's digest and signature are over their own core
-and are unchanged.
+and are unchanged. The body line names the repo slug, commit and branch only —
+never the checkout's local path, which stays on the worker's status record for
+`--status` (a graph fact is shared).
+
+**A defaulted `--restart-on-land` ignores a docs-only land.** The drain applies
+the same `codePathsChanged` filter `--status` reads: when restart-on-land is on
+only by the self-hosting default, a land that changed nothing under the
+package's `files` paths (plus `package.json`) is noticed in the log but never
+drains the worker. An explicit `--restart-on-land` / `work.restartOnLand: true`
+drains on any land; an unanswerable git read still drains.
 
 **`spor work --status` says whether a worker is behind.** The worker's status
 record carries `code` (stamp, commit, branch, root, watched ref). For a LIVE

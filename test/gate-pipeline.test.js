@@ -12048,7 +12048,8 @@ test("a gate fact, a rescue fact and an integration fact carry the code that jud
   const bare = gateRunner.buildGateFact(base);
   assert.strictEqual(stamped.id, bare.id, "the stamp is not part of the fact's identity");
   assert.match(stamped.markdown, /\ndate: 2026-09-05\nworker_code: spor@1d3c104\nedges:\n/, "frontmatter carries worker_code beside the date");
-  assert.match(stamped.markdown, /Judged by `spor work` running `spor@1d3c104` \(main\) from \/srv\/spor — the code that worker had loaded at startup; a change to the gate code that landed on that checkout's ref after this commit was not running here\./);
+  assert.match(stamped.markdown, /Judged by `spor work` running `spor@1d3c104` \(main\) — the code that worker had loaded at startup; a change to the gate code that landed on that checkout's ref after this commit was not running here\./);
+  assert.doesNotMatch(stamped.markdown, /\/srv\/spor/, "the checkout's local path never reaches a graph fact");
   assert.doesNotMatch(bare.markdown, /worker_code|Judged by/);
   assert.strictEqual(gateRunner.buildGateFact({ ...base, code: null }).markdown, bare.markdown, "an explicit null is the bare fact");
   assert.strictEqual(gateRunner.buildGateFact({ ...base, code: { commit: null } }).markdown, bare.markdown, "an identity with no stamp says nothing");
@@ -12057,7 +12058,7 @@ test("a gate fact, a rescue fact and an integration fact carry the code that jud
   // says an upgrade (not a land) is what would not have been running.
   const installed = gateRunner.buildGateFact({ ...base, code: { stamp: "@sporhq/spor@0.28.1", commit: null, branch: null, root: "/usr/lib/node_modules/@sporhq/spor" } });
   assert.match(installed.markdown, /worker_code: @sporhq\/spor@0\.28\.1\n/);
-  assert.match(installed.markdown, /running `@sporhq\/spor@0\.28\.1` from \/usr\/lib\/node_modules\/@sporhq\/spor — an installed package; a later upgrade was not running here\./);
+  assert.match(installed.markdown, /running `@sporhq\/spor@0\.28\.1` — an installed package; a later upgrade was not running here\./);
 
   const entry = { n: 1, gate: "review", category: "environment", diagnosis: "the reviewer backend was out", fixed: false, filed: [] };
   const rescue = gateRunner.buildRescueFact({ nodeId: "task-demo", runId: "run-abcdef12", project: "demo", entry, factory: "factory-spor", date: "2026-09-05", code });

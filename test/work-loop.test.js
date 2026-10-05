@@ -3585,3 +3585,33 @@ test("spor work --status marks a LIVE worker whose watched ref moved past its co
   assert.strictEqual("stale" in byId.eeeeeeee.code, false, "a stopped worker is not judged");
   assert.strictEqual("code" in byId.ffffffff, false);
 });
+
+// A DEFAULTED --restart-on-land (requireCodeChange) must not drain on a land that
+// touched only docs — the same codePathsChanged read `--status` uses.
+test("makeCodeMovedNotice requireCodeChange: a docs-only land does not drain a defaulted worker; a code land does; explicit drains on any land", () => {
+  const { makeCodeMovedNotice, loadedCodeCommit } = require("../bin/spor.js");
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  const { execFileSync } = require("child_process");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-code-paths-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "package.json"), '{"name":"x","version":"0.0.1","files":["lib"]}\n');
+  fs.mkdirSync(path.join(repo, "lib"));
+  fs.writeFileSync(path.join(repo, "lib", "i.js"), "1\n");
+  fs.writeFileSync(path.join(repo, "NOTES.md"), "1\n");
+  g("add", "."); g("commit", "-q", "-m", "one");
+  const loaded = loadedCodeCommit(repo);
+  const lines = [];
+  const defaulted = makeCodeMovedNotice(loaded, { root: repo, log: (l) => lines.push(l), requireCodeChange: true });
+  const explicit = makeCodeMovedNotice(loaded, { root: repo, log: () => {} });
+  fs.writeFileSync(path.join(repo, "NOTES.md"), "2\n");
+  g("commit", "-q", "-am", "docs only");
+  assert.strictEqual(defaulted(), undefined, "a docs-only land does not drain a defaulted worker");
+  assert.strictEqual(lines.length, 1, "the notice still says the ref moved");
+  assert.strictEqual(explicit(), g("rev-parse", "--short", "HEAD"), "an explicit flag drains on any land");
+  fs.writeFileSync(path.join(repo, "lib", "i.js"), "2\n");
+  g("commit", "-q", "-am", "code");
+  assert.strictEqual(defaulted(), g("rev-parse", "--short", "HEAD"), "a land under the published paths drains");
+});
