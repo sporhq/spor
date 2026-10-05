@@ -20,9 +20,13 @@ const u = require("./util");
 const { classifyDigestIntent } = require("./prompt-context");
 
 // The detached worker has no active config; adopt the originating cwd's cascade
-// so a configured digest.intentApiKey (never spooled — a secret) is visible.
+// ONLY when a file-configured digest.intentApiKey (never spooled — a secret) is
+// there to find, so the no-key path reads exactly what it always did.
 const classify = (job) => {
-  if (job.cwd) u.useConfig({ cwd: job.cwd });
+  if (job.cwd && !u.cfgStr("digest.intentApiKey", "DIGEST_INTENT_API_KEY")) {
+    const cfg = require(require("path").join(u.ROOT, "lib", "config.js")).loadConfig({ cwd: job.cwd });
+    if (cfg.get("digest.intentApiKey")) u.useConfig({ cwd: job.cwd });
+  }
   return classifyDigestIntent(job);
 };
 

@@ -306,8 +306,11 @@ function spoolDigestIntent(graph, input, slug, prompt, digest) {
 // The verdict only ever REMOVES noise: the worker treats anything but an
 // explicit UNWARRANTED as inject, so a broken backend degrades to the shipped
 // inject-everything behavior instead of silently eating warranted digests.
+// Only an EXPLICIT digest key opts into the paid raw-API backend: an exported
+// ANTHROPIC_API_KEY (the user's other tools) must not silently move them off
+// `claude -p`.
 function digestIntentApiKey() {
-  return u.cfgStr("digest.intentApiKey", "DIGEST_INTENT_API_KEY") || process.env.ANTHROPIC_API_KEY || "";
+  return u.cfgStr("digest.intentApiKey", "DIGEST_INTENT_API_KEY") || "";
 }
 
 function classifyDigestIntent({ prompt, tplSha, session, slug, graph, timeoutMs, cmd, vars }) {

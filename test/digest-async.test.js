@@ -626,3 +626,80 @@ test("api key + a Jev-carrying response still decides synchronously, no API call
     await fake.close();
   }
 });
+
+test("an exported ANTHROPIC_API_KEY alone does NOT opt into the paid API", async () => {
+  const { root, home, cwd } = scratch();
+  const fake = await startFakeAnthropic();
+  const { dir, log } = claudeStubDir(root);
+  try {
+    promptContext(home, cwd, {
+      extraEnv: { ANTHROPIC_API_KEY: "sk-other-tool", ANTHROPIC_BASE_URL: fake.url, PATH: `${dir}${path.delimiter}${process.env.PATH}` },
+    });
+    assert.ok(await waitFor(() => outFiles(home).length === 1));
+    assert.strictEqual(fake.requests.length, 0);
+    assert.ok(fs.existsSync(log), "claude -p still the backend");
+  } finally {
+    await fake.close();
+  }
+});
+
+// anthropic-call.js, run directly: bounded and proxy-honouring on its own.
+function runCall(env) {
+  const { spawnSync } = require("child_process");
+  return spawnSync(process.execPath, [path.join(__dirname, "..", "scripts", "engines", "anthropic-call.js")], {
+    input: "classify this",
+    encoding: "utf8",
+    timeout: 20000,
+    env: { PATH: process.env.PATH, SPOR_ANTHROPIC_KEY: "k", ...env },
+  });
+}
+
+test("anthropic-call has its own request timeout", async () => {
+  const http = require("http");
+  const srv = http.createServer(() => {}); // never answers
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const { spawn } = require("child_process");
+    const child = spawn(process.execPath, [path.join(__dirname, "..", "scripts", "engines", "anthropic-call.js")], {
+      env: { PATH: process.env.PATH, SPOR_ANTHROPIC_KEY: "k", SPOR_ANTHROPIC_TIMEOUT_MS: "400", ANTHROPIC_BASE_URL: `http://127.0.0.1:${srv.address().port}` },
+    });
+    let err = "";
+    child.stderr.on("data", (c) => (err += c));
+    child.stdin.end("x");
+    const code = await new Promise((r) => child.on("exit", r));
+    assert.strictEqual(code, 1);
+    assert.match(err, /timed out/);
+  } finally {
+    srv.closeAllConnections?.();
+    srv.close();
+  }
+});
+
+test("anthropic-call honours HTTPS_PROXY: CONNECTs through it, and a refusal fails loudly", async () => {
+  const http = require("http");
+  const seen = [];
+  const proxy = http.createServer();
+  proxy.on("connect", (req, sock) => {
+    seen.push(req.url);
+    sock.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+  });
+  await new Promise((r) => proxy.listen(0, "127.0.0.1", r));
+  try {
+    const { spawn } = require("child_process");
+    const child = spawn(process.execPath, [path.join(__dirname, "..", "scripts", "engines", "anthropic-call.js")], {
+      env: { PATH: process.env.PATH, SPOR_ANTHROPIC_KEY: "k", HTTPS_PROXY: `http://127.0.0.1:${proxy.address().port}` },
+    });
+    let err = "";
+    child.stderr.on("data", (c) => (err += c));
+    child.stdin.end("x");
+    const code = await new Promise((r) => child.on("exit", r));
+    assert.strictEqual(code, 1);
+    assert.deepStrictEqual(seen, ["api.anthropic.com:443"]);
+    assert.match(err, /proxy CONNECT refused: HTTP 403/);
+  } finally {
+    proxy.close();
+  }
+  const dead = runCall({ HTTPS_PROXY: "http://127.0.0.1:1" });
+  assert.strictEqual(dead.status, 1);
+  assert.match(dead.stderr, /proxy:/);
+});

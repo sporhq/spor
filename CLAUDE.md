@@ -548,14 +548,19 @@ boot rather than the 4.6KB classification, so a flip wants a cheaper
 `digest.intentCmd` backend first, and a different backend is a different
 classifier that must be re-scored.
 **The cheap default backend (task-spor-digest-intent-cheap-default-backend):**
-with NO `digest.intentCmd` and an Anthropic key (`digest.intentApiKey` /
-`SPOR_DIGEST_INTENT_API_KEY`, else `ANTHROPIC_API_KEY`; a secret, stripped from
-repo `.spor.json`), `classifyDigestIntent` makes ONE raw Messages API call to
+with NO `digest.intentCmd` and an EXPLICIT Anthropic key (`digest.intentApiKey` /
+`SPOR_DIGEST_INTENT_API_KEY`; a secret, stripped from repo `.spor.json`;
+`ANTHROPIC_API_KEY` is deliberately NOT read, so a user who exports it for other
+tools never silently moves from `claude -p` to the paid API), `classifyDigestIntent` makes ONE raw Messages API call to
 haiku (`scripts/engines/anthropic-call.js`, zero-dep `https`, run as a child so
 the classifier stays synchronous; `ANTHROPIC_BASE_URL` redirects it) instead of
-booting `claude -p`. Precedence: explicit `intentCmd` > key > host default
+booting `claude -p`. The call has its OWN timeout (`SPOR_ANTHROPIC_TIMEOUT_MS`,
+default 30s, independent of `digest.intentTimeoutMs`=0) and honours
+`HTTPS_PROXY`/`NO_PROXY` via a CONNECT tunnel — an unusable proxy fails loudly
+into the llm-calls error, never a direct connection around it. Precedence: explicit `intentCmd` > key > host default
 (codex) > `claude -p --model haiku`. The key is resolved in the worker (which
-adopts the job's `cwd` cascade) and never written to the spool; the llm-calls
+adopts the job's `cwd` cascade only when a file-configured key exists, so the
+no-key path is byte-identical) and never written to the spool; the llm-calls
 record carries `backend: api:<model>`. A different backend is a different
 calibration: it must be scored with `scripts/intent-eval/run.js` before
 `digest.async` can default on, and no committed run certifies the API backend yet.

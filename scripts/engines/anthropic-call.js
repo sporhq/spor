@@ -14,6 +14,35 @@
 
 const http = require("http");
 const https = require("https");
+const tls = require("tls");
+
+// Its own bound, independent of the caller's (digest.intentTimeoutMs may be 0):
+// a hung connection can never outlive this.
+const REQUEST_TIMEOUT_MS = Number(process.env.SPOR_ANTHROPIC_TIMEOUT_MS) > 0 ? Number(process.env.SPOR_ANTHROPIC_TIMEOUT_MS) : 30000;
+
+function fail(msg) {
+  process.stderr.write(`anthropic-call: ${msg}\n`);
+  process.exit(1);
+}
+
+// HTTPS_PROXY support: CONNECT tunnel, then TLS to the API over the tunnel.
+// Plain-http targets (a local fake) go direct. A proxy we cannot use FAILS
+// loudly — never a silent direct connection around a mandated proxy.
+function proxyFor(base) {
+  if (base.protocol !== "https:") return null;
+  const raw = process.env.HTTPS_PROXY || process.env.https_proxy;
+  if (!raw) return null;
+  const noProxy = (process.env.NO_PROXY || process.env.no_proxy || "").split(",").map((x) => x.trim()).filter(Boolean);
+  if (noProxy.some((h) => h === "*" || base.hostname === h.replace(/^\./, "") || base.hostname.endsWith("." + h.replace(/^\./, "")))) return null;
+  let u;
+  try {
+    u = new URL(raw.includes("://") ? raw : `http://${raw}`);
+  } catch {
+    fail(`unusable HTTPS_PROXY`);
+  }
+  if (u.protocol !== "http:") fail(`unsupported HTTPS_PROXY scheme ${u.protocol}`);
+  return u;
+}
 
 const DEFAULT_MODEL = "claude-haiku-4-5-20251001";
 
@@ -34,20 +63,44 @@ function main() {
       messages: [{ role: "user", content: prompt }],
     });
     const mod = base.protocol === "http:" ? http : https;
-    const req = mod.request(
-      {
-        protocol: base.protocol,
-        hostname: base.hostname,
-        port: base.port || undefined,
-        path: `${base.pathname.replace(/\/+$/, "")}/v1/messages`,
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "content-length": Buffer.byteLength(body),
-          "x-api-key": key,
-          "anthropic-version": "2023-06-01",
-        },
+    const opts = {
+      protocol: base.protocol,
+      hostname: base.hostname,
+      port: base.port || undefined,
+      path: `${base.pathname.replace(/\/+$/, "")}/v1/messages`,
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body),
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
       },
+    };
+    setTimeout(() => fail(`timed out after ${REQUEST_TIMEOUT_MS}ms`), REQUEST_TIMEOUT_MS);
+    const proxy = proxyFor(base);
+    if (!proxy) return send(mod, opts, body);
+    const target = `${base.hostname}:${base.port || 443}`;
+    const pheaders = { host: target };
+    if (proxy.username) {
+      pheaders["proxy-authorization"] =
+        "Basic " + Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64");
+    }
+    const creq = http.request({ hostname: proxy.hostname, port: proxy.port || 80, method: "CONNECT", path: target, headers: pheaders });
+    creq.on("error", (e) => fail(`proxy: ${e.message}`));
+    creq.on("connect", (cres, socket) => {
+      if (cres.statusCode !== 200) fail(`proxy CONNECT refused: HTTP ${cres.statusCode}`);
+      const tlsSock = tls.connect({ socket, servername: base.hostname });
+      tlsSock.on("error", (e) => fail(`tls: ${e.message}`));
+      send(mod, { ...opts, createConnection: () => tlsSock, agent: false }, body);
+    });
+    creq.end();
+  });
+}
+
+function send(mod, opts, body) {
+  {
+    const req = mod.request(
+      opts,
       (res) => {
         let raw = "";
         res.setEncoding("utf8");
@@ -69,12 +122,9 @@ function main() {
         });
       }
     );
-    req.on("error", (e) => {
-      process.stderr.write(`anthropic-call: ${e.message}\n`);
-      process.exit(1);
-    });
+    req.on("error", (e) => fail(e.message));
     req.end(body);
-  });
+  }
 }
 
 main();
