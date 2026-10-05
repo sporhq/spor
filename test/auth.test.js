@@ -974,6 +974,15 @@ test('cli: config explain renders an empty --org through the shared refusal line
   assert.doesNotMatch(r.stdout, /org '' \(from/);
 });
 
+test('cli: config explain in an agent run renders an empty --org as empty, not as a missing credential', async () => {
+  const home = tmp();
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: fakeJwt({ org: 'acme' }), SPOR_AGENT_RUN: '1' };
+  const r = await runAsync(['--org', '', 'config', 'explain'], env);
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.match(r.stdout, /tenant: +REFUSED — --org given an empty value\n/);
+  assert.doesNotMatch(r.stdout, /no stored credential|stored:/);
+});
+
 // The last door (task-spor-agent-run-no-store-token-fallback): a server with
 // NO bearer. The person's cascade pairs `--server`/SPOR_SERVER with the store's
 // credential for that server (tokenForServer) or the flat config `token`, and
