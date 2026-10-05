@@ -3289,6 +3289,12 @@ test("an already-launched fix cycle is adopted on resume, never dispatched a sec
   await deps.saveGateProgress({ gate, progress: { fixes: 1, attempts: [{}, {}], ledger: [], lastFix: { cycle: 1, runId: null, dispatched: false, fromHead: "abc", toHead: null } } });
   const other = await deps.loadGateProgress({ gate });
   assert.deepStrictEqual([other.fixes, other.lastFix.dispatched, other.lastFix.runId], [1, false, "fix-run-2"], "the stamp names cycle 2; cycle 1's pending fix stays pending (the run id still rides for the record)");
+  // …nor does the stamp of a fixer the progress already recorded as OUTAGED
+  // (issue-spor-fix-outage-redispatch-resume-skips-pending-redispatch): that
+  // launch is the dead run's, and the re-dispatch is still owed.
+  await deps.saveGateProgress({ gate, progress: { fixes: 2, attempts: [{}, {}, {}], ledger: [], lastFix: { cycle: 2, runId: null, dispatched: false, fromHead: "abc", toHead: null, outagedRunId: "fix-run-2" } } });
+  const outaged = await deps.loadGateProgress({ gate });
+  assert.deepStrictEqual([outaged.fixes, outaged.lastFix.dispatched, outaged.lastFix.runId], [2, false, null], "the dead run's stamp does not launder the owed re-dispatch");
   const foreign = await deps.loadGateProgress({ gate: { id: "acceptance" } });
   assert.strictEqual(foreign, null);
   fs.rmSync(home, { recursive: true, force: true });
@@ -7947,16 +7953,22 @@ test("a fix-outage stop leaves the progress shape a RESUME expects — it does n
   const outaged = mk(() => ({ ok: true, runId: "run-fix-1", classification: { outcome: "infrastructure", pool: "retry", reason: "credit-exhausted" } }));
   await gateRunner.runGatePipeline({ item: ITEM, factory, deps: outaged.deps });
   const afterOutage = saved.get("review");
-  // The fix LAUNCHED, so `fixes` counts it and `attempts` holds one entry per
-  // review: `attempts.length === fixes - base` is the shape a resume reads as
-  // "the fix ran, ask the review again", never as a stray entry to roll back.
-  assert.strictEqual(afterOutage.attempts.length, afterOutage.fixes, "no stray attempt entry for the resume to roll back");
-  assert.strictEqual(afterOutage.lastFix.dispatched, true);
+  // The fix LAUNCHED but OUTAGED with the tree untouched, so the cycle was
+  // never spent: the progress is the PENDING-fix shape (`fixes` uncounted,
+  // one attempt per review, `lastFix.dispatched: false` naming the dead run),
+  // which a resume reads as "re-dispatch the fix" — under the pool's count,
+  // so a resume after a spent pool adopts the dead run by name rather than
+  // launching a second fixer — never as "the fix ran, ask the review again"
+  // (issue-spor-fix-outage-redispatch-resume-skips-pending-redispatch), and
+  // never as a stray entry to roll back.
+  assert.strictEqual(afterOutage.fixes, 0, "an outaged fixer does not spend the cycle");
+  assert.strictEqual(afterOutage.attempts.length, afterOutage.fixes + 1, "no stray attempt entry for the resume to roll back");
+  assert.strictEqual(afterOutage.lastFix.dispatched, false);
+  assert.strictEqual(afterOutage.lastFix.outagedRunId, "run-fix-1");
 
-  // The other refusal path — the fix that could not be DISPATCHED — legitimately
-  // leaves a different shape (`fixes` uncounted, `lastFix.dispatched: false`),
-  // which is the pending-fix shape the resume dispatches from. Pinned so a
-  // change to either path has to say which one it meant.
+  // The other refusal path — the fix that could not be DISPATCHED — leaves the
+  // same pending-fix shape the resume dispatches from. Pinned so a change to
+  // either path has to say which one it meant.
   saved.clear();
   shapes.length = 0;
   const refused = mk(() => ({ ok: false, reason: "cannot dispatch: unsatisfiable", classification: { outcome: "unroutable", pool: null, reason: "cannot dispatch: unsatisfiable" } }));

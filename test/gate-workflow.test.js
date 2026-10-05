@@ -1199,3 +1199,143 @@ test("a ONE-SHOT rescue that launched and then ended in an infrastructure outage
     assert.equal(world.pools.retry.spent, spent);
   }
 });
+
+// THE OUTAGE RETRY POOL, CONVERGENCE MATRIX
+// (issue-spor-fix-outage-redispatch-resume-skips-pending-redispatch): every
+// lane that re-dispatches on the shared infrastructure pool (§4.2 G6) — the
+// fix cycle and the rescue, each on the signal and the one-shot form — under
+// every outage event — a launch REFUSED outage-classified, a run that
+// LAUNCHED and then outaged with the tree untouched, and a pool SPENT by a
+// second outage (launched or refused) — must settle to the SAME outcome
+// however it is interrupted: not at all; a stop DURING the outage backoff (the
+// pipeline yields and the next pass resumes from the durable progress, rescue
+// state and pool); or a worker that dies right AFTER the re-dispatch launched
+// (the journal replays to it). A fix saved as launched before the outage
+// decision settled used to resume PAST the owed re-dispatch and re-review an
+// unchanged tree.
+{
+  const INFRA = { outcome: "infrastructure", pool: "retry", reason: "credit-exhausted" };
+  const RETRY = { profile: "profile-impl", retry: { attempts: 1, backoff_ms: 60000 } };
+  const LANES = {
+    "fix/signal": { lane: "fix", oneShot: false, factory: factoryOf({ ...BASE, gates: GATES, implementation: RETRY }) },
+    "fix/one-shot": { lane: "fix", oneShot: true, factory: factoryOf({ ...BASE, gates: GATES, implementation: RETRY }) },
+    "rescue/signal": { lane: "rescue", oneShot: false, factory: factoryOf({ ...BASE, gates: [GATES[0], { ...GATES[1], cycles: 0 }], rescue: { profile: "profile-rescue", attempts: 1 }, implementation: RETRY }) },
+    "rescue/one-shot": { lane: "rescue", oneShot: true, factory: factoryOf({ ...BASE, gates: [GATES[0], { ...GATES[1], cycles: 0 }], rescue: { profile: "profile-rescue", attempts: 1 }, implementation: RETRY }) },
+  };
+  // What the lane's dispatch at each retry count does (the last entry repeats).
+  const EVENTS = {
+    refused: ["refuse", "ok"],
+    outaged: ["outage", "ok"],
+    "spent-outaged": ["outage", "outage"],
+    "spent-refused": ["refuse", "refuse"],
+  };
+  const EXPECT = {
+    refused: { state: "passed", spent: 1 },
+    outaged: { state: "passed", spent: 1 },
+    "spent-outaged": { state: "failed", spent: 1 },
+    "spent-refused": { state: "failed", spent: 1 },
+  };
+
+  // A world whose lane dispatch follows the event plan, keyed on the retry
+  // count (so a re-executed or re-adopted dispatch answers as it first did):
+  // an outaged run leaves the head where it was, a clean one moves it.
+  const outageWorld = ({ clock, spec, plan, home = null }) => {
+    const world = makeWorld({ clock, script: { factory: spec.factory, rescuePasses: true }, home });
+    world.attempts = [];
+    world.stuck = 0;
+    world.runs = new Map();
+    world.deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head: `head-v${1 + world.launched.size - world.stuck}`, base: "base0000", trustedRef: "main", trustedSha: "trust000", branch: "task-demo", cwd: "/repo/wt" });
+    const launch = (name, retry, kind) => {
+      world.attempts.push(name);
+      if (plan[Math.min(retry, plan.length - 1)] === "refuse") return { ok: false, reason: "the harness refused to start", classification: INFRA };
+      if (world.launched.has(name)) return { ok: true, runId: world.launched.get(name), adopted: true };
+      const runId = `${kind}-run-${world.launched.size + 1}`;
+      const outaged = plan[Math.min(retry, plan.length - 1)] === "outage";
+      world.launched.set(name, runId);
+      if (outaged) world.stuck += 1;
+      const payload = { ok: true, classification: outaged ? INFRA : { outcome: "resolved" } };
+      world.runs.set(runId, payload);
+      if (!spec.oneShot) world.signals.push({ name: `${kind === "fix" ? "run" : "rescue-run"}:${runId}`, payload });
+      return { ok: true, runId };
+    };
+    const report = { diagnosis: "d", category: "real-defect", fixed: true, filed: [], unread: false };
+    world.deps.awaitRun = async ({ runId }) => ({ runId, ...world.runs.get(runId) });
+    const fixName = ({ gate, cycle, retry = 0 }) => `fix-${gate.id}-${cycle}${retry > 0 ? `-t${retry}` : ""}`;
+    const rescueName = ({ attempt, retry = 0 }) => `rescue-${attempt}${retry > 0 ? `-t${retry}` : ""}`;
+    if (spec.lane === "fix" && !spec.oneShot) world.deps.dispatchFix = async (a) => launch(fixName(a), a.retry || 0, "fix");
+    if (spec.lane === "rescue" && !spec.oneShot) world.deps.dispatchRescue = async (a) => launch(rescueName(a), a.retry || 0, "rescue");
+    if (spec.oneShot) {
+      const named = spec.lane === "fix" ? fixName : rescueName;
+      delete world.deps[spec.lane === "fix" ? "dispatchFix" : "dispatchRescue"];
+      world.deps[spec.lane] = async (a) => {
+        const l = launch(named(a), a.retry || 0, spec.lane);
+        if (!l.ok) return l;
+        if (a.onLaunch) await a.onLaunch({ runId: l.runId });
+        return { ok: true, runId: l.runId, classification: world.runs.get(l.runId).classification, ...(spec.lane === "rescue" ? report : {}) };
+      };
+    }
+    return world;
+  };
+  const summary = (world, result) => ({ state: result.state, attempts: world.attempts, spent: world.pools.retry.spent, reviews: world.reviews.length, escalations: world.escalations });
+
+  // No interruption, driven by the real driver.
+  const uninterrupted = async (spec, plan) => {
+    const clock = fakeClock(1_700_000_000_000);
+    const world = outageWorld({ clock, spec, plan });
+    return summary(world, await gateRunner.runGatePipeline({ item: ITEM, factory: spec.factory, deps: world.deps }));
+  };
+  // A stop lands the moment the pool is charged (inside the backoff): the
+  // pipeline yields over the file journal, and the loop re-offers it after
+  // the timer — the next pass reads the progress, the rescue state and the
+  // pool back.
+  const duringBackoff = async (spec, plan) => {
+    const clock = fakeClock(1_700_000_000_000);
+    const world = outageWorld({ clock, spec, plan, home: scratchHome("outage-matrix") });
+    let stops = 1;
+    world.deps.stopping = () => stops > 0 && world.pools.retry.spent >= 1;
+    const first = await gateRunner.runGatePipeline({ item: ITEM, factory: spec.factory, deps: world.deps });
+    assert.equal(first.state, "interrupted", JSON.stringify(first));
+    assert.match(first.reason, /outage/);
+    stops = 0;
+    for (let drives = 0; ; drives++) {
+      assert.ok(drives < 5, "the resumed pipeline settles");
+      clock.advanceBy(wf.YIELD_MS + 60000 + 1);
+      const r = await gateRunner.runGatePipeline({ item: { ...ITEM, resumed: true }, factory: spec.factory, deps: world.deps });
+      if (r.state !== "interrupted") return summary(world, r);
+    }
+  };
+  // The worker dies right after the re-dispatch (the -t1 launch) is journaled.
+  const afterRelaunch = async (spec, plan) => {
+    const probeClock = fakeClock(1_700_000_000_000);
+    const probe = outageWorld({ clock: probeClock, spec, plan });
+    await drive(exec(probe, probeClock, { factory: spec.factory }), { clock: probeClock, signals: probe.signals });
+    const nth = probe.effects.findIndex((x) => /\/t1(\/|#)/.test(x.key) && ["dispatchFix", "dispatchRescue", "fix", "rescue"].includes(x.name)) + 1;
+    assert.ok(nth > 0, `the re-dispatch is an activity: ${probe.effects.map((x) => x.key).join(" ")}`);
+    const clock = fakeClock(1_700_000_000_000);
+    const world = outageWorld({ clock, spec, plan });
+    let crashed = 0;
+    const r = await drive(exec(world, clock, { factory: spec.factory, crashPlan: { at: "after-journal", nth } }), { clock, signals: world.signals, onCrash: () => crashed++ });
+    assert.equal(crashed, 1);
+    assert.equal(r.status, "completed", JSON.stringify(r));
+    return summary(world, r.result);
+  };
+
+  for (const [laneName, spec] of Object.entries(LANES)) {
+    for (const [event, plan] of Object.entries(EVENTS)) {
+      test(`outage retry pool matrix — ${laneName} × ${event}: uninterrupted, stopped during the backoff, and killed after the re-dispatch all converge`, async () => {
+        const reference = await uninterrupted(spec, plan);
+        const name = spec.lane === "fix" ? "fix-review-0" : "rescue-1";
+        assert.deepEqual(
+          { state: reference.state, spent: reference.spent, attempts: reference.attempts },
+          { ...EXPECT[event], attempts: [name, `${name}-t1`] },
+          "the reference: one charge of the pool, the re-dispatch under -t1, never the dead run's name"
+        );
+        if (EXPECT[event].state === "passed") assert.equal(reference.escalations.length, 0);
+        else assert.equal(reference.escalations.length, 1, "a spent pool settles as the refusal, escalated");
+        if (spec.lane === "fix") assert.equal(reference.reviews, EXPECT[event].state === "passed" ? 2 : 1, "no review of a tree the outaged fixer left untouched");
+        assert.deepEqual(await duringBackoff(spec, plan), reference, "stopped during the outage backoff");
+        assert.deepEqual(await afterRelaunch(spec, plan), reference, "killed after the re-dispatch launched");
+      });
+    }
+  }
+}
