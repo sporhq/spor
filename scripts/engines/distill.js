@@ -723,7 +723,7 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
         id, type, repo: stamp,
         title: title.replace(/\n/g, " "), summary: summary.replace(/\n/g, " "),
         date: u.localDate(), authored_via: "capture", capture_key: key, body: text,
-      });
+      }, { rawBody: true });
 
     // Settled | free | torn | taken, decided by READING the occupant rather
     // than by its existence. Unreadable is none of those — it is transient, so
@@ -754,7 +754,7 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
       // The BODY specifically, not the raw file: the frontmatter's `summary`
       // is the finding's own first line, so a whole-file match would call an
       // empty body settled on any single-fact capture.
-      return String(parsed.body || "").includes(facts.trim()) ? "settled" : "torn";
+      return String(parsed.body || "").includes(facts) ? "settled" : "torn";
     };
 
     let settledAs = null;

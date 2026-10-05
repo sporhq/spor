@@ -4195,7 +4195,7 @@ async function cmdAdd(cfg, { values, positionals }) {
     title: title.replace(/\n/g, " "), summary: summary.replace(/\n/g, " "),
     ...(neededBy ? { needed_by: neededBy } : {}),
     date: today(), edges: addEdges, body: prose,
-  });
+  }, { edgesBefore: "date", rawBody: true });
   // validate before writing (parse, then the same rules lib/validate enforces)
   let node;
   try {
@@ -4363,7 +4363,7 @@ async function cmdAsk(cfg, { values, positionals }) {
     title: titleText.replace(/\n/g, " "), summary: summary.replace(/\n/g, " "),
     status: "open", date: today(),
     edges: localMentions.map((m) => ({ type: "mentions", to: m })), body: text,
-  });
+  }, { edgesBefore: "date", rawBody: true });
   let node;
   try {
     node = graphLib.parseFrontmatter(md, `${id}.md`);
@@ -6403,7 +6403,7 @@ async function cmdInvite(cfg, { values }) {
       id: person, type: "person", title: safeName, name: safeName,
       summary: `Team member ${safeName}.`, email, date: today(),
       body: `Team member ${safeName} <${email}>.`,
-    });
+    }, { rawBody: true });
     const pr = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: md, if_exists: "skip" }] });
     if (pr.transport) {
       err(`offline — could not reach server (${pr.error})`);
@@ -6559,7 +6559,7 @@ async function cmdPersonCreate(cfg, { name, email, id }) {
     summary: `Org member ${safeName} <${safeEmail}> — the local $viewer identity anchor for this graph's queue.`,
     email: safeEmail, date: today(),
     body: `Org member ${safeName} <${safeEmail}>. Created locally by \`spor person create\`; the git-identity ($viewer) anchor the local queue and queue_mute bind to (lib/queue.js viewerFor).`,
-  });
+  }, { rawBody: true });
   let node;
   try {
     node = graphLib.parseFrontmatter(md, `${id}.md`);
@@ -6885,7 +6885,7 @@ async function cmdAgentCreateLocal(cfg, { label, owner, pubkey }) {
     spiffe, pubkey: pubkey.replace(/\n/g, " "), status: "active", date: today(),
     edges: [{ type: "owned-by", to: ownerId }],
     body: "Person-owned automation principal (dec-spor-agent-identity-nodes). Created by `spor agent create`; reused across dispatches as this machine's durable identity.",
-  });
+  }, { rawBody: true });
   let node;
   try {
     node = graphLib.parseFrontmatter(md, `${id}.md`);
