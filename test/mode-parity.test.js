@@ -95,6 +95,11 @@ const CASES = [
   { verb: "next", args: ["next", "--project", "alpha"] },
   { verb: "next", args: ["next", "--project", "beta", "--limit", "1"] },
   { verb: "next", args: ["next", "--project", "zzz-unknown"] },
+  // projectKnown/unknownProjectWarning parity (task-spor-project-known-client-server-parity-shared-predicate):
+  // "alpha" above is a stamp-only token (no repo node) — known via the stamped half;
+  // an arbitrary node id and a prototype key are neither identity nor stamp.
+  { verb: "next", args: ["next", "--project", "task-blocked"] },
+  { verb: "next", args: ["next", "--project", "constructor"] },
   { verb: "next", args: ["next", "--readiness", "agent"] },
   { verb: "next", args: ["next", "--readiness", "human,untriaged", "--limit", "2"] },
   { verb: "next", args: ["next", "--type", "task", "--exclude-type", "question"] },
@@ -102,6 +107,8 @@ const CASES = [
   { verb: "analytics", args: ["analytics"] },
   { verb: "analytics", args: ["analytics", "--project", "alpha", "--weeks", "4"] },
   { verb: "analytics", args: ["analytics", "--project", "zzz-unknown"] },
+  { verb: "analytics", args: ["analytics", "--project", "task-blocked"] },
+  { verb: "analytics", args: ["analytics", "--project", "constructor"] },
   { verb: "analytics", args: ["analytics", "--type", "task", "--top", "3"] },
   { verb: "program", args: ["program", "task-blocked"] },
   { verb: "program", args: ["program", "task-blocked", "--max-depth", "0"] },
