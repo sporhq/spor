@@ -1489,10 +1489,26 @@ test('install --server/--token persists creds to user config', () => {
   const home = scratchHome();
   const r = run(['install', 'codex', '--server', 'http://127.0.0.1:9/', '--token', 'tok9'], { ...codexInstallEnv(home), SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
-  const cfg = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
-  assert.strictEqual(cfg.server, 'http://127.0.0.1:9'); // trailing slash trimmed
-  assert.strictEqual(cfg.token, 'tok9');
+  // the token lands in the credential store, never as a flat config.json token
+  const store = JSON.parse(fs.readFileSync(path.join(home, 'auth', 'credentials.json'), 'utf8'));
+  const t = Object.values(store.tenants);
+  assert.strictEqual(t.length, 1);
+  assert.strictEqual(t[0].server, 'http://127.0.0.1:9'); // trailing slash trimmed
+  assert.strictEqual(t[0].access_token, 'tok9');
+  assert.ok(!fs.existsSync(path.join(home, 'config.json')), 'no flat config.json written for a token');
   assert.ok(fs.existsSync(path.join(home, '.codex', 'hooks.json')), 'host still installed');
+});
+
+test('install --server alone writes a flat server key, keeping existing keys and file mode', () => {
+  const home = scratchHome();
+  const cf = path.join(home, 'config.json');
+  fs.writeFileSync(cf, JSON.stringify({ keep: 1 }), { mode: 0o640 });
+  fs.chmodSync(cf, 0o640);
+  const r = run(['install', 'codex', '--server', 'http://127.0.0.1:9/'], { ...codexInstallEnv(home), SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const cfg = JSON.parse(fs.readFileSync(cf, 'utf8'));
+  assert.deepStrictEqual(cfg, { keep: 1, server: 'http://127.0.0.1:9' });
+  if (process.platform !== 'win32') assert.strictEqual(fs.statSync(cf).mode & 0o777, 0o640);
 });
 
 test('install codex stops before hook guidance when marketplace registration fails', () => {

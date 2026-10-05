@@ -82,7 +82,7 @@ test('aliases: a flat alias inherits the class of the auth subcommand it runs', 
 // declare `access` — a new verb or alias wired straight to cmdAuthLogout & co.
 // cannot ship unclassified.
 test('lint: every COMMANDS entry that reaches a credential-store primitive declares an access class', () => {
-  const PRIMITIVE = /\bauth\.(readStore|writeStore|upsertTenant|setDefault|removeTenant|clearAll)\(|\bwriteServerToken\(/;
+  const PRIMITIVE = /\bauth\.(readStore|writeStore|upsertTenant|setDefault|removeTenant|clearAll)\(|\bpersistInstallCredentials\(/;
   const bodies = new Map();
   const re = /^(?:async\s+)?function\s+([A-Za-z0-9_$]+)\s*\(/gm;
   const starts = [];

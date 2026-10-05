@@ -16,6 +16,7 @@
 const fs = require("fs");
 const path = require("path");
 const u = require("./util");
+const auth = require("../../lib/auth.js");
 
 // "Nd Nh ago" / "Nh Nm ago" / "Nm ago" / "Ns ago" from an epoch-ms instant.
 // null/NaN -> "unknown"; a future instant (clock skew) -> "just now".
@@ -87,6 +88,19 @@ function cacheReport(cacheDir) {
   return out;
 }
 
+// A 401 on a flat env bearer (SPOR_TOKEN, typically pasted into Claude Code's
+// settings.json) while the credential store holds a tenant for the SAME server
+// is the stale-env-token trap: `spor auth login` refreshed the store, but the
+// hooks keep sending the env token that shadows it. Returns the stored tenant's
+// org label, or null when the env carries no token / the store has none here.
+function staleEnvBearer(serverBase) {
+  if (!u.envDual("TOKEN")) return null;
+  const want = auth.normServer(serverBase);
+  const store = auth.readStore(u.userConfigHome());
+  const hit = Object.values(store.tenants).find((t) => t && auth.normServer(t.server) === want && t.access_token);
+  return hit ? hit.org || "(no org)" : null;
+}
+
 async function doctor() {
   const graph = u.graphHome();
   const cfg = u.config();
@@ -113,7 +127,13 @@ async function doctor() {
       kv("token", token ? "present (cannot validate while the server is unreachable)" : "MISSING — set SPOR_TOKEN");
     } else if (probe.http === "401" || probe.http === "403") {
       kv("reachable", `yes (${host})`);
-      kv("token", `REJECTED (http ${probe.http}) — invalid, revoked, or expired; re-mint it and update SPOR_TOKEN`);
+      const stale = staleEnvBearer(u.serverBase());
+      kv(
+        "token",
+        stale
+          ? `REJECTED (http ${probe.http}) — the SPOR_TOKEN in your environment (e.g. settings.json) is stale and shadows the stored ${stale} credential for ${host}; remove it, or re-mint it and update SPOR_TOKEN`
+          : `REJECTED (http ${probe.http}) — invalid, revoked, or expired; re-mint it and update SPOR_TOKEN`
+      );
     } else if (probe.http === "200") {
       let n = null;
       try {

@@ -71,6 +71,7 @@ function lazyModule(id) {
 const { loadConfig, DEFAULT_SERVER, describeTenantRefusal } = require(path.join(ROOT, "lib", "config.js"));
 const remote = require(path.join(ROOT, "lib", "remote.js"));
 const auth = require(path.join(ROOT, "lib", "auth.js"));
+const { editUserConfig } = require(path.join(ROOT, "lib", "shell", "user-config.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const { gitSpawn, gitOracle } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 const { writeSpoolFile } = require(path.join(ROOT, "lib", "shell", "spool.js"));
@@ -5414,22 +5415,34 @@ async function cmdLease(cfg, action, { positionals, values = {} }) {
   return 0;
 }
 
-// Persist server/token into the USER config (never a committable repo config).
-// Shared by 'join' and the 'install --server/--token' configure step. Only the
-// keys given are touched, so a token-only update keeps the existing server.
-function writeServerToken(home, server, token) {
-  const cfgFile = path.join(home, "config.json");
-  let data = {};
-  try {
-    data = JSON.parse(fs.readFileSync(cfgFile, "utf8")) || {};
-  } catch {
-    /* absent or malformed — start fresh */
+// Persist the 'install --server/--token' configure step into the USER config
+// (never a committable repo config). A TOKEN goes to the credential store — the
+// shape 'spor auth login' writes and the cascade prefers — keyed to the server
+// given, else the one already resolved; it is never written as a flat
+// config.json token. A server with no token is the one flat write left (a bare
+// `server` key), made through the shared atomic, mode-preserving user-config
+// writer. Returns the files written.
+function persistInstallCredentials(cfg, server, token) {
+  const home = cfg.userConfigHome();
+  const written = [];
+  server = server ? auth.normServer(server) : "";
+  if (token) {
+    const target = server || auth.normServer(cfg.serverForNewTenant() || "");
+    if (!target) throw new Error("--token needs a server — pass --server <url> (or run 'spor join <url> <token>')");
+    // makeDefault left unset: the first tenant becomes active, an existing
+    // default is not stolen (the same rule 'spor join' applies).
+    auth.upsertTenant(home, { server: target, access_token: token, org: cfg.flagOrg() || undefined });
+    written.push(auth.credentialsPath(home));
+  } else if (server) {
+    const r = editUserConfig(home, (data) => {
+      if (data.server === server) return false;
+      data.server = server;
+      return undefined;
+    });
+    if (r.malformed) throw new Error(`${r.file} is not valid JSON — left untouched`);
+    if (r.wrote) written.push(r.file);
   }
-  if (server) data.server = server.replace(/\/+$/, "");
-  if (token) data.token = token;
-  fs.mkdirSync(home, { recursive: true });
-  fs.writeFileSync(cfgFile, JSON.stringify(data, null, 2) + "\n");
-  return cfgFile;
+  return written;
 }
 
 // A positional that looks like an auth token, not a server URL — the prefixes
@@ -8161,8 +8174,8 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
   const token = values.token;
   if ((server || token) && !dryRun) {
     try {
-      const f = writeServerToken(cfg.userConfigHome(), server, token);
-      out(`wrote ${[server && "server", token && "token"].filter(Boolean).join(" + ")} to ${f}`);
+      const files = persistInstallCredentials(cfg, server, token);
+      out(`wrote ${[server && "server", token && "token"].filter(Boolean).join(" + ")} to ${files.join(", ") || "(already current)"}`);
       // Reload so --mcp / the "next:" trailer below see the creds just
       // written, instead of the pre-write snapshot cfg was constructed from
       // (Config resolves its cascade once at load time, not per-get).

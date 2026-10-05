@@ -16,6 +16,7 @@ const CODEX_NUDGE_MODEL = "gpt-5.4-mini";
 const home = require(path.join(ROOT, "lib", "shell", "home.js"));
 const { writeFileAtomic } = require(path.join(ROOT, "lib", "shell", "atomic-write.js"));
 const spool = require(path.join(ROOT, "lib", "shell", "spool.js"));
+const { editUserConfig } = require(path.join(ROOT, "lib", "shell", "user-config.js"));
 const tokenizer = require(path.join(ROOT, "lib", "kernel", "tokenizer.js"));
 const { untilAborted } = require(path.join(ROOT, "lib", "shell", "abort.js"));
 const { gitEnv, gitSpawn, gitToplevelAndCommonDir } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
@@ -969,38 +970,18 @@ function ensureGraphGitignore(graphHomeDir) {
 // never-committed file that holds server/token — so they never land in a
 // committable repo .spor.json. Written only by explicit verbs — `spor enable`,
 // `spor repos`, `spor dispatch` — never by a hook; fail-open throughout.
-function userConfigPath(graphHomeDir) {
-  return path.join(graphHomeDir, "config.json");
-}
 // Read-modify-write $SPOR_HOME/config.json, applying `mutate(repos)` to the
 // nested dispatch.repos object. Preserves every other key. Returns true only
 // when it actually wrote. Refuses to clobber a present-but-malformed config
 // (returns false) so a syntax error never costs the user their settings.
 function editRepoMap(graphHomeDir, mutate) {
   try {
-    const file = userConfigPath(graphHomeDir);
-    let raw = null;
-    try {
-      raw = fs.readFileSync(file, "utf8");
-    } catch {
-      raw = null; // absent — start fresh
-    }
-    let data = {};
-    if (raw != null) {
-      try {
-        data = JSON.parse(raw);
-      } catch {
-        return false; // malformed — do NOT overwrite
-      }
-      if (data == null || typeof data !== "object" || Array.isArray(data)) data = {};
-    }
-    if (data.dispatch == null || typeof data.dispatch !== "object" || Array.isArray(data.dispatch)) data.dispatch = {};
-    const d = data.dispatch;
-    if (d.repos == null || typeof d.repos !== "object" || Array.isArray(d.repos)) d.repos = {};
-    if (!mutate(d.repos)) return false; // unchanged — skip the write
-    if (!ensureDir(graphHomeDir)) return false;
-    fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
-    return true;
+    return editUserConfig(graphHomeDir, (data) => {
+      if (data.dispatch == null || typeof data.dispatch !== "object" || Array.isArray(data.dispatch)) data.dispatch = {};
+      const d = data.dispatch;
+      if (d.repos == null || typeof d.repos !== "object" || Array.isArray(d.repos)) d.repos = {};
+      return mutate(d.repos) ? undefined : false; // unchanged — skip the write
+    }).wrote;
   } catch {
     return false;
   }
@@ -1035,30 +1016,14 @@ function forgetRepo(graphHomeDir, slug) {
 // present-but-malformed config (same fail-safe as editRepoMap).
 function setDispatchAgent(graphHomeDir, agentId) {
   try {
-    const file = userConfigPath(graphHomeDir);
-    let raw = null;
-    try {
-      raw = fs.readFileSync(file, "utf8");
-    } catch {
-      raw = null; // absent — start fresh
-    }
-    let data = {};
-    if (raw != null) {
-      try {
-        data = JSON.parse(raw);
-      } catch {
-        return false; // malformed — do NOT overwrite
-      }
-      if (data == null || typeof data !== "object" || Array.isArray(data)) data = {};
-    }
-    if (data.dispatch == null || typeof data.dispatch !== "object" || Array.isArray(data.dispatch)) data.dispatch = {};
-    const next = agentId || null;
-    if ((data.dispatch.agent || null) === next) return false; // unchanged — skip the write
-    if (next == null) delete data.dispatch.agent;
-    else data.dispatch.agent = next;
-    if (!ensureDir(graphHomeDir)) return false;
-    fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
-    return true;
+    return editUserConfig(graphHomeDir, (data) => {
+      if (data.dispatch == null || typeof data.dispatch !== "object" || Array.isArray(data.dispatch)) data.dispatch = {};
+      const next = agentId || null;
+      if ((data.dispatch.agent || null) === next) return false; // unchanged — skip the write
+      if (next == null) delete data.dispatch.agent;
+      else data.dispatch.agent = next;
+      return undefined;
+    }).wrote;
   } catch {
     return false;
   }
@@ -1188,29 +1153,12 @@ function probeClaudePluginsSkills() {
 // present-but-malformed config, returns true only when it actually wrote.
 function editCapabilities(graphHomeDir, mutate) {
   try {
-    const file = userConfigPath(graphHomeDir);
-    let raw = null;
-    try {
-      raw = fs.readFileSync(file, "utf8");
-    } catch {
-      raw = null; // absent — start fresh
-    }
-    let data = {};
-    if (raw != null) {
-      try {
-        data = JSON.parse(raw);
-      } catch {
-        return false; // malformed — do NOT overwrite
-      }
-      if (data == null || typeof data !== "object" || Array.isArray(data)) data = {};
-    }
-    if (data.dispatch == null || typeof data.dispatch !== "object" || Array.isArray(data.dispatch)) data.dispatch = {};
-    const d = data.dispatch;
-    if (d.capabilities == null || typeof d.capabilities !== "object" || Array.isArray(d.capabilities)) d.capabilities = {};
-    if (!mutate(d.capabilities)) return false; // unchanged — skip the write
-    if (!ensureDir(graphHomeDir)) return false;
-    fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
-    return true;
+    return editUserConfig(graphHomeDir, (data) => {
+      if (data.dispatch == null || typeof data.dispatch !== "object" || Array.isArray(data.dispatch)) data.dispatch = {};
+      const d = data.dispatch;
+      if (d.capabilities == null || typeof d.capabilities !== "object" || Array.isArray(d.capabilities)) d.capabilities = {};
+      return mutate(d.capabilities) ? undefined : false; // unchanged — skip the write
+    }).wrote;
   } catch {
     return false;
   }

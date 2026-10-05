@@ -178,6 +178,22 @@ test('doctor (remote, 401): reachable but token REJECTED', async () => {
   assert.match(out, /re-mint/);
 });
 
+test('doctor (remote, 401): flags a stale env SPOR_TOKEN when the store holds a credential for the server', async () => {
+  const graph = scratchGraph();
+  const auth = require('../lib/auth.js');
+  auth.upsertTenant(graph, { server: 'http://127.0.0.1:9', org: 'acme', access_token: 'stored' });
+  const out = await runDoctor(graph, { server: 'http://127.0.0.1:9', responder: async () => fakeResponse(401) });
+  assert.match(out, /token:\s+REJECTED \(http 401\).*stale and shadows the stored acme credential/);
+});
+
+test('doctor (remote, 401): a store tenant for ANOTHER server does not trigger the stale-env hint', async () => {
+  const graph = scratchGraph();
+  const auth = require('../lib/auth.js');
+  auth.upsertTenant(graph, { server: 'http://other.example', org: 'acme', access_token: 'stored' });
+  const out = await runDoctor(graph, { server: 'http://127.0.0.1:9', responder: async () => fakeResponse(401) });
+  assert.doesNotMatch(out, /shadows/);
+});
+
 test('doctor (remote, transport down): UNREACHABLE, token validity indeterminate', async () => {
   const graph = scratchGraph();
   const out = await runDoctor(graph, {
