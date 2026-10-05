@@ -5142,7 +5142,30 @@ async function cmdPatch(cfg, { values, positionals }) {
     err(`invalid node after patch: ${e.message}`);
     return 1;
   }
-  fs.writeFileSync(file, newRaw);
+  // Compare-and-write: the validation above ran against `raw`, so re-read right
+  // before the write and refuse if the node moved meanwhile (a concurrent writer's
+  // change must not be silently overwritten — API.md's conflict contract). The
+  // write is temp + rename so no reader sees a torn file; the residual window is
+  // the gap between this re-read and the rename.
+  let latest;
+  try {
+    latest = fs.readFileSync(file, "utf8");
+  } catch {
+    latest = null;
+  }
+  if (latest !== raw) {
+    err(`patch conflict: ${id} changed while the patch was being prepared${revision ? ` (revision ${revision} is no longer current)` : ""} — re-read and retry`);
+    return 1;
+  }
+  const tmp = `${file}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(tmp, newRaw);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    err(`could not write ${id}: ${e.message}`);
+    return 1;
+  }
   out(`patched: ${id} (${Object.keys(patch).join(", ")})`);
   out(writeTargetLine(cfg));
   return 0;

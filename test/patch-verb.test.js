@@ -148,3 +148,29 @@ test("patch (local) --revision matches the blob sha spor get reports, even for n
   const r = run(["patch", "task-x", "size=m", "--revision", got.revision], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
 });
+
+test("patch (local) refuses to overwrite a node that changed after it was read", () => {
+  const { home, file } = fixtureGraph();
+  // Preload: on the SECOND read of the node file (the pre-write re-read) a
+  // concurrent writer lands first, so the patch must see the move and refuse.
+  const hook = path.join(home, "race-hook.js");
+  fs.writeFileSync(hook, `
+const fs = require("fs");
+const real = fs.readFileSync;
+let n = 0;
+fs.readFileSync = function (p, ...a) {
+  if (String(p) === ${JSON.stringify(file)} && ++n === 2) {
+    real.call(fs, p, "utf8");
+    fs.writeFileSync(p, real.call(fs, p, "utf8").replace("Body about", "Concurrent edit about"));
+  }
+  return real.call(fs, p, ...a);
+};
+`);
+  const r = run(["patch", "task-x", "size=m"], { SPOR_HOME: home, NODE_OPTIONS: `--require ${hook}` });
+  assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /patch conflict/);
+  const md = fs.readFileSync(file, "utf8");
+  assert.match(md, /Concurrent edit about/);
+  assert.doesNotMatch(md, /^size: m$/m);
+  assert.deepStrictEqual(fs.readdirSync(path.dirname(file)).filter((f) => f.includes(".tmp-")), []);
+});
