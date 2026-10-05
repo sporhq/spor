@@ -1176,3 +1176,26 @@ test("an OUTAGED rescue run is re-dispatched on the shared retry pool under a ne
     assert.equal(world.pools.retry.spent, spent);
   }
 });
+
+test("a ONE-SHOT rescue that launched and then ended in an infrastructure outage is re-dispatched on the retry pool under -t<n>, and a spent pool settles as a rescue that could not run", async () => {
+  const script = { ...SCRIPTS.rescued, factory: factoryOf({ ...BASE, gates: [GATES[0], { ...GATES[1], cycles: 0 }], rescue: { profile: "profile-rescue", attempts: 1 }, implementation: { profile: "profile-impl", retry: { attempts: 1 } } }) };
+  for (const [outages, state, spent] of [[1, "passed", 1], [2, "failed", 1]]) {
+    const clock = fakeClock(1_700_000_000_000);
+    const world = makeWorld({ clock, script });
+    world.rescueOutages = outages;
+    const deps = world.deps;
+    const inner = deps.dispatchRescue;
+    delete deps.dispatchRescue;
+    deps.rescue = async (args) => {
+      const l = await inner(args);
+      const out = world.signals.pop();
+      const classification = out.payload.classification;
+      return { ok: true, runId: l.runId, ...(classification ? { classification } : {}), diagnosis: "d", category: "real-defect", fixed: true, filed: [], unread: false };
+    };
+    const r = await drive(exec(world, clock, { factory: script.factory }), { clock, signals: world.signals });
+    assert.equal(r.status, "completed", JSON.stringify(r));
+    assert.equal(r.result.state, state);
+    assert.deepEqual([...world.launched.keys()].filter((k) => k.startsWith("rescue-")), ["rescue-1", "rescue-1-t1"]);
+    assert.equal(world.pools.retry.spent, spent);
+  }
+});
