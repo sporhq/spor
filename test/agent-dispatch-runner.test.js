@@ -48,6 +48,13 @@ function jobFixture(scriptBody, prompt, { scratchPath } = {}) {
   return { dir, job, log, record };
 }
 
+// The record fields that say WHY a run ended, for an assertion message — a
+// load flake that returns a bare exit code is otherwise undiagnosable.
+function pickTermination(record) {
+  const { state, exit_code, signal, error, termination_class, termination_signal, termination_reason } = record || {};
+  return { state, exit_code, signal, error, termination_class, termination_signal, termination_reason };
+}
+
 test("portableSpawn resolves Windows PATHEXT shims before selecting ComSpec", () => {
   const calls = [];
   const sentinel = {};
@@ -300,13 +307,18 @@ test("runJob carries a declared harness's declaration onto the run record so the
   const { runReportTexts } = require("../lib/shell/agent-dispatch-runner.js");
   const declaration = { id: "fake", command: "/bin/fake", args: [], label: "Fake", session: [], report: { from: "lastText", text: ["message.text"] } };
   const fixture = jobFixture(
-    'process.stdout.write(JSON.stringify({kind:"message",message:{text:"```json\\n{\\"diagnosis\\":\\"early\\",\\"category\\":\\"prompt\\"}\\n```"}}) + "\\n" + JSON.stringify({kind:"message",message:{text:"I will commit once the suite notifies me."}}) + "\\n"); process.exit(0);',
+    // Drain stdin before exiting: a child that exits 0 without reading the
+    // prompt races the supervisor's stdin write, and under load the write loses
+    // (EPIPE -> stdinError -> the run reads failed and runJob returns 1 despite
+    // exit 0). The test is about the record's declaration, not that race.
+    'process.stdin.resume(); process.stdin.on("end", () => { process.stdout.write(JSON.stringify({kind:"message",message:{text:"```json\\n{\\"diagnosis\\":\\"early\\",\\"category\\":\\"prompt\\"}\\n```"}}) + "\\n" + JSON.stringify({kind:"message",message:{text:"I will commit once the suite notifies me."}}) + "\\n"); process.exit(0); });',
     "p\n"
   );
   const job = readJson(fixture.job);
   atomicJson(fixture.job, { ...job, harness: "fake", harness_declaration: declaration });
   atomicJson(fixture.record, { ...readJson(fixture.record), harness: "fake" });
-  assert.strictEqual(await runJob(fixture.job), 0);
+  const code = await runJob(fixture.job);
+  assert.strictEqual(code, 0, `runJob exit code; record termination: ${JSON.stringify(pickTermination(readJson(fixture.record)))}`);
   assert.ok(!fs.existsSync(fixture.job), "the job file is gone after launch");
   const record = readJson(fixture.record);
   assert.deepStrictEqual(record.harness_declaration, declaration, "the declaration rides the record");
