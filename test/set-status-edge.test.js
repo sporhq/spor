@@ -695,12 +695,13 @@ test("edge --remove (local) on an inverse form removes the canonical edge on the
   assert.doesNotMatch(readNode(nodes, "dec-y"), /- \{type: blocks, to: task-x\}/);
 });
 
-test("edge --remove (local) on a missing edge is an idempotent no-op, never an error", () => {
+test("edge --remove (local) on a missing edge reports 'not present', exits 1 and writes nothing", () => {
   const { home, nodes } = fixtureGraph();
   const before = readNode(nodes, "dec-y");
   const r = run(["edge", "dec-y", "resolves", "task-x", "--remove"], { SPOR_HOME: home });
-  assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stdout, /edge already absent: dec-y -\[resolves\]-> task-x/);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /edge not present: dec-y -\[resolves\]-> task-x/);
+  assert.doesNotMatch(r.stdout, /edge removed/);
   assert.strictEqual(readNode(nodes, "dec-y"), before, "node untouched");
 });
 
@@ -784,7 +785,7 @@ test("edge --remove rejects --attr client-side (a removal is identified by type+
 // `supercedes`, `derives-from`) kept that spelling verbatim while cmdEdge had
 // already canonicalized the REQUESTED type through edgeRenames(). Comparing
 // the raw spellings double-added the canonical form on add, and reported
-// "already absent" on --remove. Both sides canonicalize before comparing; the
+// "not present" on --remove. Both sides canonicalize before comparing; the
 // file's own spelling is never rewritten.
 
 // A dec-y carrying `edges:` written with the legacy alias `spelling`.
@@ -903,12 +904,13 @@ test("edge --remove (remote) DELETEs {type, to} to the node's edges endpoint", a
   }
 });
 
-test("edge --remove (remote) reports an idempotent skip", async () => {
+test("edge --remove (remote) reports a skipped removal as not present, exit 1", async () => {
   const { srv, base } = await edgeStub({ resultStatus: "skipped" });
   try {
     const r = await runAsync(["edge", "dec-y", "resolves", "task-x", "--remove"], remoteEnv(base));
-    assert.strictEqual(r.status, 0, r.stderr);
-    assert.match(r.stdout, /edge already absent: dec-y -\[resolves\]-> task-x/);
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /edge not present: dec-y -\[resolves\]-> task-x/);
+    assert.doesNotMatch(r.stdout, /edge removed/);
   } finally {
     srv.close();
   }
@@ -973,13 +975,13 @@ test("edge --remove (local) withdraws a block-form YAML edge in full (issue-spor
   assert.strictEqual(v.status, 0, v.stdout);
 });
 
-test("edge --remove (local) that matches nothing reports 'already absent' and writes nothing", () => {
+test("edge --remove (local) that matches nothing reports 'not present' (exit 1) and writes nothing", () => {
   const { home, nodes } = fixtureGraph();
   writeBlockEdgeTask(nodes);
   const before = readNode(nodes, "task-x");
   const r = run(["edge", "task-x", "blocks", "task-x", "--remove"], { SPOR_HOME: home });
-  assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stdout, /edge already absent/);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /edge not present/);
   assert.strictEqual(readNode(nodes, "task-x"), before);
 });
 

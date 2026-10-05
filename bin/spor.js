@@ -5090,8 +5090,8 @@ async function cmdEdge(cfg, { values, positionals }) {
     if (remove) {
       // remove_edge semantics (API.md §1/§3): withdrawal twin of add_edge above,
       // same normalization (canonical/alias/inverse) done SERVER-side — this
-      // just posts {type, to} to the DELETE route. A missing edge is an
-      // idempotent `skipped`, never an error.
+      // just posts {type, to} to the DELETE route. A missing edge comes
+      // back as `skipped` and is reported as "not present" with exit 1.
       const r = await remote.del(cfg, `/v1/nodes/${encodeURIComponent(id)}/edges`, { body: { type, to }, timeoutMs: 8000 });
       if (r.transport) {
         err(`offline — could not reach server (${r.error})`);
@@ -5105,9 +5105,12 @@ async function cmdEdge(cfg, { values, positionals }) {
       }
       const echoed = (r.json && r.json.id) || id;
       const skipped = r.json && r.json.status === "skipped";
-      out(skipped
-        ? `edge already absent: ${id} -[${type}]-> ${to}`
-        : `edge removed: ${id} -[${type}]-> ${to}${echoed !== id ? ` (removed on ${echoed})` : ""}`);
+      if (skipped) {
+        // A remove that matched nothing did not do what was asked: say so and fail.
+        err(`edge not present: ${id} -[${type}]-> ${to}`);
+        return 1;
+      }
+      out(`edge removed: ${id} -[${type}]-> ${to}${echoed !== id ? ` (removed on ${echoed})` : ""}`);
       out(writeTargetLine(cfg));
       return 0;
     }
@@ -5183,9 +5186,8 @@ async function cmdEdge(cfg, { values, positionals }) {
     // Unlike add, a removal target need not still exist (removing a stale
     // edge onto a since-deleted node is exactly the cleanup this is for).
     if (!site) {
-      out(`edge already absent: ${id} -[${type}]-> ${to}`);
-      out(writeTargetLine(cfg));
-      return 0;
+      err(`edge not present: ${id} -[${type}]-> ${to}`);
+      return 1;
     }
     const holderFile = path.join(nodesDir, `${site.holder}.md`);
     let holderRaw = raw;
