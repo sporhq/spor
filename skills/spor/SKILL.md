@@ -138,6 +138,9 @@ spor extend <node-id> <2h|45m> # stretch your live claim for a long idle gap, up
 spor release <node-id>         # hand a task back to the pool, retiring the assigned edge (POST .../release)
 spor admin gardener [--json]   # run a gardener sweep now (POST /v1/gardener) — files findings as queue
                                #   items, resolves its own cleared ones; ops-facing (the `spor admin` surface)
+spor admin erase-journal --journal <name> (--id <id>|--text <needle>) [--also v]... [--ticket T] [--reason R] [--dry-run]
+                               #   [--allow-broken-chain] [--drop-unattributed-fragments] — redact one server audit journal in-server
+                               #   (POST /v1/admin/journal/erase, admin only); non-zero on error or a failed chain verify
 
 # dual-mode (local passthrough / remote dispatch to the server)
 spor search "<text>"           # free-text graph search (sugar for compile --query "<text>" --digest)

@@ -7286,10 +7286,91 @@ async function cmdAdmin(cfg, args) {
   const sub = args[0];
   if (sub === "gardener") return cmdAdminGardener(cfg, args.slice(1));
   if (sub === "token") return cmdAdminToken(cfg, args.slice(1));
+  if (sub === "erase-journal") return cmdAdminEraseJournal(cfg, args.slice(1));
   if (sub) err(`spor admin: unknown sub-command '${sub}'.`);
   err("usage: spor admin gardener [--json]");
   err("       spor admin token list | spor admin token revoke <hash-prefix>");
+  err("       spor admin erase-journal --journal <name> (--id <id> | --text <needle>) [--also v]... [--ticket T] [--reason R] [--dry-run]");
   return 1;
+}
+
+// spor admin erase-journal — POST /v1/admin/journal/erase (API.md §3), the
+// in-server redaction of one audit journal (server.log, integrity.log,
+// mcp-wire.log, or a llm-calls/usage day file). Remote + admin only. Exits
+// non-zero on any refusal, a failed chain verify, or a torn result; a 500 means
+// the erasure failed past its commit point and the journal is pending
+// `erase-journal --recover` on the server box (server.log/integrity.log: the
+// server exits 78 once it has replied).
+async function cmdAdminEraseJournal(cfg, args) {
+  const usage = "usage: spor admin erase-journal --journal <name> (--id <id> | --text <needle>) [--also <v>]... [--ticket <T>] [--reason <R>] [--dry-run] [--allow-broken-chain] [--drop-unattributed-fragments] [--json]";
+  if (cfg.mode() !== "remote") {
+    err("admin erase-journal needs a team graph (remote mode) — the server owns its journals; on the server box use erase-journal directly.");
+    return 1;
+  }
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args,
+      allowPositionals: false,
+      options: {
+        journal: { type: "string" }, id: { type: "string" }, text: { type: "string" },
+        also: { type: "string", multiple: true }, ticket: { type: "string" }, reason: { type: "string" },
+        "dry-run": { type: "boolean" }, "allow-broken-chain": { type: "boolean" },
+        "drop-unattributed-fragments": { type: "boolean" }, json: { type: "boolean" },
+      },
+    }));
+  } catch (e) {
+    err(`spor admin erase-journal: ${e.message}`);
+    err(usage);
+    return 1;
+  }
+  if (!values.journal || (values.id === undefined) === (values.text === undefined)) {
+    err(usage);
+    err("  --journal and exactly one of --id / --text are required.");
+    return 1;
+  }
+  if (values.also && values.id === undefined) {
+    err("--also needs --id (it adds further values to erase alongside the id).");
+    return 1;
+  }
+  const body = { journal: values.journal };
+  if (values.id !== undefined) body.id = values.id;
+  if (values.text !== undefined) body.text = values.text;
+  if (values.also) body.also = values.also;
+  if (values.ticket !== undefined) body.ticket = values.ticket;
+  if (values.reason !== undefined) body.reason = values.reason;
+  if (values["dry-run"]) body.dry_run = true;
+  if (values["allow-broken-chain"]) body.allow_broken_chain = true;
+  if (values["drop-unattributed-fragments"]) body.drop_unattributed_fragments = true;
+  const r = await remote.post(cfg, "/v1/admin/journal/erase", body, { timeoutMs: 300000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (notAdminHint(r)) return 1;
+  if (!r.ok) {
+    const e = (r.json && r.json.error) || {};
+    err(`erase-journal failed (${r.status}${e.code ? ` ${e.code}` : ""}): ${e.message || r.text}`);
+    if (r.status === 500) {
+      err("  the erasure failed past its commit point: the journal is pending 'erase-journal --recover' on the server box.");
+    }
+    return 1;
+  }
+  if (garbledBody(r, "erase-journal")) return 1;
+  const j = r.json || {};
+  const v = j.verify;
+  const bad = (v && v.ok === false) || j.torn;
+  if (values.json) {
+    out(JSON.stringify(j, null, 2));
+    return bad ? 1 : 0;
+  }
+  out(`${j.dryRun ? "dry run: " : ""}${j.name}: scanned ${j.scanned} lines in ${j.segments} segment(s), matched ${j.matched}, erased ${j.erased}, rechained ${j.rechained}`);
+  if (j.warning) err(`warning: ${j.warning}`);
+  if (j.torn) err("torn: the erasure left a torn result — inspect the journal on the server box.");
+  if (v) {
+    out(v.ok ? `verify: ok (${v.lines} lines, last_seq ${v.last_seq})` : `verify: FAILED — ${v.error}`);
+  }
+  return bad ? 1 : 0;
 }
 
 // spor admin token list|revoke — the team-wide token surface under the ops
@@ -18474,13 +18555,20 @@ const COMMANDS = {
     run: (cfg, args) => cmdAgent(cfg, args),
   },
   admin: {
-    group: "Team admin (remote, admin token)", parse: "raw", args: "gardener [--json] | token list|revoke <prefix>",
-    summary: "ops-facing operations (gardener sweep, team token admin)",
+    group: "Team admin (remote, admin token)", parse: "raw", args: "gardener [--json] | token list|revoke <prefix> | erase-journal …",
+    summary: "ops-facing operations (gardener sweep, team token admin, journal erase)",
     help:
       "Ops-facing operations, kept apart from everyday graph work — the home for\n" +
       "stewards-gated ops. Remote only: the server owns these.\n\n" +
       "  spor admin gardener           run a gardener sweep now (POST /v1/gardener)\n" +
       "      --json                    print the raw {checked, filed, resolved, skipped} envelope\n" +
+      "  spor admin erase-journal      redact one audit journal in-server (POST /v1/admin/journal/erase)\n" +
+      "      --journal <name>          server.log | integrity.log | mcp-wire.log | llm-calls/<YYYY-MM-DD>.jsonl | usage/<YYYY-MM-DD>.jsonl\n" +
+      "      --id <id> | --text <s>    exactly one; --also <v> (repeatable, ≥4 chars, with --id)\n" +
+      "      --ticket <T> --reason <R> recorded with the erasure\n" +
+      "      --dry-run                 report matches, change nothing\n" +
+      "      --allow-broken-chain, --drop-unattributed-fragments   override the 409 refusals\n" +
+      "      --json                    print the raw receipt\n" +
       "  spor admin token list         the whole team's tokens (= spor token list --all)\n" +
       "  spor admin token revoke <p>   revoke ANY token by hash prefix (= spor token revoke <p> --all)\n\n" +
       "The sweep files its observations as `type: finding` queue items\n" +
@@ -18491,7 +18579,7 @@ const COMMANDS = {
       "can run it; a 403 (should a deployment add the gate) means admin privilege is\n" +
       "required — check 'spor whoami' (is_admin). The token surface IS admin-gated:\n" +
       "everyday self-serve token management is 'spor token' (your own PATs).",
-    examples: ["spor admin gardener", "spor admin token list", "spor admin token revoke a1b2c3"],
+    examples: ["spor admin gardener", "spor admin token list", "spor admin token revoke a1b2c3", "spor admin erase-journal --journal server.log --text secret@example.com --dry-run"],
     run: (cfg, args) => cmdAdmin(cfg, args),
   },
 
