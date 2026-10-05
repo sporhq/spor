@@ -12035,3 +12035,126 @@ test("a Codex turn.failed review drives the ladder, the reviewer-unavailable esc
   fs.rmSync(home, { recursive: true, force: true });
   fs.rmSync(repo, { recursive: true, force: true });
 });
+
+// task-spor-factory-spor-worker-restart-on-land-stale-outage-fix: a worker
+// keeps the code it loaded, so the facts it writes say WHICH code judged them —
+// a refusal made by since-fixed gate code must read as that from the graph
+// alone. Without a `code`, every builder is byte-identical to before.
+test("a gate fact, a rescue fact and an integration fact carry the code that judged them; without one they are byte-identical", () => {
+  const integrationRunner = require("../lib/shell/integration-runner.js");
+  const code = { stamp: "spor@1d3c104", commit: "1d3c104", branch: "main", root: "/srv/spor" };
+  const base = { gate: { id: "review", kind: "agent-review", source: "inline" }, nodeId: "task-demo", runId: "run-abcdef12", project: "demo", verdict: "failed", detail: "no report", evidence: "", attempts: [{ verdict: "failed", detail: "no report" }], date: "2026-09-05", factory: "factory-spor" };
+  const stamped = gateRunner.buildGateFact({ ...base, code });
+  const bare = gateRunner.buildGateFact(base);
+  assert.strictEqual(stamped.id, bare.id, "the stamp is not part of the fact's identity");
+  assert.match(stamped.markdown, /\ndate: 2026-09-05\nworker_code: spor@1d3c104\nedges:\n/, "frontmatter carries worker_code beside the date");
+  assert.match(stamped.markdown, /Judged by `spor work` running `spor@1d3c104` \(main\) from \/srv\/spor — the code that worker had loaded at startup; a change to the gate code that landed on that checkout's ref after this commit was not running here\./);
+  assert.doesNotMatch(bare.markdown, /worker_code|Judged by/);
+  assert.strictEqual(gateRunner.buildGateFact({ ...base, code: null }).markdown, bare.markdown, "an explicit null is the bare fact");
+  assert.strictEqual(gateRunner.buildGateFact({ ...base, code: { commit: null } }).markdown, bare.markdown, "an identity with no stamp says nothing");
+
+  // An npm install has no commit: the stamp is the package, and the sentence
+  // says an upgrade (not a land) is what would not have been running.
+  const installed = gateRunner.buildGateFact({ ...base, code: { stamp: "@sporhq/spor@0.28.1", commit: null, branch: null, root: "/usr/lib/node_modules/@sporhq/spor" } });
+  assert.match(installed.markdown, /worker_code: @sporhq\/spor@0\.28\.1\n/);
+  assert.match(installed.markdown, /running `@sporhq\/spor@0\.28\.1` from \/usr\/lib\/node_modules\/@sporhq\/spor — an installed package; a later upgrade was not running here\./);
+
+  const entry = { n: 1, gate: "review", category: "environment", diagnosis: "the reviewer backend was out", fixed: false, filed: [] };
+  const rescue = gateRunner.buildRescueFact({ nodeId: "task-demo", runId: "run-abcdef12", project: "demo", entry, factory: "factory-spor", date: "2026-09-05", code });
+  const rescueBare = gateRunner.buildRescueFact({ nodeId: "task-demo", runId: "run-abcdef12", project: "demo", entry, factory: "factory-spor", date: "2026-09-05" });
+  assert.strictEqual(rescue.id, rescueBare.id);
+  assert.match(rescue.markdown, /\nworker_code: spor@1d3c104\nedges:\n/);
+  assert.match(rescue.markdown, /Judged by `spor work` running `spor@1d3c104`/);
+  assert.doesNotMatch(rescueBare.markdown, /worker_code|Judged by/);
+
+  const integration = { mode: "local", strategy: "merge", targetRef: "main" };
+  const merge = integrationRunner.buildIntegrationFact({ integration, nodeId: "task-demo", runId: "run-abcdef12", project: "demo", verdict: "landed", detail: "", evidence: "", attempts: [], date: "2026-09-05", factory: "factory-spor", code });
+  const mergeBare = integrationRunner.buildIntegrationFact({ integration, nodeId: "task-demo", runId: "run-abcdef12", project: "demo", verdict: "landed", detail: "", evidence: "", attempts: [], date: "2026-09-05", factory: "factory-spor" });
+  assert.strictEqual(merge.id, mergeBare.id);
+  assert.match(merge.markdown, /\nworker_code: spor@1d3c104\nedges:\n/);
+  assert.doesNotMatch(mergeBare.markdown, /worker_code/);
+});
+
+test("runGatePipeline stamps the code its deps carry on every fact it records, and records none of it when handed nothing", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const code = { stamp: "spor@1d3c104", commit: "1d3c104", branch: "main", root: "/srv/spor" };
+  const stamped = fakes();
+  stamped.deps.code = code;
+  const r = await gateRunner.runGatePipeline({ item: { node_id: "task-demo", run_id: "run-abcdef12", project: "demo" }, factory, deps: stamped.deps });
+  assert.strictEqual(r.state, "passed");
+  assert.strictEqual(stamped.seen.facts.length, 1);
+  assert.match(stamped.seen.facts[0].markdown, /worker_code: spor@1d3c104\n/);
+  assert.match(stamped.seen.facts[0].markdown, /Judged by `spor work` running `spor@1d3c104` \(main\)/);
+
+  const bare = fakes();
+  await gateRunner.runGatePipeline({ item: { node_id: "task-demo", run_id: "run-abcdef12", project: "demo" }, factory, deps: bare.deps });
+  assert.doesNotMatch(bare.seen.facts[0].markdown, /worker_code|Judged by/, "no code handed in: the fact is what it always was");
+});
+
+test("end to end: the gate fact a real worker writes names the code it ran, and the write passes the local validator with the stamp", () => {
+  const { home, nodes } = cliFixture({ factoryPayload: OK_FACTORY });
+  const r = cli(
+    ["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--factory", "factory-demo"],
+    { SPOR_HOME: home, XDG_CONFIG_HOME: home, GATE_OUTFILE: path.join(home, "invocations.jsonl"), PATH: pathWithOnlyGitAndNode() }
+  );
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  const facts = fs.readdirSync(nodes).filter((f) => f.startsWith("art-gate-acceptance-ready-"));
+  assert.strictEqual(facts.length, 1, `expected one gate fact, saw ${fs.readdirSync(nodes)}`);
+  const body = fs.readFileSync(path.join(nodes, facts[0]), "utf8");
+  // This test runs the CLI from its own checkout (or an install): either way
+  // the worker has ONE identity and stamps it — `<repo>@<sha>` or `<pkg>@<ver>`.
+  const { workerCodeIdentity } = require("../bin/spor.js");
+  const me = workerCodeIdentity();
+  assert.match(body, new RegExp(`\\nworker_code: ${me.stamp.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}\\n`), body);
+  assert.match(body, /Judged by `spor work` running `/);
+});
+
+// The self-hosting default: a factory that judges the very repo the worker's
+// own code is loaded from turns `--restart-on-land` on by default — the one
+// case where "the watched ref moved past" always means "your gate code moved".
+// A factory judging any other repo, an explicit opt-out, and a bare worker are
+// all byte-identical to the shipped off default.
+test("spor work turns --restart-on-land on by default only for a factory that judges the worker's own repo, and an explicit opt-out wins", () => {
+  const { workerCodeIdentity } = require("../bin/spor.js");
+  const me = workerCodeIdentity();
+  if (!me.commit) return; // an npm install has no checkout to watch — the default cannot arm there, and the flag says so
+  const run = (payload, env = {}, extra = []) => {
+    const { home } = cliFixture({ factoryPayload: payload });
+    const r = cli(["work", "--once", "--interval", "1", "--factory", "factory-demo", ...extra], { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode(), ...env });
+    assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+    return r.stdout;
+  };
+  const self = run({ ...OK_FACTORY, repos: [me.repo] });
+  assert.match(self, new RegExp(`work: --restart-on-land is on by default — factory factory-demo judges ${me.repo}, the repo this worker's own code is loaded from; run it under a supervisor that restarts it \\(work\\.restartOnLand: false or SPOR_WORK_RESTART_ON_LAND=0 opts out\\)`), self);
+  assert.match(self, /work: watching \S+ in \S+ for a commit that moves past /, "the notice is armed on the checkout, as before");
+
+  const optedOut = run({ ...OK_FACTORY, repos: [me.repo] }, { SPOR_WORK_RESTART_ON_LAND: "0" });
+  assert.doesNotMatch(optedOut, /--restart-on-land is on by default/, "an explicit 0 is a deliberate 'run stale until I restart you'");
+
+  const flagOff = run({ ...OK_FACTORY, repos: [me.repo] }, {}, ["--no-restart-on-land"]);
+  assert.doesNotMatch(flagOff, /--restart-on-land is on by default/, "--no-restart-on-land is an explicit opt-out too");
+  const flagOn = run({ ...OK_FACTORY, repos: ["demo"] }, {}, ["--restart-on-land"]);
+  assert.doesNotMatch(flagOn, /is on by default/, "an explicit --restart-on-land is not announced as a default");
+
+  const nodeIdForm = run({ ...OK_FACTORY, repos: [`repo-${me.repo}`] });
+  assert.match(nodeIdForm, /--restart-on-land is on by default/, "the repo node-id spelling admits the slug, as the scope guard does");
+
+  const other = run({ ...OK_FACTORY, repos: ["demo"] });
+  assert.doesNotMatch(other, /--restart-on-land is on by default/, "a factory judging another repo keeps the shipped default");
+  const unscoped = run(OK_FACTORY);
+  assert.doesNotMatch(unscoped, /--restart-on-land is on by default/, "an unscoped factory keeps the shipped default");
+});
+
+test("the code stamp names the writer, not the fact: an occupant written by older code is the same node, and the loaded identity is memoized for the process", () => {
+  const sporCli = require("../bin/spor.js");
+  const base = { gate: { id: "review", kind: "agent-review", source: "inline" }, nodeId: "task-demo", runId: "run-abcdef12", project: "demo", verdict: "failed", detail: "no report", evidence: "", attempts: [], date: "2026-09-05", factory: "factory-spor" };
+  const old = gateRunner.buildGateFact({ ...base, code: { stamp: "spor@1d3c104", commit: "1d3c104", branch: "main", root: "/srv/spor" } });
+  const newer = gateRunner.buildGateFact({ ...base, code: { stamp: "spor@a449700", commit: "a449700", branch: "main", root: "/srv/spor" } });
+  const bare = gateRunner.buildGateFact(base);
+  assert.notStrictEqual(old.markdown, newer.markdown);
+  assert.strictEqual(sporCli.gateNodeEquivalent(old.markdown, newer.markdown), true, "a resumed pipeline on newer code adopts the older code's fact");
+  assert.strictEqual(sporCli.gateNodeEquivalent(bare.markdown, newer.markdown), true, "...including one written before the stamp existed");
+  assert.strictEqual(sporCli.gateNodeEquivalent(old.markdown, gateRunner.buildGateFact({ ...base, verdict: "passed", code: { stamp: "spor@1d3c104" } }).markdown), false, "a different verdict is still a different node");
+  // What a worker LOADED never follows the checkout: one memoized object per process.
+  assert.strictEqual(sporCli.workerCodeIdentity(), sporCli.workerCodeIdentity());
+});

@@ -11623,10 +11623,48 @@ function gatingReviewerWait(home, runId, nowMs = Date.now()) {
     ...(w.reason ? { reason: String(w.reason) } : {}),
   };
 }
+// Is a LIVE worker running code its watched ref has since moved past? Read off
+// the `code` the worker recorded (workerCodeIdentity + the ref it watches) with
+// the SAME predicate the worker's own notice and `--restart-on-land` drain use
+// (codeMovedPast), so status can never call a worker stale that its own log
+// would not — and a land that touched only docs or tests is said to be "behind"
+// rather than STALE (codePathsChanged: the published code paths are unchanged,
+// so what the worker runs is not). Annotates the record in place for the JSON
+// rendering (`code.tip`, `code.stale`: true / false / null when git gave no
+// definitive answer) and returns the human suffix for the slots line. Only a
+// live worker is judged: a stopped or dead one runs nothing to be stale. A few
+// bounded git reads per live worker, fail-soft to "no verdict". A record with
+// no `code` (an older worker, or one run by a caller that named none) gets no
+// suffix at all, so its line is exactly what it was.
+function workerCodeSuffix(w) {
+  const c = w && w.code;
+  if (!c || !c.stamp) return "";
+  if (!w.live || !c.commit || !c.root || !c.watch) return `  code ${c.stamp}`;
+  let tip = "";
+  let moved = null;
+  let changed = null;
+  try {
+    tip = codeTip(c.watch, c.root);
+    moved = tip ? codeMovedPast(c.commit, tip, c.root) : null;
+    changed = moved ? codePathsChanged(c.commit, tip, c.root) : null;
+  } catch {
+    /* no verdict */
+  }
+  c.tip = tip || null;
+  // STALE when the ref moved past and the shipped code paths changed — or when
+  // git could not say which paths changed (moved past is the stronger fact).
+  c.stale = moved === null ? null : moved && changed !== false;
+  if (moved === null) return `  code ${c.stamp}${tip ? ` (${c.watch} at ${tip}; ancestry unreadable)` : ` (${c.watch} unreadable)`}`;
+  if (!moved) return `  code ${c.stamp}`;
+  if (changed === false) return `  code ${c.stamp}  behind ${c.watch} (${tip}; no change under the shipped code paths)`;
+  return `  code ${c.stamp}  STALE — ${c.watch} is at ${tip}, past the code this worker loaded; restart it${w.restart_on_land ? " (it is draining to exit for that restart)" : ""}`;
+}
 
 function cmdWorkStatus(cfg, { json }) {
   const home = cfg.userConfigHome();
   const workers = workLoop.readWorkerStatuses(home, { alive: workerAlive });
+  // Annotate before either rendering, so `--json` carries the same verdict.
+  for (const w of workers) workerCodeSuffix(w);
   // Enrich every gating slot with its execution-hold reading up front so the
   // --json shape and the text rendering below read the exact same data and
   // can never disagree (task-spor-work-status-show-execution-hold-and-stale-
@@ -11657,7 +11695,8 @@ function cmdWorkStatus(cfg, { json }) {
         `${w.accept ? `accept ${w.accept}  ` : ""}` +
         `${(w.active || []).length}/${w.concurrency} slots  dispatched ${w.dispatched || 0}  ` +
         `resolved ${o.resolved || 0} reported ${o.reported || 0} failed ${o.failed || 0}${o.declined ? ` declined ${o.declined}` : ""}` +
-        `${o.unenforced ? ` (${o.unenforced} unenforced)` : ""}`
+        `${o.unenforced ? ` (${o.unenforced} unenforced)` : ""}` +
+        workerCodeSuffix(w)
     );
     // A workspace/lock refusal is deliberately NEVER cooled onto the item that
     // hit it (task-spor-work-loop-workspace-refusal-cooldown-on-worker-not-
@@ -12168,12 +12207,17 @@ function stripFrontmatterDate(markdown) {
 // lines that carry the fact — order-insensitive, minus the server's own keys —
 // and the body, whitespace-trimmed. Anything else (a different verdict, a
 // different head, a different summary) is a different node.
-const SERVER_STAMPED_KEYS = new Set(["date", "author", "authored_via", "authored_by_agent", "session", "revision", "created_at", "updated_at", "captured_at", "authored_at"]);
+// `worker_code:` and its "Judged by" body line name the process that WROTE a
+// fact, not the fact (task-spor-reconcile-worker-code-stamp-source): a pipeline
+// resumed on newer code re-files the same deterministic id and must adopt the
+// occupant the older code wrote, not refuse it as another gate's node.
+const CODE_STAMP_BODY_LINE = /^Judged by `spor work` running .*(?:\n\n|\n|$)/m;
+const SERVER_STAMPED_KEYS = new Set(["worker_code", "date", "author", "authored_via", "authored_by_agent", "session", "revision", "created_at", "updated_at", "captured_at", "authored_at"]);
 function gateNodeShape(markdown) {
   const text = String(markdown || "").replace(/\r\n/g, "\n");
-  if (!text.startsWith("---\n")) return { fm: [], body: text.trim() };
+  if (!text.startsWith("---\n")) return { fm: [], body: text.replace(CODE_STAMP_BODY_LINE, "").trim() };
   const end = text.indexOf("\n---", 4);
-  if (end === -1) return { fm: [], body: text.trim() };
+  if (end === -1) return { fm: [], body: text.replace(CODE_STAMP_BODY_LINE, "").trim() };
   const fm = text
     .slice(4, end)
     .split("\n")
@@ -12184,7 +12228,7 @@ function gateNodeShape(markdown) {
       return !(m && SERVER_STAMPED_KEYS.has(m[1]));
     })
     .sort();
-  const body = text.slice(end + 4).replace(/^\n+/, "").trim();
+  const body = text.slice(end + 4).replace(CODE_STAMP_BODY_LINE, "").replace(/^\n+/, "").trim();
   return { fm, body };
 }
 // One tolerance, one way: an occupant with NO `gate_head:` line at all is
@@ -13100,7 +13144,7 @@ function gateDepsHost() {
     removeDispatchWorktree, reportlessReviewReason, rescueDiagnosisPath, rescueHarnessAdapter,
     rescuePassthrough, resolveNode, reviewPassthrough, reviewerIndependence, runGateCommand,
     stageThrowawayTree, stampReviewerCooldown, teardownThrowawayTree, verifyRunResolution,
-    withoutFlakeEdges, workerContract, worktreeDeclaredEnv, writeGateNode,
+    withoutFlakeEdges, workerContract, workerCodeIdentity, worktreeDeclaredEnv, writeGateNode,
     });
   }
   return _gateDeps;
@@ -17203,12 +17247,8 @@ function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {}, ref = null }
   const watch = ref || codeWatchRef(loaded, { root });
   return () => {
     if (!loaded || !watch) return;
-    const now = (codeGit(root, ["rev-parse", "--short", `${watch}^{commit}`]) || "").trim();
-    if (!now || now === noticed || now === loaded.commit) return;
-    // Abbreviations grow as a repo does, so compare the OBJECTS: a longer
-    // spelling of the loaded commit is not a move.
-    const full = (r) => (codeGit(root, ["rev-parse", "--verify", "-q", `${r}^{commit}`]) || "").trim();
-    if (full(now) && full(now) === full(loaded.commit)) return;
+    const now = codeTip(watch, root);
+    if (!now || now === noticed) return;
     // Only a DEFINITIVE ancestry answer settles this tip: exit 0 (descends)
     // or exit 1 (does not). Anything else — a timeout, a spawn error, git's
     // 128 on a momentarily unreadable object store mid-fetch — leaves the
@@ -17218,18 +17258,94 @@ function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {}, ref = null }
     // The record is a closure variable, not durable state: there is no
     // write that can fail to land, no second flag to owe, and no other actor
     // reading it.
-    const anc = gitSpawn(root, ["merge-base", "--is-ancestor", loaded.commit, now], { timeout: 3000, stdio: "ignore" });
-    if (anc.error || (anc.status !== 0 && anc.status !== 1)) return;
+    const moved = codeMovedPast(loaded.commit, now, root);
+    if (moved === null) return;
     // Remember the tip either way, so an unrelated tip is examined once and a
     // later descendant tip is still noticed.
     noticed = now;
-    if (anc.status !== 0) return;
+    if (!moved) return;
     log(`work: ${watch} in ${root} moved to ${now} — this worker still runs the code it loaded at ${loaded.commit}; restart it to pick the new code up`);
     // The tip moved past, for a caller that acts on it (`--restart-on-land`);
     // every other return above is undefined, so a caller that ignores it
     // sees nothing new.
     return now;
   };
+}
+
+// The watched ref's current tip as a short commit, "" when it does not resolve.
+function codeTip(watch, root = ROOT) {
+  return (codeGit(root, ["rev-parse", "--short", `${watch}^{commit}`]) || "").trim();
+}
+
+// The ONE definition of "the loaded code was moved past" — shared by the
+// per-pass notice (and so by the `--restart-on-land` drain) and by `spor work
+// --status`'s STALE marker (task-spor-reconcile-worker-code-stamp-source), so
+// the two surfaces can never disagree about a worker.
+// true: `tip` is a DIFFERENT commit that DESCENDS from `loadedCommit` —
+// something landed on top of the loaded code. false: the same object (an
+// abbreviation grows as a repo does, so the OBJECTS are compared — a longer
+// spelling of the loaded commit is not a move), or a tip that does not descend
+// (a branch switch, a bisect checkout, a rewind, an unrelated history: not a
+// land). null: git gave no definitive answer (a timeout, a spawn error, 128 on
+// a momentarily unreadable object store) — the caller asks again later rather
+// than recording a verdict it does not have.
+function codeMovedPast(loadedCommit, tip, root = ROOT) {
+  if (!loadedCommit || !tip) return null;
+  if (tip === loadedCommit) return false;
+  const full = (r) => (codeGit(root, ["rev-parse", "--verify", "-q", `${r}^{commit}`]) || "").trim();
+  if (full(tip) && full(tip) === full(loadedCommit)) return false;
+  const anc = gitSpawn(root, ["merge-base", "--is-ancestor", loadedCommit, tip], { timeout: 3000, stdio: "ignore" });
+  if (anc.error || (anc.status !== 0 && anc.status !== 1)) return null;
+  return anc.status === 0;
+}
+
+// Did anything under the PUBLISHED code paths change between the loaded commit
+// and the tip? A land that touched only docs or tests moved the ref past the
+// worker without changing what it runs, and `--status` should not shout STALE
+// over it. The pathspec is the package's own `files` list plus package.json,
+// read from the checkout at `root`. true: differs; false: identical under
+// those paths; null: no definitive answer (the same fail-soft posture as
+// codeMovedPast).
+function codePathsChanged(loadedCommit, tip, root = ROOT) {
+  if (!loadedCommit || !tip) return null;
+  let paths = [];
+  try {
+    paths = (JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).files || []).map((f) => String(f).replace(/\/+$/, "")).filter(Boolean);
+  } catch {
+    /* no readable manifest: judge the whole tree */
+  }
+  const r = gitSpawn(root, ["diff", "--quiet", loadedCommit, tip, "--", ...(paths.length ? [...paths, "package.json"] : ["."])], { timeout: 3000, stdio: "ignore" });
+  if (r.error || (r.status !== 0 && r.status !== 1)) return null;
+  return r.status === 1;
+}
+
+// The identity of the code THIS process loaded, memoized for the process
+// (task-spor-reconcile-worker-code-stamp-source, from the factory-spor stale-
+// worker outage): a long-running worker keeps the lib/bin it loaded, and a
+// refusal it makes after the repo has fixed that code should be readable as
+// such FROM THE GRAPH. `stamp` is `<repo>@<commit>` for a source checkout (the
+// `commits:` field's own `repo@sha` spelling, so `spor blame <sha>` finds what
+// a commit judged) or `<package>@<version>` for an npm install (nothing to
+// watch — an upgrade replaces it). Memoized on purpose: it answers "what did
+// this process LOAD", which cannot change while it runs, so an advance of the
+// checkout's HEAD after startup never reaches a stamp (a fresh read at write
+// time would say what is on disk, not what is executing).
+let CODE_IDENTITY;
+function workerCodeIdentity(root = ROOT) {
+  if (root === ROOT && CODE_IDENTITY !== undefined) return CODE_IDENTITY;
+  let pkg = {};
+  try {
+    pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) || {};
+  } catch {
+    /* no readable manifest: the version reads unknown */
+  }
+  const loaded = loadedCodeCommit(root);
+  const repo = loaded ? u.projectSlug(root) : null;
+  const identity = loaded
+    ? { ...loaded, repo, root, version: pkg.version || null, stamp: `${repo}@${loaded.commit}` }
+    : { commit: null, branch: null, repo: null, root, version: pkg.version || null, stamp: `${pkg.name || "@sporhq/spor"}@${pkg.version || "unknown"}` };
+  if (root === ROOT) CODE_IDENTITY = identity;
+  return identity;
 }
 
 // One gate's COVERAGE, for `spor work --print` (task-spor-worker-preflight-
@@ -17293,7 +17409,7 @@ function worker() {
       codeWatchRef, dispatchAgentId, dispatchSatisfiableWorkItem, dispatchWorktreeDir,
       dispatchableQueuePage, dispatchedAgents, escalateParkedPipeline, factoryScopeSlug,
       gateCoveragePreview, integrationSatisfiability, isAgentId, loadFactoryDefinition,
-      loadedCodeCommit, makeCodeMovedNotice, makeFactoryAvailabilityCheck, pollWorkRuns,
+      loadedCodeCommit, makeCodeMovedNotice, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, makeFactoryAvailabilityCheck, pollWorkRuns,
       reconcileCompletions, reconcileWithdrawnExecutions, renewLiveExecutions, replayAttestationDebts,
       resolveDir, retryOneEscalation, runGateAndIntegration, takeProjectWarning,
       targetRepoDispatchCfg, warnQueueProjectOnce, workerAlive,
@@ -19802,6 +19918,7 @@ const COMMANDS = {
       max: { type: "string", value: "N", desc: "stop after N dispatches (default: run forever)" },
       once: { type: "boolean", desc: "one selection pass, wait for those runs, exit" },
       "restart-on-land": { type: "boolean", desc: "exit cleanly (after in-flight runs and pipelines settle) when the checkout this worker loaded its code from moves past that code, so a supervisor restarts it on the new code (also work.restartOnLand; self-hosting factories)" },
+      "no-restart-on-land": { type: "boolean", desc: "never drain for a restart when the checkout moves, even for a self-hosting factory (overrides the on-by-default; --restart-on-land contradicts it)" },
       status: { type: "boolean", desc: "read back this machine's workers instead of running one" },
       json: { type: "boolean", desc: "machine-readable status (with --status)" },
       profile: { type: "string", value: "profile-id", desc: "pin the profile every dispatch runs under" },
@@ -20391,7 +20508,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
+module.exports = { gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
 
 if (require.main === module) {
   main()

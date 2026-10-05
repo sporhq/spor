@@ -3467,3 +3467,121 @@ test("liveWorkerSlots honors a live worker's slots only while its status heartbe
   const workLib = require("../lib/shell/work.js");
   assert.strictEqual(workLib.LEGACY_OWED_BY_BRIDGE_UNTIL, Date.parse("2026-10-18T00:00:00Z"), "the bridge's deletion date: the gate_factory stamp's ship date + run retention + slack");
 });
+
+
+// task-spor-factory-spor-worker-restart-on-land-stale-outage-fix: the worker
+// records which code it runs and which ref it watches, and `spor work --status`
+// reads that back as a STALE marker on the slots line — with the SAME move
+// predicate the worker's own notice and drain use.
+test("the status record carries the code the worker runs when the caller says which, and nothing when it does not", async () => {
+  const code = { stamp: "spor@1d3c104", commit: "1d3c104", branch: "main", root: "/srv/spor", watch: "main" };
+  const h = harness({ queue: [], opts: { concurrency: 1, code }, maxPasses: 1 });
+  const final = await h.run();
+  assert.deepStrictEqual(final.code, code);
+  const bare = harness({ queue: [], opts: { concurrency: 1 }, maxPasses: 1 });
+  assert.strictEqual("code" in (await bare.run()), false, "byte-identical status without one");
+});
+
+test("codeMovedPast, codePathsChanged and codeTip: one definition of 'moved past', and a docs-only land is a move that changed no shipped code", () => {
+  const { codeMovedPast, codePathsChanged, codeTip } = require("../bin/spor.js");
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  const { execFileSync } = require("child_process");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-stale-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "package.json"), '{"name":"x","version":"0.0.1","files":["lib/"]}\n');
+  fs.mkdirSync(path.join(repo, "lib"));
+  fs.writeFileSync(path.join(repo, "lib", "i.js"), "1\n");
+  fs.writeFileSync(path.join(repo, "README.md"), "a\n");
+  g("add", "."); g("commit", "-q", "-m", "one");
+  const c1 = g("rev-parse", "--short", "HEAD");
+  assert.strictEqual(codeTip("main", repo), c1);
+  assert.strictEqual(codeTip("nope", repo), "", "an unresolvable ref is an empty tip");
+  assert.strictEqual(codeMovedPast(c1, c1, repo), false, "the same commit is not a move");
+  assert.strictEqual(codeMovedPast(c1, g("rev-parse", "HEAD"), repo), false, "a longer spelling of the same object is not a move");
+  assert.strictEqual(codeMovedPast(c1, "", repo), null);
+  assert.strictEqual(codeMovedPast(c1, "0000000", repo), null, "an unreadable tip is no verdict");
+
+  fs.writeFileSync(path.join(repo, "README.md"), "b\n");
+  g("commit", "-qam", "docs");
+  const c2 = g("rev-parse", "--short", "HEAD");
+  assert.strictEqual(codeMovedPast(c1, c2, repo), true, "a descendant tip IS a move (the drain fires on it)");
+  assert.strictEqual(codePathsChanged(c1, c2, repo), false, "...but nothing under the shipped paths changed");
+
+  fs.writeFileSync(path.join(repo, "lib", "i.js"), "2\n");
+  g("commit", "-qam", "lib");
+  const c3 = g("rev-parse", "--short", "HEAD");
+  assert.strictEqual(codeMovedPast(c1, c3, repo), true);
+  assert.strictEqual(codePathsChanged(c1, c3, repo), true, "lib/ changed: the worker's code is genuinely behind");
+  assert.strictEqual(codePathsChanged(c2, c3, repo), true);
+
+  // A tip that does not descend (a rewind / branch switch) is not a move.
+  g("checkout", "-q", "-b", "other", c1);
+  fs.writeFileSync(path.join(repo, "lib", "i.js"), "9\n");
+  g("commit", "-qam", "unrelated");
+  assert.strictEqual(codeMovedPast(c3, g("rev-parse", "--short", "HEAD"), repo), false);
+});
+
+test("spor work --status marks a LIVE worker whose watched ref moved past its code STALE on the slots line, says 'behind' for a docs-only land, and leaves a current or stopped one alone", () => {
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  const { execFileSync } = require("child_process");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-stale-repo-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "package.json"), '{"name":"x","version":"0.0.1","files":["lib/"]}\n');
+  fs.mkdirSync(path.join(repo, "lib"));
+  fs.writeFileSync(path.join(repo, "lib", "i.js"), "1\n");
+  fs.writeFileSync(path.join(repo, "README.md"), "a\n");
+  g("add", "."); g("commit", "-q", "-m", "one");
+  const c1 = g("rev-parse", "--short", "HEAD");
+  fs.writeFileSync(path.join(repo, "README.md"), "b\n");
+  g("commit", "-qam", "docs");
+  const c2 = g("rev-parse", "--short", "HEAD");
+  fs.writeFileSync(path.join(repo, "lib", "i.js"), "2\n");
+  g("commit", "-qam", "lib");
+  const c3 = g("rev-parse", "--short", "HEAD");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-stale-home-"));
+  // pid: this test process — alive, and with no recorded ticks the identity
+  // check falls back to the pid probe (an older record's shape).
+  const rec = (id, code, extra = {}) => ({
+    worker_id: id, pid: process.pid, state: "waiting", project: "demo", concurrency: 2, dispatched: 3,
+    outcomes: { resolved: 3, reported: 0, failed: 0 }, active: [], gating: [], recent: [], skipped: [],
+    started_at: new Date(Date.now() - 60000).toISOString(), updated_at: new Date().toISOString(), stopped_at: null, stop_reason: null,
+    code, ...extra,
+  });
+  workLoop.writeWorkerStatus(home, rec("aaaaaaaa-0000-0000-0000-000000000001", { stamp: `x@${c1}`, commit: c1, branch: "main", root: repo, watch: "main" }));
+  workLoop.writeWorkerStatus(home, rec("bbbbbbbb-0000-0000-0000-000000000002", { stamp: `x@${c2}`, commit: c2, branch: "main", root: repo, watch: "main" }, { restart_on_land: true }));
+  workLoop.writeWorkerStatus(home, rec("cccccccc-0000-0000-0000-000000000003", { stamp: `x@${c3}`, commit: c3, branch: "main", root: repo, watch: "main" }));
+  // A docs-only move: loaded at c1 on a ref whose tip is c2.
+  g("branch", "docs-tip", c2);
+  workLoop.writeWorkerStatus(home, rec("dddddddd-0000-0000-0000-000000000004", { stamp: `x@${c1}`, commit: c1, branch: "main", root: repo, watch: "docs-tip" }));
+  // Stopped: runs nothing, so is never stale however far the ref moved.
+  workLoop.writeWorkerStatus(home, rec("eeeeeeee-0000-0000-0000-000000000005", { stamp: `x@${c1}`, commit: c1, branch: "main", root: repo, watch: "main" }, { stopped_at: new Date().toISOString(), stop_reason: "one pass (--once)" }));
+  // An older record with no `code` at all: the line is exactly what it was.
+  workLoop.writeWorkerStatus(home, rec("ffffffff-0000-0000-0000-000000000006", undefined));
+
+  const text = cli(["work", "--status"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(text.status, 0, text.stderr);
+  const line = (id) => text.stdout.split("\n").find((l) => l.startsWith(id)) || "";
+  assert.match(line("aaaaaaaa"), new RegExp(`0/2 slots  dispatched 3  resolved 3 reported 0 failed 0  code x@${c1}  STALE — main is at ${c3}, past the code this worker loaded; restart it$`), line("aaaaaaaa"));
+  assert.match(line("bbbbbbbb"), new RegExp(`code x@${c2}  STALE — main is at ${c3}, past the code this worker loaded; restart it \\(it is draining to exit for that restart\\)$`), line("bbbbbbbb"));
+  assert.match(line("cccccccc"), new RegExp(`failed 0  code x@${c3}$`), line("cccccccc"));
+  assert.match(line("dddddddd"), new RegExp(`code x@${c1}  behind docs-tip \\(${c2}; no change under the shipped code paths\\)$`), line("dddddddd"));
+  assert.match(line("eeeeeeee"), new RegExp(`stopped \\(one pass \\(--once\\)\\).*failed 0  code x@${c1}$`), "a stopped worker shows its code but is never judged stale");
+  assert.match(line("ffffffff"), /failed 0$/, "a record with no code is rendered exactly as before");
+
+  const json = cli(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(json.status, 0, json.stderr);
+  const byId = Object.fromEntries(JSON.parse(json.stdout).workers.map((w) => [w.worker_id.slice(0, 8), w]));
+  assert.strictEqual(byId.aaaaaaaa.code.stale, true);
+  assert.strictEqual(byId.aaaaaaaa.code.tip, c3);
+  assert.strictEqual(byId.cccccccc.code.stale, false);
+  assert.strictEqual(byId.dddddddd.code.stale, false, "behind, but not stale: the shipped paths did not change");
+  assert.strictEqual("stale" in byId.eeeeeeee.code, false, "a stopped worker is not judged");
+  assert.strictEqual("code" in byId.ffffffff, false);
+});

@@ -2474,7 +2474,7 @@ the operator's call; the notice only makes the drift visible in the log rather
 than discoverable after a pipeline ran stale.
 
 The operator can make that call once, up front: `--restart-on-land`
-(`work.restartOnLand`, `SPOR_WORK_RESTART_ON_LAND=1`; off by default) is for a
+(`work.restartOnLand`, `SPOR_WORK_RESTART_ON_LAND=1`; off by default, except for a self-hosting factory — below) is for a
 self-hosting factory whose worker runs from the very checkout its own pipelines
 land onto. The first time the watched ref moves past the loaded code (a
 descendant tip — the same test as the notice, so a branch switch or rewind in
@@ -2486,6 +2486,53 @@ was moved past, and a supervisor (a systemd unit, a shell loop) restarts it on
 the new code. The latch never clears: a further move before the drain finishes
 is logged like any other but changes nothing. On an npm install there is no
 checkout to watch, so the flag says so once at startup and is otherwise inert.
+
+**It is ON by default for a self-hosting factory.** A worker whose loaded
+factory declares (or defaults to, via the factory node's own repo stamp) a
+`repos` scope that includes the repo the worker's own code is loaded from is
+the one case where "the watched ref moved past" always means "your gate code
+moved" — the case that once ran two days of stale code past a landed gate fix,
+announcing it eight times into a log nobody was paged on, then charged a
+reviewer outage as two rejections. There the default is on, said once at
+startup (`--restart-on-land is on by default — factory X judges <repo>, the
+repo this worker's own code is loaded from; run it under a supervisor that
+restarts it`). The scope test is the one that bounds candidates (`repo-spor`
+admits `spor`, never the reverse). Explicit choices win over the default:
+`--no-restart-on-land`, `work.restartOnLand: false` and
+`SPOR_WORK_RESTART_ON_LAND=0` are a deliberate "run stale until I restart
+you" (`--restart-on-land` together with `--no-restart-on-land` is refused). A
+factory judging another repo, an unscoped factory, a bare worker and an npm
+install are byte-identical to before. A self-hosting worker therefore wants a
+supervisor loop (`while spor work --factory <id> ...; do sleep 5; done`);
+installing one is the operator's call, never this client's.
+
+**Every fact names the code that judged it.** `workerCodeIdentity()` is the
+identity of the code the process LOADED, read once at startup and memoized:
+`<repo>@<commit>` for a source checkout (the `commits:` field's own `repo@sha`
+spelling, so `spor blame <sha>` finds what a commit judged) or
+`<package>@<version>` for an install. It is stamped as `worker_code:`
+frontmatter plus a "Judged by `spor work` running …" body line on every
+`art-gate-*`, `art-rescue-*` and `art-merge-*` fact and on the gate,
+implementation and integration escalations. It is never re-read from the
+checkout at write time, so advancing the checkout's HEAD after startup does not
+change a stamp: it says what was executing, not what is on disk. The stamp is
+not part of any node id and the occupant comparison ignores it, so a pipeline
+resumed on newer code adopts the facts older code already wrote. A caller with
+no code identity writes byte-identical nodes. The stamp is a label, not a
+signed claim: the attestation's digest and signature are over their own core
+and are unchanged.
+
+**`spor work --status` says whether a worker is behind.** The worker's status
+record carries `code` (stamp, commit, branch, root, watched ref). For a LIVE
+worker the slots line ends in `code <stamp>` and, using the same predicate the
+notice and the drain use (`codeMovedPast`), one of: nothing more (current);
+`STALE — <ref> is at <tip>, past the code this worker loaded; restart it`
+(plus "it is draining to exit for that restart" under `--restart-on-land`);
+`behind <ref> (<tip>; no change under the shipped code paths)` for a land that
+touched only docs or tests; or `(<ref> at <tip>; ancestry unreadable)` when git
+gave no answer. A stopped or dead worker is shown its stamp but never judged,
+and a record with no `code` renders exactly as before. `--json` carries
+`code.stale` (true / false / null) and `code.tip`.
 
 ### 10.7 A refusal is graph state, not a machine-local cooldown
 

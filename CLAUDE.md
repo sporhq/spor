@@ -1130,15 +1130,33 @@ Knobs: `work.concurrency` (1), `work.intervalMs` (30s), `work.maxIntervalMs`
 `work.runMaxMs` (24h), `work.runIdleMs` (45min), `work.parkedReofferMax`
 (10 identical `interrupted` re-offers of a parked gate pipeline before it is
 escalated to a person; 0 = unbounded), `work.restartOnLand`
-(`--restart-on-land`, off — a self-hosting factory's worker drains and exits
+(`--restart-on-land` — a self-hosting factory's worker drains and exits
 for a supervisor restart once the watched ref — the factory's integration
 target when it resolves in the code checkout, else the loaded branch — moves to
 a DESCENDANT of the loaded commit; a branch switch, bisect or rewind is not a
 land, and the git reads are env-scrubbed via `gitSpawn`,
-task-spor-work-announce-lib-commit-and-notice-main-moved),
+task-spor-work-announce-lib-commit-and-notice-main-moved. Off by default
+EXCEPT when the loaded factory's `repos` scope includes the repo the worker's
+own code is loaded from — the self-hosting case — which defaults it ON,
+announced at startup; `--no-restart-on-land`, `work.restartOnLand: false` or
+`SPOR_WORK_RESTART_ON_LAND=0` still wins, and every other factory is
+byte-identical, task-spor-reconcile-worker-code-stamp-source),
 `work.project` (falls back to `queue.project`). Status is machine-local under
 `journal/work/<worker>.work.json`, read back by `spor work --status [--json]` (a
-worker whose pid is gone reads STALE, never running). See test/work-loop.test.js.
+worker whose pid is gone reads STALE, never running). The same task made the
+CODE a worker runs a graph-readable fact: `workerCodeIdentity()` (bin/spor.js,
+memoized per process — the revision the worker LOADED, never re-read from the
+checkout at write time; `<repo>@<sha>` for a source checkout, `<pkg>@<version>`
+for an install) is stamped as `worker_code:` frontmatter plus a "Judged by
+`spor work` running …" body line on every `art-gate-*`, `art-rescue-*` and
+`art-merge-*` fact and on the gate/implementation/integration escalations
+(`gateRunner.codeStampFrontmatter`/`codeStampLine`, carried to the builders as
+`deps.code`; absent is byte-identical; `gateNodeShape` ignores the stamp so a
+resume on newer code adopts older code's facts), and recorded on the worker's
+status file so `spor work --status` marks a LIVE worker whose watched ref moved
+past its loaded commit `STALE` (`workerCodeSuffix`, the SAME `codeMovedPast`
+predicate the notice/drain use; a land that changed nothing under the package's
+`files` paths reads `behind …`, `codePathsChanged`). See test/work-loop.test.js.
 **The gate pipeline (task-spor-work-gate-pipeline):** the loop still runs BARE
 by default — with no factory declared nothing changes — but `work.factory`
 (`--factory <id>`) points it at a graph-resident `type: factory` node

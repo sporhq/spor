@@ -819,3 +819,28 @@ test("linkFact recurrence: a dead target recovers an already-paid rung, else fil
   const unreadable = depsFor(t, hostFor({ nodeUnreadable: () => true }));
   assert.match((await unreadable.deps.linkFact(args)).reason, /could not be read before recurrence selection/);
 });
+
+// task-spor-reconcile-worker-code-stamp-source: the escalations a worker files
+// name the code it LOADED (host.workerCodeIdentity, memoized per process), and a
+// host with none files exactly what it always did.
+test("a gate escalation carries worker_code and the Judged-by line; a host without an identity files it bare", async (t) => {
+  const sporCli = require("../bin/spor.js");
+  const code = { stamp: "spor@1d3c104", commit: "1d3c104", branch: "main", root: "/srv/spor" };
+  const file = async (hostOver, which) => {
+    const written = [];
+    const { deps } = depsFor(t, { buildGateWorkNode: sporCli.buildGateWorkNode, fenceSafe: (x) => x, gateIdSuffix: sporCli.gateIdSuffix, writeGateNode: async (_cfg, id, md) => (written.push({ id, md }), { ok: true, id }), ...hostOver }, {
+      factory: { id: "f", trustedRef: "main", integration: { mode: "local", strategy: "merge", targetRef: "main" } },
+    });
+    if (which === "gate") await deps.escalate({ gate: { id: "review", kind: "agent-review", cycles: 1 }, attempts: [{ verdict: "failed", detail: "no" }], detail: "no", evidence: "", findings: [], ledger: [] });
+    else await deps.escalate({ attempts: [{ verdict: "failed", detail: "no" }], detail: "no", evidence: "" });
+    assert.strictEqual(written.length, 1);
+    return { markdown: written[0].md, deps };
+  };
+  const stamped = await file({ workerCodeIdentity: () => code }, "gate");
+  assert.match(stamped.markdown, /\nworker_code: spor@1d3c104\n/);
+  assert.match(stamped.markdown, /Judged by `spor work` running `spor@1d3c104` \(main\) from \/srv\/spor/);
+  assert.strictEqual(stamped.deps.code, code, "the deps expose the loaded identity for the fact builders");
+  const bare = await file({}, "gate");
+  assert.doesNotMatch(bare.markdown, /worker_code|Judged by/);
+  assert.strictEqual(bare.deps.code, null);
+});
