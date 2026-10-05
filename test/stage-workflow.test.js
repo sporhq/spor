@@ -244,3 +244,15 @@ test("refusalSurface / carryRefusalTags / describeRefusal: what a pipeline resul
   assert.match(sw.describeRefusal({ reason: "journal_version_mismatch", tombstoned: false, replayed: false }), /^refused: the attempt's journal was recorded by another version of the workflow — a fresh attempt/);
   assert.equal(sw.describeRefusal(null), null);
 });
+
+test("journalFailureSurface reads a poisoned persist failure and nothing else", () => {
+  const fsErr = Object.assign(new Error("EACCES: permission denied, open '/j/x.jsonl'"), { code: "EACCES", path: "/j/x.jsonl", poisoned: true });
+  const f = sw.journalFailureSurface(fsErr);
+  assert.deepEqual(f, { code: "EACCES", path: "/j/x.jsonl", message: fsErr.message });
+  const line = sw.describeJournalFailure(f);
+  assert.match(line, /journal unwritable \(EACCES\) at \/j\/x\.jsonl/);
+  assert.match(line, /--regate/);
+  assert.equal(sw.journalFailureSurface(new Error("boom")), null);
+  assert.equal(sw.journalFailureSurface(null), null);
+  assert.equal(sw.describeJournalFailure(null), null);
+});

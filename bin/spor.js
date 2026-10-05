@@ -11601,6 +11601,7 @@ function cmdWorkStatus(cfg, { json }) {
       // A REFUSED attempt — the factory edited mid-flight, a journal of another
       // workflow version, a tombstone re-settled — says so, for every stage.
       if (r.refusal) out(`            ${stageWorkflow.describeRefusal(r.refusal)}`);
+      if (r.journal_failure) out(`            ${stageWorkflow.describeJournalFailure(r.journal_failure)}`);
       // A pipeline PAUSED on a review lane's stated reset: when it wakes.
       if (r.paused_until) out(`            paused until ${r.paused_until} — slot freed; re-offered then`);
       // A verdict this worker's pipeline did NOT produce (cross-model review,
