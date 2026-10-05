@@ -78,7 +78,7 @@ const PASS = '```json\n{"verdict":"pass"}\n```';
 // are on the graph) — never of a call counter — so a re-executed activity
 // answers exactly as its first execution did.
 function makeWorld({ clock, script = SCRIPTS.passed, adopt = true, home = null, stage = "gates-a0" } = {}) {
-  const w = { signals: [], calls: new Map(), effects: [], facts: new Map(), escalations: [], demotions: [], launched: new Map(), dispatches: 0, rescues: 0, reviews: [], suites: 0, progress: new Map(), rescueState: null, stopping: false, preflight: { ok: true }, preflights: 0, slept: 0 };
+  const w = { signals: [], calls: new Map(), effects: [], facts: new Map(), escalations: [], demotions: [], launched: new Map(), dispatches: 0, rescues: 0, reviews: [], suites: 0, progress: new Map(), rescueState: null, stopping: false, preflight: { ok: true }, preflights: 0, slept: 0, pools: { retry: { spent: 0 } }, rescueOutages: 0 };
   const headNow = () => `head-v${1 + w.launched.size}`;
   const deps = {
     now: () => clock.now(),
@@ -112,19 +112,23 @@ function makeWorld({ clock, script = SCRIPTS.passed, adopt = true, home = null, 
       w.signals.push({ name: `run:${runId}`, payload: { ok: true, classification: { outcome: "resolved" } } });
       return { ok: true, runId };
     },
-    dispatchRescue: async ({ attempt }) => {
-      const name = `rescue-${attempt}`;
+    dispatchRescue: async ({ attempt, retry = 0 }) => {
+      const name = `rescue-${attempt}${retry > 0 ? `-t${retry}` : ""}`;
       if (adopt && w.launched.has(name)) return { ok: true, runId: w.launched.get(name), adopted: true };
       w.rescues += 1;
       const runId = `rescue-run-${w.rescues}`;
       w.launched.set(name, runId);
-      w.signals.push({ name: `rescue-run:${runId}`, payload: { ok: true } });
+      w.signals.push({ name: `rescue-run:${runId}`, payload: w.rescueOutages > 0 ? (w.rescueOutages -= 1, { ok: true, classification: { outcome: "infrastructure", pool: "retry", reason: "credit-exhausted" } }) : { ok: true } });
       return { ok: true, runId };
     },
     rescueReport: async ({ runId }) => ({ diagnosis: `fixed in ${runId}`, category: "real-defect", fixed: true, filed: ["task-factory-tweak"], unread: false }),
     // Under the kernel's drive() the queued signals are delivered before this is
     // ever asked; under the real driver it answers the run's terminal state.
     awaitRun: async ({ runId }) => ({ ok: true, runId, classification: { outcome: "resolved" } }),
+    loadGatePools: async () => w.pools,
+    saveGatePools: async ({ pools }) => {
+      w.pools = { ...w.pools, ...JSON.parse(JSON.stringify(pools)) };
+    },
     loadGateProgress: async ({ gate, rescue = 0 }) => w.progress.get(`${rescue}:${gate.id}`) || null,
     saveGateProgress: async ({ gate, progress, rescue = 0 }) => {
       w.progress.set(`${rescue}:${gate.id}`, JSON.parse(JSON.stringify(progress)));
@@ -1122,4 +1126,19 @@ test("a gate journal recorded before the pathless-timeout fix replays to its jou
   const fresh = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: w2.deps });
   assert.equal(fresh.state, "failed");
   assert.notEqual(fresh.gates[0].verdict, "infrastructure", "the new reading: an actual failure, charged");
+});
+
+test("an OUTAGED rescue run is re-dispatched on the shared retry pool under a new run name, and a spent pool settles as a rescue that could not run", async () => {
+  const script = { ...SCRIPTS.rescued, factory: factoryOf({ ...BASE, gates: [GATES[0], { ...GATES[1], cycles: 0 }], rescue: { profile: "profile-rescue", attempts: 1 }, implementation: { profile: "profile-impl", retry: { attempts: 1 } } }) };
+  for (const [outages, state, rescues, spent] of [[1, "passed", 2, 1], [2, "failed", 2, 1]]) {
+    const clock = fakeClock(1_700_000_000_000);
+    const world = makeWorld({ clock, script });
+    world.rescueOutages = outages;
+    const r = await drive(exec(world, clock, { factory: script.factory }), { clock, signals: world.signals });
+    assert.equal(r.status, "completed", JSON.stringify(r));
+    assert.equal(r.result.state, state);
+    assert.deepEqual([...world.launched.keys()].filter((k) => k.startsWith("rescue-")), ["rescue-1", "rescue-1-t1"], "the re-dispatch carries the retry count, so it never adopts the dead run");
+    assert.equal(world.rescues, rescues);
+    assert.equal(world.pools.retry.spent, spent);
+  }
 });

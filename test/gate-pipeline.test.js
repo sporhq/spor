@@ -84,7 +84,7 @@ function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok:
       return review(args, seen);
     },
     fix: async (args) => {
-      seen.fixes.push({ gate: args.gate.id, cycle: args.cycle, findings: args.findings });
+      seen.fixes.push({ gate: args.gate.id, cycle: args.cycle, findings: args.findings, retry: args.retry || 0 });
       return fix(args, seen);
     },
     recordFact: async ({ id, markdown }) => {
@@ -7734,7 +7734,7 @@ test("the escalation an OUTAGE files says the reviewer never answered — never 
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test("a fix cycle's OWN outage that left the tree untouched stops the gate — it does not re-review an unchanged tree", async () => {
+test("a fix cycle's OWN outage that left the tree untouched is re-dispatched from the pool, and stops once the pool is spent", async () => {
   const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 1 } }, rescue: { profile: "profile-rescue" } });
   const rejecting = { ok: true, text: '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"lib/x.js","summary":"boom","evidence":"ran npm test, it failed"}]}\n```' };
   const { deps, seen } = fakes({
@@ -7750,12 +7750,47 @@ test("a fix cycle's OWN outage that left the tree untouched stops the gate — i
   };
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
   assert.strictEqual(res.state, "failed");
-  assert.strictEqual(seen.fixes.length, 1, "the gate stops at the outaged fix — it does not spend the second cycle re-reviewing an unchanged tree");
-  assert.strictEqual(seen.reviews.length, 1);
+  assert.deepStrictEqual(seen.fixes.map((f) => [f.cycle, f.retry]), [[0, 0], [0, 1]], "the fixer was re-asked once at the SAME cycle, under the new retry count (its run name)");
+  assert.strictEqual(seen.pools.retry.spent, 1, "one charge on the shared pool");
+  assert.strictEqual(seen.reviews.length, 1, "no second review of an unchanged tree");
   assert.strictEqual(res.gates[0].verdict, "infrastructure");
   assert.match(seen.escalations[0].detail, /never finished/);
   assert.match(seen.escalations[0].detail, /exactly where it was/);
   assert.strictEqual(seen.escalations[0].outage.outcome, "infrastructure");
+});
+
+test("an outaged fix dispatch (the run never ran) is re-made on the pool and the second fixer's tree is judged", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE, implementation: { profile: "profile-impl", retry: { attempts: 1 } } });
+  const rejecting = { ok: true, text: '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"lib/x.js","summary":"boom","evidence":"ran npm test, it failed"}]}\n```' };
+  let reviews = 0;
+  let fixCalls = 0;
+  const { deps, seen } = fakes({
+    pools: { retry: { spent: 0 } },
+    changedSeq: [
+      { ok: true, paths: ["lib/x.js"], head: "aaaa" },
+      { ok: true, paths: ["lib/x.js"], head: "bbbb" },
+    ],
+    review: () => ((reviews += 1) === 1 ? rejecting : { ok: true, text: '```json\n{"verdict":"pass","prior":[{"id":"F1","status":"resolved","note":"fixed"}]}\n```' }),
+    fix: () => ((fixCalls += 1) === 1
+      ? { ok: false, reason: "the harness died at boot", classification: { outcome: "infrastructure", pool: "retry", reason: "credit-exhausted" } }
+      : { ok: true, runId: "run-fix-2" }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(seen.fixes.map((f) => f.retry), [0, 1]);
+  assert.strictEqual(seen.pools.retry.spent, 1);
+});
+
+test("an outaged fix with NO retry pool declared is not re-dispatched", async () => {
+  const factory = factoryOf({ ...OUTAGE_BASE });
+  const rejecting = { ok: true, text: '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"lib/x.js","summary":"boom","evidence":"ran npm test, it failed"}]}\n```' };
+  const { deps, seen } = fakes({
+    review: () => rejecting,
+    fix: () => ({ ok: false, reason: "refused", classification: { outcome: "infrastructure", pool: "retry", reason: "credit-exhausted" } }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.fixes.length, 1);
 });
 
 test("...but a fix that COMMITTED before its harness died is judged like any other fix", async () => {
