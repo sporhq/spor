@@ -590,6 +590,61 @@ it, so an undo never drops a capture from triage — its id rides back as
 a line naming the ledger entry rides back in `warnings` instead. The MCP twin
 of `POST /v1/gardener/auto-writes/undo` (§3).
 
+### `agent_create`
+
+The MCP twin of `spor agent create` / the self-serve `POST /v1/agents`, for a
+caller who reaches Spor only through a person-scoped connector and has no
+terminal. Input `{ "label": "<short human label>", "id"?: "agent-<slug>",
+"pubkey"? }` — `label` derives the id (pass `id` explicitly when the label has
+no latin characters to derive from); `pubkey` is an optional public-key
+fingerprint recorded on the node (forward-compat, no signature is enforced).
+It writes a `type: agent` node through the same code path as `POST /v1/agents`,
+so node shape, validation and the ownership gate cannot drift between the two
+doors, and echoes the node it wrote. The **owner is always the caller's bound
+person** (from the token, never an argument).
+
+**Attribution only: no token is minted and none is ever returned** — a bearer
+in a chat transcript is a credential-exfiltration surface
+(dec-spor-agent-activation-attribution-only-over-mcp). Creating an agent does
+not activate it; select it with `agent_use`. A headless agent's standing
+credentials still come from the RFC 8628 device grant (§4), whose URL and user
+code are chat-safe by design.
+
+### `agent_use`
+
+The MCP twin of `spor agent use`: attribute this connection's subsequent
+writes to one of the caller's own agents, so they read "agent on behalf of
+person" (`authored_by_agent` is stamped by the ordinary write path) instead of
+person-direct. Input `{ "agent"?: "agent-<slug>", "clear"?: boolean }`:
+
+- `agent` — select that agent;
+- no arguments — read the current selection plus the menu of agents the caller
+  owns;
+- `clear: true` — drop the selection and write person-direct again.
+
+Contract a caller must know:
+
+- **Attribution only.** No token is minted or returned, ever; the verb changes
+  who a write is *labelled* as, not what credential made it.
+- **Owner-only.** Only an agent the caller owns is accepted, and ownership
+  (the `owned-by` edge) is re-checked on **every** call, so revoking or
+  re-pointing an agent stops its attribution on the next request. "Not yours"
+  and "does not exist" are indistinguishable (one `not_owned` outcome), so the
+  verb is no enumeration oracle. A token that already carries an agent (a
+  `spor dispatch` agent token) is never relabelled.
+- **Credential-scoped.** `/mcp` is stateless, so the selection is keyed on the
+  credential the connection presents (a hash of the graph home and the bearer,
+  never the token itself) — not on the person and not on a caller-supplied
+  session id. It therefore never affects the caller's other devices or
+  sessions.
+- **Expiring and non-durable.** The binding is held in server memory and
+  expires (12h default, `SPOR_AGENT_BINDING_TTL_MS`). It is dropped by a server
+  restart or by reconnecting with a fresh credential; the caller simply re-runs
+  `agent_use`. Until then writes fall back to person-direct attribution, which
+  is the safe direction.
+- **Standing credentials** are not part of this surface; they come from the
+  RFC 8628 device grant (§4).
+
 ### `erase_journal`
 
 The MCP twin of `POST /v1/admin/journal/erase` (§3): same arguments (`journal`, one of `id`/`text`, `also`, `ticket`, `reason`, `dry_run`, `allow_broken_chain`, `drop_unattributed_fragments`), same admin gate (stewards→root), and the same shared operation, so the result is the REST 200 body. A refusal is an `isError` result carrying `{status: "rejected", code, message}`. After a failure past the commit point on `server.log`/`integrity.log` the server exits 78 once it has replied (see §3). The `text`/`also` needles are never written to `mcp-wire.log` or `usage`.
