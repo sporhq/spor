@@ -167,6 +167,18 @@ function err(s) {
   process.stderr.write(s + "\n");
 }
 
+// A 2xx whose body would not parse is a failed read, not an empty one:
+// `r.json || {}` turned it into a confidently-empty envelope and the verb
+// carried on as if the server had said nothing
+// (issue-spor-verify-run-resolution-silent-json-parse-failure; lib/remote.js
+// `jsonError` is the signal). Reports it and returns true so the caller can
+// `return 1` / hand the failure up.
+function garbledBody(r, what) {
+  if (!r || !r.ok || !r.jsonError) return false;
+  err(`${what}: the server answered ${r.status} with an unparseable body (${r.jsonError})`);
+  return true;
+}
+
 // Echo which write target a mutating verb resolved to — remote server or local
 // graph home — right under its confirmation line, so a write is never
 // ambiguous about where it landed (task-spor-cli-write-banner-mode-echo). The
@@ -798,6 +810,9 @@ async function fetchQueuePaged(cfg, baseQs, target) {
     qs.set("offset", String(offset));
     const r = await remote.get(cfg, `/v1/queue?${qs.toString()}`, { timeoutMs: 6000 });
     if (r.transport || !r.ok) return r;
+    // A garbled 2xx page is a failed read: hand it up as a failure whose message
+    // the caller's generic `queue error` line prints (no second report here).
+    if (r.jsonError) return { ...r, ok: false, json: { error: { message: `unparseable response body (${r.jsonError})` } } };
     const page = r.json || {};
     if (!envelope) envelope = page;
     lastPage = page;
@@ -2511,6 +2526,7 @@ async function runStart(cfg, workflowId, values) {
     err(`run error ${r.status}${code ? ` (${code})` : ""}${msg ? `: ${msg}` : ""}`);
     return 1;
   }
+  if (garbledBody(r, "run start")) return 1;
   const j = r.json || {};
   if (values.json) {
     out(JSON.stringify(j, null, 2));
@@ -2541,6 +2557,7 @@ async function runStatus(cfg, runId, wantJson) {
     err(`run status error ${r.status}${code ? ` (${code})` : ""}${msg ? `: ${msg}` : ""}`);
     return 1;
   }
+  if (garbledBody(r, "run status")) return 1;
   const j = r.json || {};
   if (wantJson) {
     out(JSON.stringify(j, null, 2));
@@ -2605,6 +2622,7 @@ async function cmdShare(cfg, { values, positionals }) {
     if (code === "no_person") err("  your token must be bound to a person node to mint a share ticket — check 'spor whoami'.");
     return 1;
   }
+  if (garbledBody(r, "share")) return 1;
   const j = r.json || {};
   if (values.json) {
     out(JSON.stringify(j, null, 2));
@@ -3839,6 +3857,10 @@ async function cmdMerge(cfg, { values, positionals }) {
   if (notAdminHint(r)) return 1;
   const json = !!values.json;
   if (r.status === 409) {
+    if (r.jsonError) {
+      err(`merge: apply refused (409) — the plan is not clean, and the report body was unparseable (${r.jsonError})`);
+      return 1;
+    }
     const j = r.json || {};
     if (json) {
       out(JSON.stringify(j, null, 2));
@@ -3848,6 +3870,7 @@ async function cmdMerge(cfg, { values, positionals }) {
     }
     return 1;
   }
+  if (garbledBody(r, "merge")) return 1;
   if (!r.ok || !r.json) {
     const msg = r.json && r.json.error && r.json.error.message;
     err(`merge error ${r.status}${msg ? `: ${msg}` : ""}`);
@@ -4238,6 +4261,7 @@ async function cmdAsk(cfg, { values, positionals }) {
       err(`ask error ${r.status}${e && e.message ? `: ${e.message}` : ""}${detail}`);
       return 1;
     }
+    if (garbledBody(r, "ask")) return 1;
     const j = r.json || {};
     out(j.id ? `question filed: ${j.id}` : `question filed (${j.status || "ok"})`);
     out(writeTargetLine(cfg));
@@ -6614,6 +6638,7 @@ async function cmdAgentCreateRemote(cfg, { label, owner, pubkey }) {
     err(`agent create failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
     return 1;
   }
+  if (garbledBody(r, "agent create")) return 1;
   const j = r.json || {};
   const id = j.id || `agent-${kebab(label)}`;
   out(`created agent ${id}${j.owner ? ` owned by ${labelledPerson(j.owner_name, j.owner)}` : ""}`);
@@ -6835,6 +6860,7 @@ async function cmdAgentTokenMint(cfg, agent, args) {
     err(`mint failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
     return 1;
   }
+  if (garbledBody(r, "agent token mint")) return 1;
   const j = r.json || {};
   if (j.standing !== true) {
     // The route exists but the server didn't honor standing mode (pre-standing-PAT
@@ -7160,6 +7186,7 @@ async function cmdAdminGardener(cfg, args) {
     err(`gardener sweep failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
     return 1;
   }
+  if (garbledBody(r, "gardener sweep")) return 1;
   if (json) {
     out(JSON.stringify(r.json, null, 2));
     return 0;
