@@ -875,3 +875,15 @@ for (const transport of ["environment", "repository", "environment-over-reposito
     }
   });
 }
+
+test("a filesystem that refuses hard links with ENOTSUP still publishes through the wx-reservation fallback", async (t) => {
+  const repo = producerRepo(t);
+  const store = pathToFileURL(scratch(t, "cand-store-notsup")).href;
+  const cand = mintFor(repo);
+  const origLink = fs.linkSync;
+  fs.linkSync = () => { const e = new Error("ENOTSUP"); e.code = "ENOTSUP"; throw e; };
+  t.after(() => { fs.linkSync = origLink; });
+  const r = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "bundle", bundleStore: store });
+  assert.strictEqual(r.ok, true, r.reason);
+  assert.ok(fs.statSync(fileURLToPath(r.candidate.reference.locator)).size > 0);
+});
