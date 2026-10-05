@@ -1505,8 +1505,9 @@ test('install --token refuses over a corrupt credential store, leaving it byte-f
   fs.mkdirSync(path.dirname(cred), { recursive: true });
   fs.writeFileSync(cred, '{"tenants": {"x": TRUNCATED');
   const r = run(['install', 'codex', '--server', 'http://127.0.0.1:9/', '--token', 'tok9'], { ...codexInstallEnv(home), SPOR_HOME: home });
-  // install stays fail-soft on its configure step (the host install still lands),
-  // but the token write is refused rather than read-as-empty-and-overwritten.
+  // the token write is refused rather than read-as-empty-and-overwritten, and
+  // install exits non-zero so a script notices the token was never saved.
+  assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /could not write config: credential store .* is not valid JSON — refusing to overwrite it/);
   assert.strictEqual(fs.readFileSync(cred, 'utf8'), '{"tenants": {"x": TRUNCATED');
 });

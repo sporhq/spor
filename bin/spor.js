@@ -8184,6 +8184,7 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
       u.setConfig(cfg);
     } catch (e) {
       err(`could not write config: ${e.message}`);
+      return 1;
     }
   }
 
