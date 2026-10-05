@@ -250,7 +250,8 @@ test("journalFailureSurface reads a poisoned persist failure and nothing else", 
   const f = sw.journalFailureSurface(fsErr);
   assert.deepEqual(f, { code: "EACCES", path: "/j/x.jsonl", message: fsErr.message });
   const line = sw.describeJournalFailure(f);
-  assert.match(line, /journal unwritable \(EACCES\) at \/j\/x\.jsonl/);
+  assert.match(line, /'spor work --regate <run>'$/);
+  assert.doesNotMatch(line, /--resume/);
   assert.match(line, /--regate/);
   assert.equal(sw.journalFailureSurface(new Error("boom")), null);
   assert.equal(sw.journalFailureSurface(null), null);
