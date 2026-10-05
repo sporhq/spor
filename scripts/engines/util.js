@@ -1849,15 +1849,16 @@ const HAIKU_OUT_USD = 5 / 1e6;
 // Run scripts/engines/anthropic-call.js: prompt on stdin, one JSON line out.
 // Returns { text, usage, cost_usd, model } or null (failure filled in).
 function runAnthropicApiBackend(prompt, apiKey, { timeoutMs, failure } = {}) {
+  // The key goes on stdin (first line), and the child gets a NARROW env — not
+  // the ambient one, which may carry other secrets (tokens, other API keys).
+  const env = {};
+  for (const k of Object.keys(process.env)) {
+    if (/^(PATH|SYSTEMROOT|TMPDIR|TEMP|TMP|HOME|USERPROFILE|HTTPS?_PROXY|NO_PROXY|NODE_EXTRA_CA_CERTS|SSL_CERT_(FILE|DIR)|ANTHROPIC_BASE_URL|SPOR_ANTHROPIC_(MODEL|TIMEOUT_MS))$/i.test(k)) env[k] = process.env[k];
+  }
   const r = spawnSync(process.execPath, [path.join(__dirname, "anthropic-call.js")], {
-    input: prompt,
+    input: `${apiKey}\n${prompt}`,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      SPOR_ANTHROPIC_KEY: apiKey,
-      SPOR_DISTILLING: "1",
-      SUBSTRATE_DISTILLING: "1",
-    },
+    env: { ...env, SPOR_DISTILLING: "1", SUBSTRATE_DISTILLING: "1" },
     maxBuffer: 16 * 1024 * 1024,
     ...(timeoutMs > 0 ? { timeout: timeoutMs, killSignal: "SIGKILL" } : {}),
   });

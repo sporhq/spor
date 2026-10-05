@@ -9,8 +9,12 @@
 // classifier contract stays unchanged: prompt on stdin, one JSON line on
 // stdout `{text, usage, model}`, non-zero exit on any failure. Zero deps.
 //
-//   SPOR_ANTHROPIC_KEY=<key> [SPOR_ANTHROPIC_MODEL=…] [ANTHROPIC_BASE_URL=…] \
-//     node anthropic-call.js < prompt
+// The key rides stdin, never the environment (a child's env is readable via
+// /proc and inherited by anything it spawns): the FIRST line is the key, the
+// rest is the prompt.
+//
+//   [SPOR_ANTHROPIC_MODEL=…] [ANTHROPIC_BASE_URL=…] node anthropic-call.js \
+//     < "<key>\n<prompt>"
 
 const http = require("http");
 const https = require("https");
@@ -44,19 +48,35 @@ function proxyFor(base) {
   return u;
 }
 
+// A plaintext http base would put the key on the wire and skip HTTPS_PROXY, so
+// only a loopback http base (a local fake / gateway) is allowed.
+function isLoopback(host) {
+  return host === "localhost" || host === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(host);
+}
+
 const DEFAULT_MODEL = "claude-haiku-4-5-20251001";
 
 function main() {
-  const key = process.env.SPOR_ANTHROPIC_KEY;
-  if (!key) {
-    process.stderr.write("anthropic-call: no key\n");
-    process.exit(2);
-  }
-  let prompt = "";
+  let input = "";
   process.stdin.setEncoding("utf8");
-  process.stdin.on("data", (c) => (prompt += c));
+  process.stdin.on("data", (c) => (input += c));
   process.stdin.on("end", () => {
-    const base = new URL(process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com");
+    const nl = input.indexOf("\n");
+    const key = nl < 0 ? input.trim() : input.slice(0, nl).trim();
+    const prompt = nl < 0 ? "" : input.slice(nl + 1);
+    if (!key) {
+      process.stderr.write("anthropic-call: no key\n");
+      process.exit(2);
+    }
+    let base;
+    try {
+      base = new URL(process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com");
+    } catch {
+      return fail("unusable ANTHROPIC_BASE_URL");
+    }
+    if (base.protocol !== "https:" && !(base.protocol === "http:" && isLoopback(base.hostname))) {
+      return fail("refusing ANTHROPIC_BASE_URL: only https, or http to a loopback host, may carry the key");
+    }
     const body = JSON.stringify({
       model: process.env.SPOR_ANTHROPIC_MODEL || DEFAULT_MODEL,
       max_tokens: 16,
@@ -107,7 +127,15 @@ function send(mod, opts, body) {
         res.on("data", (c) => (raw += c));
         res.on("end", () => {
           if (res.statusCode !== 200) {
-            process.stderr.write(`anthropic-call: HTTP ${res.statusCode}: ${raw.slice(0, 300)}\n`);
+            // Status + the API's own error class only: the body is
+            // endpoint-controlled and a misbehaving one can echo request
+            // headers (the key) back, and this line lands in journal/llm-calls.
+            let cls = "";
+            try {
+              const t = JSON.parse(raw).error.type;
+              if (typeof t === "string" && /^[a-z_]{1,64}$/.test(t)) cls = ` ${t}`;
+            } catch {}
+            process.stderr.write(`anthropic-call: HTTP ${res.statusCode}${cls}\n`);
             process.exit(1);
           }
           try {
@@ -122,7 +150,7 @@ function send(mod, opts, body) {
         });
       }
     );
-    req.on("error", (e) => fail(e.message));
+    req.on("error", (e) => fail(e.code || "request error"));
     req.end(body);
   }
 }

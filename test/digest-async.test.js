@@ -647,10 +647,10 @@ test("an exported ANTHROPIC_API_KEY alone does NOT opt into the paid API", async
 function runCall(env) {
   const { spawnSync } = require("child_process");
   return spawnSync(process.execPath, [path.join(__dirname, "..", "scripts", "engines", "anthropic-call.js")], {
-    input: "classify this",
+    input: "k\nclassify this",
     encoding: "utf8",
     timeout: 20000,
-    env: { PATH: process.env.PATH, SPOR_ANTHROPIC_KEY: "k", ...env },
+    env: { PATH: process.env.PATH, ...env },
   });
 }
 
@@ -661,11 +661,11 @@ test("anthropic-call has its own request timeout", async () => {
   try {
     const { spawn } = require("child_process");
     const child = spawn(process.execPath, [path.join(__dirname, "..", "scripts", "engines", "anthropic-call.js")], {
-      env: { PATH: process.env.PATH, SPOR_ANTHROPIC_KEY: "k", SPOR_ANTHROPIC_TIMEOUT_MS: "400", ANTHROPIC_BASE_URL: `http://127.0.0.1:${srv.address().port}` },
+      env: { PATH: process.env.PATH, SPOR_ANTHROPIC_TIMEOUT_MS: "400", ANTHROPIC_BASE_URL: `http://127.0.0.1:${srv.address().port}` },
     });
     let err = "";
     child.stderr.on("data", (c) => (err += c));
-    child.stdin.end("x");
+    child.stdin.end("k\nx");
     const code = await new Promise((r) => child.on("exit", r));
     assert.strictEqual(code, 1);
     assert.match(err, /timed out/);
@@ -687,11 +687,11 @@ test("anthropic-call honours HTTPS_PROXY: CONNECTs through it, and a refusal fai
   try {
     const { spawn } = require("child_process");
     const child = spawn(process.execPath, [path.join(__dirname, "..", "scripts", "engines", "anthropic-call.js")], {
-      env: { PATH: process.env.PATH, SPOR_ANTHROPIC_KEY: "k", HTTPS_PROXY: `http://127.0.0.1:${proxy.address().port}` },
+      env: { PATH: process.env.PATH, HTTPS_PROXY: `http://127.0.0.1:${proxy.address().port}` },
     });
     let err = "";
     child.stderr.on("data", (c) => (err += c));
-    child.stdin.end("x");
+    child.stdin.end("k\nx");
     const code = await new Promise((r) => child.on("exit", r));
     assert.strictEqual(code, 1);
     assert.deepStrictEqual(seen, ["api.anthropic.com:443"]);
@@ -702,4 +702,31 @@ test("anthropic-call honours HTTPS_PROXY: CONNECTs through it, and a refusal fai
   const dead = runCall({ HTTPS_PROXY: "http://127.0.0.1:1" });
   assert.strictEqual(dead.status, 1);
   assert.match(dead.stderr, /proxy:/);
+});
+
+test("anthropic-call refuses a non-loopback http base, and redacts a non-200 body", async () => {
+  const http = require("http");
+  const refused = runCall({ ANTHROPIC_BASE_URL: "http://api.example.com" });
+  assert.strictEqual(refused.status, 1);
+  assert.match(refused.stderr, /refusing ANTHROPIC_BASE_URL/);
+  const srv = http.createServer((req, res) => {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "authentication_error", message: `bad key ${req.headers["x-api-key"]}` } }));
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const { spawn } = require("child_process");
+    const child = spawn(process.execPath, [path.join(__dirname, "..", "scripts", "engines", "anthropic-call.js")], {
+      env: { PATH: process.env.PATH, ANTHROPIC_BASE_URL: `http://127.0.0.1:${srv.address().port}` },
+    });
+    let err = "";
+    child.stderr.on("data", (c) => (err += c));
+    child.stdin.end("k\nx");
+    const code = await new Promise((r) => child.on("exit", r));
+    assert.strictEqual(code, 1);
+    assert.match(err, /HTTP 401 authentication_error/);
+    assert.ok(!err.includes("bad key"));
+  } finally {
+    srv.close();
+  }
 });

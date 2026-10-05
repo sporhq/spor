@@ -553,7 +553,7 @@ with NO `digest.intentCmd` and an EXPLICIT Anthropic key (`digest.intentApiKey` 
 `ANTHROPIC_API_KEY` is deliberately NOT read, so a user who exports it for other
 tools never silently moves from `claude -p` to the paid API), `classifyDigestIntent` makes ONE raw Messages API call to
 haiku (`scripts/engines/anthropic-call.js`, zero-dep `https`, run as a child so
-the classifier stays synchronous; `ANTHROPIC_BASE_URL` redirects it) instead of
+the classifier stays synchronous; `ANTHROPIC_BASE_URL` redirects it — https, or http only to a loopback host; the key rides the child's stdin, never its env, which is an allowlist; a non-200 records status + the API error class, never the body) instead of
 booting `claude -p`. The call has its OWN timeout (`SPOR_ANTHROPIC_TIMEOUT_MS`,
 default 30s, independent of `digest.intentTimeoutMs`=0) and honours
 `HTTPS_PROXY`/`NO_PROXY` via a CONNECT tunnel — an unusable proxy fails loudly
