@@ -1499,6 +1499,18 @@ test('install --server/--token persists creds to user config', () => {
   assert.ok(fs.existsSync(path.join(home, '.codex', 'hooks.json')), 'host still installed');
 });
 
+test('install --token refuses over a corrupt credential store, leaving it byte-for-byte', () => {
+  const home = scratchHome();
+  const cred = path.join(home, 'auth', 'credentials.json');
+  fs.mkdirSync(path.dirname(cred), { recursive: true });
+  fs.writeFileSync(cred, '{"tenants": {"x": TRUNCATED');
+  const r = run(['install', 'codex', '--server', 'http://127.0.0.1:9/', '--token', 'tok9'], { ...codexInstallEnv(home), SPOR_HOME: home });
+  // install stays fail-soft on its configure step (the host install still lands),
+  // but the token write is refused rather than read-as-empty-and-overwritten.
+  assert.match(r.stderr, /could not write config: credential store .* is not valid JSON — refusing to overwrite it/);
+  assert.strictEqual(fs.readFileSync(cred, 'utf8'), '{"tenants": {"x": TRUNCATED');
+});
+
 test('install --server alone writes a flat server key, keeping existing keys and file mode', () => {
   const home = scratchHome();
   const cf = path.join(home, 'config.json');

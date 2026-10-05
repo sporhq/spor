@@ -68,3 +68,69 @@ test('an unreadable (non-ENOENT) config is not treated as absent', { skip: !posi
   fs.chmodSync(f, 0o600);
   assert.strictEqual(fs.readFileSync(f, 'utf8'), '{"a":1}');
 });
+
+test('a config holding a secret (legacy flat token) is tightened to owner-only', { skip: !posix }, () => {
+  const home = scratch();
+  const f = path.join(home, 'config.json');
+  fs.writeFileSync(f, JSON.stringify({ server: 'https://s', token: 'T' }));
+  fs.chmodSync(f, 0o644);
+  editUserConfig(home, (d) => { d.dispatch = { agent: 'a' }; });
+  assert.strictEqual(fs.statSync(f).mode & 0o777, 0o600);
+  // a nested secret key counts too
+  const g = path.join(home, 'config.json');
+  fs.writeFileSync(g, JSON.stringify({ attestation: { signingKey: 'K' } }));
+  fs.chmodSync(g, 0o640);
+  editUserConfig(home, (d) => { d.x = 1; });
+  assert.strictEqual(fs.statSync(g).mode & 0o777, 0o600);
+});
+
+test('a token REMOVED by the edit does not force the tighten; owner bits are kept', { skip: !posix }, () => {
+  const home = scratch();
+  const f = path.join(home, 'config.json');
+  fs.writeFileSync(f, JSON.stringify({ token: 'T' }));
+  fs.chmodSync(f, 0o644);
+  editUserConfig(home, (d) => { delete d.token; });
+  assert.strictEqual(fs.statSync(f).mode & 0o777, 0o644);
+});
+
+test('writes through a DANGLING symlinked config.json, leaving the link in place', { skip: !posix }, () => {
+  const home = scratch();
+  const real = path.join(scratch(), 'missing-dir', 'config.json');
+  fs.symlinkSync(real, path.join(home, 'config.json'));
+  const r = editUserConfig(home, (d) => { d.a = 1; });
+  assert.strictEqual(r.file, real);
+  assert.ok(fs.lstatSync(path.join(home, 'config.json')).isSymbolicLink());
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(real, 'utf8')), { a: 1 });
+  assert.strictEqual(fs.statSync(real).mode & 0o777, 0o600);
+});
+
+test('a no-op edit still tightens a secret-bearing config left world-readable', { skip: !posix }, () => {
+  const home = scratch();
+  const f = path.join(home, 'config.json');
+  fs.writeFileSync(f, JSON.stringify({ server: 'https://s', token: 'T' }));
+  fs.chmodSync(f, 0o644);
+  assert.strictEqual(editUserConfig(home, () => false).wrote, false);
+  assert.strictEqual(fs.statSync(f).mode & 0o777, 0o600);
+});
+
+test('a dangling RELATIVE link with `..`, inside a symlinked home, resolves as the kernel does', { skip: !posix }, () => {
+  const root = scratch();
+  fs.mkdirSync(path.join(root, 'dotfiles', 'spor'), { recursive: true });
+  const home = path.join(root, 'home');
+  fs.symlinkSync(path.join(root, 'dotfiles', 'spor'), home);
+  fs.symlinkSync('../private/c.json', path.join(home, 'config.json'));
+  const r = editUserConfig(home, (d) => { d.a = 1; });
+  const expected = path.join(fs.realpathSync(root), 'dotfiles', 'private', 'c.json');
+  assert.strictEqual(r.file, expected);
+  assert.strictEqual(fs.realpathSync(path.join(home, 'config.json')), expected, 'the link now resolves to what was written');
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8')), { a: 1 });
+});
+
+test('a symlink loop is refused, never replaced', { skip: !posix }, () => {
+  const home = scratch();
+  const f = path.join(home, 'config.json');
+  fs.symlinkSync('loop2', f);
+  fs.symlinkSync('config.json', path.join(home, 'loop2'));
+  assert.throws(() => editUserConfig(home, (d) => { d.a = 1; }), (e) => e.code === 'ELOOP');
+  assert.ok(fs.lstatSync(f).isSymbolicLink());
+});

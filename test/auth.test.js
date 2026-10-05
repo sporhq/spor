@@ -67,6 +67,83 @@ test('readStore: malformed file -> empty store (fail-open)', () => {
   assert.deepStrictEqual(auth.readStore(home), { version: 1, tenants: {}, default: null });
 });
 
+// Every WRITE path re-reads the store strictly: only ENOENT means "no store";
+// a corrupt or unreadable file is refused, never read as empty and written back
+// over every stored credential (issue-spor-credential-store-fail-open-overwrite-
+// and-legacy-token-mode).
+const STORE_WRITERS = {
+  upsertTenant: (home) => auth.upsertTenant(home, { server: 'https://b', org: 'beta', access_token: 'BT' }),
+  removeTenant: (home) => auth.removeTenant(home, 'acme'),
+  setDefault: (home) => auth.setDefault(home, 'acme'),
+};
+for (const [name, write] of Object.entries(STORE_WRITERS)) {
+  for (const [label, body] of [['invalid JSON', '{"tenants": {"https://a/acme": {'], ['a non-object root', '[1,2]'], ['a non-object tenants', '{"tenants": [1]}']]) {
+    test(`${name}: refuses a store holding ${label}, leaving it untouched`, () => {
+      const home = tmp();
+      fs.mkdirSync(path.join(home, 'auth'), { recursive: true });
+      fs.writeFileSync(auth.credentialsPath(home), body);
+      assert.throws(() => write(home), /refusing to overwrite it/);
+      assert.strictEqual(fs.readFileSync(auth.credentialsPath(home), 'utf8'), body);
+    });
+  }
+  test(`${name}: refuses an unreadable (non-ENOENT) store`, { skip: process.platform === 'win32' || process.getuid?.() === 0 }, () => {
+    const home = tmp();
+    auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
+    const before = fs.readFileSync(auth.credentialsPath(home), 'utf8');
+    fs.chmodSync(auth.credentialsPath(home), 0o000);
+    try {
+      assert.throws(() => write(home), (e) => e.code === 'EACCES' && /cannot read credential store/.test(e.message));
+    } finally {
+      fs.chmodSync(auth.credentialsPath(home), 0o600);
+    }
+    assert.strictEqual(fs.readFileSync(auth.credentialsPath(home), 'utf8'), before);
+  });
+}
+
+test('clearAll: discards a corrupt store (that is the ask) but refuses an unreadable one', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, () => {
+  const home = tmp();
+  fs.mkdirSync(path.join(home, 'auth'), { recursive: true });
+  fs.writeFileSync(auth.credentialsPath(home), 'not json');
+  assert.strictEqual(auth.clearAll(home), 0);
+  assert.deepStrictEqual(auth.readStoreStrict(home).tenants, {});
+  auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
+  fs.chmodSync(auth.credentialsPath(home), 0o000);
+  try {
+    assert.throws(() => auth.clearAll(home), /cannot read credential store/);
+  } finally {
+    fs.chmodSync(auth.credentialsPath(home), 0o600);
+  }
+  assert.ok(auth.readStore(home).tenants['https://a/acme']);
+});
+
+test('readStoreStrict: absent store is empty; a well-formed one reads like readStore', () => {
+  const home = tmp();
+  assert.deepStrictEqual(auth.readStoreStrict(home), { version: 1, tenants: {}, default: null });
+  auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
+  assert.deepStrictEqual(auth.readStoreStrict(home), auth.readStore(home));
+});
+
+test('writeStore: a DANGLING symlinked store is written through, the link kept', { skip: process.platform === 'win32' }, () => {
+  const home = tmp();
+  const real = path.join(tmp(), 'creds.json'); // never created
+  fs.mkdirSync(path.join(home, 'auth'), { recursive: true });
+  fs.symlinkSync(real, auth.credentialsPath(home));
+  auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
+  assert.ok(fs.lstatSync(auth.credentialsPath(home)).isSymbolicLink(), 'link not replaced');
+  assert.strictEqual(JSON.parse(fs.readFileSync(real, 'utf8')).tenants['https://a/acme'].access_token, 'AT');
+  assert.strictEqual(fs.statSync(real).mode & 0o777, 0o600);
+});
+
+test('writeStore: a dangling link whose target DIRECTORY is missing is created, not refused', { skip: process.platform === 'win32' }, () => {
+  const home = tmp();
+  const real = path.join(tmp(), 'not', 'yet', 'creds.json');
+  fs.mkdirSync(path.join(home, 'auth'), { recursive: true });
+  fs.symlinkSync(real, auth.credentialsPath(home));
+  auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
+  assert.ok(fs.lstatSync(auth.credentialsPath(home)).isSymbolicLink());
+  assert.strictEqual(auth.readStore(home).tenants['https://a/acme'].access_token, 'AT');
+});
+
 test('upsertTenant: first becomes default; second does not steal it', () => {
   const home = tmp();
   const a = auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
@@ -437,6 +514,32 @@ test('refreshTenant: mints a new access token and updates the store in place', a
     const s = auth.readStore(home);
     assert.strictEqual(s.tenants[key].access_token, 'FRESH');
     assert.strictEqual(s.tenants[key].refresh_token, 'RT2', 'rotated refresh token stored');
+  } finally {
+    srv.close();
+  }
+});
+
+test('refreshTenant: a store gone corrupt mid-refresh is left untouched; the fresh token still serves the call', async () => {
+  const { srv, base } = await refreshServer();
+  try {
+    const home = tmp();
+    const key = auth.tenantKey(base, 'acme');
+    auth.writeStore(home, { tenants: { [key]: { server: base, org: 'acme', access_token: 'STALE', refresh_token: 'RT' } }, default: key });
+    // corrupt the store between the lookup and the strict re-read
+    const orig = fs.readFileSync;
+    let reads = 0;
+    fs.readFileSync = function (f, ...rest) {
+      if (f === auth.credentialsPath(home) && ++reads === 2) fs.writeFileSync(f, 'torn {');
+      return orig.call(this, f, ...rest);
+    };
+    let fresh;
+    try {
+      fresh = await auth.refreshTenant(home, key);
+    } finally {
+      fs.readFileSync = orig;
+    }
+    assert.strictEqual(fresh, 'FRESH');
+    assert.strictEqual(fs.readFileSync(auth.credentialsPath(home), 'utf8'), 'torn {');
   } finally {
     srv.close();
   }
