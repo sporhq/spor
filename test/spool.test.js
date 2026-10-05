@@ -132,3 +132,41 @@ test('writeFileAtomic is spool.js\'s writer: one temp-naming scheme, no pid-only
   assert.strictEqual(fs.readFileSync(f, 'utf8'), 'b');
   assert.deepStrictEqual(fs.readdirSync(path.dirname(f)), ['x.json']);
 });
+
+test('linkOrReserve: every no-link() code takes the reservation fallback; EEXIST loses; other codes throw', () => {
+  for (const code of spool.LINK_FALLBACK_CODES) {
+    const d = scratch();
+    const real = fs.linkSync;
+    fs.linkSync = () => { const e = new Error('no link'); e.code = code; throw e; };
+    try {
+      const f = path.join(d, 'a');
+      const tmp = path.join(d, 'a.tmp');
+      fs.writeFileSync(tmp, 'bytes');
+      assert.strictEqual(spool.linkOrReserve(tmp, f), true, code);
+      assert.strictEqual(fs.readFileSync(f, 'utf8'), 'bytes', code);
+      fs.writeFileSync(tmp, 'other');
+      assert.strictEqual(spool.linkOrReserve(tmp, f), false, code);
+      assert.strictEqual(fs.readFileSync(f, 'utf8'), 'bytes', code);
+    } finally { fs.linkSync = real; }
+  }
+  for (const code of ['ENOTSUP', 'EOPNOTSUPP', 'EPERM']) assert.ok(spool.LINK_FALLBACK_CODES.includes(code));
+  const d = scratch();
+  const real = fs.linkSync;
+  fs.linkSync = () => { const e = new Error('boom'); e.code = 'EIO'; throw e; };
+  try {
+    fs.writeFileSync(path.join(d, 't'), 'x');
+    assert.throws(() => spool.linkOrReserve(path.join(d, 't'), path.join(d, 'f')), { code: 'EIO' });
+  } finally { fs.linkSync = real; }
+});
+
+test('linkOrReserve: a failed rename removes our empty reservation', () => {
+  const d = scratch();
+  const realL = fs.linkSync, realR = fs.renameSync;
+  fs.linkSync = () => { const e = new Error('no link'); e.code = 'ENOTSUP'; throw e; };
+  fs.renameSync = () => { const e = new Error('rename'); e.code = 'EIO'; throw e; };
+  try {
+    fs.writeFileSync(path.join(d, 't'), 'x');
+    assert.throws(() => spool.linkOrReserve(path.join(d, 't'), path.join(d, 'f')), { code: 'EIO' });
+    assert.ok(!fs.existsSync(path.join(d, 'f')));
+  } finally { fs.linkSync = realL; fs.renameSync = realR; }
+});
