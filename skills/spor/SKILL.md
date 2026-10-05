@@ -115,6 +115,7 @@ spor correct <target> "<text>" # standing briefing correction (corr file locally
 spor priority <id> <p1|p2|p3|clear>  # set/clear queue human-triage priority (local: rewrite frontmatter; remote: /v1/nodes/{id}/priority)
 spor set-status <id> <status>  # flip a node's status — an active status (active/open) also CLAIMS it (local: rewrite frontmatter; remote: /v1/nodes/{id}/status)
 spor edge <id> <type> <to> [--remove]  # add (or --remove) a typed edge, e.g. close a loop with resolves (local: append/remove edge line; remote: POST/DELETE /v1/nodes/{id}/edges)
+spor patch <id> key=value… [--unset <key>] [--revision <sha>]  # change frontmatter scalars in place without a whole-node rewrite; body + edges untouched, dedicated-door fields (status/edges/priority/…) refused (local: rewrite frontmatter; remote: PATCH /v1/nodes/{id})
 
 # remote (team server) only
 spor lens [<id>]               # list saved views, or render one
@@ -207,7 +208,7 @@ A few of these have enough surface to be worth a sentence:
   `--if-exists error` rejects collisions; `--if-exists skip` no-ops on an
   existing id; `--if-exists update` requires the `revision` from `spor get <id>
   --json` so updates are optimistic-concurrency checked instead of last-writer
-  wins. Prefer `spor edge`/`spor set-status` for narrow mutations; use
+  wins. Prefer `spor edge`/`spor set-status` for narrow mutations and `spor patch` for a few frontmatter scalars; use
   `put-node` for full-node artifacts such as briefing versions or body edits.
   Node bodies are capped at 8192 bytes. When authoring a long artifact in remote
   mode, add `--spill` (MCP `put_node` `spill: true`) to a CREATE: the server then

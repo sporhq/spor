@@ -5019,6 +5019,135 @@ function setStatusLocal(cfg, id, value, { graph = null } = {}) {
   return { ok: true, node };
 }
 
+// --- spor patch ---------------------------------------------------------------
+// The CLI wrapper for patch_node (PATCH /v1/nodes/{id}, task-spor-cli-patch-verb-
+// and-docs): a JSON-merge-patch over a node's flat frontmatter scalars — set a
+// key, `--unset` a key, leave the body, edges and every unnamed key exactly as
+// they are. Fields with a dedicated door are refused (the server names the door;
+// the local mirror below keeps the same posture for the handful it knows).
+// Mirrors the server's setFields-reserved set (spor-server reserved-fields.js):
+// value = the door to name in the refusal, or "" for a structural / stamped key.
+const PATCH_LOCAL_PROTECTED = new Map([
+  ["id", ""], ["type", ""], ["date", ""], ["pin", ""], ["exclude", ""],
+  ["author", ""], ["authored_via", ""], ["authored_by_agent", ""], ["session", ""], ["created_by", ""],
+  ["created_at", ""], ["updated_at", ""], ["schema_version", ""],
+  ["status", "spor set-status"], ["edges", "spor edge"], ["commits", "spor put-node"],
+  ["priority", "spor priority"], ["priority_by", "spor priority"], ["priority_at", "spor priority"], ["priority_via", "spor priority"],
+  ["readiness", "spor ready"], ["readiness_by", "spor ready"], ["readiness_at", "spor ready"], ["readiness_via", "spor ready"],
+]);
+
+function parsePatchArgs(positionals, unset) {
+  const patch = {};
+  for (const pair of positionals.slice(1)) {
+    const eq = String(pair).indexOf("=");
+    if (eq <= 0) return { error: `bad field '${pair}' — expected key=value (use --unset <key> to remove one)` };
+    const key = pair.slice(0, eq);
+    if (!/^[a-z][a-z0-9_]*$/.test(key)) return { error: `field key '${key}' is not a simple lower_snake key` };
+    patch[key] = pair.slice(eq + 1);
+  }
+  for (const key of unset) {
+    if (!/^[a-z][a-z0-9_]*$/.test(key)) return { error: `field key '${key}' is not a simple lower_snake key` };
+    if (Object.prototype.hasOwnProperty.call(patch, key)) return { error: `'${key}' is both set and --unset` };
+    patch[key] = null;
+  }
+  if (!Object.keys(patch).length) return { error: "no fields to patch" };
+  return { patch };
+}
+
+async function cmdPatch(cfg, { values, positionals }) {
+  const id = positionals[0];
+  if (!id) {
+    err("usage: spor patch <id> key=value [key=value …] [--unset <key>] [--revision <sha>]");
+    return 1;
+  }
+  const bad = badNodeIdReason(id);
+  if (bad) {
+    err(bad);
+    return 1;
+  }
+  const parsed = parsePatchArgs(positionals, [].concat(values.unset || []));
+  if (parsed.error) {
+    err(parsed.error);
+    err("usage: spor patch <id> key=value [key=value …] [--unset <key>] [--revision <sha>]");
+    return 1;
+  }
+  const { patch } = parsed;
+  const revision = values.revision ? String(values.revision) : null;
+
+  if (cfg.mode() === "remote") {
+    const body = revision ? { patch, revision } : { patch };
+    const r = await remote.request(cfg, "PATCH", `/v1/nodes/${encodeURIComponent(id)}`, { body, timeoutMs: 8000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (r.status === 404) {
+      err(`no such node: ${id}`);
+      return 1;
+    }
+    if (!r.ok) {
+      const e = (r.json && r.json.error) || {};
+      err(`patch error ${r.status}${e.message ? `: ${e.message}` : ""}`);
+      if (Array.isArray(e.details)) for (const d of e.details) err(`  ${d}`);
+      return 1;
+    }
+    out(`${r.json && r.json.status === "skipped" ? "patch skipped (fields already current)" : "patched"}: ${id} (${Object.keys(patch).join(", ")})`);
+    out(writeTargetLine(cfg));
+    for (const w of (r.json && r.json.warnings) || []) err(`  warning: ${w}`);
+    return 0;
+  }
+
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const file = path.join(cfg.nodesDir(), `${id}.md`);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    err(`no such node: ${id}`);
+    return 1;
+  }
+  if (revision && gitBlobSha(Buffer.from(raw, "utf8")) !== revision) {
+    err(`patch conflict: ${id} has changed since revision ${revision}`);
+    return 1;
+  }
+  for (const k of Object.keys(patch)) {
+    if (PATCH_LOCAL_PROTECTED.has(k)) {
+      const door = PATCH_LOCAL_PROTECTED.get(k);
+      err(`field '${k}' has a dedicated door — not settable via patch${door ? `: use ${door}` : " (structural or server-stamped)"}`);
+      return 1;
+    }
+  }
+  let newRaw = raw;
+  for (const [k, v] of Object.entries(patch)) {
+    newRaw = newRaw && frontmatter.withKey(newRaw, k, v == null ? null : String(v).replace(/[\r\n]+/g, " ").replace(/[[\]]/g, "").trim());
+  }
+  if (newRaw == null) {
+    err(`could not locate frontmatter in ${id}`);
+    return 1;
+  }
+  if (newRaw === raw) {
+    out(`patch skipped (fields already current): ${id}`);
+    return 0;
+  }
+  let node;
+  try {
+    const g = graphLib.loadGraph(cfg.nodesDir());
+    node = graphLib.parseFrontmatter(newRaw, `${id}.md`);
+    const v = graphLib.validateNode(g, node);
+    if (!v.ok) {
+      err(`invalid node after patch:\n  ${v.errors.join("\n  ")}`);
+      return 1;
+    }
+  } catch (e) {
+    err(`invalid node after patch: ${e.message}`);
+    return 1;
+  }
+  fs.writeFileSync(file, newRaw);
+  out(`patched: ${id} (${Object.keys(patch).join(", ")})`);
+  out(writeTargetLine(cfg));
+  return 0;
+}
+
 // Validate + normalize `--attr key=value` pairs to a flat {k: String(v)} map (or
 // null when none), mirroring the server's normalizeEdgeAttrs: only [\w-] tokens
 // round-trip through the frontmatter edge grammar, type/to are structural (not
@@ -19045,6 +19174,27 @@ const COMMANDS = {
     options: {},
     examples: ["spor set-status task-x active", "spor set-status question-7 answered", "spor set-status issue-9 resolved"],
     run: (cfg, p) => cmdSetStatus(cfg, p),
+  },
+  patch: {
+    group: "Graph", parse: "strict", args: "<id> key=value…",
+    summary: "change a node's frontmatter scalars in place (patch_node; remote: PATCH /v1/nodes/{id})",
+    help:
+      "Change a node's frontmatter fields without fetching and resubmitting the\n" +
+      "whole document — a JSON merge patch. Each key=value sets that scalar field\n" +
+      "(always a string from the shell); --unset <key> (repeatable) removes one.\n" +
+      "The body, the edges and every unnamed field are left exactly as they are, and\n" +
+      "the rewritten node is validated like any put-node update. Fields with their\n" +
+      "own verb are refused, naming it: status (set-status), edges (edge), priority,\n" +
+      "readiness, commits, and the structural id/type/date. --revision <sha> (from\n" +
+      "'spor get <id> --json') fails with a conflict if the node moved since you read\n" +
+      "it. Remote mode sends PATCH /v1/nodes/{id} (the patch_node twin); local mode\n" +
+      "rewrites the node file in place. A patch that changes nothing is a no-op.",
+    options: {
+      unset: { type: "string", value: "key", desc: "remove this field (repeatable)", multiple: true },
+      revision: { type: "string", value: "sha", desc: "fail if the node's revision has moved since this blob sha" },
+    },
+    examples: ["spor patch task-x repo=spor-server", "spor patch task-x size=m --unset needed_by", "spor patch art-y delivery_ref=PR-12 --revision 3f2a9c1"],
+    run: (cfg, p) => cmdPatch(cfg, p),
   },
   edge: {
     group: "Graph", parse: "strict", args: "<id> <type> <to>", aliases: ["add-edge"],
