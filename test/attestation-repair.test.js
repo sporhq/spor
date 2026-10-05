@@ -424,6 +424,60 @@ test("an interrupted --regate is adopted by the worker loop under the SAME attem
   assert.equal(stageProjection.pipelineLease(f.home, runner.readJson(f.file)).attempt, 1, "the adoption opened no new attempt");
 });
 
+// Mixed: explicit re-gates and loop adoptions interleave across interruptions.
+// Every attempt owns exactly ONE parent journal (named by the lease's attempt),
+// each adoption continues the journal the interrupted claim parked rather than
+// opening a neighbour, and an explicit --regate over an unsettled attempt resumes it, so the
+// whole mix stays on one attempt; once it passes nothing is left to adopt.
+test("interrupted --regate and loop adoption interleaved: no orphaned or duplicated journal adoption", async () => {
+  const gatesLib = require("../lib/shell/gate-runner.js");
+  const loop = require("../lib/shell/work-loop.js");
+  const f = fixture();
+  runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "failed", gate_worker: "old" });
+  const INTERRUPTED = { state: "interrupted", gates: [], facts: [], reason: "the worker was asked to stop" };
+  const script = [INTERRUPTED, INTERRUPTED, INTERRUPTED, f.gateResult];
+  const seen = [];
+  const original = gatesLib.runGatePipeline;
+  gatesLib.runGatePipeline = async ({ item }) => {
+    seen.push(item.attempt);
+    return script.shift();
+  };
+  const journals = () => fs.readdirSync(runner.runPaths(f.home, f.item.run_id).workflows).filter((n) => n.startsWith("pipeline-") && n.endsWith(".workflow.jsonl")).sort();
+  const regate = () => cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory: f.factory, factoryId: f.factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home });
+  const adopt = async () => {
+    const rec = runner.readJson(f.file);
+    const entries = loop.openPipelines(stageProjection.openPipelineCandidates(f.home, [rec]), { now: () => Date.now() + 3600000, factory: f.factory.id, ownerLive: () => false });
+    assert.equal(entries.length, 1, "exactly one adoptable pipeline, never an orphan or a duplicate");
+    return cli.runGateAndIntegration(f.cfg, entries[0], entries[0].record, { factory: f.factory, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home, workerId: "adopter", log: () => {}, stopping: () => false, sleep: async () => {} });
+  };
+  const leaseNow = () => stageProjection.pipelineLease(f.home, runner.readJson(f.file));
+  try {
+    assert.equal(await regate(), 1, "re-gate #1 interrupted");
+    const a1 = seen[0];
+    assert.equal(leaseNow().attempt, 1);
+    assert.deepEqual(journals(), [`pipeline-a${a1}.workflow.jsonl`]);
+
+    assert.equal((await adopt()).state, "interrupted", "the loop's adoption is interrupted too");
+    assert.equal(seen[1], a1, "adoption continued re-gate #1's attempt");
+    assert.equal(leaseNow().attempt, 1, "adoption opened no new attempt");
+    assert.ok(leaseNow().released_at, "the interrupted adopter handed the lease back");
+    assert.deepEqual(journals(), [`pipeline-a${a1}.workflow.jsonl`], "still one parent journal");
+
+    assert.equal(await regate(), 1, "re-gate #2 (a resume of the parked attempt) interrupted");
+    assert.equal(seen[2], a1, "an explicit --regate over an unsettled attempt resumes it");
+    assert.equal(leaseNow().attempt, 1, "a resume opens no new attempt");
+    assert.deepEqual(journals(), [`pipeline-a${a1}.workflow.jsonl`], "still one parent journal");
+
+    assert.equal((await adopt()).state, "passed");
+    assert.equal(seen[3], a1, "the final adoption continued the same attempt");
+    assert.deepEqual(journals(), [`pipeline-a${a1}.workflow.jsonl`], "no neighbouring journal was opened");
+    assert.equal(leaseNow().attempt, 1);
+    const rec = runner.readJson(f.file);
+    assert.equal(rec.gate_state, "passed");
+    assert.equal(loop.openPipelines(stageProjection.openPipelineCandidates(f.home, [rec]), { now: () => Date.now() + 3600000, factory: f.factory.id, ownerLive: () => false }).length, 0, "settled: nothing left to adopt");
+  } finally { gatesLib.runGatePipeline = original; }
+});
+
 // ...and the post-settle writers (the attestation node, the propose-mode PR
 // body) are lease-checked immediately before they write: a driver displaced
 // since its settle writes neither over the new holder's attempt.
