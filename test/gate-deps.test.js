@@ -532,3 +532,290 @@ test("a gate journal crashed mid-suite resumes with the journaled change set: th
   assert.ok(!resumed.result.escalated_to, "nothing escalated");
   assert.match(fs.readFileSync(path.join(nodes, "task-x.md"), "utf8"), /status: open/, "the item was not demoted or touched");
 });
+
+// --- the remaining gate-only deps, driven directly
+// (task-spor-extend-isolated-testing-to-other-gate-deps) ---
+
+function depsFor(t, hostOver, ctxOver = {}) {
+  const home = scratchHome(t);
+  const runId = ctxOver.runId || "88888888-8888-8888-8888-888888888888";
+  writeRecord(home, runId);
+  const { makeGateDeps } = gateDeps.createGateDeps(fakeHost({ gateStem: (id) => id, ...hostOver }));
+  const logs = [];
+  const warns = [];
+  const deps = makeGateDeps(cfgFor(home), {
+    record: { cwd: "/tmp/x", run_id: runId }, entry: { run_id: runId, node_id: "task-x" },
+    factory: { id: "f", trustedRef: "main" }, slug: "demo", passthrough: {},
+    warn: (w) => warns.push(w), sleep: async () => {}, log: (l) => logs.push(l), home,
+    ...ctxOver,
+  });
+  return { deps, home, logs, warns };
+}
+
+const reviewHost = (over = {}) => ({
+  gateChangeSet: () => ({ ok: true, head: "aaaa1111", base: "base0001", cwd: "/tmp/x", paths: ["lib/x.js"], dirty: false }),
+  gateWorkItemText: async () => "the item",
+  gateDiffText: () => "diff",
+  reviewPassthrough: (p) => p,
+  ...over,
+});
+const reviewGate = { id: "review", kind: "agent-review", profile: "profile-codex", cycles: 2 };
+
+test("review refuses, naming why, when the change under review was never read", async (t) => {
+  const { deps } = depsFor(t, reviewHost());
+  const out = await deps.review({ gate: reviewGate, cycle: 0, prior: [] });
+  assert.deepStrictEqual(out, { ok: false, reason: "the change under review could not be read" });
+});
+
+test("review: a refused dispatch carries the host reason and a classification; an await timeout is NOT classified", async (t) => {
+  const refused = depsFor(t, reviewHost(), { dispatch: async () => ({ ok: false, reason: "profile unsatisfiable here" }) });
+  await refused.deps.changedPaths({ trustedRef: "main" });
+  const a = await refused.deps.review({ gate: reviewGate, cycle: 0, prior: [] });
+  assert.strictEqual(a.ok, false);
+  assert.match(a.reason, /the review under profile-codex could not be dispatched: profile unsatisfiable here/);
+  assert.ok(a.classification, "a refusal is classified for the record");
+
+  const timedOut = depsFor(t, reviewHost({ awaitGateRun: async () => ({ ok: false, reason: "timed out after 10m" }) }), {
+    dispatch: async () => ({ ok: true, run: { run_id: "r1" } }),
+  });
+  await timedOut.deps.changedPaths({ trustedRef: "main" });
+  assert.deepStrictEqual(await timedOut.deps.review({ gate: reviewGate, cycle: 0, prior: [] }), { ok: false, reason: "timed out after 10m" });
+});
+
+test("review: a finished run's report text is the verdict channel; an empty report is a reportless failure, never a pass", async (t) => {
+  const record = { run_id: "r1", state: "done", terminal_state: "reported", created_at: "2026-10-05T00:00:00Z", finished_at: "2026-10-05T00:01:00Z" };
+  let text = "```json\n{\"verdict\":\"approved\"}\n```";
+  const { deps } = depsFor(
+    t,
+    reviewHost({
+      awaitGateRun: async () => ({ ok: true, record }),
+      gateRunReportText: () => text,
+      reportlessReviewReason: () => "left no final report",
+    }),
+    { dispatch: async () => ({ ok: true, run: { run_id: "r1" } }) }
+  );
+  await deps.changedPaths({ trustedRef: "main" });
+  const ok = await deps.review({ gate: reviewGate, cycle: 0, prior: [] });
+  assert.strictEqual(ok.ok, true);
+  assert.strictEqual(ok.text, text);
+  assert.strictEqual(ok.runId, "r1");
+  assert.strictEqual(ok.startedAt, record.created_at);
+  assert.strictEqual(ok.finishedAt, record.finished_at);
+  text = "   ";
+  const none = await deps.review({ gate: reviewGate, cycle: 0, prior: [] });
+  assert.strictEqual(none.ok, false);
+  assert.match(none.reason, /the review run under profile-codex left no final report/);
+  assert.strictEqual(none.runId, "r1");
+});
+
+test("rescue refuses without a declared lane, and without a checkout to work in", async (t) => {
+  const bare = depsFor(t, {}, { factory: { id: "f", trustedRef: "main" } });
+  const a = await bare.deps.dispatchRescue({ gate: reviewGate, attempt: 1 });
+  assert.deepStrictEqual(a, { ok: false, reason: "no rescue lane is declared on the factory" });
+  const nowhere = depsFor(t, {}, { factory: { id: "f", rescue: { profile: "profile-strong", attempts: 1 } }, record: {} });
+  const b = await nowhere.deps.dispatchRescue({ gate: reviewGate, attempt: 1 });
+  assert.match(b.reason, /nowhere to work/);
+});
+
+test("the rescue dispatches under the lane's profile, forced, no-auto-route, into the checkout, then reads its diagnosis", async (t) => {
+  const calls = [];
+  const excluded = [];
+  const { deps, home } = depsFor(
+    t,
+    {
+      gateWorkItemText: async () => "the item",
+      launchedFixRun: () => null,
+      rescueHarnessAdapter: async () => ({}),
+      rescuePassthrough: () => ({ values: { "permission-mode": "bypassPermissions" }, dropped: [], applied: [], translated: null }),
+      rescueDiagnosisPath: (cwd, name) => `${cwd}/.diag/${name}.json`,
+      excludeRescueDiagnosisDir: (cwd) => excluded.push(cwd),
+      awaitGateRun: async (_cfg, id) => ({ ok: true, record: { run_id: id, state: "done" } }),
+      gateRescueDiagnosis: () => ({ ok: true, diagnosis: "stale premise", category: "stale-premise", fixed: false, filed: ["task-y"] }),
+    },
+    {
+      factory: { id: "f", trustedRef: "main", rescue: { profile: "profile-strong", attempts: 2 } },
+      dispatch: async (_cfg, values, prompt) => { calls.push({ values, prompt }); return { ok: true, run: { run_id: "rescue-run-1" } }; },
+    }
+  );
+  const launched = [];
+  const out = await deps.rescue({ gate: reviewGate, attempt: 1, detail: "d", findings: [], attempts: [], onLaunch: (x) => launched.push(x) });
+  assert.strictEqual(out.ok, true, out.reason);
+  assert.strictEqual(out.runId, "rescue-run-1");
+  assert.strictEqual(out.category, "stale-premise");
+  assert.deepStrictEqual(out.filed, ["task-y"]);
+  assert.strictEqual(out.unread, false);
+  assert.deepStrictEqual(launched, [{ runId: "rescue-run-1" }]);
+  const { values, prompt } = calls[0];
+  assert.strictEqual(values.profile, "profile-strong");
+  assert.strictEqual(values.node, "task-x");
+  assert.strictEqual(values.dir, "/tmp/x");
+  assert.strictEqual(values.force, true);
+  assert.strictEqual(values["no-worktree"], true);
+  assert.strictEqual(values["no-auto-route"], true);
+  assert.strictEqual(values["permission-mode"], "bypassPermissions");
+  assert.match(values.name, /^rescue-.+-1$/);
+  assert.match(prompt[0], /RESCUE lane of the 'f' factory for Spor work item task-x \(rescue attempt 1 of 2\)/);
+  assert.deepStrictEqual(excluded, ["/tmp/x"]);
+  const rec = readRecord(dispatchRuns.runPaths(home, "88888888-8888-8888-8888-888888888888").record);
+  assert.strictEqual(rec.gate_rescue_run_id, "rescue-run-1");
+  assert.strictEqual(rec.gate_rescue_attempt, 1);
+});
+
+test("a rescue already launched under its name is adopted, and a refused dispatch / failed wait surfaces as ok:false", async (t) => {
+  const common = {
+    gateWorkItemText: async () => "the item",
+    rescueDiagnosisPath: () => "/tmp/x/.diag",
+  };
+  const ctx = { factory: { id: "f", rescue: { profile: "profile-strong", attempts: 1 } } };
+  let dispatched = 0;
+  const adopted = depsFor(t, { ...common, launchedFixRun: (_h, node, name) => (node === "task-x" && /^rescue-/.test(name) ? { run_id: "already-rescuing" } : null) }, {
+    ...ctx, dispatch: async () => { dispatched++; return { ok: true, run: { run_id: "x" } }; },
+  });
+  const a = await adopted.deps.dispatchRescue({ gate: reviewGate, attempt: 1 });
+  assert.deepStrictEqual(a, { ok: true, runId: "already-rescuing", adopted: true });
+  assert.strictEqual(dispatched, 0);
+  assert.ok(adopted.logs.some((l) => /rescue attempt 1 on task-x was already launched as run already- — adopting it/.test(l)));
+
+  const shape = { launchedFixRun: () => null, rescueHarnessAdapter: async () => ({}), rescuePassthrough: () => ({ values: {}, dropped: [], applied: [], translated: null }), excludeRescueDiagnosisDir: () => {} };
+  const refused = depsFor(t, { ...common, ...shape }, { ...ctx, dispatch: async () => ({ ok: false, reason: "no host" }) });
+  assert.match((await refused.deps.rescue({ gate: reviewGate, attempt: 1 })).reason, /rescue under profile-strong could not be dispatched: no host/);
+
+  const waited = depsFor(t, { ...common, ...shape, awaitGateRun: async () => ({ ok: false, reason: "stuck" }) }, { ...ctx, dispatch: async () => ({ ok: true, run: { run_id: "r9" } }) });
+  assert.deepStrictEqual(await waited.deps.rescue({ gate: reviewGate, attempt: 1 }), { ok: false, reason: "stuck" });
+});
+
+test("rescueReport marks an unparseable diagnosis unread and logs it, never throwing", async (t) => {
+  const { deps, logs } = depsFor(t, {
+    rescueDiagnosisPath: () => "/tmp/x/.diag",
+    gateRescueDiagnosis: () => ({ ok: false, error: "no block", diagnosis: null, category: null, fixed: false, filed: [] }),
+  });
+  const out = await deps.rescueReport({ runId: "no-such-run", attempt: 2 });
+  assert.strictEqual(out.unread, true);
+  assert.ok(logs.some((l) => /rescue attempt 2 on task-x left no structured diagnosis \(no block\)/.test(l)));
+});
+
+test("acquireGateLease sizes the lease to the gate's own budget and keys it on the change's checkout", async (t) => {
+  const seen = [];
+  const { deps } = depsFor(
+    t,
+    {
+      gateLeaseBudgetMs: (gate) => (gate && gate.timeoutMs) || 1,
+      acquireIntegrationLease: async (_cfg, home, top, opts) => { seen.push({ top, opts }); return { token: "tok" }; },
+      releaseIntegrationLease: async (_cfg, token) => { seen.push({ released: token }); },
+      gateChangeSet: () => ({ ok: true, head: "h", base: "b", cwd: "/tmp/x", top: "/repo/top", paths: [], dirty: false }),
+    }
+  );
+  // Before any change is read, the lease is keyed on the record's own cwd.
+  assert.deepStrictEqual(await deps.acquireGateLease({ gate: { timeoutMs: 1800000 } }), { token: "tok" });
+  assert.strictEqual(seen[0].top, "/tmp/x");
+  assert.deepStrictEqual(seen[0].opts, { slug: "demo", waitMs: 1800000, budgetMs: 1800000 });
+  await deps.changedPaths({ trustedRef: "main" });
+  await deps.acquireGateLease({ gate: { timeoutMs: 5 } });
+  assert.strictEqual(seen[1].top, "/repo/top", "once the change is read, the lease follows its checkout");
+  assert.strictEqual(seen[1].opts.budgetMs, 5);
+  await deps.releaseGateLease("tok");
+  assert.deepStrictEqual(seen[2], { released: "tok" });
+});
+
+const NODE_MD = (title, edges = "") => `---\nid: art-gate-x\ntype: artifact\ntitle: ${title}\nsummary: s\nedges:\n${edges}---\n\nbody\n`;
+
+test("readFact reads typed edges and reports `same` only on an equivalent node; unreadable and foreign-graph answers are ok:false", async (t) => {
+  let node = null;
+  let unreadable = false;
+  const hostBase = {
+    withoutFlakeEdges: (md) => md,
+    gateNodeEquivalent: (a, b) => a === b,
+    nodeUnreadable: () => false,
+    attestationPublicationConfig: (cfg, origin) => (origin === "other" ? null : cfg),
+    resolveNode: async (_cfg, _id, read) => { if (unreadable) read.unreadable = true; return node; },
+  };
+  const { deps } = depsFor(t, hostBase);
+  const md = NODE_MD("Gate verdict: pass", "  - {type: relates-to, to: task-x}\n  - {type: mentions, to: issue-flake-a}\n");
+  node = { raw: md, title: "Gate verdict: pass" };
+  const same = await deps.readFact({ id: "art-gate-x", markdown: md });
+  assert.strictEqual(same.ok, true);
+  assert.strictEqual(same.same, true);
+  assert.deepStrictEqual(same.edges, [{ type: "relates-to", to: "task-x" }, { type: "mentions", to: "issue-flake-a" }]);
+
+  const other = await deps.readFact({ id: "art-gate-x", markdown: NODE_MD("Gate verdict: pass", "") });
+  assert.strictEqual(other.same, false, "a different body under the same title is not the same fact");
+
+  const retitled = await deps.readFact({ id: "art-gate-x", markdown: NODE_MD("Gate verdict: FAIL") });
+  assert.strictEqual(retitled.same, false);
+
+  node = null;
+  assert.deepStrictEqual(await deps.readFact({ id: "art-gate-x", markdown: md }), { ok: true, same: false, edges: [] }, "no node is a clean absence");
+  unreadable = true;
+  assert.deepStrictEqual(await deps.readFact({ id: "art-gate-x", markdown: md }), { ok: false, reason: "art-gate-x could not be read" }, "an unreadable node is NOT absence");
+  assert.match((await deps.readFact({ id: "art-gate-x", markdown: md, origin: "other" })).reason, /different or unknown graph/);
+});
+
+test("readFact reports a throwing read as ok:false with the cause", async (t) => {
+  const { deps } = depsFor(t, {
+    attestationPublicationConfig: (cfg) => cfg,
+    resolveNode: async () => { throw new Error("socket hang up"); },
+  });
+  const out = await deps.readFact({ id: "art-gate-x", markdown: NODE_MD("t") });
+  assert.deepStrictEqual(out, { ok: false, reason: "art-gate-x could not be read (socket hang up)" });
+});
+
+test("linkFact pays the edge through the idempotent door, and refuses a flake fact bound for a different graph", async (t) => {
+  const edges = [];
+  const { deps } = depsFor(t, {
+    addGateEdge: async (_cfg, id, type, to) => { edges.push({ id, type, to }); return { ok: true, id, to }; },
+    attestationPublicationConfig: (cfg, origin) => (origin === "other" ? null : cfg),
+  });
+  assert.deepStrictEqual(await deps.linkFact({ id: "art-gate-x", type: "relates-to", to: "issue-flake-a" }), { ok: true, id: "art-gate-x", to: "issue-flake-a" });
+  assert.deepStrictEqual(edges, [{ id: "art-gate-x", type: "relates-to", to: "issue-flake-a" }]);
+  const foreign = await deps.linkFact({ id: "art-gate-x", type: "relates-to", to: "issue-flake-a", origin: "other" });
+  assert.match(foreign.reason, /different or unknown graph/);
+  const noOrigin = await deps.linkFact({ id: "art-gate-x", type: "relates-to", to: "issue-flake-a", file: "test/a.test.js" });
+  assert.match(noOrigin.reason, /different or unknown graph/, "a file-keyed flake edge with no origin has no graph to bind to");
+  assert.strictEqual(edges.length, 1, "neither refusal wrote an edge");
+});
+
+test("linkFact: a failure that is not a retargetable code, or one with nothing to re-file, is returned as is", async (t) => {
+  const failure = { ok: false, code: "target_not_live", reason: "gone" };
+  const plain = depsFor(t, { addGateEdge: async () => failure, attestationPublicationConfig: (cfg) => cfg });
+  assert.strictEqual(await plain.deps.linkFact({ id: "a", type: "relates-to", to: "issue-flake-a" }), failure, "no file/gate: nothing to recur onto");
+  const other = depsFor(t, { addGateEdge: async () => ({ ok: false, code: "boom" }), attestationPublicationConfig: (cfg) => cfg });
+  assert.deepStrictEqual(await other.deps.linkFact({ id: "a", type: "relates-to", to: "i", file: "f", gate: { id: "g" }, origin: "o" }), { ok: false, code: "boom" });
+});
+
+test("linkFact recurrence: a dead target recovers an already-paid rung, else files the next rung and links it", async (t) => {
+  const added = [];
+  let sourceEdges = "";
+  const hostFor = (over = {}) => ({
+    attestationPublicationConfig: (cfg) => cfg,
+    nodeUnreadable: () => false,
+    addGateEdge: async (_cfg, id, type, to) => {
+      added.push(to);
+      return to === "issue-flake-a" ? { ok: false, code: "target_not_live" } : { ok: true, id, to };
+    },
+    resolveNode: async () => ({ raw: NODE_MD("t", sourceEdges) }),
+    ...over,
+  });
+  const args = { id: "art-gate-x", type: "relates-to", to: "issue-flake-a", gate: { id: "g", command: "npm test" }, file: "test/a.test.js", files: ["test/a.test.js"], origin: "o" };
+
+  sourceEdges = "  - {type: relates-to, to: issue-flake-a-r2}\n";
+  const paid = depsFor(t, hostFor());
+  assert.deepStrictEqual(await paid.deps.linkFact(args), { ok: true, id: "art-gate-x", to: "issue-flake-a-r2" }, "a payment that landed before a crash stays paid");
+  assert.deepStrictEqual(added, ["issue-flake-a"], "no second edge");
+
+  added.length = 0;
+  sourceEdges = "";
+  const filed = [];
+  const next = depsFor(t, hostFor());
+  next.deps.fileFlakeItem = async (a) => { filed.push(a); return { ok: true, id: "issue-flake-a-r2" }; };
+  const out = await next.deps.linkFact(args);
+  assert.deepStrictEqual(out, { ok: true, id: "art-gate-x", to: "issue-flake-a-r2" });
+  assert.deepStrictEqual(added, ["issue-flake-a", "issue-flake-a-r2"]);
+  assert.strictEqual(filed[0].file, "test/a.test.js");
+  assert.strictEqual(filed[0].command, "npm test");
+
+  next.deps.fileFlakeItem = async () => ({ ok: false, reason: "no rung" });
+  assert.deepStrictEqual(await next.deps.linkFact(args), { ok: false, reason: "no rung" });
+
+  const unreadable = depsFor(t, hostFor({ nodeUnreadable: () => true }));
+  assert.match((await unreadable.deps.linkFact(args)).reason, /could not be read before recurrence selection/);
+});
