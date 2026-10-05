@@ -337,13 +337,13 @@ function digestServer(intent, found = true) {
 
 // Remote mode, pure: no local nodes/ dir, so the only digest is the server's.
 // `asyncFlag` undefined leaves SPOR_DIGEST_ASYNC UNSET (the default).
-async function remotePrompt(intent, { asyncFlag, intentCmd = null, found = true, keepLocal = false, seed = null } = {}) {
+async function remotePrompt(intent, { asyncFlag, intentCmd = null, found = true, keepLocal = false, seed = null, extraEnv = {} } = {}) {
   const { root, home, cwd } = scratch();
   if (!keepLocal) fs.rmSync(path.join(home, "nodes"), { recursive: true });
   if (seed) seed(home);
   const { srv, hits, base } = await digestServer(intent, found);
   try {
-    const e = env(home, intentCmd, { SPOR_SERVER: base, SPOR_TOKEN: "spor_pat_test" });
+    const e = env(home, intentCmd, { SPOR_SERVER: base, SPOR_TOKEN: "spor_pat_test", ...extraEnv });
     if (asyncFlag === undefined) delete e.SPOR_DIGEST_ASYNC;
     else e.SPOR_DIGEST_ASYNC = asyncFlag;
     const payload = { cwd, session_id: "s1", hook_event_name: "UserPromptSubmit", prompt: PROMPT };
@@ -507,4 +507,122 @@ test("intent gate suppresses prompt 1's digest; a low-signal follow-up prompt 2 
     /dec-widget-cache/,
     "prompt 2 must still get its digest — prompt 1's suppressed digest was never actually shown"
   );
+});
+
+// ---------------------------------------------------------------------------
+// Cheap default backend (task-spor-digest-intent-cheap-default-backend): with an
+// API key and no digest.intentCmd the worker classifies with ONE raw Messages
+// API call (no `claude` spawn); with no key it spawns exactly what it always
+// did. A fake Anthropic API (test/helpers/fake-anthropic.js) and a PATH-resident
+// fake `claude` are the two oracles.
+// ---------------------------------------------------------------------------
+const { startFakeAnthropic } = require("./helpers/fake-anthropic");
+const { writeFakePathNodeBin } = require("./helpers/portable");
+
+function claudeStubDir(root) {
+  const dir = path.join(root, "bin");
+  const log = path.join(root, "claude-spawned");
+  writeFakePathNodeBin(dir, "claude", `
+require("fs").appendFileSync(${JSON.stringify(log)}, "spawn\\n");
+process.stdin.resume();
+process.stdin.on("end", () => process.stdout.write(JSON.stringify({ result: "WARRANTED", usage: {}, total_cost_usd: 0 })));
+`);
+  return { dir, log };
+}
+
+test("api key + no intentCmd: one raw Messages API call, no claude spawn, same result file", async () => {
+  const { root, home, cwd } = scratch();
+  const fake = await startFakeAnthropic({ handler: () => ({ text: "WARRANTED" }) });
+  const { dir, log } = claudeStubDir(root);
+  try {
+    const extraEnv = {
+      SPOR_DIGEST_INTENT_API_KEY: "sk-test-key",
+      ANTHROPIC_BASE_URL: fake.url,
+      PATH: `${dir}${path.delimiter}${process.env.PATH}`,
+    };
+    assert.strictEqual(promptContext(home, cwd, { extraEnv }).trim(), "");
+    assert.ok(await waitFor(() => outFiles(home).length === 1), "worker never wrote a result");
+    assert.strictEqual(fake.requests.length, 1, "exactly one API call");
+    const req = fake.requests[0];
+    assert.strictEqual(req.url, "/v1/messages");
+    assert.strictEqual(req.headers["x-api-key"], "sk-test-key");
+    assert.strictEqual(req.body.stream, undefined);
+    assert.match(req.body.model, /haiku/);
+    assert.match(req.body.messages[0].content, /widget thumbnail caching/);
+    assert.ok(!fs.existsSync(log), "claude was never spawned");
+    const calls = llmCalls(home);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].source, "digest-intent");
+    assert.match(calls[0].backend, /^api:/);
+    assert.match(calls[0].response, /WARRANTED/);
+    // The secret is never spooled.
+    const spooled = fs.readdirSync(spoolDir(home)).map((f) => fs.readFileSync(path.join(spoolDir(home), f), "utf8")).join("");
+    assert.ok(!spooled.includes("sk-test-key"));
+    // Same result file as any backend: the next prompt drains and injects it.
+    const ctx = JSON.parse(promptContext(home, cwd, { prompt: "ok", extraEnv })).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /dec-widget-cache/);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("api key: an UNWARRANTED API verdict suppresses; an API failure fails open", async () => {
+  const { root, home, cwd } = scratch();
+  const fake = await startFakeAnthropic({ handler: () => ({ text: "UNWARRANTED" }) });
+  try {
+    const extraEnv = { SPOR_DIGEST_INTENT_API_KEY: "k", ANTHROPIC_BASE_URL: fake.url };
+    promptContext(home, cwd, { extraEnv });
+    assert.ok(await waitFor(() => tryLlmCalls(home)?.length === 1), "worker never ran");
+    assert.strictEqual(outFiles(home).length, 0);
+  } finally {
+    await fake.close();
+  }
+  // Dead endpoint: the call fails, the digest still spools.
+  const b = scratch();
+  const dead = await startFakeAnthropic();
+  const deadUrl = dead.url;
+  await dead.close();
+  promptContext(b.home, b.cwd, { extraEnv: { SPOR_DIGEST_INTENT_API_KEY: "k", ANTHROPIC_BASE_URL: deadUrl } });
+  assert.ok(await waitFor(() => outFiles(b.home).length === 1), "failure must still spool the digest");
+  assert.match(llmCalls(b.home)[0].error, /anthropic api failed/);
+});
+
+test("an explicit intentCmd beats an API key", async () => {
+  const { root, home, cwd } = scratch();
+  const fake = await startFakeAnthropic();
+  try {
+    promptContext(home, cwd, {
+      intentCmd: warrantedStub(root),
+      extraEnv: { SPOR_DIGEST_INTENT_API_KEY: "k", ANTHROPIC_BASE_URL: fake.url },
+    });
+    assert.ok(await waitFor(() => outFiles(home).length === 1));
+    assert.strictEqual(fake.requests.length, 0, "no API call when a cmd is configured");
+    assert.match(llmCalls(home)[0].backend, /^cmd:/);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("no key: spawns exactly the claude -p backend it always did", async () => {
+  const { root, home, cwd } = scratch();
+  const { dir, log } = claudeStubDir(root);
+  promptContext(home, cwd, { extraEnv: { PATH: `${dir}${path.delimiter}${process.env.PATH}` } });
+  assert.ok(await waitFor(() => outFiles(home).length === 1));
+  assert.ok(fs.existsSync(log), "claude was spawned");
+  assert.strictEqual(llmCalls(home)[0].backend, "cli:claude -p --model haiku");
+});
+
+test("api key + a Jev-carrying response still decides synchronously, no API call", async () => {
+  const fake = await startFakeAnthropic();
+  try {
+    const { home, stdout } = await remotePrompt(JEV_NO, {
+      asyncFlag: "1",
+      extraEnv: { SPOR_DIGEST_INTENT_API_KEY: "k", ANTHROPIC_BASE_URL: fake.url },
+    });
+    assert.strictEqual(stdout.trim(), "");
+    assert.strictEqual(fake.requests.length, 0);
+    assert.strictEqual(llmCalls(home).length, 0);
+  } finally {
+    await fake.close();
+  }
 });

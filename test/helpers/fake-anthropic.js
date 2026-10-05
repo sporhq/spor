@@ -131,7 +131,24 @@ function startFakeAnthropic(opts = {}) {
       } catch {
         spec = { text: "handler-error" };
       }
-      streamMessage(res, specToMessage(spec, (body && body.model) || "claude-fake"));
+      const msg = specToMessage(spec, (body && body.model) || "claude-fake");
+      // A non-streaming request (a raw API client, not claude) gets the plain JSON
+      // Message; claude always streams.
+      if (body && body.stream !== true) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          id: "msg_fake",
+          type: "message",
+          role: "assistant",
+          model: msg.model,
+          content: msg.blocks,
+          stop_reason: msg.stopReason,
+          stop_sequence: null,
+          usage: msg.usage ?? { input_tokens: 10, output_tokens: 1 },
+        }));
+        return;
+      }
+      streamMessage(res, msg);
     });
   });
   return new Promise((resolve) => {

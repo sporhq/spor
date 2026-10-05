@@ -19,7 +19,14 @@
 const u = require("./util");
 const { classifyDigestIntent } = require("./prompt-context");
 
-u.runSpoolWorker(process.argv[2], classifyDigestIntent, (job, verdict) =>
+// The detached worker has no active config; adopt the originating cwd's cascade
+// so a configured digest.intentApiKey (never spooled — a secret) is visible.
+const classify = (job) => {
+  if (job.cwd) u.useConfig({ cwd: job.cwd });
+  return classifyDigestIntent(job);
+};
+
+u.runSpoolWorker(process.argv[2], classify, (job, verdict) =>
   verdict !== "UNWARRANTED" && job.digest
     ? { digest: job.digest, sig: job.sig, slug: job.slug, verdict: verdict ?? "fail-open", ts: u.jqNow() }
     : null

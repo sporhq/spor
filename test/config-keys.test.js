@@ -55,7 +55,7 @@ test("derived: ENV_MAP, KNOWN_KEYS and the repo bans come from the table", () =>
   assert.deepStrictEqual(config.REPO_FORBIDDEN_KEYS, ["token"]);
   assert.deepStrictEqual(
     [...config.REPO_FORBIDDEN_PATHS].sort(),
-    ["attestation.signingKey", "digest.intentCmd", "dispatch.allowPersonToken", "dispatch.bin", "dispatch.harness", "distill.cmd", "nudge.cmd"],
+    ["attestation.signingKey", "digest.intentApiKey", "digest.intentCmd", "dispatch.allowPersonToken", "dispatch.bin", "dispatch.harness", "distill.cmd", "nudge.cmd"],
   );
   // The applied structural defaults are exactly the pre-table DEFAULTS literal.
   assert.deepStrictEqual(config.DEFAULTS, {

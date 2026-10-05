@@ -547,6 +547,18 @@ classification on a cold CLI prompt cache (~$0.01 warm), ~98% of it CLI session
 boot rather than the 4.6KB classification, so a flip wants a cheaper
 `digest.intentCmd` backend first, and a different backend is a different
 classifier that must be re-scored.
+**The cheap default backend (task-spor-digest-intent-cheap-default-backend):**
+with NO `digest.intentCmd` and an Anthropic key (`digest.intentApiKey` /
+`SPOR_DIGEST_INTENT_API_KEY`, else `ANTHROPIC_API_KEY`; a secret, stripped from
+repo `.spor.json`), `classifyDigestIntent` makes ONE raw Messages API call to
+haiku (`scripts/engines/anthropic-call.js`, zero-dep `https`, run as a child so
+the classifier stays synchronous; `ANTHROPIC_BASE_URL` redirects it) instead of
+booting `claude -p`. Precedence: explicit `intentCmd` > key > host default
+(codex) > `claude -p --model haiku`. The key is resolved in the worker (which
+adopts the job's `cwd` cascade) and never written to the spool; the llm-calls
+record carries `backend: api:<model>`. A different backend is a different
+calibration: it must be scored with `scripts/intent-eval/run.js` before
+`digest.async` can default on, and no committed run certifies the API backend yet.
 **The server-computed verdict (task-spor-digest-intent-jev-gate):** `/v1/digest`
 may return `intent: {warranted, needs_history, digest_helps, source: "judgment"}` —
 the tenant server asks the judgment model over the prompt it was already sent (API.md §3), so

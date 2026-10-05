@@ -271,7 +271,10 @@ function spoolDigestIntent(graph, input, slug, prompt, digest) {
     slug,
     graph,
     timeoutMs: u.cfgNum("digest.intentTimeoutMs", "DIGEST_INTENT_TIMEOUT", 30000),
-    cmd: u.cfgStr("digest.intentCmd", "DIGEST_INTENT_CMD") || u.hostDefaultBackendCmd("nudge") || "",
+    // An explicit cmd wins; with an API key the worker makes one raw API call
+    // (cmd stays empty); otherwise the host default, else `claude -p`.
+    cmd: u.cfgStr("digest.intentCmd", "DIGEST_INTENT_CMD") || (digestIntentApiKey() ? "" : u.hostDefaultBackendCmd("nudge") || ""),
+    cwd: input.cwd ?? "",
     vars,
     digest,
     sig: digestSignature(digest),
@@ -303,8 +306,18 @@ function spoolDigestIntent(graph, input, slug, prompt, digest) {
 // The verdict only ever REMOVES noise: the worker treats anything but an
 // explicit UNWARRANTED as inject, so a broken backend degrades to the shipped
 // inject-everything behavior instead of silently eating warranted digests.
+function digestIntentApiKey() {
+  return u.cfgStr("digest.intentApiKey", "DIGEST_INTENT_API_KEY") || process.env.ANTHROPIC_API_KEY || "";
+}
+
 function classifyDigestIntent({ prompt, tplSha, session, slug, graph, timeoutMs, cmd, vars }) {
+  // Backend precedence: an explicit/host cmd, else — with a key — one raw
+  // Messages API call, else `claude -p --model haiku`
+  // (task-spor-digest-intent-cheap-default-backend). Resolved here, in the
+  // worker, so the secret never rides the spool file.
+  const apiKey = cmd ? "" : digestIntentApiKey();
   const res = u.runClassifierBackend({
+    apiKey,
     prompt,
     tplSha,
     session,

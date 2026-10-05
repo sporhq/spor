@@ -1842,6 +1842,42 @@ function runClaudeBackend(prompt, { timeoutMs, failure } = {}) {
   return parseClaudeResult(r.stdout);
 }
 
+// Haiku 4.5 list price, USD per token (input / output). Telemetry only.
+const HAIKU_IN_USD = 1 / 1e6;
+const HAIKU_OUT_USD = 5 / 1e6;
+
+// Run scripts/engines/anthropic-call.js: prompt on stdin, one JSON line out.
+// Returns { text, usage, cost_usd, model } or null (failure filled in).
+function runAnthropicApiBackend(prompt, apiKey, { timeoutMs, failure } = {}) {
+  const r = spawnSync(process.execPath, [path.join(__dirname, "anthropic-call.js")], {
+    input: prompt,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      SPOR_ANTHROPIC_KEY: apiKey,
+      SPOR_DISTILLING: "1",
+      SUBSTRATE_DISTILLING: "1",
+    },
+    maxBuffer: 16 * 1024 * 1024,
+    ...(timeoutMs > 0 ? { timeout: timeoutMs, killSignal: "SIGKILL" } : {}),
+  });
+  if (r.status !== 0 || r.error) {
+    if (failure) Object.assign(failure, backendFailure(r));
+    return null;
+  }
+  try {
+    const j = JSON.parse(r.stdout);
+    const usage = j.usage || null;
+    const cost_usd = usage
+      ? (usage.input_tokens || 0) * HAIKU_IN_USD + (usage.output_tokens || 0) * HAIKU_OUT_USD
+      : null;
+    return { text: stripTrailingNewlines(String(j.text ?? "")), usage, cost_usd, model: j.model || null };
+  } catch {
+    if (failure) Object.assign(failure, backendFailure({ ...r, status: 1 }));
+    return null;
+  }
+}
+
 // Shared classifier-backend invocation, used by the capture nudge
 // (post-tool.js's classifyForNudge) and the digest-intent classifier
 // (prompt-context.js's classifyDigestIntent): pick a backend (a configured
@@ -1852,7 +1888,7 @@ function runClaudeBackend(prompt, { timeoutMs, failure } = {}) {
 // with `error` set). Callers own all response PARSING (===FACT=== blocks vs
 // WARRANTED/UNWARRANTED) and all cooldown/journal STATE — this function's
 // only side effect is the llm-calls record.
-function runClassifierBackend({ prompt, tplSha, session, project, graph, source, template, timeoutMs, cmd, vars }) {
+function runClassifierBackend({ prompt, tplSha, session, project, graph, source, template, timeoutMs, cmd, vars, apiKey }) {
   const llmDir = path.join(graph, "journal", "llm-calls");
   const t0 = Date.now();
   let backend = "";
@@ -1892,6 +1928,19 @@ function runClassifierBackend({ prompt, tplSha, session, project, graph, source,
       recordLlm("", `${source} cmd failed`, failure);
       return null;
     }
+  } else if (apiKey) {
+    // One raw Messages API call (anthropic-call.js) instead of a `claude -p`
+    // boot; used only when no cmd is configured. The key rides the child's env.
+    const res = runAnthropicApiBackend(prompt, apiKey, { timeoutMs, failure });
+    backend = `api:${res ? res.model || "anthropic" : "anthropic"}`;
+    if (res === null) {
+      recordLlm("", "anthropic api failed", failure);
+      return null;
+    }
+    response = res.text;
+    usage = res.usage;
+    cost_usd = res.cost_usd;
+    model = res.model;
   } else {
     backend = "cli:claude -p --model haiku";
     const res = runClaudeBackend(prompt, { timeoutMs, failure });
