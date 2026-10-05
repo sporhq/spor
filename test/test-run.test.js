@@ -252,7 +252,7 @@ test("withCrashReporter adds the reporter pair unless the caller chose a reporte
 
 // process.kill(pid, "SIGKILL") on Windows is a plain TerminateProcess: the child exits
 // with a code, never a signal, so there is no "killed by SIGKILL" crash to name.
-const NO_SIGKILL = process.platform === "win32" && "no SIGKILL signal exit on Windows";
+const NO_SIGKILL = process.platform === "win32" && "no SIGKILL signal exit on Windows (see the TerminateProcess test below for what Windows asserts instead)";
 
 function runCrashFixture(env) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "test-run-crash-"));
@@ -280,6 +280,19 @@ test("SPOR_TEST_RERUN_CRASHED=0 is strict: the crash stays red and is still name
   const r = runCrashFixture({ SPOR_TEST_RERUN_CRASHED: "0" });
   assert.strictEqual(r.status, 1, r.stderr);
   assert.match(r.stderr, /killed by SIGKILL/);
+  assert.match(r.stderr, /test-run: FAILED/);
+});
+
+// The Windows half of the two tests above: the same kill is a TerminateProcess, so the
+// reporter records an exit code and no signal. By the signal-kills-only rule
+// (dec-spor-crash-rerun-signal-kills-only-keyed-on-exit-record) that is a deterministic
+// failure: still NAMED, never re-run, never FLAKY, and the run stays red even though
+// SPOR_TEST_RERUN_CRASHED is left at its default.
+test("a TerminateProcess kill on Windows is named as an exit code and stays red: never re-run, never FLAKY", { skip: process.platform !== "win32" && "POSIX reports this kill as SIGKILL, covered above" }, () => {
+  const r = runCrashFixture({});
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /crashed outside a test: .*crash\.test\.js — exited \d+/);
+  assert.doesNotMatch(r.stderr, /killed by|re-running|FLAKY/);
   assert.match(r.stderr, /test-run: FAILED/);
 });
 
