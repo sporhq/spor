@@ -258,3 +258,16 @@ test('the last-known retry count survives independently of the pool head, only r
   fs.writeFileSync(runs.runPaths(f.home, f.runId).dir + `/${f.runId}.gate-progress.jsonl`, 'garbage\n');
   assert.equal(await deps.lastKnownRetry(), 2, 'a destroyed pool head does not take the count with it');
 });
+
+test('a displaced former owner cannot write or lower the retry-count sidecar', async (t) => {
+  const f = fixture(t);
+  const old = f.deps();
+  await old.saveGatePools({ pools: { retry: { spent: 3 } } });
+  runs.stampGateState(f.home, f.runId, { gate_settle_id: 'owner-b', gate_regate_count: 1 }, { own: 'owner-a' });
+  await assert.rejects(() => old.saveGatePools({ pools: { retry: { spent: 9 } } }), /could not be updated/);
+  assert.equal(await old.lastKnownRetry(), 3, 'a refused save raised nothing');
+  const sidecar = runs.runPaths(f.home, f.runId).retryCount;
+  fs.writeFileSync(sidecar, JSON.stringify({ key: `${f.runId}`, spent: 3 }));
+  await assert.rejects(() => old.saveGatePools({ pools: { retry: { spent: 1 } } }), /could not be updated/);
+  assert.equal(await old.lastKnownRetry(), 3, 'a stale writer never lowers the count');
+});
