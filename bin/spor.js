@@ -7522,24 +7522,35 @@ function spawnPortableSync(cmd, args, opts = {}) {
 // status null). Routing stdout to a temp FILE takes the pipe out of it: the
 // call returns the moment the child exits, and the timeout still bounds a child
 // that genuinely hangs. Returns spawnSync's shape with `stdout` read back as
-// utf8 (stderr is discarded — every caller here reads stdout only).
+// utf8; stderr goes to a second temp file and is read back too (a pipe there
+// has the same daemon-holds-it hazard), so a caller that reports a failure can
+// still quote the CLI's message. The marketplace add/update shell-outs use it
+// for the same reason as `plugin list` (task-spor-generalize-spawn-capture-sync).
 function spawnCaptureSync(cmd, args, { timeout = 8000, ...opts } = {}) {
   let dir = null;
   let fd = null;
+  let efd = null;
   try {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cap-"));
     const file = path.join(dir, "stdout");
+    const efile = path.join(dir, "stderr");
     fd = fs.openSync(file, "w");
-    const r = spawnPortableSync(cmd, args, { ...opts, stdio: ["ignore", fd, "ignore"], timeout });
+    efd = fs.openSync(efile, "w");
+    const r = spawnPortableSync(cmd, args, { ...opts, stdio: ["ignore", fd, efd], timeout });
     fs.closeSync(fd);
     fd = null;
+    fs.closeSync(efd);
+    efd = null;
     let stdout = "";
+    let stderr = "";
     try { stdout = fs.readFileSync(file, "utf8"); } catch { /* nothing written */ }
-    return { ...r, stdout };
+    try { stderr = fs.readFileSync(efile, "utf8"); } catch { /* nothing written */ }
+    return { ...r, stdout, stderr };
   } catch (e) {
-    return { status: null, stdout: "", error: e };
+    return { status: null, stdout: "", stderr: "", error: e };
   } finally {
     if (fd != null) try { fs.closeSync(fd); } catch { /* already closed */ }
+    if (efd != null) try { fs.closeSync(efd); } catch { /* already closed */ }
     if (dir) try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 }
@@ -7834,7 +7845,7 @@ function detectHosts() {
 // swaps the cached copy. Returns 0/1; prints a before→after line. The caller has
 // already ensured the claude CLI exists and the marketplace is registered.
 function refreshClaudePlugin(cmd, cliScope, before, cfg = null) {
-  spawnPortableSync(cmd, ["plugin", "marketplace", "update", "spor"], { encoding: "utf8" });
+  spawnCaptureSync(cmd, ["plugin", "marketplace", "update", "spor"], { timeout: 60000 });
   // Claude Code resolves an installed plugin by its name@marketplace id (the
   // install side uses 'spor@spor'); the bare 'spor' is unresolvable and fails
   // with "Plugin 'spor' not found" (issue-spor-upgrade-wrong-plugin-marketplace-id).
@@ -7876,7 +7887,7 @@ function installClaude(scope, dryRun, cfg = null) {
     err(`meanwhile, load spor without a marketplace per session:  claude --plugin-dir ${ROOT}`);
     return 1;
   }
-  const add = spawnPortableSync(cmd, addArgs, { encoding: "utf8" });
+  const add = spawnCaptureSync(cmd, addArgs, { timeout: 60000 });
   if (add.status !== 0 && !/already|exists|known/i.test((add.stderr || "") + (add.stdout || ""))) {
     err(`claude plugin marketplace add failed: ${(add.stderr || add.stdout || "").trim() || "unknown error"}`);
     return 1;
@@ -7912,7 +7923,7 @@ function installCodex(scope, dryRun, cfg = null) {
     err("codex CLI not on PATH — install Codex, then re-run 'spor install codex'.");
     return 1;
   }
-  const mp = spawnPortableSync(cmd, mpArgs, { encoding: "utf8", cwd: ROOT });
+  const mp = spawnCaptureSync(cmd, mpArgs, { cwd: ROOT, timeout: 60000 });
   if (mp.status !== 0 && !/already|exists|known/i.test((mp.stderr || "") + (mp.stdout || ""))) {
     err(`codex plugin marketplace add failed: ${(mp.stderr || mp.stdout || "").trim() || "unknown error"}`);
     return 1;
@@ -8308,7 +8319,7 @@ function upgradeClaude(scope, dryRun, cfg = null) {
   }
   // Re-register the marketplace source first, tolerating "already exists", so a
   // moved checkout repoints before the update re-reads it.
-  const add = spawnPortableSync(cmd, mpAdd, { encoding: "utf8" });
+  const add = spawnCaptureSync(cmd, mpAdd, { timeout: 60000 });
   if (add.status !== 0 && !/already|exists|known/i.test((add.stderr || "") + (add.stdout || ""))) {
     err(`claude plugin marketplace add failed: ${(add.stderr || add.stdout || "").trim() || "unknown error"}`);
     return 1;
