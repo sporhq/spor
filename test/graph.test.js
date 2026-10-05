@@ -2060,6 +2060,32 @@ b
   assert.ok(v.warnings.some((w) => /widget-a\.md: unknown type 'widget'/.test(w)));
 });
 
+test("validateGraph: a loader-skipped schema file still reports its own schema parse errors", () => {
+  const fx = tmpGraph({
+    "schema-node-widget.md": `---
+id: schema-node-widget
+type: schema
+kind: node-schema
+schema_version: 2026.06.10.3
+title: Widget
+summary: s
+date: 2026-08-08
+status: active
+edges:
+  - this is not an edge entry
+---
+
+\`\`\`json
+{ not valid json
+\`\`\`
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.ok(v.errors.some((e) => /schema-node-widget\.md/.test(e) && /SKIPPED by the loader/.test(e)));
+  assert.ok(v.errors.some((e) => /^schema-node-widget\.md: (?!.*SKIPPED)/.test(e) && !/edge entry/.test(e)),
+    `expected a schema parse error, got: ${JSON.stringify(v.errors)}`);
+});
+
 test("validateGraph: a loader-skipped repo file claims no slug and aliases nothing", () => {
   const fx = tmpGraph({
     "repo-bad.md": `---
