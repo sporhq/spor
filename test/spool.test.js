@@ -50,6 +50,27 @@ test('writeSpoolFile publishes whole files and leaves no temp behind', () => {
   assert.ok(fs.existsSync(path.join(dir, 'made', 'z.json')));
 });
 
+test('writeSpoolFile {durable} fsyncs the temp file before the rename and the dir after', () => {
+  const dir = scratch();
+  const f = path.join(dir, 'cred.json');
+  const calls = [];
+  const realFsync = fs.fsyncSync;
+  const realRename = fs.renameSync;
+  fs.fsyncSync = (fd) => { calls.push('fsync'); return realFsync(fd); };
+  fs.renameSync = (a, b) => { calls.push('rename'); return realRename(a, b); };
+  try {
+    spool.writeSpoolFile(f, 'x', { mode: 0o600, durable: true });
+    assert.deepStrictEqual(calls, ['fsync', 'rename', 'fsync']);
+    calls.length = 0;
+    spool.writeSpoolFile(f, 'y');
+    assert.deepStrictEqual(calls, ['rename']); // hot spools stay unsynced
+  } finally {
+    fs.fsyncSync = realFsync;
+    fs.renameSync = realRename;
+  }
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), 'y');
+});
+
 test('createExclusive: first writer wins and the loser never clobbers', () => {
   const dir = scratch();
   const f = path.join(dir, 'origin.json');
