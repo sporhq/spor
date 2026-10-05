@@ -453,27 +453,40 @@ function programStub({ status = 200, text, json } = {}) {
 const remoteEnv = (home, base, extra = {}) =>
   baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra });
 
-test("program (remote): GETs /v1/program/{id}?format=text and prints the server's rendering verbatim", async () => {
+test("program (remote): an older server ignoring format=envelope falls back to format=text, printed verbatim", async () => {
   const { srv, hits, base } = await programStub({ text: "program task-hub (server rendering)" });
   try {
     const r = await runAsync(["program", "task-hub"], remoteEnv(freshHome(), base));
     assert.equal(r.status, 0, r.stderr);
     assert.equal(r.stdout, "program task-hub (server rendering)\n");
-    const hit = hits.find((h) => h.url.startsWith("/v1/program/task-hub"));
-    assert.ok(hit, "GET /v1/program/task-hub");
-    assert.equal(new URLSearchParams(hit.url.split("?")[1]).get("format"), "text");
+    const formats = hits.filter((h) => h.url.startsWith("/v1/program/task-hub")).map((h) => new URLSearchParams(h.url.split("?")[1]).get("format"));
+    assert.deepEqual(formats, ["envelope", "text"]);
   } finally { srv.close(); }
 });
 
-test("program (remote): --json requests format=json and prints the server envelope verbatim", async () => {
+test("program (remote): --json against an older server falls back to format=json, printed verbatim", async () => {
   const body = { found: true, root_id: "task-hub", progress: { total: 1, done: 1, pct: 100 } };
   const { srv, hits, base } = await programStub({ json: body });
   try {
     const r = await runAsync(["program", "task-hub", "--json"], remoteEnv(freshHome(), base));
     assert.equal(r.status, 0, r.stderr);
     assert.deepEqual(JSON.parse(r.stdout), body);
-    const hit = hits.find((h) => h.url.startsWith("/v1/program/task-hub"));
-    assert.equal(new URLSearchParams(hit.url.split("?")[1]).get("format"), "json");
+    const formats = hits.filter((h) => h.url.startsWith("/v1/program/task-hub")).map((h) => new URLSearchParams(h.url.split("?")[1]).get("format"));
+    assert.deepEqual(formats, ["envelope", "json"]);
+  } finally { srv.close(); }
+});
+
+test("program (remote): an envelope-serving server is rendered through renderReport", async () => {
+  const env = { found: true, root_id: "task-hub", root: { title: "Hub" }, progress: { total: 1, done: 1, active: 0, blocked: 0, open: 0, pct: 100 }, count: 1, truncated: false, tree: [{ id: "task-a", depth: 0, bucket: "done", title: "A" }], outside_ids: [] };
+  const srv = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(env));
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const r = await runAsync(["program", "task-hub"], remoteEnv(freshHome(), `http://127.0.0.1:${srv.address().port}`));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout, require("../lib/program.js").renderReport(env) + "\n");
   } finally { srv.close(); }
 });
 

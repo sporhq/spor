@@ -103,6 +103,12 @@ const CASES = [
   { verb: "analytics", args: ["analytics", "--project", "alpha", "--weeks", "4"] },
   { verb: "analytics", args: ["analytics", "--project", "zzz-unknown"] },
   { verb: "analytics", args: ["analytics", "--type", "task", "--top", "3"] },
+  { verb: "program", args: ["program", "task-blocked"] },
+  { verb: "program", args: ["program", "task-blocked", "--max-depth", "0"] },
+  { verb: "program", args: ["program", "task-blocked", "--max-nodes", "1"] },
+  { verb: "program", args: ["program", "task-unblocker"] },
+  { verb: "program", args: ["program", "task-blocked", "--max-depth", "-1"] },
+  { verb: "program", args: ["program", "task-blocked", "--max-nodes", "abc"] },
 ];
 
 for (const c of CASES) {
@@ -125,6 +131,11 @@ for (const c of CASES) {
       // Same serialization, not just the same fields: both pretty-print.
       assert.match(local.stdout, /^\{\n {2}"items"/);
       assert.match(remote.stdout, /^\{\n {2}"items"/);
+    } else if (c.verb === "program") {
+      // Byte-identical once the CLI's own generated_at stamp is pinned.
+      const pin = (s) => s.replace(/"generated_at": "[^"]*"/, '"generated_at": "<pinned>"');
+      assert.strictEqual(pin(remote.stdout), pin(local.stdout), "program --json byte-identical");
+      assert.match(remote.stdout, /"found": true/);
     } else {
       // Byte-identical once the report's own clock stamp (window.now — the
       // instant each arm ran analyze()) is pinned to one value.
@@ -139,6 +150,7 @@ test("mode parity: remote actually went through the stub for every verb", () => 
   // would make every diff above pass vacuously.
   assert.ok(stub.requests.some((p) => p.startsWith("/v1/queue?")), "queue was requested");
   assert.ok(stub.requests.some((p) => p.startsWith("/v1/analytics")), "analytics was requested");
+  assert.ok(stub.requests.some((p) => p.startsWith("/v1/program/") && p.includes("format=envelope")), "program envelope was requested");
   assert.ok(stub.requests.some((p) => /[?&]readiness=agent\b/.test(p)), "--readiness forwarded");
   assert.ok(stub.requests.some((p) => /[?&]type=task\b/.test(p) && /[?&]exclude_type=question\b/.test(p)), "type filters forwarded");
 });

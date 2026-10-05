@@ -23,6 +23,7 @@ const path = require("node:path");
 const ROOT = path.join(__dirname, "..", "..");
 const graphLib = require(path.join(ROOT, "lib", "graph.js"));
 const queueLib = require(path.join(ROOT, "lib", "queue.js"));
+const programKernel = require(path.join(ROOT, "lib", "kernel", "program.js"));
 const analyticsLib = require(path.join(ROOT, "lib", "analytics.js"));
 
 // server/rest.js
@@ -123,6 +124,27 @@ function startStubServer({ nodesDir }) {
       });
       const projectWarning = graphLib.unknownProjectWarning(g, project, "analytics");
       return send(res, 200, projectWarning ? { ...report, project_warning: projectWarning } : report);
+    }
+
+    const pm = req.method === "GET" && url.pathname.match(/^\/v1\/program\/([^/]+)$/);
+    if (pm) {
+      // server GET /v1/program/{id}?format=envelope: the kernel's walkProgram
+      // envelope; absent depth/max_nodes take the kernel defaults, present ones
+      // clamp to 0..1000. Unknown root -> 404.
+      const clamp = (key) => {
+        const v = sp.get(key);
+        if (v == null) return undefined;
+        const n = Math.floor(Number(v));
+        return Number.isFinite(n) ? Math.min(1000, Math.max(0, n)) : undefined;
+      };
+      const maxDepth = clamp("depth");
+      const maxNodes = clamp("max_nodes");
+      const env = programKernel.walkProgram(g, decodeURIComponent(pm[1]), {
+        ...(maxDepth != null ? { maxDepth } : {}),
+        ...(maxNodes != null ? { maxNodes } : {}),
+      });
+      if (env.found === false) return send(res, 404, { error: { code: "not_found", message: "unknown root" } });
+      return send(res, 200, env);
     }
 
     send(res, 404, { error: { code: "not_found", message: `stub has no route ${url.pathname}` } });

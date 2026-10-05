@@ -3520,31 +3520,53 @@ async function cmdProgram(cfg, args) {
   return programLocal(cfg, id, args);
 }
 
-// The remote arm: GET /v1/program/{id}, format=json for --json else format=text,
-// and print the server's own body verbatim — no local re-rendering, since the
-// server's view-tree shape belongs to its own (separate) kernel.
+// The remote arm: GET /v1/program/{id}?format=envelope — the client kernel's
+// walkProgram envelope — printed through lib/program.js renderReport, the same
+// renderer local mode uses (norm-spor-cli-mode-parity). A server that predates
+// the envelope format ignores it and answers with its own view tree (no
+// `found`/`tree`); that body is not renderable here, so re-ask for the server's
+// own json/text rendering and print it verbatim, as before.
 async function programRemote(cfg, id, args) {
+  const programLib = require(path.join(ROOT, "lib", "program.js"));
   const wantJson = args.includes("--json");
-  const depth = optVal(args, "max-depth");
-  const maxNodes = optVal(args, "max-nodes");
-  const qs = new URLSearchParams();
-  qs.set("format", wantJson ? "json" : "text");
-  if (depth != null) qs.set("depth", depth);
-  if (maxNodes != null) qs.set("max_nodes", maxNodes);
-  const r = await remote.get(cfg, `/v1/program/${encodeURIComponent(id)}?${qs.toString()}`, { timeoutMs: 10000 });
-  if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
-    return 1;
-  }
-  if (r.status === 404) {
-    err(`program: unknown root '${id}'`);
-    return 1;
-  }
-  if (!r.ok) {
+  // numOpt, like the local arm: a junk/negative bound means "kernel default",
+  // not a raw value the server would clamp to 0.
+  const depth = numOpt(args, "max-depth");
+  const maxNodes = numOpt(args, "max-nodes");
+  const get = (format) => {
+    const qs = new URLSearchParams();
+    qs.set("format", format);
+    if (depth != null) qs.set("depth", String(depth));
+    if (maxNodes != null) qs.set("max_nodes", String(maxNodes));
+    return remote.get(cfg, `/v1/program/${encodeURIComponent(id)}?${qs.toString()}`, { timeoutMs: 10000 });
+  };
+  const fail = (r) => {
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (r.status === 404) {
+      err(`program: unknown root '${id}'`);
+      return 1;
+    }
     const msg = r.json && r.json.error && r.json.error.message;
     err(`program error ${r.status}${msg ? `: ${msg}` : ""}`);
     return 1;
+  };
+  let r = await get("envelope");
+  if (!r.ok) return fail(r);
+  const env = r.json;
+  if (env && typeof env === "object" && typeof env.found === "boolean" && (env.found === false || Array.isArray(env.tree))) {
+    if (env.found === false) {
+      err(`program: unknown root '${id}'`);
+      return 1;
+    }
+    if (wantJson) out(JSON.stringify({ ...env, generated_at: new Date().toISOString() }, null, 2));
+    else out(programLib.renderReport(env));
+    return 0;
   }
+  r = await get(wantJson ? "json" : "text");
+  if (!r.ok) return fail(r);
   out(wantJson ? (r.json != null ? JSON.stringify(r.json) : r.text || "") : r.text != null ? r.text : "");
   return 0;
 }
