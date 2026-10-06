@@ -563,7 +563,7 @@ adopts the job's `cwd` cascade only when a file-configured key exists, so the
 no-key path is byte-identical) and never written to the spool; the llm-calls
 record carries `backend: api:<model>`. A different backend is a different
 calibration: it must be scored with `scripts/intent-eval/run.js` before
-`digest.async` can default on, and no committed run certifies the API backend yet.
+`digest.async` can default on: `runs/2026-10-06-raw-api-haiku{,-draw2}.json` (`run.js --raw-api`, held-out population) certify it — two PASS draws, 5.9% and 5.4% warranted suppressed, 0/71 good lost.
 **The server-computed verdict (task-spor-digest-intent-jev-gate):** `/v1/digest`
 may return `intent: {warranted, needs_history, digest_helps, source: "judgment"}` —
 the tenant server asks the judgment model over the prompt it was already sent (API.md §3), so

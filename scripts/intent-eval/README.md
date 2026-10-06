@@ -375,6 +375,7 @@ and a flip resting on it would rest on that.
 | **Jev, server questions, ≥ 0.5** (`jev-server.json`) | **0/71** | **1/205 (0.5%)** | 3/18 (17%) | **0.9294** | PASS |
 | Jev, A/B-eval questions, ≥ 0.5 (`jev-ab.json`) | 0/71 | 3/205 (1.5%) | 4/18 (22%) | 0.9269 | PASS |
 | Haiku, shipped conjunctive prompt (`haiku.json`) | 0/71 | 7/205 (3.4%) | 10/18 (56%) | **0.9296** | PASS |
+| Haiku via the raw Messages API backend, two draws (`runs/2026-10-06-raw-api-haiku{,-draw2}.json`, `--raw-api`, exe.dev gateway) | 0/71 | 12/205 (5.9%), 11/205 (5.4%) | 10/18 (56%), 11/18 (61%) | 0.9172, 0.9220 | PASS |
 
 All three pass the harm gate. What separates them is **noise removal**. On this
 set Jev with the server's questions is conservative: it barely moves off
@@ -394,6 +395,15 @@ one Jev removes. So the open question for default-on is no longer the backend
 cost; it is whether ~17% noise removal is worth a default flip at all. A
 noise-heavier fresh window, once the new VM has accumulated one, is the
 measurement that decides it.
+
+**The raw-API backend (task-spor-digest-intent-cheap-default-backend).** The same
+held-out population scored through `--raw-api` (one Messages API call to haiku,
+`SPOR_DIGEST_INTENT_API_KEY` + `ANTHROPIC_BASE_URL`; `run.js` scrubs `SPOR_*` from
+the child, and `--raw-api` lets only the key/timeout/model knobs through) passes
+the gate on two draws, at ~$0.002 and ~0.7s per classification against
+~$0.08/~15s for `claude -p` (the gateway run itself billed nothing). Both draws
+sit inside the 6% budget by under one case (5.9%, 5.4%) — a thin margin worth
+re-checking on a fresh window before `digest.async` flips default-on.
 
 **Reproducing.** Every number above re-derives with no backend call:
 

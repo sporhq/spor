@@ -12,7 +12,7 @@
 // re-score against. This is that harness, committed.
 //
 //   node scripts/intent-eval/run.js --labels <evalDir> [--engine-root DIR]
-//        [--template FILE] [--cmd "<backend>"] [--concurrency K] [--limit N]
+//        [--template FILE] [--cmd "<backend>"] [--raw-api] [--concurrency K] [--limit N]
 //        [--only id,id] [--label NAME] [--out runs/<name>.jsonl] [--json OUT]
 //        [--budget 0.06] [--strict]
 //   node scripts/intent-eval/run.js --labels <evalDir> --replay <prior.jsonl>
@@ -64,6 +64,13 @@ const ONLY = arg("only", "");
 // candidate can only be scored from a whole second checkout, which is how the
 // last one rotted unmeasured — candidates/ holds the ones already scored.
 const TEMPLATE = arg("template", "");
+// --raw-api scores the raw Messages API backend (task-spor-digest-intent-cheap-
+// default-backend): the explicit key and its timeout/model knobs are the ONLY
+// SPOR_* vars let through the scrub below, so the child resolves the backend the
+// way a configured worker would while everything else stays a pure function of
+// (template, case). The base URL is ANTHROPIC_BASE_URL, which is not scrubbed.
+const RAW_API = flag("raw-api");
+const RAW_API_ENV = ["SPOR_DIGEST_INTENT_API_KEY", "SPOR_ANTHROPIC_TIMEOUT_MS", "SPOR_ANTHROPIC_MODEL"];
 const TIMEOUT = parseInt(arg("timeout", "60000"), 10);
 const BUDGET = parseFloat(arg("budget", String(M.DEFAULT_BUDGET)));
 const REPLAY = arg("replay", null);
@@ -90,7 +97,9 @@ function classify(job) {
     // inherited, because the default backend is the real `claude` CLI and it
     // needs HOME and PATH to authenticate.
     const env = Object.fromEntries(
-      Object.entries(process.env).filter(([k]) => !/^(SPOR|SUBSTRATE)_/.test(k))
+      Object.entries(process.env).filter(
+        ([k]) => !/^(SPOR|SUBSTRATE)_/.test(k) || (RAW_API && RAW_API_ENV.includes(k))
+      )
     );
     const child = spawn(process.execPath, [path.join(__dirname, "classify-one.js"), ENGINE_ROOT], {
       env,
@@ -182,7 +191,7 @@ function report(records, score, gate, tables, spend, drops) {
           ? `   [replay decisions recorded under this same sha]`
           : "")
   );
-  console.log(`backend      : ${REPLAY ? `replay ${REPLAY}` : CMD ? `cmd:${CMD}` : "cli:claude -p --model haiku (shipped default)"}`);
+  console.log(`backend      : ${REPLAY ? `replay ${REPLAY}` : CMD ? `cmd:${CMD}` : RAW_API ? `raw Messages API (${process.env.SPOR_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"} via ANTHROPIC_BASE_URL)` : "cli:claude -p --model haiku (shipped default)"}`);
   console.log(`corpus       : ${LABELS_DIR}`);
   console.log(
     `population   : ${score.n} fired user-prompt cases ` +
