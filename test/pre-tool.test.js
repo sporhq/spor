@@ -441,12 +441,19 @@ test("preTool: pattern-based process kills are denied; PID/pgid kills pass", asy
     "# don't\nkill $(pgrep foo)",
     "echo it's; kill $(pgrep foo)",
     "ps aux | grep x | awk '{print $2}' | xargs kill",
+    "find . -exec sh -c 'pgrep x | xargs kill' \\;",
+    "watch -n5 'pgrep -f node | xargs kill'",
+    "flock /tmp/l -c 'pgrep x | xargs kill'",
+    "su -c 'pgrep x | xargs kill'",
+    "bash -c -- 'kill $(pgrep node)'",
+    "watch 'pkill -f node'",
+    "find . -exec pkill -f {} \\;",
   ]) {
     const out = await run(c);
     assert.equal(out?.hookSpecificOutput?.permissionDecision, "deny", c);
     assert.match(out.hookSpecificOutput.permissionDecisionReason, /process guard/, c);
   }
-  for (const c of ["kill -- -12345", "kill 4242", "pgrep -f node", 'git commit -m "pkill is banned"', "echo pkill", "echo 'kill $(pgrep node)'", "git commit -m 'avoid kill $(pgrep x)'", 'git commit -m "avoid kill $(pgrep x)"', "git log --grep='pgrep x | xargs kill'", "pgrep x | while read p; do echo $p; done; kill 4242", "cat > n.md <<EOF\npkill -f x\nEOF"])
+  for (const c of ["kill -- -12345", "kill 4242", "pgrep -f node", 'git commit -m "pkill is banned"', "echo pkill", "echo 'kill $(pgrep node)'", "git commit -m 'avoid kill $(pgrep x)'", 'git commit -m "avoid kill $(pgrep x)"', "git log --grep='pgrep x | xargs kill'", "pgrep x | while read p; do echo $p; done; kill 4242", "cat > n.md <<EOF\npkill -f x\nEOF", "docker ps -q | xargs docker kill", "gh issue create --body 'pgrep x | xargs kill'", "grep -n 'kill $(pgrep' f", "man pkill", 'node --test --test-name-pattern "pkill denied" x.test.js', "sed -i 's/pkill -f x/kill y/' README.md", `find . -name '*.md' -exec grep -l "pkill -f" {} +`, 'curl -d "pkill -f is banned" http://x'])
     assert.equal(await run(c), null, c);
   assert.equal(await run("pkill node", main), null, "non-worktree session is a no-op");
   fs.rmSync(base, { recursive: true, force: true });

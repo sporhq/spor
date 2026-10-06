@@ -209,6 +209,12 @@ function findDashC(tokens) {
   return -1;
 }
 
+// The inline command string of a `sh -c` call, given findDashC's index: the
+// next argument, skipping a `--` end-of-options marker (`bash -c -- 'cmd'`).
+function dashCBody(tokens, i) {
+  return tokens[i + 1] === "--" ? tokens[i + 2] : tokens[i + 1];
+}
+
 // A leading run of `NAME=value` tokens in a segment is a POSIX temporary
 // environment assignment, scoped to the single command that follows (`FOO=1
 // BAR=2 cmd args`) — most relevantly `GIT_WORK_TREE=<dir> git commit ...`,
@@ -289,8 +295,8 @@ function scanBashForViolation(command, cwd, session, depth = 0) {
     }
     if (SHELL_DASH_C.has(tokens[0])) {
       const dashCIdx = findDashC(tokens);
-      if (dashCIdx !== -1 && tokens[dashCIdx + 1]) {
-        const nested = scanBashForViolation(tokens[dashCIdx + 1], dir, session, depth + 1);
+      if (dashCIdx !== -1 && dashCBody(tokens, dashCIdx)) {
+        const nested = scanBashForViolation(dashCBody(tokens, dashCIdx), dir, session, depth + 1);
         if (nested) return nested;
         continue;
       }
@@ -336,13 +342,22 @@ const KILL_PREFIXES = new Set([
 ]);
 // A heredoc body is data, not commands: drop it before scanning.
 const HEREDOC_RE = /<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\n|$)/g;
+// Wrappers that run a quoted argument as a command string on this box
+// (`watch '…'`, `flock <lock> -c '…'`, `su -c '…'`): their multi-word
+// arguments are rescanned as code. `find -exec … ;` is handled on its own.
+const ARG_COMMAND_RUNNERS = new Set(["watch", "flock", "su", "runuser"]);
+const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+const shellQuote = (t) => (/^[\w@%+=:,./-]+$/.test(t) ? t : `'${t.replace(/'/g, "'\\''")}'`);
 // `kill $(pgrep …)`, and a pgrep/pidof/ps pipeline feeding `xargs … kill` or a
 // `while read` loop that kills. Run on codeView(), never the raw string.
+// `ps` counts only as a segment's command word, so `docker ps -q | xargs
+// docker kill` (containers, not host processes) passes.
+const KILL_SELECTOR = "(?:\\b(?:pgrep|pidof)|(?:^|[\\n;&|(`])\\s*(?:sudo\\s+)?ps)\\b";
 const KILL_PGREP_RE = new RegExp(
   [
     "\\bkill\\b[^\\n;&|]*(?:\\$\\(|`)\\s*(?:pgrep|pidof)\\b",
-    "\\b(?:pgrep|pidof|ps)\\b[^\\n;&]*\\|\\s*(?:sudo\\s+)?xargs\\b[^\\n;&|]*\\bkill\\b",
-    "\\b(?:pgrep|pidof|ps)\\b[^\\n;&]*\\|\\s*while\\b[^;]*?[;\\n]\\s*do\\b[^;\\n]*\\n?[^;\\n]*\\bkill\\b",
+    `${KILL_SELECTOR}[^\\n;&]*\\|\\s*(?:sudo\\s+)?xargs\\b[^\\n;&|]*\\bkill\\b`,
+    `${KILL_SELECTOR}[^\\n;&]*\\|\\s*while\\b[^;]*?[;\\n]\\s*do\\b[^;\\n]*\\n?[^;\\n]*\\bkill\\b`,
   ].join("|")
 );
 
@@ -437,13 +452,30 @@ function scanBashForPatternKill(command, depth = 0) {
     if (PATTERN_KILLERS.has(word)) return denyKill(`'${word}' terminates processes by pattern`);
     if (SHELL_DASH_C.has(word)) {
       const i = findDashC(tokens);
-      if (i !== -1 && tokens[i + 1]) {
-        const nested = scanBashForPatternKill(tokens[i + 1], depth + 1);
+      if (i !== -1 && dashCBody(tokens, i)) {
+        const nested = scanBashForPatternKill(dashCBody(tokens, i), depth + 1);
         if (nested) return nested;
       }
     } else if (word === "eval" && tokens[1]) {
       const nested = scanBashForPatternKill(tokens.slice(1).join(" "), depth + 1);
       if (nested) return nested;
+    } else if (ARG_COMMAND_RUNNERS.has(word)) {
+      for (const t of tokens.slice(1)) {
+        if (!/\s/.test(t)) continue;
+        const nested = scanBashForPatternKill(t, depth + 1);
+        if (nested) return nested;
+      }
+    } else if (word === "find") {
+      // Each `-exec <cmd> … ;|+` is a command line: rescan it re-quoted, so
+      // `-exec sh -c '…'` keeps its body as one word.
+      for (let i = 1; i < tokens.length; i++) {
+        if (!FIND_EXEC.has(tokens[i])) continue;
+        let j = i + 1;
+        while (j < tokens.length && !["+", ";", "\\", "\\;"].includes(tokens[j])) j++;
+        const nested = scanBashForPatternKill(tokens.slice(i + 1, j).map(shellQuote).join(" "), depth + 1);
+        if (nested) return nested;
+        i = j;
+      }
     }
   }
   return null;
