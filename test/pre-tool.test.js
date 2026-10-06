@@ -517,8 +517,7 @@ test("preTool: pattern-based process kills are denied; PID/pgid kills pass", asy
     "pgrep x | xargs kill '",
     "kill `pgrep x",
     // The raw backstop: pkill/killall anywhere, or kill + a selector, outside
-    // the quoted argument of a known data command, is denied.
-    "echo pkill",
+    // the (literal) argument of a known data command, is denied.
     'git commit -m "avoid kill $(pgrep x)"', // the $(…) runs: not data
     "pgrep x | while read p; do echo $p; done; kill 4242",
     "cat > n.md <<EOF\npkill -f x\nEOF",
@@ -568,8 +567,29 @@ test("preTool: pattern-based process kills are denied; PID/pgid kills pass", asy
     "arr=( $(cat pids) ); kill \"${arr[@]}\"",
     "local -a p=( 1 ); kill 1",
     "bash -c 'kill $( cat app.pid )'",
+    "grep -R pkill .",
+    "grep -rn killall scripts",
+    "git log --grep=pkill",
+    "git log -Spkill --oneline",
+    "git commit -m pkill",
+    "git commit --message=pkill",
+    "echo pkill",
+    "printf pkill",
   ])
     assert.equal(await run(c), null, c);
+  // Unquoted data words stay denied wherever the word is EXECUTED or expands.
+  for (const c of [
+    "echo pkill; pkill node",
+    "echo $(pkill node)",
+    "echo `pkill node`",
+    "echo pkill && pkill -f x",
+    "grep foo pkill",
+    "grep -R foo . | xargs pkill",
+    "git log --grep=x; pkill node",
+    "echo $(echo pkill) | sh",
+    "shopt -s expand_aliases\nalias echo=\necho pkill -f zzz",
+  ])
+    assert.equal((await run(c))?.hookSpecificOutput?.permissionDecision, "deny", c);
   assert.equal(await run("pkill node", main), null, "non-worktree session is a no-op");
   fs.rmSync(base, { recursive: true, force: true });
 });

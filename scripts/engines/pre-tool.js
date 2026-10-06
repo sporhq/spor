@@ -836,7 +836,13 @@ function forEachSimple(node, fn) {
 function dataRanges(ast) {
   const ranges = [];
   forEachSimple(ast, (node) => {
-    for (const w of dataArgs(node.words)) ranges.push(...w.qspans);
+    for (const w of dataArgs(node.words)) {
+      // A word with no expansion is literal text whether or not it is quoted
+      // (`grep -R pkill .`, `echo pkill`); one that expands is data only in
+      // its quoted spans.
+      if (!w.expands && w.start >= 0) ranges.push([w.start, w.start + w.raw.length]);
+      else ranges.push(...w.qspans);
+    }
     if (node.words.length && !node.words[0].expands && node.words[0].text === "cat") {
       for (const r of node.redirs) if (r.heredoc?.quoted && r.heredoc.start >= 0) ranges.push([r.heredoc.start, r.heredoc.end]);
     }
@@ -866,7 +872,10 @@ function backstop(command, ast, flow) {
   const selectors = matchesOf(SELECTOR_WORD_RE, command);
   if (psSelects || dynamic) selectors.push(...matchesOf(PS_WORD_RE, command));
   if (!killers.length && !(kills.length && (selectors.length || psSelects))) return null;
-  const ranges = dynamic ? [] : dataRanges(ast);
+  // An alias can rewrite a data command's name (`alias echo=`) so its plain
+  // arguments run as a command: no data exception once aliases are in play.
+  const aliased = /(?<![\w-])(?:alias|expand_aliases)(?![\w-])/.test(command);
+  const ranges = dynamic || aliased ? [] : dataRanges(ast);
   const isData = ([a, b]) => ranges.some(([x, y]) => x <= a && b <= y);
   if (!psSelects && [...killers, ...kills, ...selectors].every(isData)) return null;
   if (dynamic) return "a command that builds code at run time (a dynamic `sh -c`/`eval` body, an expanded command name, a piped or sourced script) mentions a pattern kill";
