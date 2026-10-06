@@ -17,6 +17,7 @@
 
 const path = require("path");
 const u = require("./util");
+const shellAst = require("./shell-ast");
 
 // A linked git worktree whose main checkout differs from its own toplevel —
 // the same test inferenceRoot() already relies on to collapse worktree
@@ -331,97 +332,346 @@ function scanBashForViolation(command, cwd, session, depth = 0) {
 // Pattern-based process termination (issue-spor-orchestrator-agent-global-
 // pkill-kills-other-agents): a box runs many agents' suites concurrently, so
 // `pkill -f "node --test"` kills the siblings' runs too. The prompts forbid it;
-// this denies it mechanically. Matches the command word of any segment
-// (through env/sudo/command/exec prefixes and sh -c / eval wrappers), plus the
-// `kill $(pgrep …)` / `pgrep … | xargs kill` spellings of the same thing.
-// Killing by recorded PID or process group (`kill -- -<pgid>`) passes.
+// this denies it mechanically, STRUCTURALLY
+// (issue-spor-kill-guard-structural-selector-to-kill-flow): the command is
+// parsed (shell-ast.js) into the units the shell would execute — through
+// wrappers (sudo/env/timeout/nice/nohup/watch/flock/su/runuser/xargs/find
+// -exec/…), `sh -c`/`eval` bodies, command and process substitutions — and it
+// is denied when
+//   - any executed unit is pkill/killall, or
+//   - a process SELECTOR (pgrep, pidof, ps — not `ps -p <pid>`) feeds a unit
+//     that runs `kill`: through its stdin (a pipe, `< <(…)`, a here-string or
+//     heredoc), its arguments (`kill $(pgrep …)`, `xargs -a <(pgrep …) kill`),
+//     an output process substitution (`pgrep … > >(xargs kill)`), or a
+//     variable the selector's output was assigned to (`p=$(pgrep …); kill $p`,
+//     `for p in $(pgrep …)`, `read p < <(pgrep …)`).
+// Quoted text that is never executed (echo/git -m/--grep arguments) is data,
+// never matched. Killing by recorded PID or process group (`kill -- -<pgid>`)
+// passes.
 const PATTERN_KILLERS = new Set(["pkill", "killall", "killall5"]);
-const KILL_PREFIXES = new Set([
-  "sudo", "command", "exec", "nohup", "time", "env", "timeout", "nice", "ionice", "setsid", "stdbuf", "xargs",
-  "then", "do", "else", "elif", "!",
-]);
-// A heredoc body is data, not commands: drop it before scanning.
-const HEREDOC_RE = /<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\n|$)/g;
-// Wrappers that run a quoted argument as a command string on this box
-// (`watch '…'`, `flock <lock> -c '…'`, `su -c '…'`): their multi-word
-// arguments are rescanned as code. `find -exec … ;` is handled on its own.
-const ARG_COMMAND_RUNNERS = new Set(["watch", "flock", "su", "runuser"]);
+const SELECTORS = new Set(["pgrep", "pidof", "ps"]);
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ash", "ksh", "mksh"]);
+// Commands that run another command. `args`: options taking a value;
+// `pos`: positional words between the options and the command (timeout's
+// duration, flock's lock file, chrt's priority, taskset's mask); `script`:
+// options whose value is a shell command string.
+const WRAPPERS = {
+  sudo: { args: ["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T", "--user", "--group", "--chdir", "--host", "--prompt"] },
+  doas: { args: ["-u", "-C"] },
+  nohup: {},
+  setsid: {},
+  builtin: {},
+  nocorrect: {},
+  unbuffer: {},
+  busybox: {},
+  exec: { args: ["-a"] },
+  time: { args: ["-f", "-o", "--format", "--output"] },
+  nice: { args: ["-n", "--adjustment"] },
+  ionice: { args: ["-c", "-n", "-p", "-P", "-u", "--class", "--classdata"] },
+  stdbuf: { args: ["-i", "-o", "-e"] },
+  chrt: { pos: 1 },
+  taskset: { pos: 1 },
+  timeout: { args: ["-s", "-k", "--signal", "--kill-after"], pos: 1 },
+  xargs: { args: ["-I", "-L", "-n", "-P", "-s", "-d", "-E", "-a", "--arg-file", "--delimiter", "--max-args", "--max-procs", "--max-chars", "--replace", "--max-lines", "--eof"] },
+  parallel: { args: ["-j", "-N", "-L", "-n", "-a", "--jobs", "--arg-file"], stopAt: ":::" },
+  env: { args: ["-u", "-C", "--unset", "--chdir"], script: ["-S", "--split-string"] },
+  flock: { args: ["-w", "-E", "--timeout", "--wait", "--conflict-exit-code"], pos: 1, script: ["-c", "--command"] },
+  su: { args: ["-s", "-g", "-G", "--shell", "--group", "--supp-group"], script: ["-c", "--command", "--session-command"] },
+  runuser: { args: ["-u", "-g", "-G", "-s", "--user", "--group", "--shell"], script: ["-c", "--command", "--session-command"] },
+  watch: { args: ["-n", "--interval"] }, // runs its remaining words, joined, through `sh -c`
+};
 const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
-const shellQuote = (t) => (/^[\w@%+=:,./-]+$/.test(t) ? t : `'${t.replace(/'/g, "'\\''")}'`);
-// `kill $(pgrep …)`, and a pgrep/pidof/ps pipeline feeding `xargs … kill` or a
-// `while read` loop that kills. Run on codeView(), never the raw string.
-// `ps` counts only as a segment's command word, so `docker ps -q | xargs
-// docker kill` (containers, not host processes) passes.
-const KILL_SELECTOR = "(?:\\b(?:pgrep|pidof)|(?:^|[\\n;&|(`])\\s*(?:sudo\\s+)?ps)\\b";
-const KILL_PGREP_RE = new RegExp(
-  [
-    "\\bkill\\b[^\\n;&|]*(?:\\$\\(|`)\\s*(?:pgrep|pidof)\\b",
-    `${KILL_SELECTOR}[^\\n;&]*\\|\\s*(?:sudo\\s+)?xargs\\b[^\\n;&|]*\\bkill\\b`,
-    `${KILL_SELECTOR}[^\\n;&]*\\|\\s*while\\b[^;]*?[;\\n]\\s*do\\b[^;\\n]*\\n?[^;\\n]*\\bkill\\b`,
-  ].join("|")
-);
+const DECLARATIONS = new Set(["local", "declare", "typeset", "export", "readonly"]);
+const READERS = new Set(["read", "mapfile", "readarray"]);
+const INPUT_REDIRS = new Set(["<", "<<", "<<-", "<<<", "<>", "<&"]);
+const MAX_SCRIPT_DEPTH = 6;
 
-// The command string with quoted DATA blanked out, so KILL_PGREP_RE sees only
-// what the shell would execute: a single-quoted span is inert, and a
-// double-quoted span is inert except for its `$(…)`/backtick substitutions,
-// which run. (`sh -c`/`eval` bodies are rescanned separately from their
-// tokens, so blanking them here loses nothing.) Length-preserving.
-function codeView(command) {
-  let out = "";
-  let i = 0;
-  const blank = (c) => (c === "\n" ? c : " ");
-  while (i < command.length) {
-    const c = command[i];
-    if (c === "\\") {
-      out += c + (command[i + 1] ?? "");
-      i += 2;
-    } else if (c === "'") {
-      const j = command.indexOf("'", i + 1);
-      if (j === -1) {
-        out += c; // unterminated: a stray apostrophe, not a span — keep scanning
-        i++;
-        continue;
-      }
-      out += command.slice(i, j + 1).replace(/[^\n]/g, " ");
-      i = j + 1;
-    } else if (c === "#" && (i === 0 || /\s/.test(command[i - 1]))) {
-      const j = command.indexOf("\n", i);
-      const end = j === -1 ? command.length : j;
-      out += " ".repeat(end - i); // a comment is not executed (and may hold an apostrophe)
-      i = end;
-    } else if (c === '"') {
-      out += " ";
+// What a simple command's argv executes: the leaf commands it runs and the
+// shell command strings it hands to a shell. `stdinShell` marks a shell that
+// reads its script from stdin (`bash`, `sh -s`), so a heredoc fed to it is code.
+function execTargets(argv, out = { leaves: [], scripts: [], stdinShell: false }) {
+  let a = argv;
+  while (a.length && ENV_ASSIGN_RE.test(a[0])) a = a.slice(1);
+  if (!a.length) return out;
+  const name = path.basename(a[0].replace(/^\\/, ""));
+  if (SHELLS.has(name)) {
+    const i = findDashC(a);
+    if (i !== -1) {
+      const body = dashCBody(a, i);
+      if (body != null) out.scripts.push(body);
+    } else if (a.slice(1).every((t) => t.startsWith("-"))) out.stdinShell = true;
+    out.leaves.push({ name, args: a.slice(1) });
+    return out;
+  }
+  if (name === "eval") {
+    out.scripts.push(a.slice(1).join(" "));
+    return out;
+  }
+  if (name === "command" && /^-[a-zA-Z]*[vV]/.test(a[1] || "")) return out; // `command -v pkill`: a lookup
+  if (name === "find") {
+    // Each `-exec <cmd> … ;|+` runs <cmd>.
+    for (let i = 1; i < a.length; i++) {
+      if (!FIND_EXEC.has(a[i])) continue;
+      let j = i + 1;
+      while (j < a.length && !["+", ";", "\\;"].includes(a[j])) j++;
+      execTargets(a.slice(i + 1, j), out);
+      i = j;
+    }
+    out.leaves.push({ name, args: a.slice(1) });
+    return out;
+  }
+  const spec = name === "command" ? {} : WRAPPERS[name];
+  if (!spec) {
+    out.leaves.push({ name, args: a.slice(1) });
+    return out;
+  }
+  const scriptAt = spec.script ? a.findIndex((t, k) => k > 0 && (spec.script.includes(t) || spec.script.some((s) => s.startsWith("--") && t.startsWith(s + "=")))) : -1;
+  if (scriptAt !== -1) {
+    const t = a[scriptAt];
+    const body = t.includes("=") && t.startsWith("--") ? t.slice(t.indexOf("=") + 1) : a[scriptAt + 1];
+    if (body != null) out.scripts.push(body);
+    return out;
+  }
+  let i = 1;
+  const seen = new Set();
+  while (i < a.length) {
+    const t = a[i];
+    if (t === "--") {
       i++;
-      let depth = 0;
-      let bt = false;
-      while (i < command.length && !(command[i] === '"' && depth === 0)) {
-        const d = command[i];
-        if (d === "\\") {
-          out += "  ";
-          i += 2;
-          continue;
-        }
-        if (d === "$" && command[i + 1] === "(") {
-          depth++;
-          out += "$(";
-          i += 2;
-          continue;
-        }
-        if (depth > 0 && d === ")") depth--;
-        if (d === "`") bt = !bt;
-        out += depth > 0 || bt || d === "`" ? d : blank(d);
-        i++;
+      break;
+    }
+    if (name === "env" && ENV_ASSIGN_RE.test(t)) i++;
+    else if (t.startsWith("-") && t.length > 1) {
+      seen.add(t);
+      i += spec.args?.includes(t) ? 2 : 1;
+    } else break;
+  }
+  if (name === "su") return out; // `su <user>` without -c: an interactive shell
+  if (name === "runuser" && !seen.has("-u") && !seen.has("--user")) return out;
+  let rest = a.slice(i + (spec.pos || 0));
+  if (spec.stopAt && rest.includes(spec.stopAt)) rest = rest.slice(0, rest.indexOf(spec.stopAt));
+  if (name === "watch") {
+    if (rest.length) out.scripts.push(rest.join(" "));
+    return out;
+  }
+  return execTargets(rest, out);
+}
+
+// `ps -p <pid>` / `ps -q <pid>` reads a KNOWN process (e.g. a recorded pid's
+// process group), so it is not a pattern selector. Only the option itself
+// counts — never a `p` inside another option's value (`-opid`, `--sort -pcpu`).
+function isSelector(leaf) {
+  if (!SELECTORS.has(leaf.name)) return false;
+  if (leaf.name !== "ps") return true;
+  return !leaf.args.some((t) => /^-[pq](\d[\d,]*)?$/.test(t) || /^--(pid|quick-pid)(=|$)/.test(t));
+}
+
+// The per-scan analysis over one parsed command. Facts are memoized per node.
+class KillFlow {
+  constructor() {
+    this.execMemo = new WeakMap();
+    this.infoMemo = new WeakMap();
+    this.tainted = new Set();
+  }
+
+  parseScript(text, depth) {
+    return depth < MAX_SCRIPT_DEPTH ? shellAst.parse(text) : { type: "list", items: [] };
+  }
+
+  // A simple command's own execution: its leaves and parsed shell bodies.
+  exec(node, depth) {
+    let ex = this.execMemo.get(node);
+    if (ex) return ex;
+    const t = execTargets(node.words.map((w) => w.text));
+    const asts = t.scripts.map((s) => this.parseScript(s, depth));
+    if (t.stdinShell) {
+      for (const r of node.redirs) {
+        if (r.heredoc) asts.push(this.parseScript(r.heredoc.body, depth));
+        else if (r.op === "<<<" && r.target) asts.push(this.parseScript(r.target.text, depth));
       }
-      if (i < command.length) {
-        out += " ";
-        i++;
-      }
-    } else {
-      out += c;
-      i++;
+    }
+    ex = { leaves: t.leaves, asts, depth: depth + 1 };
+    this.execMemo.set(node, ex);
+    return ex;
+  }
+
+  // Does executing `node` (anything it runs, substitutions included) run a
+  // selector / a kill, and which pattern killer, if any?
+  info(node, depth = 0) {
+    let inf = this.infoMemo.get(node);
+    if (inf) return inf;
+    inf = { selects: false, kills: false, killer: null };
+    this.infoMemo.set(node, inf); // cycle-safe placeholder
+    const add = (o) => {
+      inf.selects ||= o.selects;
+      inf.kills ||= o.kills;
+      inf.killer ||= o.killer;
+    };
+    for (const child of this.children(node, depth)) add(this.info(child.ast, child.depth));
+    if (node.type === "simple") add(this.execInfo(node, depth));
+    return inf;
+  }
+
+  // The facts of a simple command's own execution, substitutions excluded.
+  execInfo(node, depth) {
+    const ex = this.exec(node, depth);
+    const inf = { selects: false, kills: false, killer: null };
+    for (const leaf of ex.leaves) {
+      if (PATTERN_KILLERS.has(leaf.name)) inf.killer ||= leaf.name;
+      if (leaf.name === "kill") inf.kills = true;
+      if (isSelector(leaf)) inf.selects = true;
+    }
+    for (const ast of ex.asts) {
+      const o = this.info(ast, ex.depth);
+      inf.selects ||= o.selects;
+      inf.kills ||= o.kills;
+      inf.killer ||= o.killer;
+    }
+    return inf;
+  }
+
+  // Every nested node `node` executes, tagged with the substitution kind.
+  *children(node, depth) {
+    const words = (ws) => ws.flatMap((w) => (w ? w.subs.map((s) => ({ ast: s.ast, kind: s.kind, depth })) : []));
+    const redirs = (rs) =>
+      rs.flatMap((r) => [...words([r.target]), ...(r.heredoc ? r.heredoc.subs.map((s) => ({ ast: s.ast, kind: s.kind, depth })) : [])]);
+    switch (node.type) {
+      case "list":
+        for (const p of node.items) yield { ast: p, depth };
+        break;
+      case "pipeline":
+        for (const s of node.stages) yield { ast: s, depth };
+        break;
+      case "simple":
+        yield* words(node.assigns);
+        yield* words(node.words);
+        yield* redirs(node.redirs);
+        yield* this.exec(node, depth).asts.map((ast) => ({ ast, kind: "script", depth: depth + 1 }));
+        break;
+      case "group":
+      case "subshell":
+        yield { ast: node.body, depth };
+        yield* redirs(node.redirs);
+        break;
+      case "if":
+        for (const l of node.lists) yield { ast: l, depth };
+        yield* redirs(node.redirs);
+        break;
+      case "loop":
+        yield { ast: node.cond, depth };
+        yield { ast: node.body, depth };
+        yield* redirs(node.redirs);
+        break;
+      case "for":
+        yield* words(node.words);
+        yield { ast: node.body, depth };
+        yield* redirs(node.redirs);
+        break;
+      case "case":
+        yield* words([node.word]);
+        for (const b of node.bodies) yield { ast: b, depth };
+        yield* redirs(node.redirs);
+        break;
+      case "func":
+        yield { ast: node.body, depth };
+        break;
     }
   }
-  return out;
+
+  refsTainted(text) {
+    for (const v of this.tainted) if (new RegExp(`\\$\\{?[#!]?${v}\\b`).test(text)) return true;
+    return false;
+  }
+
+  wordTainted(word, depth) {
+    if (!word) return false;
+    return word.subs.some((s) => this.info(s.ast, depth).selects) || this.refsTainted(word.raw);
+  }
+
+  stdinTainted(node, inherited, depth) {
+    if (inherited) return true;
+    return (node.redirs || []).some(
+      (r) =>
+        INPUT_REDIRS.has(r.op) &&
+        (this.wordTainted(r.target, depth) ||
+          (r.heredoc && !r.heredoc.quoted && (r.heredoc.subs.some((s) => this.info(s.ast, depth).selects) || this.refsTainted(r.heredoc.body))))
+    );
+  }
+
+  // Walk `node` with what its stdin carries, calling `fn(node, stdinSel,
+  // depth)` on every command, pipeline stage and nested script; the first
+  // truthy return stops the walk.
+  walk(node, stdinSel, depth, fn) {
+    switch (node.type) {
+      case "list":
+        for (const p of node.items) {
+          const r = this.walk(p, stdinSel, depth, fn);
+          if (r) return r;
+        }
+        return null;
+      case "pipeline": {
+        let fed = stdinSel;
+        for (const s of node.stages) {
+          const r = this.walk(s, fed, depth, fn);
+          if (r) return r;
+          fed = fed || this.info(s, depth).selects; // a selector upstream taints every later stage
+        }
+        return null;
+      }
+      default: {
+        const st = this.stdinTainted(node, stdinSel, depth);
+        const r = fn(node, st, depth);
+        if (r) return r;
+        const outFed = node.type === "simple" ? this.execInfo(node, depth).selects : this.info(node, depth).selects;
+        for (const c of this.children(node, depth)) {
+          // `>(…)` reads the command's stdout; everything else inherits its stdin.
+          const r2 = this.walk(c.ast, c.kind === "out" ? outFed : st, c.depth, fn);
+          if (r2) return r2;
+        }
+        return null;
+      }
+    }
+  }
+
+  // Variables a selector's output reaches, to a fixed point.
+  collectTaint(ast) {
+    for (let pass = 0; pass < 8; pass++) {
+      const before = this.tainted.size;
+      this.walk(ast, false, 0, (node, st, depth) => {
+        const taint = (raw) => this.tainted.add(raw.match(/^[A-Za-z_][A-Za-z0-9_]*/)[0]);
+        if (node.type === "for" && node.name && node.words.some((w) => this.wordTainted(w, depth))) this.tainted.add(node.name);
+        if (node.type !== "simple") return null;
+        for (const w of node.assigns) if (this.wordTainted(w, depth)) taint(w.raw);
+        const argv = node.words.map((w) => w.text);
+        const leaf = this.exec(node, depth).leaves[0];
+        if (leaf && DECLARATIONS.has(leaf.name)) {
+          for (const w of node.words.slice(1)) if (ENV_ASSIGN_RE.test(w.raw) && this.wordTainted(w, depth)) taint(w.raw);
+        }
+        if (leaf && READERS.has(leaf.name) && st) {
+          this.tainted.add(leaf.name === "read" ? "REPLY" : "MAPFILE");
+          for (const t of argv.slice(1)) if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(t)) this.tainted.add(t);
+        }
+        return null;
+      });
+      if (this.tainted.size === before) break;
+    }
+  }
+
+  // The deny detail for the first pattern kill in `ast`, or null.
+  check(ast) {
+    this.collectTaint(ast);
+    return this.walk(ast, false, 0, (node, st, depth) => {
+      if (node.type === "simple") {
+        const ex = this.execInfo(node, depth);
+        const killer = this.exec(node, depth).leaves.find((l) => PATTERN_KILLERS.has(l.name));
+        if (killer) return `'${killer.name}' terminates processes by pattern`;
+        if (ex.kills && [...node.assigns, ...node.words].some((w) => this.wordTainted(w, depth)))
+          return "'kill' is handed a pgrep/pidof/ps-selected process set";
+      }
+      if (st && this.info(node, depth).kills) return "'kill' reads a pgrep/pidof/ps-selected process set";
+      return null;
+    });
+  }
 }
 
 function denyKill(detail) {
@@ -434,51 +684,10 @@ function denyKill(detail) {
   };
 }
 
-function scanBashForPatternKill(command, depth = 0) {
-  if (!command || depth > 4) return null;
-  command = command.replace(HEREDOC_RE, "");
-  if (KILL_PGREP_RE.test(codeView(command))) return denyKill("'kill' of a pgrep-selected process set matches by pattern");
-  for (const rawTokens of segmentsOf(command)) {
-    let tokens = stripEnvAssignments(rawTokens).rest;
-    // Peel wrappers plus their flags/numeric args (`sudo -u x`, `timeout 5`, `env -i`).
-    while (tokens.length) {
-      const t = tokens[0];
-      if (KILL_PREFIXES.has(t) || ENV_ASSIGN_RE.test(t) || /^-\w*$/.test(t) || /^\d+[smhd]?$/.test(t)) {
-        tokens = tokens.slice((t === "-u" || t === "-g") ? 2 : 1);
-      } else break;
-    }
-    if (!tokens.length) continue;
-    const word = path.basename(tokens[0].replace(/^\\/, ""));
-    if (PATTERN_KILLERS.has(word)) return denyKill(`'${word}' terminates processes by pattern`);
-    if (SHELL_DASH_C.has(word)) {
-      const i = findDashC(tokens);
-      if (i !== -1 && dashCBody(tokens, i)) {
-        const nested = scanBashForPatternKill(dashCBody(tokens, i), depth + 1);
-        if (nested) return nested;
-      }
-    } else if (word === "eval" && tokens[1]) {
-      const nested = scanBashForPatternKill(tokens.slice(1).join(" "), depth + 1);
-      if (nested) return nested;
-    } else if (ARG_COMMAND_RUNNERS.has(word)) {
-      for (const t of tokens.slice(1)) {
-        if (!/\s/.test(t)) continue;
-        const nested = scanBashForPatternKill(t, depth + 1);
-        if (nested) return nested;
-      }
-    } else if (word === "find") {
-      // Each `-exec <cmd> … ;|+` is a command line: rescan it re-quoted, so
-      // `-exec sh -c '…'` keeps its body as one word.
-      for (let i = 1; i < tokens.length; i++) {
-        if (!FIND_EXEC.has(tokens[i])) continue;
-        let j = i + 1;
-        while (j < tokens.length && !["+", ";", "\\", "\\;"].includes(tokens[j])) j++;
-        const nested = scanBashForPatternKill(tokens.slice(i + 1, j).map(shellQuote).join(" "), depth + 1);
-        if (nested) return nested;
-        i = j;
-      }
-    }
-  }
-  return null;
+function scanBashForPatternKill(command) {
+  if (!command || typeof command !== "string") return null;
+  const detail = new KillFlow().check(shellAst.parse(command));
+  return detail ? denyKill(detail) : null;
 }
 
 function checkBashTool(input, session) {

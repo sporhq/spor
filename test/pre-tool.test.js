@@ -448,12 +448,89 @@ test("preTool: pattern-based process kills are denied; PID/pgid kills pass", asy
     "bash -c -- 'kill $(pgrep node)'",
     "watch 'pkill -f node'",
     "find . -exec pkill -f {} \\;",
+    // issue-spor-kill-guard-structural-selector-to-kill-flow: selector->kill data
+    // flow through process substitution, xargs-run shell bodies and wrappers.
+    "xargs kill < <(pgrep node)",
+    "while read p; do kill $p; done < <(pgrep node)",
+    'pgrep node | xargs sh -c "kill $@" sh',
+    'pgrep node | xargs -I{} sh -c "kill {}"',
+    "pgrep node | xargs -I {} sh -c 'kill {}'",
+    "watch pkill node",
+    "flock f pkill node",
+    "flock -w 5 /tmp/l pkill node",
+    "nice -n 5 pkill node",
+    "nohup pkill node",
+    "timeout -s KILL 5 pkill node",
+    "su -c 'pkill node' root",
+    "runuser -u nobody -- pkill node",
+    "env -S 'pkill node'",
+    "busybox pkill node",
+    "for p in $(pgrep node); do kill $p; done",
+    "pids=$(pgrep node); kill $pids",
+    "p=$(pgrep node) && sudo kill -9 \"$p\"",
+    "read -r p < <(pgrep node); kill $p",
+    "mapfile -t ps < <(pgrep node); kill \"${ps[@]}\"",
+    "pgrep node > >(xargs kill)",
+    "pgrep node | tee >(xargs kill)",
+    "xargs -a <(pgrep node) kill",
+    "parallel kill ::: $(pgrep node)",
+    "kill $(pgrep node | head -1)",
+    "kill $(echo $(pgrep node))",
+    "pgrep node | grep -v 1 | xargs -n1 kill",
+    "{ xargs kill; } < <(pgrep node)",
+    "xargs kill <<< \"$(pgrep node)\"",
+    "xargs kill <<EOF\n$(pgrep node)\nEOF",
+    "bash <<EOF\npkill node\nEOF",
+    "pgrep node | sh -c 'xargs kill'",
+    "find . -exec sh -c 'kill $(pgrep x)' \\;",
+    "(pgrep node | xargs kill)",
+    "if true; then pgrep node | xargs kill; fi",
+    "f() { pkill node; }; f",
+    "case x in x) pkill node;; esac",
+    "pgrep node |\nxargs kill",
+    "ps -eo pid,cmd | awk '/node/{print $1}' | xargs kill",
+    'p="$(pgrep foo)"; kill $p',
+    "ps -eopid,args | grep node | awk '{print $1}' | xargs kill",
+    "ps aux --sort -pcpu | grep node | awk '{print $2}' | xargs kill",
   ]) {
     const out = await run(c);
     assert.equal(out?.hookSpecificOutput?.permissionDecision, "deny", c);
     assert.match(out.hookSpecificOutput.permissionDecisionReason, /process guard/, c);
   }
-  for (const c of ["kill -- -12345", "kill 4242", "pgrep -f node", 'git commit -m "pkill is banned"', "echo pkill", "echo 'kill $(pgrep node)'", "git commit -m 'avoid kill $(pgrep x)'", 'git commit -m "avoid kill $(pgrep x)"', "git log --grep='pgrep x | xargs kill'", "pgrep x | while read p; do echo $p; done; kill 4242", "cat > n.md <<EOF\npkill -f x\nEOF", "docker ps -q | xargs docker kill", "gh issue create --body 'pgrep x | xargs kill'", "grep -n 'kill $(pgrep' f", "man pkill", 'node --test --test-name-pattern "pkill denied" x.test.js', "sed -i 's/pkill -f x/kill y/' README.md", `find . -name '*.md' -exec grep -l "pkill -f" {} +`, 'curl -d "pkill -f is banned" http://x'])
+  for (const c of [
+    "kill -- -12345",
+    "kill 4242",
+    "pgrep -f node",
+    'git commit -m "pkill is banned"',
+    "echo pkill",
+    "echo 'kill $(pgrep node)'",
+    "git commit -m 'avoid kill $(pgrep x)'",
+    'git commit -m "avoid kill $(pgrep x)"',
+    "git log --grep='pgrep x | xargs kill'",
+    "pgrep x | while read p; do echo $p; done; kill 4242",
+    "cat > n.md <<EOF\npkill -f x\nEOF",
+    "docker ps -q | xargs docker kill",
+    "gh issue create --body 'pgrep x | xargs kill'",
+    "grep -n 'kill $(pgrep' f",
+    "man pkill",
+    'node --test --test-name-pattern "pkill denied" x.test.js',
+    "sed -i 's/pkill -f x/kill y/' README.md",
+    `find . -name '*.md' -exec grep -l "pkill -f" {} +`,
+    'curl -d "pkill -f is banned" http://x',
+    "command -v pkill",
+    "kill -- -\"$(cat f.pgid)\"",
+    "kill \"$(cat app.pid)\"",
+    "kill -- -$(ps -o pgid= -p 4242 | tr -d ' ')",
+    "pgrep -f node | wc -l",
+    "pids=$(pgrep node); echo $pids; kill 4242",
+    "pgrep node >/dev/null && kill 4242",
+    "docker kill $(docker ps -q)",
+    "echo 'xargs kill < <(pgrep node)'",
+    'git commit -m "fix: while read p; do kill $p; done < <(pgrep x)"',
+    "cat <<'EOF' | sh -c 'cat >notes.md'\npgrep x | xargs kill\nEOF",
+    'printf "%s\\n" "pgrep node | xargs sh -c \'kill $@\'"',
+    "systemctl kill foo.service",
+  ])
     assert.equal(await run(c), null, c);
   assert.equal(await run("pkill node", main), null, "non-worktree session is a no-op");
   fs.rmSync(base, { recursive: true, force: true });
@@ -562,4 +639,20 @@ test("dispatcher: pre-tool denies a Bash git commit that resolves to the shared 
   assert.strictEqual(allowed.stdout, "");
 
   fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("shell-ast: parsing never throws and always terminates on malformed input", () => {
+  const { parse } = require("../scripts/engines/shell-ast");
+  const alphabet = ["(", ")", "$(", "<(", ">(", "`", "'", '"', "\\", "{", "}", ";", ";;", "|", "&", "\n", "<<", "EOF", "<<<", "if", "then", "fi", "do", "done", "case", "esac", "for", "in", "while", "kill", "pgrep", " ", "x=(", "${"];
+  let seed = 42;
+  const rand = (n) => ((seed = (seed * 1103515245 + 12345) % 2147483648) % n);
+  for (let k = 0; k < 2000; k++) {
+    let src = "";
+    for (let n = rand(30); n > 0; n--) src += alphabet[rand(alphabet.length)];
+    const ast = parse(src);
+    assert.equal(ast.type, "list", JSON.stringify(src));
+    pt.scanBashForPatternKill(src);
+  }
+  for (const open of ["(", "{ ", "if a; then ", "while a; do ", "a=(", "f() ", "$(", "<("])
+    assert.equal(parse(open.repeat(5000) + "x").type, "list", `deep ${open}`);
 });
