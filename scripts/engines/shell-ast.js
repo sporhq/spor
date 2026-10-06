@@ -10,7 +10,10 @@
 //
 // It is not a shell: no expansion is performed, and malformed input never
 // throws — an unterminated quote is read as a literal character and a stray
-// operator is skipped, so a parse always returns a tree.
+// operator is skipped, so a parse always returns a tree. Every such recovery
+// is RECORDED on the returned list's `errors` (unterminated quotes and
+// substitutions, a missing `done`/`fi`/`}`/`)`, a dropped token, a nesting
+// cap), so a caller can refuse to trust a tree it had to guess at.
 //
 // Tree shape:
 //   list     { type: "list", items: [pipeline] }        (`;` `&&` `||` `&` newline)
@@ -22,8 +25,18 @@
 //          | { type: "for", name, words: [word], body: list, redirs }
 //          | { type: "case", word, bodies: [list], redirs }
 //          | { type: "func", body: command }
-//   word     { text, raw, quoted, subs: [{ kind: "cmd"|"in"|"out"|"array", ast: list }] }
-//   redir    { op, target: word|null, heredoc?: { body, quoted, subs } }
+//   word     { text, raw, quoted, expands, start, qspans,
+//              subs: [{ kind: "cmd"|"in"|"out"|"array", ast: list }] }
+//   redir    { op, target: word|null, heredoc?: { body, quoted, subs, start, end } }
+//   (`coproc [NAME] cmd` parses as a group around cmd.)
+//
+// `expands`: the word holds a parameter/command expansion outside single
+// quotes, so its runtime value is not its text. `start` and `qspans` are
+// offsets into the TOP-LEVEL source — the word's first character and the
+// [from, to) ranges of its literally-quoted characters (single quotes, ANSI-C
+// `$'…'`, double-quoted text between expansions) — or -1 / [] for a word
+// parsed from a re-quoted string (a backtick body). A heredoc's start/end are
+// the same kind of offsets (or -1).
 
 const ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
 const REDIR_OPS = ["&>>", "<<<", "<<-", "<<", ">>", "<>", ">&", "<&", ">|", "&>", "<", ">"];
@@ -42,6 +55,12 @@ class Parser {
     this.consumed = 0;
     this.nest = 0;
     this.pendingHeredocs = [];
+    this.errors = [];
+    this.root = true; // src is the top-level source, so offsets are meaningful
+  }
+
+  err(msg) {
+    this.errors.push({ msg, pos: this.pos });
   }
 
   // A child parser for a nested command string; past MAX_DEPTH it is parsed
@@ -49,6 +68,8 @@ class Parser {
   child(src, pos) {
     const p = new Parser(src, pos, this.depth + 1);
     p.nest = this.nest;
+    p.errors = this.errors;
+    p.root = this.root && src === this.src;
     return p;
   }
 
@@ -123,7 +144,12 @@ class Parser {
     const start = this.pos;
     let text = "";
     let quoted = false;
+    let expands = false;
     const subs = [];
+    const qspans = [];
+    const span = (a, b) => {
+      if (this.root && b > a) qspans.push([a, b]);
+    };
     while (this.pos < s.length) {
       const c = s[this.pos];
       if (c === " " || c === "\t" || c === "\r" || c === "\n" || c === ";" || c === "&" || c === "|" || c === ")") break;
@@ -134,7 +160,12 @@ class Parser {
           const p = this.child(s, this.pos + 1);
           const ast = p.parseList([], [")"]);
           subs.push({ kind: "array", ast });
-          this.pos = p.pos < s.length && s[p.pos] === ")" ? p.pos + 1 : p.pos;
+          // the child's peek, not s[p.pos]: blanks may sit before the `)`
+          if (p.peek().op === ")") this.pos = p.peeked.end;
+          else {
+            this.pos = p.pos;
+            this.err("unterminated array assignment");
+          }
           text += s.slice(start + text.length, this.pos);
           continue;
         }
@@ -144,6 +175,7 @@ class Parser {
         if (s[this.pos + 1] !== "(") break;
         const kind = c === "<" ? "in" : "out";
         const from = this.pos;
+        expands = true;
         subs.push({ kind, ast: this.readNested(this.pos + 2) });
         text += s.slice(from, this.pos);
         continue;
@@ -157,14 +189,27 @@ class Parser {
         }
         continue;
       }
+      if (c === "$" && s[this.pos + 1] === "'") {
+        // ANSI-C `$'…'`: a quoted span whose backslash escapes are decoded,
+        // so `$'\''` is ONE quote character, not a span boundary.
+        const got = this.readAnsiC();
+        if (got !== null) {
+          span(this.pos - got.raw.length + 2, this.pos - 1);
+          text += got.text;
+          quoted = true;
+          continue;
+        }
+      }
       if (c === "'") {
         const j = s.indexOf("'", this.pos + 1);
         if (j === -1) {
+          this.err("unterminated single quote");
           text += c; // unterminated: a stray apostrophe, not a span
           this.pos++;
           continue;
         }
         text += s.slice(this.pos + 1, j);
+        span(this.pos + 1, j);
         quoted = true;
         this.pos = j + 1;
         continue;
@@ -172,13 +217,16 @@ class Parser {
       if (c === '"') {
         const close = this.findDoubleClose(this.pos + 1);
         if (close === -1) {
+          this.err("unterminated double quote");
           text += c; // unterminated: a stray quote, not a span
           this.pos++;
           continue;
         }
         quoted = true;
         this.pos++;
-        text += this.readDouble(subs, '"');
+        const d = this.readDouble(subs, '"', span);
+        text += d.text;
+        expands ||= d.expands;
         this.pos++; // the closing quote
         continue;
       }
@@ -186,13 +234,45 @@ class Parser {
         const got = this.readExpansion(subs);
         if (got !== null) {
           text += got;
+          expands = true;
           continue;
         }
+        if (c === "$" && /[A-Za-z0-9_@*#?!$-]/.test(s[this.pos + 1] || "")) expands = true;
       }
       text += c;
       this.pos++;
     }
-    return { text, raw: s.slice(start, this.pos), quoted, subs };
+    return { text, raw: s.slice(start, this.pos), quoted, expands, subs, start: this.root ? start : -1, qspans };
+  }
+
+  // ANSI-C `$'…'` at this.pos: consumes it and returns its decoded text and
+  // raw spelling, or null (recording the error) when it is unterminated.
+  readAnsiC() {
+    const s = this.src;
+    const from = this.pos;
+    let text = "";
+    const esc = { n: "\n", t: "\t", r: "\r", a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", v: "\v" };
+    for (let j = from + 2; j < s.length; j++) {
+      const c = s[j];
+      if (c === "'") {
+        this.pos = j + 1;
+        return { text, raw: s.slice(from, this.pos) };
+      }
+      if (c === "\\" && j + 1 < s.length) {
+        // \xHH, \uHHHH, \UHHHHHHHH, \NNN (octal), \cX, then the single-letter escapes
+        const m = s.slice(j + 1).match(/^(?:x([0-9a-fA-F]{1,2})|u([0-9a-fA-F]{1,4})|U([0-9a-fA-F]{1,8})|([0-7]{1,3})|c(.))/);
+        if (m) {
+          const code = m[1] ? parseInt(m[1], 16) : m[2] ? parseInt(m[2], 16) : m[3] ? parseInt(m[3], 16) : m[4] ? parseInt(m[4], 8) : m[5].charCodeAt(0) & 31;
+          text += code <= 0x10ffff ? String.fromCodePoint(code) : "";
+          j += m[0].length;
+          continue;
+        }
+        const n = s[++j];
+        text += esc[n] ?? n;
+      } else text += c;
+    }
+    this.err("unterminated ANSI-C quote");
+    return null;
   }
 
   // Index of the `"` closing a double-quoted span opened just before `from`,
@@ -224,9 +304,11 @@ class Parser {
 
   // Read double-quoted content up to `term` (or end of input when null),
   // collecting the substitutions that still run inside it.
-  readDouble(subs, term) {
+  readDouble(subs, term, span = () => {}) {
     const s = this.src;
     let text = "";
+    let expands = false;
+    let from = this.pos;
     while (this.pos < s.length && s[this.pos] !== term) {
       const c = s[this.pos];
       if (c === "\\") {
@@ -240,16 +322,31 @@ class Parser {
         continue;
       }
       if (c === "$" || c === "`") {
+        const at = this.pos;
         const got = this.readExpansion(subs);
         if (got !== null) {
+          span(from, at);
+          from = this.pos;
           text += got;
+          expands = true;
+          continue;
+        }
+        const name = c === "$" && s.slice(at + 1).match(/^(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?!$-])/);
+        if (name) {
+          // `$name`: a variable, never literal text
+          span(from, at);
+          this.pos = at + 1 + name[0].length;
+          from = this.pos;
+          text += s.slice(at, this.pos);
+          expands = true;
           continue;
         }
       }
       text += c;
       this.pos++;
     }
-    return text;
+    span(from, this.pos);
+    return { text, expands };
   }
 
   // `$(…)`, `$((…))`, `${…}` or a backtick span at this.pos: consumes it and
@@ -267,7 +364,10 @@ class Parser {
           j += 2;
         } else body += s[j++];
       }
-      if (j >= s.length) return null; // unterminated backtick: literal
+      if (j >= s.length) {
+        this.err("unterminated backtick");
+        return null; // unterminated backtick: literal
+      }
       subs.push({ kind: "cmd", ast: this.child(body, 0).parseAll() });
       this.pos = j + 1;
       return s.slice(from, this.pos);
@@ -291,6 +391,7 @@ class Parser {
         else if (s[j] === "}") depth--;
         j++;
       }
+      if (depth > 0) this.err("unterminated ${");
       this.pos = j;
       return s.slice(from, this.pos);
     }
@@ -301,12 +402,17 @@ class Parser {
   // this.pos just past its closing `)`.
   readNested(from) {
     if (this.depth >= MAX_DEPTH) {
+      this.err("substitution nesting too deep");
       this.pos = this.src.length;
       return { type: "list", items: [] };
     }
     const p = this.child(this.src, from);
     const ast = p.parseList([], [")"]);
-    this.pos = p.pos < this.src.length && this.src[p.pos] === ")" ? p.pos + 1 : p.pos;
+    if (p.peek().op === ")") this.pos = p.peeked.end;
+    else {
+      this.pos = p.pos;
+      this.err("unterminated substitution");
+    }
     if (p.pendingHeredocs.length) this.pendingHeredocs.push(...p.pendingHeredocs);
     return ast;
   }
@@ -315,18 +421,27 @@ class Parser {
     const s = this.src;
     for (const h of this.pendingHeredocs.splice(0)) {
       const lines = [];
+      const start = this.pos;
+      let end = start;
+      let closed = false;
       while (this.pos < s.length) {
-        let end = s.indexOf("\n", this.pos);
-        if (end === -1) end = s.length;
-        const line = s.slice(this.pos, end);
-        this.pos = Math.min(end + 1, s.length);
-        if ((h.strip ? line.replace(/^\t+/, "") : line) === h.delim) break;
+        let eol = s.indexOf("\n", this.pos);
+        if (eol === -1) eol = s.length;
+        const line = s.slice(this.pos, eol);
+        const at = this.pos;
+        this.pos = Math.min(eol + 1, s.length);
+        if ((h.strip ? line.replace(/^\t+/, "") : line) === h.delim) {
+          closed = true;
+          break;
+        }
         lines.push(line);
+        end = at + line.length;
       }
+      if (!closed) this.err("unterminated heredoc");
       const body = lines.join("\n");
       const subs = [];
       if (!h.quoted) this.child(body, 0).readDouble(subs, null);
-      h.redir.heredoc = { body, quoted: h.quoted, subs };
+      h.redir.heredoc = { body, quoted: h.quoted, subs, start: this.root ? start : -1, end: this.root ? end : -1 };
     }
   }
 
@@ -337,8 +452,12 @@ class Parser {
     while (!this.peek().eof) {
       const list = this.parseList([], []);
       items.push(...list.items);
-      if (!this.peek().eof) this.next(); // a stray `)`/reserved word: skip it
+      if (!this.peek().eof) {
+        this.err("unexpected token");
+        this.next(); // a stray `)`/reserved word: skip it
+      }
     }
+    if (this.pendingHeredocs.length) this.err("unterminated heredoc");
     return { type: "list", items };
   }
 
@@ -365,6 +484,7 @@ class Parser {
         // no progress on an unexpected token: drop it
         const t = this.peek();
         if (this.isStop(t, stopWords, stopOps)) break;
+        this.err("unexpected token");
         this.next();
       }
     }
@@ -383,7 +503,10 @@ class Parser {
       const cmd = this.parseCommand(stopWords, stopOps);
       if (cmd) stages.push(cmd);
       else if (!tok.op || !["\n", ";", "&", "&&", "||", "|"].includes(tok.op)) {
-        if (!this.isStop(this.peek(), stopWords, stopOps)) this.next();
+        if (!this.isStop(this.peek(), stopWords, stopOps)) {
+          this.err("unexpected token");
+          this.next();
+        }
       }
       if (this.peek().op !== "|") break;
       this.next();
@@ -395,6 +518,7 @@ class Parser {
   expectWord(text) {
     const t = this.peek();
     if (t.word && t.word.text === text && isReserved(t.word)) this.next();
+    else this.err(`expected '${text}'`);
   }
 
   skipSeparators() {
@@ -403,6 +527,7 @@ class Parser {
 
   parseCommand(stopWords, stopOps) {
     if (this.nest >= MAX_NEST) {
+      this.err("command nesting too deep");
       this.pos = this.src.length;
       this.peeked = null;
       return null;
@@ -422,7 +547,23 @@ class Parser {
       this.next();
       const body = this.parseList([], [")"]);
       if (this.peek().op === ")") this.next();
+      else this.err("expected ')'");
       node = { type: "subshell", body, redirs: [] };
+    } else if (tok.word && isLiteral(tok.word) && tok.word.text === "coproc") {
+      // `coproc [NAME] command`: NAME is taken only before a compound command.
+      this.next();
+      const t = this.peek();
+      if (t.word && !isReserved(t.word)) {
+        const save = { pos: this.pos, peeked: this.peeked };
+        this.next();
+        const u = this.peek();
+        if (!(u.op === "(" || (u.word && isReserved(u.word) && COMPOUND_STARTS.has(u.word.text)))) {
+          this.pos = save.pos;
+          this.peeked = save.peeked;
+        }
+      }
+      const cmd = this.parseCommand(stopWords, stopOps);
+      node = { type: "group", body: { type: "list", items: cmd ? [{ type: "pipeline", stages: [cmd] }] : [] }, redirs: [] };
     } else if (tok.word && isReserved(tok.word)) {
       const w = tok.word.text;
       if (w === "{") {
@@ -437,7 +578,10 @@ class Parser {
         for (;;) {
           lists.push(this.parseList(["elif", "else", "fi"], []));
           const t = this.peek();
-          if (!t.word || !isReserved(t.word)) break;
+          if (!t.word || !isReserved(t.word)) {
+            this.err("expected 'fi'");
+            break;
+          }
           if (t.word.text === "fi") {
             this.next();
             break;
@@ -493,7 +637,10 @@ class Parser {
         for (;;) {
           this.skipSeparators();
           const t = this.peek();
-          if (t.eof) break;
+          if (t.eof) {
+            this.err("expected 'esac'");
+            break;
+          }
           if (t.word && t.word.text === "esac" && isReserved(t.word)) {
             this.next();
             break;
@@ -577,14 +724,21 @@ class Parser {
 }
 
 // A word is a reserved word only when it is literal and unquoted.
-function isReserved(word) {
-  return !word.quoted && !word.subs.length && word.text === word.raw && RESERVED_WORDS.has(word.text);
+function isLiteral(word) {
+  return !word.quoted && !word.subs.length && word.text === word.raw;
 }
+function isReserved(word) {
+  return isLiteral(word) && RESERVED_WORDS.has(word.text);
+}
+const COMPOUND_STARTS = new Set(["{", "if", "while", "until", "for", "select", "case"]);
 const RESERVED_WORDS = new Set(["if", "then", "elif", "else", "fi", "do", "done", "case", "esac", "while", "until", "for", "select", "in", "function", "{", "}", "!", "time"]);
 
 function parse(src) {
-  if (typeof src !== "string") return { type: "list", items: [] };
-  return new Parser(src, 0, 0).parseAll();
+  if (typeof src !== "string") return { type: "list", items: [], errors: [] };
+  const p = new Parser(src, 0, 0);
+  const ast = p.parseAll();
+  ast.errors = p.errors;
+  return ast;
 }
 
 module.exports = { parse };

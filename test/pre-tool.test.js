@@ -492,6 +492,42 @@ test("preTool: pattern-based process kills are denied; PID/pgid kills pass", asy
     'p="$(pgrep foo)"; kill $p',
     "ps -eopid,args | grep node | awk '{print $1}' | xargs kill",
     "ps aux --sort -pcpu | grep node | awk '{print $2}' | xargs kill",
+    // Operator decision (2026-10-06): ANSI-C quoting, coproc and dynamic
+    // bodies — the parser must not let through what main's raw check denied.
+    String.raw`echo $'\'' ; pkill node`,
+    String.raw`$'pkill' node`,
+    String.raw`$'\x70kill' -f node`,
+    "echo $'it\\'s'; pkill node",
+    "coproc pkill node",
+    "coproc X { pkill node; }",
+    "coproc kill $(pgrep node)",
+    'cmd="pkill node"; bash -c "$cmd"',
+    "eval \"$(echo 'pkill node')\"",
+    "c='pkill -f node'; eval \"$c\"",
+    "$(echo 'pkill node')",
+    "echo 'pkill node' | sh",
+    "source <(echo 'pkill node')",
+    "x=kill; $x $(pgrep node)",
+    "echo 'pkill node' | xargs -I{} sh -c {}",
+    "echo 'pkill -f x' | xargs sh -c",
+    // ... and fails CLOSED on kill input it cannot parse cleanly.
+    "kill $(pgrep node",
+    "for p in 1; do pkill x",
+    'echo "kill $(pgrep x)',
+    "pgrep x | xargs kill '",
+    "kill `pgrep x",
+    // The raw backstop: pkill/killall anywhere, or kill + a selector, outside
+    // the quoted argument of a known data command, is denied.
+    "echo pkill",
+    'git commit -m "avoid kill $(pgrep x)"', // the $(…) runs: not data
+    "pgrep x | while read p; do echo $p; done; kill 4242",
+    "cat > n.md <<EOF\npkill -f x\nEOF",
+    "gh issue create --body 'pgrep x | xargs kill'",
+    "man pkill",
+    "command -v pkill",
+    'node --test --test-name-pattern "pkill denied" x.test.js',
+    "pids=$(pgrep node); echo $pids; kill 4242",
+    "pgrep node >/dev/null && kill 4242",
   ]) {
     const out = await run(c);
     assert.equal(out?.hookSpecificOutput?.permissionDecision, "deny", c);
@@ -502,34 +538,36 @@ test("preTool: pattern-based process kills are denied; PID/pgid kills pass", asy
     "kill 4242",
     "pgrep -f node",
     'git commit -m "pkill is banned"',
-    "echo pkill",
+    "echo 'pkill'",
     "echo 'kill $(pgrep node)'",
     "git commit -m 'avoid kill $(pgrep x)'",
-    'git commit -m "avoid kill $(pgrep x)"',
+    "git commit -am 'avoid pkill -f'",
+    "git commit --message='pkill is banned'",
+    "git commit -m \"$(cat <<'EOF'\nfix: deny pkill and kill $(pgrep x)\nEOF\n)\"",
+    "git log -S'pkill' --oneline",
+    "grep -rn 'pkill\\|kill $(pgrep' scripts",
+    "grep -e 'killall' -e 'pkill' -r .",
+    "echo $'pkill is banned'",
+    "printf '%s\\n' 'pkill -f node'",
     "git log --grep='pgrep x | xargs kill'",
-    "pgrep x | while read p; do echo $p; done; kill 4242",
-    "cat > n.md <<EOF\npkill -f x\nEOF",
     "docker ps -q | xargs docker kill",
-    "gh issue create --body 'pgrep x | xargs kill'",
     "grep -n 'kill $(pgrep' f",
-    "man pkill",
-    'node --test --test-name-pattern "pkill denied" x.test.js',
-    "sed -i 's/pkill -f x/kill y/' README.md",
-    `find . -name '*.md' -exec grep -l "pkill -f" {} +`,
-    'curl -d "pkill -f is banned" http://x',
-    "command -v pkill",
     "kill -- -\"$(cat f.pgid)\"",
     "kill \"$(cat app.pid)\"",
     "kill -- -$(ps -o pgid= -p 4242 | tr -d ' ')",
     "pgrep -f node | wc -l",
-    "pids=$(pgrep node); echo $pids; kill 4242",
-    "pgrep node >/dev/null && kill 4242",
     "docker kill $(docker ps -q)",
     "echo 'xargs kill < <(pgrep node)'",
     'git commit -m "fix: while read p; do kill $p; done < <(pgrep x)"',
     "cat <<'EOF' | sh -c 'cat >notes.md'\npgrep x | xargs kill\nEOF",
     'printf "%s\\n" "pgrep node | xargs sh -c \'kill $@\'"',
     "systemctl kill foo.service",
+    "kill $( cat app.pid )",
+    "kill $(cat app.pid; )",
+    "kill -- -\"$(\n  cat f.pgid\n  )\"",
+    "arr=( $(cat pids) ); kill \"${arr[@]}\"",
+    "local -a p=( 1 ); kill 1",
+    "bash -c 'kill $( cat app.pid )'",
   ])
     assert.equal(await run(c), null, c);
   assert.equal(await run("pkill node", main), null, "non-worktree session is a no-op");
@@ -655,4 +693,16 @@ test("shell-ast: parsing never throws and always terminates on malformed input",
   }
   for (const open of ["(", "{ ", "if a; then ", "while a; do ", "a=(", "f() ", "$(", "<("])
     assert.equal(parse(open.repeat(5000) + "x").type, "list", `deep ${open}`);
+});
+
+test("shell-ast: records the recoveries it made, and decodes ANSI-C quoting", () => {
+  const { parse } = require("../scripts/engines/shell-ast");
+  for (const ok of ["for p in 1 2; do echo $p; done", "case x in a|b) echo;; esac", "x $(( (a+b) * 2 ))", "cat <<'EOF'\nhi\nEOF", "echo $'a\\'b'"])
+    assert.deepEqual(parse(ok).errors, [], ok);
+  for (const bad of ["echo 'x", 'echo "x', "echo `x", "echo $(x", "for p in 1; do echo", "if a; then b", "{ a;", "( a", "cat <<EOF\nx", "echo $'x", "echo ${x"])
+    assert.ok(parse(bad).errors.length, bad);
+  const w = parse("echo $'\\x70kill' \"a $b c\"").items[0].stages[0].words;
+  assert.equal(w[1].text, "pkill");
+  assert.equal(w[2].expands, true);
+  assert.deepEqual(w[2].qspans, [[18, 20], [22, 24]]);
 });

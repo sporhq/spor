@@ -386,56 +386,68 @@ const READERS = new Set(["read", "mapfile", "readarray"]);
 const INPUT_REDIRS = new Set(["<", "<<", "<<-", "<<<", "<>", "<&"]);
 const MAX_SCRIPT_DEPTH = 6;
 
-// What a simple command's argv executes: the leaf commands it runs and the
+// What a simple command's words execute: the leaf commands it runs and the
 // shell command strings it hands to a shell. `stdinShell` marks a shell that
 // reads its script from stdin (`bash`, `sh -s`), so a heredoc fed to it is code.
-function execTargets(argv, out = { leaves: [], scripts: [], stdinShell: false }) {
-  let a = argv;
-  while (a.length && ENV_ASSIGN_RE.test(a[0])) a = a.slice(1);
+// A script is `dynamic` when its text is not known before it runs — built from
+// an expansion (`bash -c "$cmd"`, `eval "$(…)"`) or filled in per input by
+// xargs/parallel — and `out.dynamic` marks a command name that is itself an
+// expansion (`$cmd args`) or a `source`/`.` of a file.
+function execTargets(words, out = { leaves: [], scripts: [], stdinShell: false, dynamic: false }, fedArgs = false) {
+  let a = words;
+  while (a.length && ENV_ASSIGN_RE.test(a[0].text)) a = a.slice(1);
   if (!a.length) return out;
-  const name = path.basename(a[0].replace(/^\\/, ""));
+  const argv = a.map((w) => w.text);
+  const script = (ws) => out.scripts.push({ text: ws.map((w) => w.text).join(" "), dynamic: fedArgs || ws.some((w) => w.expands) });
+  if (a[0].expands || /[$`]/.test(argv[0])) out.dynamic = true;
+  const name = path.basename(argv[0].replace(/^\\/, ""));
+  if (name === "source" || name === ".") out.dynamic = true;
   if (SHELLS.has(name)) {
-    const i = findDashC(a);
+    const i = findDashC(argv);
     if (i !== -1) {
-      const body = dashCBody(a, i);
-      if (body != null) out.scripts.push(body);
-    } else if (a.slice(1).every((t) => t.startsWith("-"))) out.stdinShell = true;
-    out.leaves.push({ name, args: a.slice(1) });
+      const at = argv[i + 1] === "--" ? i + 2 : i + 1;
+      if (a[at]) script([a[at]]);
+      else out.dynamic ||= fedArgs; // `xargs sh -c`: the body is an input line
+    } else if (argv.slice(1).every((t) => t.startsWith("-"))) out.stdinShell = true;
+    else out.dynamic ||= fedArgs; // `xargs sh file`: a script file per input
+    out.leaves.push({ name, args: argv.slice(1) });
     return out;
   }
   if (name === "eval") {
-    out.scripts.push(a.slice(1).join(" "));
+    script(a.slice(1));
     return out;
   }
-  if (name === "command" && /^-[a-zA-Z]*[vV]/.test(a[1] || "")) return out; // `command -v pkill`: a lookup
+  if (name === "command" && /^-[a-zA-Z]*[vV]/.test(argv[1] || "")) return out; // `command -v pkill`: a lookup
   if (name === "find") {
-    // Each `-exec <cmd> … ;|+` runs <cmd>.
+    // Each `-exec <cmd> … ;|+` runs <cmd>, with the found paths as arguments.
     for (let i = 1; i < a.length; i++) {
-      if (!FIND_EXEC.has(a[i])) continue;
+      if (!FIND_EXEC.has(argv[i])) continue;
       let j = i + 1;
-      while (j < a.length && !["+", ";", "\\;"].includes(a[j])) j++;
-      execTargets(a.slice(i + 1, j), out);
+      while (j < a.length && !["+", ";", "\;"].includes(argv[j])) j++;
+      execTargets(a.slice(i + 1, j), out, true);
       i = j;
     }
-    out.leaves.push({ name, args: a.slice(1) });
+    out.leaves.push({ name, args: argv.slice(1) });
     return out;
   }
   const spec = name === "command" ? {} : WRAPPERS[name];
   if (!spec) {
-    out.leaves.push({ name, args: a.slice(1) });
+    out.leaves.push({ name, args: argv.slice(1) });
     return out;
   }
-  const scriptAt = spec.script ? a.findIndex((t, k) => k > 0 && (spec.script.includes(t) || spec.script.some((s) => s.startsWith("--") && t.startsWith(s + "=")))) : -1;
+  const scriptAt = spec.script ? argv.findIndex((t, k) => k > 0 && (spec.script.includes(t) || spec.script.some((s) => s.startsWith("--") && t.startsWith(s + "=")))) : -1;
   if (scriptAt !== -1) {
-    const t = a[scriptAt];
-    const body = t.includes("=") && t.startsWith("--") ? t.slice(t.indexOf("=") + 1) : a[scriptAt + 1];
-    if (body != null) out.scripts.push(body);
+    const t = argv[scriptAt];
+    if (t.includes("=") && t.startsWith("--")) {
+      const w = a[scriptAt];
+      out.scripts.push({ text: t.slice(t.indexOf("=") + 1), dynamic: fedArgs || w.expands });
+    } else if (a[scriptAt + 1]) script([a[scriptAt + 1]]);
     return out;
   }
   let i = 1;
   const seen = new Set();
   while (i < a.length) {
-    const t = a[i];
+    const t = argv[i];
     if (t === "--") {
       i++;
       break;
@@ -449,12 +461,13 @@ function execTargets(argv, out = { leaves: [], scripts: [], stdinShell: false })
   if (name === "su") return out; // `su <user>` without -c: an interactive shell
   if (name === "runuser" && !seen.has("-u") && !seen.has("--user")) return out;
   let rest = a.slice(i + (spec.pos || 0));
-  if (spec.stopAt && rest.includes(spec.stopAt)) rest = rest.slice(0, rest.indexOf(spec.stopAt));
+  const restText = rest.map((w) => w.text);
+  if (spec.stopAt && restText.includes(spec.stopAt)) rest = rest.slice(0, restText.indexOf(spec.stopAt));
   if (name === "watch") {
-    if (rest.length) out.scripts.push(rest.join(" "));
+    if (rest.length) script(rest);
     return out;
   }
-  return execTargets(rest, out);
+  return execTargets(rest, out, fedArgs || name === "xargs" || name === "parallel");
 }
 
 // `ps -p <pid>` / `ps -q <pid>` reads a KNOWN process (e.g. a recorded pid's
@@ -472,25 +485,44 @@ class KillFlow {
     this.execMemo = new WeakMap();
     this.infoMemo = new WeakMap();
     this.tainted = new Set();
+    this.errors = [];
   }
 
   parseScript(text, depth) {
-    return depth < MAX_SCRIPT_DEPTH ? shellAst.parse(text) : { type: "list", items: [] };
+    if (depth >= MAX_SCRIPT_DEPTH) {
+      this.errors.push({ msg: "shell body nesting too deep" });
+      return { type: "list", items: [] };
+    }
+    const ast = shellAst.parse(text);
+    this.errors.push(...ast.errors);
+    return ast;
   }
 
   // A simple command's own execution: its leaves and parsed shell bodies.
   exec(node, depth) {
     let ex = this.execMemo.get(node);
     if (ex) return ex;
-    const t = execTargets(node.words.map((w) => w.text));
-    const asts = t.scripts.map((s) => this.parseScript(s, depth));
+    const t = execTargets(node.words);
+    const asts = t.scripts.map((s) => this.parseScript(s.text, depth));
+    let dynamic = t.dynamic || t.scripts.some((s) => s.dynamic);
     if (t.stdinShell) {
+      // A shell reading its script from stdin: a heredoc/here-string body is
+      // parsed; anything else (a pipe, a file) is code we cannot see.
+      let seen = false;
       for (const r of node.redirs) {
-        if (r.heredoc) asts.push(this.parseScript(r.heredoc.body, depth));
-        else if (r.op === "<<<" && r.target) asts.push(this.parseScript(r.target.text, depth));
+        if (r.heredoc) {
+          seen = true;
+          dynamic ||= !r.heredoc.quoted && r.heredoc.subs.length > 0;
+          asts.push(this.parseScript(r.heredoc.body, depth));
+        } else if (r.op === "<<<" && r.target) {
+          seen = true;
+          dynamic ||= !!r.target.expands;
+          asts.push(this.parseScript(r.target.text, depth));
+        }
       }
+      if (!seen) dynamic = true;
     }
-    ex = { leaves: t.leaves, asts, depth: depth + 1 };
+    ex = { leaves: t.leaves, asts, depth: depth + 1, dynamic };
     this.execMemo.set(node, ex);
     return ex;
   }
@@ -674,6 +706,174 @@ class KillFlow {
   }
 }
 
+// The raw-text backstop (operator decision on issue-spor-kill-guard-
+// structural-selector-to-kill-flow, 2026-10-06): the guard stops ACCIDENTAL
+// pattern kills, and the parser above must never let through what the old
+// raw-text check denied. So, whatever the parser concluded, a command that
+// mentions pkill/killall ANYWHERE, or `kill` together with a selector
+// (pgrep/pidof, or an executed pattern `ps`), is denied — unless every one of
+// those mentions sits inside the literally-quoted argument of a known DATA
+// command: echo/printf arguments, `git commit -m/--message`, `git log
+// --grep/-S/-G`, a grep pattern, or a quoted-delimiter heredoc fed to `cat`
+// (the `git commit -m "$(cat <<'EOF' … EOF)"` idiom). That exception is void
+// when the command runs anything whose text is not known before it runs (a
+// dynamic `bash -c "$cmd"`/`eval "$(…)"` body, an expanded command name, a
+// shell fed from a pipe, a `source`), since data can become code there. And
+// it fails CLOSED: a kill-mentioning command the parser could not read cleanly
+// (an unterminated quote or substitution, a missing `done`, …) is denied.
+const KILLER_WORD_RE = /(?<![\w-])(?:pkill|killall5?)(?![\w-])/g;
+const KILL_WORD_RE = /(?<![\w-])kill(?![\w-])/g;
+const SELECTOR_WORD_RE = /(?<![\w-])(?:pgrep|pidof)(?![\w-])/g;
+const PS_WORD_RE = /(?<![\w-])ps(?![\w-])/g;
+const ANY_KILL_RE = /(?<![\w-])(?:kill|pkill|killall5?)(?![\w-])/;
+const GREP_VALUE_OPTS = new Set(["-A", "-B", "-C", "-m", "-f", "-d", "-D", "--file", "--max-count", "--context", "--after-context", "--before-context"]);
+const GIT_VALUE_OPTS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
+
+// The words of a simple command that a known data command only prints,
+// writes or matches against — never executes.
+function dataArgs(words) {
+  if (!words.length || words[0].expands || words[0].quoted) return [];
+  const argv = words.map((w) => w.text);
+  const name = path.basename(argv[0]);
+  if (name === "echo" || name === "printf") return words.slice(1);
+  if (name === "grep" || name === "egrep" || name === "fgrep") {
+    const out = [];
+    let explicit = false;
+    for (let i = 1; i < words.length; i++) {
+      const t = argv[i];
+      if (t === "-e" || t === "--regexp") {
+        if (words[i + 1]) out.push(words[++i]);
+        explicit = true;
+      } else if (t.startsWith("--regexp=") || /^-e./.test(t)) {
+        out.push(words[i]);
+        explicit = true;
+      } else if (t === "--") {
+        if (!explicit && words[i + 1]) out.push(words[i + 1]);
+        break;
+      } else if (GREP_VALUE_OPTS.has(t)) i++;
+      else if (!(t.startsWith("-") && t.length > 1)) {
+        if (!explicit) out.push(words[i]); // the first operand is the pattern
+        break;
+      }
+    }
+    return out;
+  }
+  if (name === "git") {
+    let i = 1;
+    while (i < words.length && argv[i].startsWith("-")) i += GIT_VALUE_OPTS.has(argv[i]) ? 2 : 1;
+    const sub = argv[i];
+    const out = [];
+    for (let j = i + 1; j < words.length; j++) {
+      const t = argv[j];
+      const takesNext = sub === "commit" ? t === "--message" || /^-[a-zA-Z]*m$/.test(t) : sub === "log" ? ["--grep", "-S", "-G"].includes(t) : false;
+      const attached =
+        sub === "commit" ? t.startsWith("--message=") || /^-m./.test(t) : sub === "log" ? t.startsWith("--grep=") || /^-[SG]./.test(t) : false;
+      if (takesNext) {
+        if (words[j + 1]) out.push(words[++j]);
+      } else if (attached) out.push(words[j]);
+    }
+    return out;
+  }
+  return [];
+}
+
+// Every simple command in `node`, substitutions included (same source text).
+function forEachSimple(node, fn) {
+  if (!node) return;
+  const words = (ws) => {
+    for (const w of ws) if (w) for (const sub of w.subs) forEachSimple(sub.ast, fn);
+  };
+  const redirs = (rs) => {
+    for (const r of rs || []) {
+      words([r.target]);
+      if (r.heredoc) for (const sub of r.heredoc.subs) forEachSimple(sub.ast, fn);
+    }
+  };
+  switch (node.type) {
+    case "list":
+      node.items.forEach((n) => forEachSimple(n, fn));
+      break;
+    case "pipeline":
+      node.stages.forEach((n) => forEachSimple(n, fn));
+      break;
+    case "simple":
+      fn(node);
+      words(node.assigns);
+      words(node.words);
+      redirs(node.redirs);
+      break;
+    case "group":
+    case "subshell":
+      forEachSimple(node.body, fn);
+      redirs(node.redirs);
+      break;
+    case "if":
+      node.lists.forEach((n) => forEachSimple(n, fn));
+      redirs(node.redirs);
+      break;
+    case "loop":
+      forEachSimple(node.cond, fn);
+      forEachSimple(node.body, fn);
+      redirs(node.redirs);
+      break;
+    case "for":
+      words(node.words);
+      forEachSimple(node.body, fn);
+      redirs(node.redirs);
+      break;
+    case "case":
+      words([node.word]);
+      node.bodies.forEach((n) => forEachSimple(n, fn));
+      redirs(node.redirs);
+      break;
+    case "func":
+      forEachSimple(node.body, fn);
+      break;
+  }
+}
+
+// [from, to) ranges of the top-level command text that are quoted data.
+function dataRanges(ast) {
+  const ranges = [];
+  forEachSimple(ast, (node) => {
+    for (const w of dataArgs(node.words)) ranges.push(...w.qspans);
+    if (node.words.length && !node.words[0].expands && node.words[0].text === "cat") {
+      for (const r of node.redirs) if (r.heredoc?.quoted && r.heredoc.start >= 0) ranges.push([r.heredoc.start, r.heredoc.end]);
+    }
+  });
+  return ranges;
+}
+
+function matchesOf(re, text) {
+  return [...text.matchAll(re)].map((m) => [m.index, m.index + m[0].length]);
+}
+
+function backstop(command, ast, flow) {
+  const errors = [...(ast.errors || []), ...flow.errors];
+  if (errors.length && ANY_KILL_RE.test(command))
+    return `a command mentioning kill could not be parsed cleanly (${errors[0].msg}), so it cannot be shown safe`;
+  let dynamic = false;
+  let psSelects = false;
+  flow.walk(ast, false, 0, (node, st, depth) => {
+    if (node.type !== "simple") return null;
+    const ex = flow.exec(node, depth);
+    dynamic ||= ex.dynamic;
+    psSelects ||= ex.leaves.some((l) => l.name === "ps" && isSelector(l));
+    return null;
+  });
+  const killers = matchesOf(KILLER_WORD_RE, command);
+  const kills = matchesOf(KILL_WORD_RE, command);
+  const selectors = matchesOf(SELECTOR_WORD_RE, command);
+  if (psSelects || dynamic) selectors.push(...matchesOf(PS_WORD_RE, command));
+  if (!killers.length && !(kills.length && (selectors.length || psSelects))) return null;
+  const ranges = dynamic ? [] : dataRanges(ast);
+  const isData = ([a, b]) => ranges.some(([x, y]) => x <= a && b <= y);
+  if (!psSelects && [...killers, ...kills, ...selectors].every(isData)) return null;
+  if (dynamic) return "a command that builds code at run time (a dynamic `sh -c`/`eval` body, an expanded command name, a piped or sourced script) mentions a pattern kill";
+  const what = killers.length && !killers.every(isData) ? `'${command.slice(...killers.find((m) => !isData(m)))}'` : "'kill' with a pgrep/pidof/ps selector";
+  return `${what} appears outside quoted data (only a quoted echo/printf argument, git commit -m, git log --grep/-S/-G or grep pattern is treated as text)`;
+}
+
 function denyKill(detail) {
   return {
     hookSpecificOutput: {
@@ -686,7 +886,9 @@ function denyKill(detail) {
 
 function scanBashForPatternKill(command) {
   if (!command || typeof command !== "string") return null;
-  const detail = new KillFlow().check(shellAst.parse(command));
+  const ast = shellAst.parse(command);
+  const flow = new KillFlow();
+  const detail = flow.check(ast) ?? backstop(command, ast, flow);
   return detail ? denyKill(detail) : null;
 }
 
