@@ -786,6 +786,208 @@ test("bin/spor.js: one execution instance per process, opaque and within the ser
   assert.equal(spor.executionInstance(), a, "stable for the life of the process");
 });
 
+// A process that LOSES the fence never re-claims that execution (the merge
+// gate's livelock finding on issue-spor-execution-fence-shared-by-same-agent-
+// processes). Two live processes of one owner would otherwise fence each other
+// out every pass: each pass's reporter.resume() claims, and a different
+// instance is admitted against the live lease and advances the fence. Each
+// simulated PROCESS is a store instance (its own home and run-record copy);
+// each PASS is a fresh reporter over a freshly opened store, as bin/spor.js
+// opens one per pass.
+function twoProcessFixture(fake, tag) {
+  const proc = (instance) => {
+    const home = tmp(`${tag}-${instance}`);
+    const cfg = remoteCfg(home, fake.base);
+    return { home, cfg, instance, open: () => store.openExecutionStore(cfg, { home, machine: "box", instance }) };
+  };
+  const seed = (p, record) => {
+    const rp = dispatchRuns.runPaths(p.home, record.run_id);
+    fs.mkdirSync(path.dirname(rp.record), { recursive: true });
+    fs.writeFileSync(rp.record, JSON.stringify(record));
+  };
+  const pass = (p, record) => spor.executionReporter(p.cfg, record, { home: p.home, store: p.open() });
+  return { proc, seed, pass };
+}
+
+async function openedRecord(p, runId) {
+  const st = p.open();
+  const opened = await st.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+  assert.equal(opened.ok, true, JSON.stringify(opened));
+  return {
+    run_id: runId,
+    node_id: "task-x",
+    impl_claim: { execution_id: opened.execution.execution_id, store: "remote", fence: opened.fence, gates: ["acceptance"], completion: { by: "controller", after: "gates" } },
+  };
+}
+
+test("two processes of one owner: B's claim advances the fence, A is refused fence_stale and then NEVER re-claims across later passes, and B completes", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const { proc, seed, pass } = twoProcessFixture(fake, "fenced-out");
+    const A = proc("pA-fenced");
+    const B = proc("pB-fenced");
+    const record = await openedRecord(A, "run-fo");
+    seed(A, record);
+    seed(B, record);
+    const id = record.impl_claim.execution_id;
+    // A's pass 1 holds fence 1.
+    const a1 = pass(A, record);
+    assert.deepEqual(await a1.resume(), { ok: true, fence: 1 });
+    // B (a second live process of the same worker on the same box) claims:
+    // admitted against the live lease, the fence advances.
+    const b1 = pass(B, record);
+    assert.deepEqual(await b1.resume(), { ok: true, fence: 2 });
+    // A's next write is refused; it loses ownership.
+    const lost = await a1.candidateSubmitted(CAND);
+    assert.equal(lost.code, "fence_stale");
+    assert.equal(a1.owned, false);
+    assert.equal(store.fencedOut("pA-fenced", id), 1, "the loss is recorded for A's process, at the fence it lost");
+    assert.equal(store.fencedOut("pB-fenced", id), null);
+    a1.leave();
+    // A's later passes: the claim is refused LOCALLY — no claim reaches the
+    // store, so the fence stays B's — and the item is handed off, not failed.
+    const claimsBefore = fake.state.requests.filter((r) => r.path.endsWith("/claim")).length;
+    for (let n = 0; n < 3; n++) {
+      const again = pass(A, record);
+      const r = await again.resume();
+      assert.equal(r.ok, false);
+      assert.equal(r.handed_off, true, "the execution is handed to the other process");
+      assert.equal(again.owned, false);
+      assert.equal((await again.confirm()).confirmed, false, "a handed-off process can never confirm a completion");
+      assert.notEqual(spor.LIVE_EXECUTIONS.get(id), again, "A's pass is not registered for the heartbeat");
+    }
+    // Any store this process instance opens refuses, including a direct claim.
+    assert.equal((await A.open().claim(id, {})).handed_off, true);
+    assert.equal(fake.state.requests.filter((r) => r.path.endsWith("/claim")).length, claimsBefore, "no claim was sent for a lost execution");
+    assert.equal(fake.record(id).owner.fence, 2);
+    assert.equal(fake.record(id).owner.instance, "pB-fenced");
+    assert.equal(fake.record(id).released_at ?? null, null, "nothing was released on the winner's behalf");
+    // B works the execution through to completion across its own passes.
+    const b2 = pass(B, record);
+    assert.deepEqual(await b2.resume(), { ok: true, fence: 2 }, "B's same-instance re-claim keeps its fence");
+    assert.equal((await b2.candidateSubmitted(CAND)).ok, true);
+    assert.equal((await b2.gateSettled("acceptance", "passed")).ok, true);
+    const confirmed = await b2.confirm();
+    assert.equal(confirmed.confirmed, true, JSON.stringify(confirmed));
+    assert.equal((await b2.completionWritten("art-x")).ok, true);
+    assert.equal(fake.record(id).stage, "completed");
+    b1.leave();
+    b2.leave();
+  } finally {
+    spor.LIVE_EXECUTIONS.clear();
+    await fake.close();
+  }
+});
+
+test("bin/spor.js callers stop at an execution THIS process lost: the gate pipeline is not run (no claim, no pipeline lease, nothing stamped) and the completion reconciler skips it", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-handoff": itemNode("task-handoff"), "factory-t": itemNode("factory-t") } });
+  try {
+    const home = tmp("callers-handed-off");
+    const cfg = remoteCfg(home, fake.base);
+    const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller", after: "gates" } });
+    const held = await spor.claimExecutionHold(cfg, { id: "task-handoff" }, factory, { home });
+    assert.equal(held.ok, true, held.reason);
+    const record = { run_id: "run-ho", node_id: "task-handoff", ...held.recordFields };
+    const rp = dispatchRuns.runPaths(home, "run-ho");
+    fs.mkdirSync(path.dirname(rp.record), { recursive: true });
+    fs.writeFileSync(rp.record, JSON.stringify(record));
+    const id = record.impl_claim.execution_id;
+    // A node id of its own: execution ids are content-addressed, and the loss
+    // is recorded against THIS test runtime's real process instance.
+    // This process (the real per-process instance) holds the execution; a
+    // second process of the same worker claims it and this one is refused.
+    const mine = spor.executionReporter(cfg, record, { home });
+    assert.equal((await mine.resume()).ok, true);
+    const other = store.openExecutionStore(remoteCfg(tmp("callers-other"), fake.base), { machine: os.hostname(), instance: "p-other-process" });
+    assert.equal((await other.claim(id, {})).ok, true);
+    assert.equal((await mine.candidateSubmitted(CAND)).code, "fence_stale");
+    mine.leave();
+    assert.notEqual(store.fencedOut(spor.executionInstance(), id), null);
+    const claims = () => fake.state.requests.filter((r) => r.path.endsWith("/claim")).length;
+    const before = claims();
+    const lines = [];
+    const res = await spor.runGateAndIntegration(cfg, { run_id: "run-ho", node_id: "task-handoff", project: "spor" }, record, { home, log: (l) => lines.push(l) });
+    assert.equal(res.not_run, true);
+    assert.equal(res.superseded, true, "shaped as a lost race: the loop stamps nothing");
+    assert.equal(res.handed_off, true);
+    const after = dispatchRuns.readJson(rp.record);
+    assert.equal(after.gate_state ?? null, null, "nothing is stamped on the record");
+    const winner = dispatchRuns.claimPipeline(home, "run-ho", { workerId: "the-winner", ownerLive: () => true });
+    assert.equal(winner.refused ?? null, null, "the pipeline lease is left free for the process that holds the execution");
+    await spor.reconcileCompletions(cfg, { home, log: (l) => lines.push(l) });
+    assert.equal(claims(), before, "neither caller re-claimed the lost execution");
+    assert.equal(fake.record(id).owner.instance, "p-other-process");
+    assert.equal(fake.record(id).stage === "refused" || !!fake.record(id).released_at, false, "nothing ended on the winner's behalf");
+  } finally {
+    spor.LIVE_EXECUTIONS.clear();
+    await fake.close();
+  }
+});
+
+test("restart takeover still works: a NEW process instance (no in-memory loss record) takes over the execution its dead predecessor held, at an advanced fence", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const { proc, seed, pass } = twoProcessFixture(fake, "restart");
+    const old = proc("pA-dead");
+    const record = await openedRecord(old, "run-rs");
+    seed(old, record);
+    const id = record.impl_claim.execution_id;
+    const before = pass(old, record);
+    assert.equal((await before.resume()).ok, true);
+    before.leave();
+    // The process dies with its lease still live; the restarted process shares
+    // its home (same box, same run record) but is a new instance.
+    const restarted = { ...old, instance: "pA-restarted", open: () => store.openExecutionStore(old.cfg, { home: old.home, machine: "box", instance: "pA-restarted" }) };
+    const after = pass(restarted, record);
+    assert.deepEqual(await after.resume(), { ok: true, fence: 2 }, "admitted against the live lease, the fence advances");
+    assert.equal(fake.record(id).owner.instance, "pA-restarted");
+    assert.equal((await after.candidateSubmitted(CAND)).ok, true);
+    assert.equal((await after.gateSettled("acceptance", "passed")).ok, true);
+    assert.equal((await after.confirm()).confirmed, true);
+    assert.equal((await after.completionWritten("art-x")).ok, true);
+    assert.equal(fake.record(id).stage, "completed");
+    after.leave();
+  } finally {
+    spor.LIVE_EXECUTIONS.clear();
+    await fake.close();
+  }
+});
+
+test("store: a fence_stale on a fence this instance has since superseded with its OWN newer claim is not a loss", async () => {
+  const home = tmp("own-stale");
+  const pinRead = (id) => ({ revision: `rev-${id}`, repo: "spor" });
+  const p1 = store.openExecutionStore(null, { home, mode: "local", worker: "agent-a", machine: "box", instance: "p-own", pinRead });
+  const opened = await p1.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+  const id = opened.execution.execution_id;
+  const took = await p1.claim(id, { takeover: true });
+  assert.equal(took.fence, 2, "an explicit takeover by this same instance advances its own fence");
+  assert.equal((await p1.renew(id, { fence: 1 })).code, "fence_stale");
+  assert.equal(store.fencedOut("p-own", id), null, "a stale fence of our own is not a loss to someone else");
+  assert.equal((await p1.claim(id, {})).fence, 2);
+});
+
+// NOT a bug, by design (spor-server b5b0953, EXECUTION-STATE.md §4): an
+// instance-LESS (legacy) claim against a record held by an instance-bearing
+// process of the same owner pair is a different instance — it advances the
+// fence and clears owner.instance.
+test("an instance-less claim against an instance-bearing owner of the same pair advances the fence and clears owner.instance", async () => {
+  const LATE = later(3600);
+  const rec = kernel.claim(kernel.initExecution(SPEC, { sha256 }), { worker: "agent-one", machine: "box", instance: "p1", lease_expires_at: LATE, now: T0 }).record;
+  const legacy = kernel.claim(rec, { worker: "agent-one", machine: "box", lease_expires_at: LATE, now: later(1) });
+  assert.equal(legacy.ok, true);
+  assert.equal(legacy.fence, 2);
+  assert.equal("instance" in legacy.record.owner, false, "the owner no longer names the instance-bearing process");
+  // ...and the same through the local store.
+  const home = tmp("legacy-vs-instance");
+  const pinRead = (id) => ({ revision: `rev-${id}`, repo: "spor" });
+  const withInstance = store.openExecutionStore(null, { home, mode: "local", worker: "agent-a", machine: "box", instance: "p-legacy-test", pinRead });
+  const without = store.openExecutionStore(null, { home, mode: "local", worker: "agent-a", machine: "box", pinRead });
+  const opened = await withInstance.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+  const claimed = await without.claim(opened.execution.execution_id, {});
+  assert.equal(claimed.fence, 2);
+  assert.equal("instance" in claimed.execution.owner, false);
+});
+
 test("remote ownership belongs to the fixed agent and machine pair on every mutation", async () => {
   let clock = T0;
   const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") }, now: () => clock });

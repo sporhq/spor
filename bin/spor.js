@@ -14761,7 +14761,7 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
     }
     if (r.ownership === false || executionKernel.OWNERSHIP_CODES.includes(r.code)) {
       owned = false;
-      note(`lost:${r.code}`, `work: ${record.node_id} — execution ${id} is no longer held by this worker (${r.code}: ${r.message}${r.holder ? `; held by ${r.holder.worker}` : ""}); the pipeline continues but writes no completion under this fence`);
+      note(`lost:${r.code}`, `work: ${record.node_id} — execution ${id} is no longer held by this worker (${r.code}: ${r.message}${r.holder ? `; held by ${r.holder.worker}` : ""}); the pipeline continues but writes no completion under this fence${r.code === "fence_stale" ? ", and this process never re-claims it" : ""}`);
     } else if (r.deferred) {
       note("deferred", `work: ${record.node_id} — execution ${id}: the store is unreachable (${r.message}); ${r.pending} event(s) spooled to the outbox and replayed on the next call`);
     } else if (r.code === "execution_terminal") {
@@ -14829,6 +14829,14 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
         return { ok: true, unconfirmed: true, fence };
       }
       owned = false;
+      if (r.handed_off) {
+        // This process LOST the fence to another holder earlier in its life
+        // (lib/shell/execution-store.js FENCED_OUT): the store refused the
+        // claim locally, with no traffic. The execution is the winner's —
+        // nothing is released, failed or abandoned on its behalf.
+        note("handed-off", `work: ${record.node_id} — execution ${id} was handed to another process (${r.message}); this process stops working it`);
+        return { ok: false, code: r.code, message: r.message, holder: null, handed_off: true };
+      }
       const h = r.holder;
       log(`work: ${record.node_id} — execution ${id} could not be claimed (${r.code}: ${r.message}${h ? `; held by ${h.worker}${h.machine ? ` on ${h.machine}` : ""} until ${h.lease_expires_at}` : ""})`);
       return { ok: false, code: r.code, message: r.message, holder: h || null };
@@ -15103,7 +15111,8 @@ async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = ()
       const ending = executionReporter(cfg, r, { home, log });
       try {
         const result = ending && await ending.retryEnd(r.completion_execution_end);
-        if (!result?.ok) log(`work: ${r.node_id} — execution release remains owed`);
+        if (result?.handed_off) log(`work: ${r.node_id} — execution ${ending.id} was handed to another process; its release is that holder's, not this process's`);
+        else if (!result?.ok) log(`work: ${r.node_id} — execution release remains owed`);
       } catch (e) {
         log(`work: ${r.node_id} — execution release retry deferred (${e.message || e})`);
       } finally { if (ending) ending.leave(); }
@@ -15134,6 +15143,12 @@ async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = ()
       reporter = executionReporter(cfg, r, { home, log });
       if (reporter) {
         const resumed = await reporter.resume();
+        if (resumed.handed_off) {
+          // Handed to another process of this worker: the completion is the
+          // winner's to write — this process neither drives nor withdraws it.
+          reporter.leave();
+          continue;
+        }
         if (!resumed.ok) log(`work: ${r.node_id} — its execution ${reporter.id} is not held by this worker (${resumed.code}); the completion is left owed`);
       }
     }
@@ -15171,6 +15186,33 @@ async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = ()
       if (reporter) reporter.leave();
     }
   }
+}
+
+// The not-run result for a controller record whose execution this process
+// lost to another holder (and so never re-claims): shaped like a lost settle
+// race — `superseded` + `not_run` — so the loop stamps nothing on the record
+// and the winner's verdict stands. Logged once per execution per process.
+const HANDED_OFF_NOTED = new Set();
+function handedOffResult(record, item, ctx, { force = false } = {}) {
+  const claim = record && record.impl_claim;
+  if (!claim || !claim.store || !claim.execution_id || !completionKernel.isControllerRecord(record)) return null;
+  const lost = executionStore.fencedOut(executionInstance(), claim.execution_id);
+  if (lost == null && !force) return null;
+  if (!HANDED_OFF_NOTED.has(claim.execution_id)) {
+    HANDED_OFF_NOTED.add(claim.execution_id);
+    ctx.log(`work: ${item.node_id} — execution ${claim.execution_id} was handed to another process of this worker${lost != null ? ` (fence ${lost} lost)` : ""}; this process does not drive its pipeline again`);
+  }
+  return {
+    state: "superseded",
+    reason: `the gate pipeline was not run: execution ${claim.execution_id} is held by another process of this worker`,
+    gates: [],
+    facts: [],
+    attestation: null,
+    superseded: true,
+    not_run: true,
+    handed_off: true,
+    settled: null,
+  };
 }
 
 // Run the gate pipeline and, if every declared gate passed and the factory
@@ -15212,6 +15254,12 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
         return false;
       }
     });
+  // An execution this PROCESS lost to another holder (a second `spor work`
+  // process of the same worker took it over: lib/shell/execution-store.js
+  // FENCED_OUT) is never driven again by this process — not even far enough
+  // to take the pipeline lease the winner may need. Nothing is stamped.
+  const handedOff = handedOffResult(record, item, ctx);
+  if (handedOff) return handedOff;
   const claim = ctx.gateClaim || dispatchRuns.claimPipeline(home, item.run_id, { workerId: ctx.workerId || null, ownerLive, factory: (ctx.factory && ctx.factory.id) || null });
   if (ctx.gateClaim && currentLeaseToken(home, record) !== claim.token) claim.refused = "the re-gate ownership changed before judging";
   // The caller's handle on this pass's lease token (the work loop's markGate
@@ -15256,6 +15304,12 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   const reporter = controller ? executionReporter(cfg, record, { home, log: ctx.log }) : null;
   if (reporter) {
     const resumed = await reporter.resume();
+    if (resumed.handed_off) {
+      if (ownToken) {
+        try { dispatchRuns.releasePipeline(home, item.run_id, ownToken); } catch { /* lapses on its TTL */ }
+      }
+      return handedOffResult(record, item, ctx, { force: true });
+    }
     if (!resumed.ok) {
       // A LIVE lease held by another worker: the execution — and the
       // completion — is theirs. This pass judges nothing, files nothing, and
