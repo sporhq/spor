@@ -1282,9 +1282,13 @@ test("outbox: a gone holder's line whose fence's loss was never recorded on this
     fs.writeFileSync(aFile, `${JSON.stringify({ event: { type: "gate.settled", gate_id: "acceptance", attempt: 1, state: "failed" }, queued_at: new Date(Date.now() - 60000).toISOString(), fence: 1, by: aBy })}\n`);
     const E = box.open("pE-undated");
     assert.equal((await E.claim(id, { takeover: true })).fence, 3);
-    assert.deepEqual(E.owed(id), []);
+    assert.deepEqual(E.owed(id).map((l) => l.event.attempt), [1], "a stranded line may yet be judged owed, so its key stays spent");
     assert.equal((await E.reconcile(id, { fence: 3 })).replayed, 0);
     assert.deepEqual(fake.events(id).filter((e) => e.type === "gate.settled"), []);
+    // issue-spor-execution-event-lost-on-outbox-lock-contention: STRANDED,
+    // not dropped — the file is preserved byte-for-byte and reported.
+    assert.deepEqual(outboxLines(aFile).map((l) => l.event.attempt), [1], "the undatable line is left in its file, never adopted or deleted");
+    assert.deepEqual(E.outboxReport(id).map((f) => [f.state, f.lines, f.owner && f.owner.instance]), [["stranded", 1, "pA-undated"]]);
   } finally {
     await fake.close();
   }
@@ -1316,6 +1320,174 @@ test("outbox: owed() still counts a LIVE loser's lines (its pre-loss backlog is 
   } finally {
     await fake.close();
   }
+});
+
+// issue-spor-execution-event-lost-on-outbox-lock-contention
+test("outbox: a takeover-ledger write that fails strands the gone holder's file — preserved, reported stranded by outboxReport(), never dropped", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const box = sharedHomeFixture(fake, "outbox-ledgerfail");
+    const L = box.open("pL-ledgerfail");
+    const o = await L.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+    const id = o.execution.execution_id;
+    assert.equal((await L.event(id, { fence: 1, event: { type: "candidate.submitted", candidate: CAND } })).ok, true);
+    fake.state.down = true;
+    assert.equal((await L.event(id, { fence: 1, event: { type: "gate.settled", gate_id: "acceptance", attempt: 1, state: "passed" } })).deferred, true);
+    fake.state.down = false;
+    // The ledger becomes unwritable: W's grant of fence 2 (L's loss) never lands in it.
+    const ledgerFile = store.takeoverPath(box.home, "remote", id);
+    fs.rmSync(ledgerFile, { force: true });
+    fs.mkdirSync(ledgerFile);
+    await pause(5);
+    const W = box.open("pW-ledgerfail");
+    assert.equal((await W.claim(id, {})).fence, 2);
+    fs.rmSync(ledgerFile, { recursive: true });
+    // L dies; a restarted holder takes fence 3 (recorded) and reconciles.
+    const lFile = store.outboxPath(box.home, "remote", id, sha256("pL-ledgerfail").slice(0, 16));
+    const gone = deadPidNow();
+    const before = fs.readFileSync(lFile, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).map((l) => JSON.stringify({ ...l, by: { ...l.by, pid: gone, ticks: null } })).join("\n") + "\n";
+    fs.writeFileSync(lFile, before);
+    await pause(5);
+    const logs = [];
+    const W2 = store.openExecutionStore(box.cfg, { home: box.home, machine: "box", instance: "pW2-ledgerfail", log: (l) => logs.push(l) });
+    assert.equal((await W2.claim(id, {})).fence, 3);
+    const r = await W2.reconcile(id, { fence: 3 });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(fs.readFileSync(lFile, "utf8"), before, "the stranded file is untouched");
+    assert.deepEqual(fake.events(id).filter((e) => e.type === "gate.settled"), [], "nothing undatable was replayed");
+    assert.deepEqual(W2.outboxReport(id).map((f) => [f.state, f.lines]), [["stranded", 1]]);
+    assert.ok(logs.some((l) => /left stranded/.test(l)), logs.join("\n"));
+  } finally {
+    await fake.close();
+  }
+});
+
+// A REAL second process holds the execution's outbox lock until told to let go.
+function holdOutboxLockInChild(home, id) {
+  const file = path.join(path.dirname(store.outboxPath(home, "remote", id)), `${id}.outbox`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const held = path.join(tmp("lockchild"), "held");
+  const release = `${held}.release`;
+  const script = `
+    const fs = require("node:fs");
+    const { withLocalExecutionLock } = require(${JSON.stringify(path.join(__dirname, "..", "lib", "shell", "local-execution-lock.js"))});
+    withLocalExecutionLock(${JSON.stringify(file)}, async () => {
+      fs.writeFileSync(${JSON.stringify(held)}, "1");
+      while (!fs.existsSync(${JSON.stringify(release)})) await new Promise((r) => setTimeout(r, 10));
+    }).then(() => process.exit(0));`;
+  const child = require("node:child_process").spawn(process.execPath, ["-e", script], { stdio: "ignore" });
+  const exited = new Promise((r) => child.on("exit", r));
+  return {
+    ready: async () => {
+      for (let i = 0; i < 500 && !fs.existsSync(held); i++) await pause(10);
+      assert.ok(fs.existsSync(held), "the child took the lock");
+    },
+    release: async () => {
+      fs.writeFileSync(release, "1");
+      await exited;
+    },
+  };
+}
+
+test("outbox lock contention: event() waits a bounded budget and reports the event UNSPOOLED (nothing written), never a silent loss", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const home = tmp("lockbudget");
+    const cfg = remoteCfg(home, fake.base);
+    const A = store.openExecutionStore(cfg, { home, machine: "box", instance: "pA-lockbudget", outboxLock: { attempts: 5, waitMs: 10 } });
+    const o = await A.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+    const id = o.execution.execution_id;
+    const child = holdOutboxLockInChild(home, id);
+    await child.ready();
+    const r = await A.event(id, { fence: 1, event: { type: "candidate.submitted", candidate: CAND } });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, "outbox_unwritable");
+    assert.equal(r.unspooled, true, JSON.stringify(r));
+    assert.equal(r.locked, true);
+    assert.deepEqual(A.outbox(id), [], "nothing was spooled past the lock");
+    await child.release();
+    assert.equal((await A.event(id, { fence: 1, event: { type: "candidate.submitted", candidate: CAND } })).ok, true);
+    assert.equal(fake.events(id).filter((e) => e.type === "candidate.submitted").length, 1);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("outbox lock contention: the reporter HOLDS an unspooled event in memory, keeps later events behind it, and the next pass's heartbeat delivers each exactly once", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const home = tmp("lockhold");
+    const cfg = remoteCfg(home, fake.base);
+    const open = () => store.openExecutionStore(cfg, { home, machine: "box", instance: "pA-lockhold", outboxLock: { attempts: 5, waitMs: 10 } });
+    const opened = await open().open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+    const id = opened.execution.execution_id;
+    const record = { run_id: "run-lockhold", node_id: "task-x", impl_claim: { execution_id: id, store: "remote", fence: opened.fence, gates: ["acceptance"], completion: { by: "controller", after: "gates" } } };
+    const rp = dispatchRuns.runPaths(home, record.run_id);
+    fs.mkdirSync(path.dirname(rp.record), { recursive: true });
+    fs.writeFileSync(rp.record, JSON.stringify(record));
+    const logs = [];
+    const reporter = spor.executionReporter(cfg, record, { home, store: open(), log: (l) => logs.push(l) });
+    assert.equal((await reporter.resume()).ok, true);
+    assert.equal((await reporter.candidateSubmitted(CAND)).ok, true);
+    const child = holdOutboxLockInChild(home, id);
+    await child.ready();
+    const first = await reporter.gateSettled("acceptance", "failed");
+    assert.equal(first.ok, false);
+    assert.equal(first.held, true, JSON.stringify(first));
+    const second = await reporter.gateSettled("acceptance", "passed");
+    assert.equal(second.held, true, "a later event queues behind the held one, never ahead of it");
+    assert.equal(reporter.held, 2);
+    assert.ok(spor.HELD_REPORTERS.has(reporter));
+    assert.ok(logs.some((l) => /held in memory/.test(l)), logs.join("\n"));
+    assert.equal((await reporter.confirm()).confirmed, false, "no completion while a verdict is held");
+    reporter.leave(); // the pipeline settles; the held events are still owed
+    await spor.renewLiveExecutions();
+    assert.equal(reporter.held, 2, "still contended: still held, nothing lost");
+    await child.release();
+    await spor.renewLiveExecutions();
+    assert.equal(reporter.held, 0);
+    assert.equal(spor.HELD_REPORTERS.has(reporter), false);
+    assert.deepEqual(fake.events(id).filter((e) => e.type === "gate.settled").map((e) => [e.attempt, e.state]), [[1, "failed"], [2, "passed"]], "both landed, in order, exactly once");
+    await spor.renewLiveExecutions();
+    assert.equal(fake.events(id).filter((e) => e.type === "gate.settled").length, 2, "no re-send once delivered");
+    assert.deepEqual(open().outbox(id), []);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("outbox lock contention: overlapping flushes (a heartbeat during a report) never send one event twice at once nor drop the next held one", async () => {
+  const calls = [];
+  let n = 0;
+  const st = {
+    ttlMs: 1000,
+    async event(_id, { event }) {
+      const which = ++n;
+      calls.push(event.attempt);
+      if (event.attempt === 1) {
+        await pause(which === 1 ? 40 : 100);
+        return { ok: true };
+      }
+      await pause(60);
+      return { ok: false, code: "outbox_unwritable", unspooled: true, message: "locked" };
+    },
+    async renew() {
+      return { ok: true };
+    },
+  };
+  const home = tmp("flush-overlap");
+  const record = { run_id: "run-overlap", node_id: "task-x", impl_claim: { execution_id: "exec-1", store: "remote", fence: 1, gates: ["acceptance"], completion: { by: "controller", after: "gates" } } };
+  const reporter = spor.executionReporter({ userConfigHome: () => home }, record, { home, store: st });
+  const first = reporter.gateSettled("acceptance", "failed");
+  await pause(5);
+  const beat = reporter.renew();
+  await first;
+  const second = await reporter.gateSettled("acceptance", "passed");
+  await beat;
+  assert.deepEqual(calls, [1, 2], "the first event was sent once; the heartbeat waited for the running flush");
+  assert.equal(second.held, true);
+  assert.equal(reporter.held, 1, "the contended event is still held, not removed by another flush");
+  spor.HELD_REPORTERS.delete(reporter);
 });
 
 test("restart takeover still works: a NEW process instance (no in-memory loss record) takes over the execution its dead predecessor held, at an advanced fence", async () => {

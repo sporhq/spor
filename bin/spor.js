@@ -10881,7 +10881,7 @@ async function cmdExecutions(cfg, { values, positionals: pos }) {
     if (owed.length) out(`  outbox: ${owed.length} event(s) owed to the server — replayed on the pipeline's next call`);
     // Per file, who holds it: a file whose owner is live elsewhere or cannot
     // be judged is stranded until its owner returns (or GC), not replayed.
-    const OUTBOX_STATE = { own: "this process", shared: "shared — adopted by the next holder", adoptable: "owner gone — adopted by the next holder", live: "held by a live process — stranded until it replays or loses", unknown: "owner unknown (another machine or unreadable) — stranded" };
+    const OUTBOX_STATE = { own: "this process", shared: "shared — adopted by the next holder", adoptable: "owner gone — adopted by the next holder", live: "held by a live process — stranded until it replays or loses", unknown: "owner unknown (another machine or unreadable) — stranded", stranded: "owner gone, but a line's fence loss is undatable on this box — STRANDED for a person to judge (never adopted or deleted)" };
     for (const f of store.outboxReport ? store.outboxReport(x.execution_id) : []) {
       const who = f.owner && f.owner.instance != null ? ` instance ${short(f.owner.instance)}${f.owner.pid != null ? ` pid ${f.owner.pid}` : ""}${f.owner.machine ? ` on ${f.owner.machine}` : ""}` : "";
       out(`    ${path.basename(f.file)}: ${f.lines} line(s)${who}; ${OUTBOX_STATE[f.state] || f.state}`);
@@ -14678,6 +14678,10 @@ const GATE_VERDICT_TO_STATE = Object.freeze({
 // to 5min). A reporter registers itself when it resumes and leaves when its
 // pipeline settles.
 const LIVE_EXECUTIONS = new Map();
+// Reporters holding events their store could not spool. Kept apart from
+// LIVE_EXECUTIONS because a pipeline that settles LEAVES that map while its
+// held events are still owed; the per-pass heartbeat flushes both.
+const HELD_REPORTERS = new Set();
 
 // One REPORTER per pipeline, bound to a record's claim: the fence-bearing
 // door every §7.3 event and every ownership check goes through. Returns null
@@ -14760,14 +14764,68 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
     }
   };
 
-  async function send(event) {
-    if (fence == null) return { ok: false, code: "not_owned", message: "no fence" };
+  // Events the store could NOT spool (its outbox lock stayed contended past
+  // the store's bounded wait, or the outbox could not be written at all):
+  // nothing durable holds them, so they are held HERE, in order, and re-sent
+  // ahead of anything newer — on the next report, the per-pass heartbeat
+  // (renew), a resume, and before confirm() — until the store takes them.
+  // Never dropped (issue-spor-execution-event-lost-on-outbox-lock-contention).
+  // A process that dies with events held loses them; the window is the lock
+  // wait, not a partition (a partition spools).
+  const held = [];
+  let holding = false;
+  async function deliver(event) {
     let r;
     try {
       r = await st.event(id, { fence, event });
     } catch (e) {
       r = { ok: false, code: "error", message: String((e && e.message) || e) };
     }
+    return r;
+  }
+  // Re-send what is held, oldest first, stopping at the first the store still
+  // cannot spool. ONE flush at a time (a heartbeat's renew can overlap a
+  // pipeline's report): a second caller waits for the running flush and then
+  // runs its own, so no event is sent twice concurrently and none is removed
+  // by a flush that did not deliver it. Each delivered event's answer is
+  // handled once, by the flush that delivered it, and recorded in `answered`
+  // for the sender waiting on it. Resolves the blocking failure, or null.
+  const answered = new WeakMap();
+  let flushing = Promise.resolve();
+  async function drainHeld() {
+    while (held.length && fence != null) {
+      const ev = held[0];
+      const r = await deliver(ev);
+      if (r.unspooled) {
+        if (!holding) log(`work: ${record.node_id} — execution ${id}: the outbox could not take a ${ev.type} event (${r.message}); ${held.length} event(s) held in memory and re-sent on the next pass — never dropped`);
+        holding = true;
+        HELD_REPORTERS.add(reporter);
+        return r;
+      }
+      const at = held.indexOf(ev);
+      if (at >= 0) held.splice(at, 1);
+      answered.set(ev, handle(ev, r));
+      if (!held.length && holding) {
+        holding = false;
+        HELD_REPORTERS.delete(reporter);
+        log(`work: ${record.node_id} — execution ${id}: the held event(s) reached the outbox`);
+      }
+    }
+    return null;
+  }
+  function flushHeld() {
+    const run = flushing.then(drainHeld, drainHeld);
+    flushing = run.then(() => {}, () => {});
+    return run;
+  }
+  async function send(event) {
+    if (fence == null) return { ok: false, code: "not_owned", message: "no fence" };
+    if (!held.includes(event)) held.push(event);
+    const blocked = await flushHeld();
+    if (answered.has(event)) return answered.get(event);
+    return { ...(blocked || { code: "outbox_unwritable", message: "the outbox has not yet taken this event" }), ok: false, held: true, pending: held.length };
+  }
+  function handle(event, r) {
     if (r.ok) {
       if (r.execution) last = r.execution;
       return r;
@@ -14804,6 +14862,11 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
     get record() {
       return last;
     },
+    // How many events this reporter holds that the store could not yet spool.
+    get held() {
+      return held.length;
+    },
+    flushHeld: async () => (await flushHeld()) == null,
     // Re-take the lease at the start of every pipeline pass (a fresh launch,
     // a resumed orphan, a re-gate): a same-owner claim keeps its fence, an
     // expired dead worker's lease advances it, a live foreign lease refuses.
@@ -14833,6 +14896,7 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
         }
         if (r.fence !== fence) log(`work: ${record.node_id} — execution ${id} re-claimed at fence ${r.fence}${fence != null ? ` (was ${fence})` : ""}`);
         stampFence(r.fence, r.execution && r.execution.owner ? r.execution.owner.lease_expires_at : null);
+        if (held.length) await reporter.flushHeld();
         LIVE_EXECUTIONS.set(id, reporter);
         return { ok: true, fence: r.fence };
       }
@@ -14856,6 +14920,7 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
     },
     async renew() {
       if (fence == null) return { ok: false };
+      if (held.length) await reporter.flushHeld();
       const r = await st.renew(id, { fence, ttl_ms: st.ttlMs });
       if (r.ok && r.execution) last = r.execution;
       else if (!r.ok && (r.ownership === false || executionKernel.OWNERSHIP_CODES.includes(r.code))) {
@@ -14869,6 +14934,8 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
     // confirms. Never "probably still mine".
     async confirm() {
       if (fence == null || !owned) return { ok: false, confirmed: false, reason: `execution ${id} is not held by this worker` };
+      // A verdict the outbox never took must land before the resolving edge.
+      if (held.length && !(await reporter.flushHeld())) return { ok: false, confirmed: false, reason: `execution ${id}: ${held.length} event(s) could not yet be spooled to the outbox` };
       const r = await st.confirmOwnership(id, fence);
       if (!r.confirmed && r.ownership === false) owned = false;
       if (r.execution) last = r.execution;
@@ -14878,7 +14945,7 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
     candidateSubmitted: async (candidate, { premature = false } = {}) => {
       candidateTip = candidate;
       const pinnedResult = await send({ type: candidate.supersedes ? "candidate.superseded" : "candidate.submitted", candidate, ...(premature ? { premature_resolution: true } : {}) });
-      if (candidate.reference?.verified_at && (pinnedResult.ok || pinnedResult.deferred)) {
+      if (candidate.reference?.verified_at && (pinnedResult.ok || pinnedResult.deferred || pinnedResult.held)) {
         return send({ type: "candidate.published", candidate_id: candidate.candidate_id, reference: candidate.reference, verified_at: candidate.reference.verified_at });
       }
       return pinnedResult;
@@ -14950,6 +15017,8 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
     async release() {
       LIVE_EXECUTIONS.delete(id);
       if (fence == null) return { ok: false };
+      // A release is terminal: anything still held would then never land.
+      if (held.length && !(await reporter.flushHeld())) return { ok: false, code: "outbox_unwritable", held: true, pending: held.length, message: `execution ${id}: ${held.length} event(s) could not yet be spooled; not released` };
       return st.release(id, { fence });
     },
     leave() {
@@ -14965,6 +15034,16 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
 // the same per-pass slot as the proposal check and the completion reconciler,
 // so a worker whose gates run for hours keeps its lease without a timer.
 async function renewLiveExecutions(log = () => {}) {
+  // A settled pipeline's reporter that still holds unspooled events is no
+  // longer beating, but what it holds is still owed: re-send it here.
+  for (const rep of [...HELD_REPORTERS]) {
+    if (LIVE_EXECUTIONS.get(rep.id) === rep) continue;
+    try {
+      await rep.flushHeld();
+    } catch (e) {
+      log(`work: execution ${rep.id} held-event flush threw (${(e && e.message) || e})`);
+    }
+  }
   for (const [id, rep] of [...LIVE_EXECUTIONS.entries()]) {
     try {
       const r = await rep.renew();
@@ -20732,7 +20811,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
+module.exports = { gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
 
 if (require.main === module) {
   main()
