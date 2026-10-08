@@ -258,9 +258,9 @@ in this order:
 | `runnable` | on this pass's dispatchable page AND eligible for THIS worker by the dispatcher's own predicate (`classifyWorkItem`: accept policy, factory repo scope, assignee, decline finding) | movable |
 | `ineligible` | on the page, but that same predicate refuses it here — the verdict is the reason (the dispatcher would skip it on exactly these grounds) | stuck |
 | `undispatchable` | located on the queue but not on the dispatchable page (held for triage, a stale backend's demoted blocked item) | stuck |
-| `claimed` | absent from a COMPLETE walk, otherwise dispatchable, with an `assigned` edge to another agent or to a person (a person's claim writes the same edge), for less than `work.runMaxMs` | movable |
-| `claim-stale` | the same, pinned past `work.runMaxMs`: a claim that never moved — named, never waited on forever | stuck |
-| `off-queue` | absent from a complete walk with no foreign claim (held for triage, muted, dormant, a question, not queueable work) | stuck |
+| `claimed` | off the page with a lease in force (`lease_state` on the program envelope's row: in progress or reserved — no clock, read even off an incomplete walk); or, where the envelope carries no lease reading (an older server), absent from a COMPLETE walk, otherwise dispatchable, with an `assigned` edge to another agent or to a person (a person's claim writes the same edge, and counts even when this box's own agent is assigned too), for less than `work.runMaxMs` | movable |
+| `claim-stale` | the edge reading only, pinned past `work.runMaxMs`: a claim that never moved — named, never waited on forever | stuck |
+| `off-queue` | absent from a complete walk with no claim — no lease in force where the envelope says so, whatever `assigned` edge the node carries (held for triage, muted, dormant, a question, not queueable work) | stuck |
 | `unknown` | absent from the page and the walk was NOT complete (a dead read, a backend without `?offset`, the page ceiling) | undecided |
 
 The standing is the fold over those buckets: `complete` when no member

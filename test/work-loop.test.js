@@ -4272,6 +4272,58 @@ test("--program (residual 1): a live person claim is time-bounded movement, not 
   assert.strictEqual(status.stop_reason, "stopped by the test driver");
 });
 
+// issue-spor-program-envelope-missing-lease-state: where the program envelope
+// carries the server's lease reading, the lease — not the `assigned` edges —
+// says whether a hidden member is being worked.
+test("--program: the envelope's lease reading decides a hidden member, and the edges are not read", () => {
+  const { programStanding } = workLoop;
+  const m = (extra = {}) => ({ id: "c", bucket: "open", status: "open", human: null, blockers: [], agents: [], persons: [], ...extra });
+  const hidden = { complete: true, located: new Map() };
+  const partial = { complete: false, located: new Map() };
+  const run = (member, queue, opts = {}) => programStanding({ members: [member], queue }, { page: new Map(), selfAgent: "agent-me", foreignHoldMs: 1000, now: 10, ...opts });
+
+  // A live lease: claimed, no clock, named by its holder — even with no edge.
+  let r = run(m({ lease: { state: "in_progress", by: "person-bob" } }), hidden);
+  assert.strictEqual(r.state, "moving");
+  assert.deepStrictEqual(r.members[0], { id: "c", bucket: "claimed", why: "in progress by person-bob" });
+  assert.strictEqual(r.foreignSince.size, 0, "a lease needs no staleness clock");
+  // ...never stale however long it has been held (the server lapses it).
+  r = run(m({ lease: { state: "in_progress", by: "person-bob" }, persons: ["person-bob"] }), hidden, { now: 1e9, foreignSince: new Map([[workLoop.programForeignKey("c", ["person-bob"]), 0]]) });
+  assert.strictEqual(r.members[0].bucket, "claimed");
+  // A reservation is a claim too, and a lease holds off an incomplete read.
+  assert.strictEqual(run(m({ lease: { state: "reserved", by: "person-ann" } }), hidden).members[0].why, "reserved by person-ann");
+  assert.strictEqual(run(m({ lease: { state: "in_progress", by: "person-bob" } }), partial).members[0].bucket, "claimed");
+  // No lease in force: an `assigned` edge (a mute, a wake date, mere routing)
+  // is NOT a claim — off-queue at once, never 24h of "claimed" then claim-stale.
+  r = run(m({ lease: null, persons: ["person-bob"], agents: ["agent-other"] }), hidden);
+  assert.strictEqual(r.state, "halted");
+  assert.strictEqual(r.members[0].bucket, "off-queue");
+  assert.match(r.members[0].why, /no lease in force/);
+  assert.strictEqual(run(m({ lease: null }), partial).members[0].bucket, "unknown");
+
+  // And through the remote snapshot's closure: the envelope's flag is what
+  // makes `lease` present at all.
+  const { membershipClosure } = require("../lib/shell/work-program.js");
+  const tree = [
+    { id: "a", parent: "p", edge: "member-of-program", bucket: "open", lease_state: "in_progress", lease_by: "person-bob" },
+    { id: "b", parent: "p", edge: "member-of-program", bucket: "open", lease_state: null },
+  ];
+  assert.deepStrictEqual(membershipClosure({ root_id: "p", leases: true, tree }).map((x) => x.lease), [{ state: "in_progress", by: "person-bob" }, null]);
+  assert.ok(membershipClosure({ root_id: "p", tree }).every((x) => !("lease" in x)), "an envelope without the reading leaves `lease` absent");
+});
+
+// fa5936f merge review: a hidden member assigned to BOTH this box's agent and
+// a person still carries the person's claim (the interim, lease-less rule).
+test("--program (interim rule): a person claim counts even when this box's own agent is assigned too", () => {
+  const { programStanding } = workLoop;
+  const m = { id: "c", bucket: "open", status: "open", human: null, blockers: [], agents: ["agent-me", "agent-other"], persons: ["person-bob"] };
+  const r = programStanding({ members: [m], queue: { complete: true, located: new Map() } }, { page: new Map(), selfAgent: "agent-me", foreignHoldMs: 1000, now: 10 });
+  assert.strictEqual(r.state, "moving");
+  assert.strictEqual(r.members[0].bucket, "claimed");
+  // Our own agent's assignment still drops the other agents, as before.
+  assert.ok(r.foreignSince.has(workLoop.programForeignKey("c", ["person-bob"])));
+});
+
 // 2. The offset walk overlapped its windows but never CHECKED the overlap: a
 // re-rank between two requests that slid the boundary by more than the overlap
 // skipped a member unread, and the walk still reported `complete` — so the

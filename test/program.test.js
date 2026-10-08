@@ -255,6 +255,46 @@ test("walkProgram: a member-of-program cycle back to the root terminates", () =>
   assert.deepEqual(r.node_ids, ["task-a"]);
 });
 
+test("walkProgram: an injected lease table annotates every row with lease_state (issue-spor-program-envelope-missing-lease-state)", () => {
+  const g = tmpGraph(
+    Object.fromEntries([
+      node("task-hub", "task"),
+      node("task-live", "task", { edges: [["member-of-program", "task-hub"]] }),
+      node("task-res", "task", { edges: [["member-of-program", "task-hub"]] }),
+      node("task-lapsed", "task", { edges: [["member-of-program", "task-hub"]] }),
+      node("task-free", "task", { edges: [["member-of-program", "task-hub"]] }),
+    ])
+  ).load();
+  const plain = walkProgram(g, "task-hub");
+  assert.ok(!("leases" in plain), "no table injected: no envelope flag");
+  assert.ok(plain.tree.every((r) => !("lease_state" in r) && !("lease_by" in r)), "no table injected: rows unchanged");
+
+  const leases = {
+    "task-live": { by: "person-bob", expires: 2000 },
+    "task-res": { by: "person-ann", expires: 2000, reserved: true },
+    "task-lapsed": { by: "person-bob", expires: 500 },
+  };
+  const r = walkProgram(g, "task-hub", { leases, now: 1000 });
+  assert.equal(r.leases, true);
+  const byId = Object.fromEntries(r.tree.map((x) => [x.id, x]));
+  assert.equal(byId["task-live"].lease_state, "in_progress");
+  assert.equal(byId["task-live"].lease_by, "person-bob");
+  assert.equal(byId["task-res"].lease_state, "reserved");
+  assert.equal(byId["task-res"].lease_by, "person-ann");
+  assert.equal(byId["task-lapsed"].lease_state, null, "a lapsed lease is not in force");
+  assert.ok(!("lease_by" in byId["task-lapsed"]));
+  assert.equal(byId["task-free"].lease_state, null);
+  // The lease reading is additive: buckets and progress are unchanged by it.
+  assert.deepEqual(r.progress, plain.progress);
+  // An empty table still says the walk could read leases.
+  assert.equal(walkProgram(g, "task-hub", { leases: {}, now: 1000 }).leases, true);
+
+  const text = programLib.renderReport(r);
+  assert.match(text, /task-live  Title of task-live  \[in progress by person-bob\]/);
+  assert.match(text, /task-res  Title of task-res  \[reserved by person-ann\]/);
+  assert.doesNotMatch(text, /task-free.*\[/);
+});
+
 test("renderReport: names blocking items outside a declared program", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-hub", "task"),
