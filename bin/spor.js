@@ -14462,8 +14462,12 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
     opened = await store.open(openArgs);
   }
   if (!opened.ok) {
-    const foreign = opened.code === "execution_open";
-    return { ok: false, kind: foreign ? "foreign-hold" : "store", reason: `execution store refused ${item.id}: ${opened.code}: ${opened.message}${foreign && opened.execution ? ` (execution ${opened.execution.execution_id})` : ""}` };
+    // `handed_off`: this PROCESS lost the item's live execution to another
+    // holder earlier in its life (lib/shell/execution-store.js) and is refused
+    // locally, so the re-open never advances the winner's fence — the item is
+    // the winner's, exactly a foreign hold.
+    const foreign = opened.code === "execution_open" || !!opened.handed_off;
+    return { ok: false, kind: foreign ? "foreign-hold" : "store", ...(opened.handed_off ? { handed_off: true } : {}), reason: `execution store refused ${item.id}: ${opened.code}: ${opened.message}${foreign && opened.execution ? ` (execution ${opened.execution.execution_id})` : ""}` };
   }
   let fence = opened.fence;
   let execution = opened.execution;
@@ -14477,7 +14481,7 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
     if (!claimed.ok) {
       const h = claimed.holder || (execution.owner || null);
       const who = h ? `${h.worker}${h.machine ? ` on ${h.machine}` : ""} until ${h.lease_expires_at}` : "another worker";
-      return { ok: false, kind: claimed.code === "already_owned" || claimed.code === "lease_live" ? "foreign-hold" : "store", reason: `execution ${execution.execution_id} on ${item.id} is held by ${who} (${claimed.code}: ${claimed.message})` };
+      return { ok: false, kind: claimed.code === "already_owned" || claimed.code === "lease_live" || claimed.handed_off ? "foreign-hold" : "store", ...(claimed.handed_off ? { handed_off: true } : {}), reason: `execution ${execution.execution_id} on ${item.id} is held by ${who} (${claimed.code}: ${claimed.message})` };
     }
     fence = claimed.fence;
     execution = claimed.execution;

@@ -4165,7 +4165,11 @@ content-addressed ids byte-for-byte (`exec-<16 hex>` of the NUL-joined
 the literal `local`, the word the server falls back to for an identity with no
 org), the same event vocabulary and idempotency keys, the same fence
 arithmetic and the same `boundary_reached` predicate — with the hash injected
-like every kernel module. `lib/shell/execution-store.js` is one interface
+like every kernel module. "Byte-identical with spor-server" is a claim about
+those SHARED REDUCER FUNCTIONS (`claim()`, `renew()`, `release()`, the event
+fold, the id and key derivations) and what they produce, not about the whole
+file: the client kernel is a port with its own header and its own comments.
+`lib/shell/execution-store.js` is one interface
 with two backings, and `openExecutionStore` picks by mode:
 
 - **Remote** drives `/v1/executions` (API.md §3): `POST` opens (or
@@ -4230,7 +4234,21 @@ its candidate, integration cannot start before the gates) hold across the
 outage; a permanent refusal of one spooled event (`422`, an off-state `409`)
 drops that event with a log line and keeps replaying, a terminal execution
 drops the rest, and an ownership refusal (`fence_stale`, `not_owned`,
-`lease_expired`) KEEPS the spool as evidence and stops. What the client never
+`lease_expired`) KEEPS the spool as evidence and stops. The outbox is keyed by
+PROCESS INSTANCE (`exec/<id>.outbox.<tag>.jsonl`; an instance-less caller keeps
+the shared `<id>.outbox.jsonl`) — two `spor work` processes of one owner share
+this directory, and the winner's replay must never send the loser's events
+under the winner's fence (issue-spor-execution-sticky-loss-gaps-open-and-outbox).
+A process replays only what it spooled; a process that records the sticky loss
+below DROPS what it still owed, since that can never land under its fence; and
+another instance's file is ADOPTED only when its author is provably gone from
+this box (pid + start ticks) and only the lines it queued before the adopter
+acquired the execution — a dead predecessor's partition backlog, never a
+stale-fence write. The loss is sticky on every door that could hand the fence
+back: a claim of the lost id, and a RE-OPEN of its (item, factory), which the
+kernel would otherwise turn into a re-claim at an advanced fence — refused
+locally (`handed_off`, a foreign hold at `claimExecutionHold`) until the lost
+execution is terminal, when an open addresses a new pipeline attempt. What the client never
 does is write the resolving edge on the strength of local state:
 `writeCompletion` runs the store's `confirm` between the premature-edge
 retype and step (1) — flush the outbox, then `renew` under the fence — and

@@ -1681,7 +1681,9 @@ idempotent event log, the pinned completion boundary — is held by the SERVER's
 contract; the server refuses a resolving edge into a held item, the one thing a
 client cannot) and by a shape-compatible local store under
 `journal/executions/<tenant>/` in personal mode. `lib/kernel/execution.js` is a
-PORT of the server's reducer and must stay byte-identical to it — the ids
+PORT of the server's reducer and its shared reducer functions (`claim()` and
+the rest — not the whole file, which has its own header) must stay
+byte-identical to it — the ids
 (`exec-<16 hex>` over the NUL-joined `(tenant, node_id, factory,
 pipeline_attempt)`), the record shape, the event keys, the fence arithmetic —
 so a local execution and a hosted one describe the same thing (the test pins

@@ -743,8 +743,13 @@ test("local store: a second process instance of the same (worker, machine) re-op
   assert.equal((await p1.event(id, { fence: 1, event: { type: "stage.started", attempt: 1 } })).code, "fence_stale");
   assert.equal((await p1.renew(id, { fence: 1 })).code, "fence_stale");
   assert.equal((await p2.event(id, { fence: 2, event: { type: "stage.started", attempt: 1 } })).ok, true);
-  const back = await p1.open(args);
-  assert.equal(back.fence, 3, "the first process re-opening fences the second out in turn");
+  // The first process LOST it: its re-open is refused locally rather than
+  // fencing the second out in turn (issue-spor-execution-sticky-loss-gaps-
+  // open-and-outbox). A third, fresh instance re-opening still advances it.
+  assert.equal((await p1.open(args)).handed_off, true, "the loser never re-opens its way back to a fence");
+  const p3 = store.openExecutionStore(null, { home, mode: "local", worker: "agent-a", machine: "box", instance: "p3", pinRead });
+  const back = await p3.open(args);
+  assert.equal(back.fence, 3, "a third process re-opening fences the second out in turn");
   const claimed = await p2.claim(id, {});
   assert.equal(claimed.fence, 4, "a claim by a different instance advances it too");
   assert.equal((await p2.claim(id, {})).fence, 4, "a same-instance re-claim keeps it");
@@ -920,6 +925,251 @@ test("bin/spor.js callers stop at an execution THIS process lost: the gate pipel
     assert.equal(fake.record(id).stage === "refused" || !!fake.record(id).released_at, false, "nothing ended on the winner's behalf");
   } finally {
     spor.LIVE_EXECUTIONS.clear();
+    await fake.close();
+  }
+});
+
+// The loss covers the OPEN door too (issue-spor-execution-sticky-loss-gaps-
+// open-and-outbox): a re-open of the item names no execution id, yet the
+// kernel would re-claim the live execution for this (different) instance and
+// advance the fence past the winner's — so a process that lost an item's
+// execution is refused the re-open locally until that execution is terminal.
+test("a process that lost an execution is refused a RE-OPEN of its item (no open reaches the store, the winner keeps its fence) until the lost execution is terminal", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const { proc, seed, pass } = twoProcessFixture(fake, "reopen");
+    const A = proc("pA-reopen");
+    const B = proc("pB-reopen");
+    const record = await openedRecord(A, "run-ro");
+    seed(A, record);
+    seed(B, record);
+    const id = record.impl_claim.execution_id;
+    const args = { node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" };
+    const a1 = pass(A, record);
+    assert.deepEqual(await a1.resume(), { ok: true, fence: 1 });
+    const b1 = pass(B, record);
+    assert.deepEqual(await b1.resume(), { ok: true, fence: 2 });
+    assert.equal((await a1.candidateSubmitted(CAND)).code, "fence_stale");
+    a1.leave();
+    const opens = () => fake.state.requests.filter((r) => r.method === "POST" && r.path === "/v1/executions").length;
+    const before = opens();
+    for (let n = 0; n < 2; n++) {
+      const again = await A.open().open(args);
+      assert.equal(again.ok, false);
+      assert.equal(again.handed_off, true, "the re-open is refused as handed off");
+      assert.equal(again.fence ?? null, null, "the loser is never handed a fence");
+    }
+    assert.equal(opens(), before, "no open was sent for the lost item");
+    assert.equal(fake.record(id).owner.fence, 2);
+    assert.equal(fake.record(id).owner.instance, "pB-reopen");
+    // Once the winner ENDS the execution, an open addresses a new pipeline
+    // attempt (a different execution), which the loser may take.
+    assert.equal((await B.open().release(id, { fence: 2 })).ok, true);
+    const fresh = await A.open().open(args);
+    assert.equal(fresh.ok, true, JSON.stringify(fresh));
+    assert.notEqual(fresh.execution.execution_id, id, "a new pipeline attempt, never the lost execution");
+    assert.equal(fresh.fence, 1);
+    b1.leave();
+  } finally {
+    spor.LIVE_EXECUTIONS.clear();
+    await fake.close();
+  }
+});
+
+test("local store: the re-open refusal holds in personal mode too — the lost item's live execution is never re-claimed by the loser", async () => {
+  const home = tmp("reopen-local");
+  const pinRead = (id) => ({ revision: `rev-${id}`, repo: "spor" });
+  const p1 = store.openExecutionStore(null, { home, mode: "local", worker: "agent-a", machine: "box", instance: "p1-reopen", pinRead });
+  const p2 = store.openExecutionStore(null, { home, mode: "local", worker: "agent-a", machine: "box", instance: "p2-reopen", pinRead });
+  const args = { node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" };
+  const first = await p1.open(args);
+  const id = first.execution.execution_id;
+  assert.equal((await p2.open(args)).fence, 2);
+  assert.equal((await p1.renew(id, { fence: 1 })).code, "fence_stale");
+  const again = await p1.open(args);
+  assert.equal(again.handed_off, true);
+  const rec = await p2.get(id);
+  assert.equal(rec.execution.owner.instance, "p2-reopen", "the winner still holds it");
+  assert.equal(rec.execution.owner.fence, 2);
+});
+
+test("bin/spor.js: claimExecutionHold for an item whose execution THIS process lost is refused as a foreign hold, with no open sent and no fence handed back", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-reopen": itemNode("task-reopen"), "factory-t": itemNode("factory-t") } });
+  try {
+    const home = tmp("hold-reopen");
+    const cfg = remoteCfg(home, fake.base);
+    const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller", after: "gates" } });
+    const held = await spor.claimExecutionHold(cfg, { id: "task-reopen" }, factory, { home });
+    assert.equal(held.ok, true, held.reason);
+    const id = held.executionId;
+    const record = { run_id: "run-hr", node_id: "task-reopen", ...held.recordFields };
+    const rp = dispatchRuns.runPaths(home, "run-hr");
+    fs.mkdirSync(path.dirname(rp.record), { recursive: true });
+    fs.writeFileSync(rp.record, JSON.stringify(record));
+    const mine = spor.executionReporter(cfg, record, { home });
+    assert.equal((await mine.resume()).ok, true);
+    const other = store.openExecutionStore(remoteCfg(tmp("hold-reopen-other"), fake.base), { machine: os.hostname(), instance: "p-hold-winner" });
+    assert.equal((await other.claim(id, {})).ok, true);
+    assert.equal((await mine.candidateSubmitted(CAND)).code, "fence_stale");
+    mine.leave();
+    const opens = () => fake.state.requests.filter((r) => r.method === "POST" && r.path === "/v1/executions").length;
+    const before = opens();
+    const again = await spor.claimExecutionHold(cfg, { id: "task-reopen" }, factory, { home });
+    assert.equal(again.ok, false);
+    assert.equal(again.kind, "foreign-hold");
+    assert.equal(again.handed_off, true);
+    assert.equal(again.fence ?? null, null);
+    assert.equal(opens(), before, "the re-open never reached the store");
+    assert.equal(fake.record(id).owner.instance, "p-hold-winner");
+    assert.equal(fake.record(id).owner.fence, 2);
+  } finally {
+    spor.LIVE_EXECUTIONS.clear();
+    await fake.close();
+  }
+});
+
+// The OUTBOX is keyed by process instance (issue-spor-execution-sticky-loss-
+// gaps-open-and-outbox): two processes of one owner on one box share the
+// outbox DIRECTORY, and the winner's reconcile must never send what the loser
+// spooled under the winner's fence.
+function sharedHomeFixture(fake, tag) {
+  const home = tmp(tag);
+  const cfg = remoteCfg(home, fake.base);
+  return { home, cfg, open: (instance) => store.openExecutionStore(cfg, { home, machine: "box", instance }) };
+}
+
+test("outbox: a loser's spooled event is never replayed under the winner's fence — the winner replays only its own, and the loser drops its own when the loss is recorded", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const box = sharedHomeFixture(fake, "outbox-loser");
+    const A = box.open("pA-outbox");
+    const B = box.open("pB-outbox");
+    const o = await A.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+    const id = o.execution.execution_id;
+    assert.equal(o.fence, 1);
+    assert.equal((await A.event(id, { fence: 1, event: { type: "candidate.submitted", candidate: CAND } })).ok, true);
+    // B (a second live process of the same owner, same box) takes the fence.
+    assert.equal((await B.claim(id, {})).fence, 2);
+    // A, partitioned, spools a verdict it can no longer own.
+    fake.state.down = true;
+    const deferred = await A.event(id, { fence: 1, event: { type: "gate.settled", gate_id: "acceptance", attempt: 1, state: "failed" } });
+    assert.equal(deferred.deferred, true);
+    fake.state.down = false;
+    assert.equal(A.outbox(id).length, 1, "the outbox shows what A owes");
+    // B reconciles and sends its own verdict: A's line is not B's to send.
+    const before = fake.state.requests.length;
+    assert.equal((await B.reconcile(id, { fence: 2 })).replayed, 0, "nothing of A's is replayed by B");
+    assert.equal((await B.event(id, { fence: 2, event: { type: "gate.settled", gate_id: "acceptance", attempt: 2, state: "passed" } })).ok, true);
+    const sent = fake.state.requests.slice(before).filter((q) => q.path.endsWith("/events"));
+    assert.deepEqual(sent.map((q) => [q.body.fence, q.body.event.attempt]), [[2, 2]], "only B's own event went out, under B's fence");
+    assert.deepEqual(fake.events(id).filter((e) => e.type === "gate.settled").map((e) => e.state), ["passed"], "A's failed verdict never landed");
+    // A's next call learns of the loss: its owed line is dropped, not left for B.
+    assert.equal((await A.reconcile(id, { fence: 1 })).code, "fence_stale");
+    assert.equal(store.fencedOut("pA-outbox", id), 1);
+    assert.deepEqual(A.outbox(id), [], "the loser's owed events are dropped with the loss");
+    assert.equal((await B.reconcile(id, { fence: 2 })).ok, true);
+    assert.deepEqual(fake.events(id).filter((e) => e.type === "gate.settled").map((e) => e.state), ["passed"]);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("outbox: a GONE predecessor's backlog from before the takeover is adopted and replayed by the new holder; what it spooled after the takeover is dropped", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const box = sharedHomeFixture(fake, "outbox-dead");
+    const A = box.open("pA-dead-outbox");
+    const o = await A.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+    const id = o.execution.execution_id;
+    assert.equal((await A.event(id, { fence: 1, event: { type: "candidate.submitted", candidate: CAND } })).ok, true);
+    // A's process died with a partition backlog. Its file names a pid that is
+    // gone (a reaped child's), on this machine.
+    const { spawnSync } = require("node:child_process");
+    const deadPid = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout;
+    const by = { instance: "pA-dead-outbox", machine: "box", pid: Number(deadPid), ticks: null };
+    const tag = sha256("pA-dead-outbox").slice(0, 16);
+    const file = store.outboxPath(box.home, "remote", id, tag);
+    const ev = (attempt, state) => ({ event: { type: "gate.settled", gate_id: "acceptance", attempt, state, idempotency_key: `${id}:acceptance:${attempt}` }, queued_at: new Date(Date.now() - 60000).toISOString(), by });
+    fs.writeFileSync(file, `${JSON.stringify(ev(1, "passed"))}\n`);
+    // The restarted process takes over...
+    const B = box.open("pB-restarted-outbox");
+    assert.equal((await B.claim(id, {})).fence, 2);
+    // ...and a line the dead process queued AFTER that takeover is a stale-fence write.
+    fs.appendFileSync(file, `${JSON.stringify({ ...ev(2, "failed"), queued_at: new Date(Date.now() + 1000).toISOString() })}\n`);
+    const r = await B.reconcile(id, { fence: 2 });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.replayed, 1);
+    assert.deepEqual(fake.events(id).filter((e) => e.type === "gate.settled").map((e) => [e.attempt, e.state]), [[1, "passed"]]);
+    assert.equal(fs.existsSync(file), false, "the adopted file is gone");
+    assert.deepEqual(B.outbox(id), []);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("outbox: adoption judges the FILE owner's liveness (a live holder carrying a dead predecessor's lines first is never raided), and a loser's forfeit hands adopted lines back for the real holder", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const box = sharedHomeFixture(fake, "outbox-owner");
+    const { spawnSync } = require("node:child_process");
+    const deadPid = Number(spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout);
+    const deadBy = { instance: "pA-gone-owner", machine: "box", pid: deadPid, ticks: null };
+    const liveBy = { instance: "pB-live-owner", machine: "box", pid: process.pid, ticks: null };
+    const line = (by, attempt, state, ago) => ({ event: { type: "gate.settled", gate_id: "acceptance", attempt, state }, queued_at: new Date(Date.now() - ago).toISOString(), by });
+    const write = (file, lines) => fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    // A (gone) left a backlog from while it held the execution.
+    const deadFile = (id) => store.outboxPath(box.home, "remote", id, sha256("pA-gone-owner").slice(0, 16));
+    const C = box.open("pC-loser-owner");
+    const o = await C.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+    const id = o.execution.execution_id;
+    assert.equal((await C.event(id, { fence: 1, event: { type: "candidate.submitted", candidate: CAND } })).ok, true);
+    // 1. A LIVE holder's file whose first line is an adopted dead author's.
+    const liveFile = store.outboxPath(box.home, "remote", id, sha256("pB-live-owner").slice(0, 16));
+    write(liveFile, [line(deadBy, 1, "passed", 120000), line(liveBy, 2, "passed", 1000)]);
+    assert.equal((await C.reconcile(id, { fence: 1 })).ok, true);
+    assert.equal(fs.readFileSync(liveFile, "utf8").trim().split("\n").length, 2, "a live owner's file is left whole");
+    fs.rmSync(liveFile);
+    // 2. A gone predecessor's pre-takeover line, adopted by the LOSER, goes back on forfeit.
+    write(deadFile(id), [line(deadBy, 1, "passed", 120000)]);
+    const B = box.open("pB-winner-owner");
+    assert.equal((await B.claim(id, {})).fence, 2);
+    const lost = await C.reconcile(id, { fence: 1 });
+    assert.equal(lost.code, "fence_stale");
+    assert.equal(store.fencedOut("pC-loser-owner", id), 1);
+    assert.deepEqual(C.outbox(id).map((l) => l.by.instance), ["pA-gone-owner"], "the adopted line is back in its author's file, not dropped");
+    assert.equal(fs.existsSync(deadFile(id)), true);
+    const r = await B.reconcile(id, { fence: 2 });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.replayed, 1, "the real holder replays the gone predecessor's backlog");
+    assert.deepEqual(fake.events(id).filter((e) => e.type === "gate.settled").map((e) => [e.attempt, e.fence]), [[1, 2]]);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("outbox: a gone holder's file that holds ONLY lines it adopted is still adopted by the next holder — the file names its owner (held_by), not just each line's author", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const box = sharedHomeFixture(fake, "outbox-heldby");
+    const { spawnSync } = require("node:child_process");
+    const gone = () => Number(spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout);
+    const D = box.open("pD-heldby");
+    const o = await D.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+    const id = o.execution.execution_id;
+    assert.equal((await D.event(id, { fence: 1, event: { type: "candidate.submitted", candidate: CAND } })).ok, true);
+    // D adopted a gone A's backlog into its own file, then D died too.
+    const aBy = { instance: "pA-heldby", machine: "box", pid: gone(), ticks: null };
+    const dBy = { instance: "pD-heldby", machine: "box", pid: gone(), ticks: null };
+    const dFile = store.outboxPath(box.home, "remote", id, sha256("pD-heldby").slice(0, 16));
+    fs.writeFileSync(dFile, `${JSON.stringify({ event: { type: "gate.settled", gate_id: "acceptance", attempt: 1, state: "passed" }, queued_at: new Date(Date.now() - 60000).toISOString(), by: aBy, held_by: dBy })}\n`);
+    const F = box.open("pF-heldby");
+    assert.equal((await F.claim(id, {})).fence, 2);
+    const r = await F.reconcile(id, { fence: 2 });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.replayed, 1);
+    assert.equal(fs.existsSync(dFile), false);
+    assert.deepEqual(fake.events(id).filter((e) => e.type === "gate.settled").map((e) => [e.attempt, e.fence]), [[1, 2]]);
+  } finally {
     await fake.close();
   }
 });
