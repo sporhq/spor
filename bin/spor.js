@@ -9376,6 +9376,45 @@ function ladderWidth(depth, step, maxLimit) {
   return w;
 }
 
+// `spor work --program`'s member read (issue-spor-program-standing-
+// dispatchable-page-cap): the queue entries of a program's open members, by id,
+// in the queue's own rank order. The ranked page dispatchableQueuePage serves is
+// capped (one server page remotely), so a member ranked below it read as "not on
+// the dispatchable queue" and halted a program with runnable work left. There is
+// no by-id queue read, so this walks the ranked queue with ?offset — the same
+// fetchQueuePage steps, one server page each — until every asked-for id has been
+// located or the queue ends, keeping only those ids. Consecutive windows overlap
+// by a few items so a re-rank between requests (API.md §5) cannot slide a member
+// across a boundary unseen. `complete` is true only when the walk located every
+// id or read the queue to its end; a dead read, a backend that ignores ?offset,
+// or the page ceiling leaves it false, and the loop then concludes nothing about
+// a member it did not find.
+//   -> {items: [dispatchable member entries, rank order], located: Map id ->
+//       raw entry (dispatchable or not), complete}
+const PROGRAM_QUEUE_MAX_PAGES = 100;
+const PROGRAM_QUEUE_OVERLAP = 5;
+async function programQueueEntries(cfg, slug, ids, { maxPages = PROGRAM_QUEUE_MAX_PAGES } = {}) {
+  const want = new Set(ids || []);
+  const located = new Map();
+  let complete = false;
+  if (!want.size) return { items: [], located, complete: true };
+  const ctx = {};
+  let offset = 0;
+  for (let p = 0; p < maxPages; p++) {
+    const res = await fetchQueuePage(cfg, slug, SERVER_PAGE_MAX, ctx, offset);
+    if (res.paged === null) break; // no answer: says nothing about the queue
+    const raw = Array.isArray(res.items) ? res.items : [];
+    for (const it of raw) if (it && want.has(it.id) && !located.has(it.id)) located.set(it.id, it);
+    if (located.size >= want.size) { complete = true; break; }
+    if (!res.more) { complete = true; break; }
+    // A backend without ?offset re-serves its top page: nothing deeper is reachable.
+    if (res.paged === false || !raw.length) break;
+    offset += raw.length > PROGRAM_QUEUE_OVERLAP * 2 ? raw.length - PROGRAM_QUEUE_OVERLAP : raw.length;
+  }
+  const ranked = [...located.values()];
+  return { items: winnowQueuePage(ranked), located, complete };
+}
+
 // One step of that read: the `LIMIT` ranked items starting at `OFFSET`, plus
 // whether anything remains BEYOND them (`more`). The server takes ?offset
 // directly (API.md §5, alongside next_offset/truncated); the local ranker has
@@ -17465,7 +17504,7 @@ function worker() {
     _worker = workLib.createWorker({
       err, out, annotateInFlight, checkProposals, cmdWorkRegate, cmdWorkRegateFlakes, cmdWorkStatus,
       codeWatchRef, dispatchAgentId, dispatchSatisfiableWorkItem, dispatchWorktreeDir,
-      dispatchableQueuePage, dispatchedAgents, escalateParkedPipeline, factoryScopeSlug,
+      dispatchableQueuePage, dispatchedAgents, escalateParkedPipeline, factoryScopeSlug, programQueueEntries,
       gateCoveragePreview, integrationSatisfiability, isAgentId, loadFactoryDefinition,
       loadedCodeCommit, makeCodeMovedNotice, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, makeFactoryAvailabilityCheck, pollWorkRuns,
       reconcileCompletions, reconcileWithdrawnExecutions, renewLiveExecutions, replayAttestationDebts,
@@ -20578,7 +20617,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
+module.exports = { gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
 
 if (require.main === module) {
   main()

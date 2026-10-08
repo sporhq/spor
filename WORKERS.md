@@ -235,14 +235,31 @@ as above. The worker exits when every member is terminal (`complete`), or
 HALTS once nothing left can move: every remaining member needs a person (its
 derived readiness is human — never claimed), was refused or cooled off here
 (an unsatisfiable profile, a policy/scope skip, a failed gate), is blocked, or
-is not on the dispatchable queue at all. The halt line names each such member
+is not dispatchable from the queue at all (held for triage, muted, dormant,
+not queueable work). Where each member stands is read off the members
+themselves, never off the worker's capped ranked page: each pass walks the
+ranked queue with `?offset` until every open member's entry is located or the
+queue ends (`programQueueEntries`), so a member ranked below one page is still
+dispatched in queue order and never read as "off the queue"
+(issue-spor-program-standing-dispatchable-page-cap); a walk that could not read
+the whole queue (a dead read, a backend without `?offset`) concludes nothing
+that pass. The halt line names each stuck member
 and why, and `spor work --status` keeps it (`program.outcome`,
-`program.stuck`). A member in flight on this box, held by someone else
-(`status: active`), or — remotely, for a worker with an agent identity —
-assigned to another agent while off this worker's page (a claim writes that
-edge and its lease hides the item) is the program still moving; the edge
-alone, back on the page, is stuck. The standing is never judged on a pass that cooled an item off: the
-page widens past a cooling item only on the next fetch. An unreadable program takes no work that pass (fail
+`program.stuck`). A member in flight on this box, or held by someone else
+(`status: active`), is the program still moving. The stuck readings — needs a
+person, blocked, cooling off here — are judged FIRST, so an `assigned` edge
+never makes a stuck member look live. A foreign assignment (remotely, for a
+worker with an agent identity: an `assigned` edge to another agent) is movement
+only when backed by a live claim lease, and no lease table is readable
+client-side, so the worker reads the lease off the queue itself: the ranker
+hides an item from every other viewer exactly while someone else's lease on it
+is in force, and a lapsed lease returns it to the pool. The claim reading
+therefore needs the member to be otherwise dispatchable, absent from a COMPLETE
+member walk, and pinned that way for less than `work.runMaxMs` (the same ceiling
+a worker follows its own run for); past it the member is stuck ("assigned to
+agent-x … no progress"). The edge alone, back on the page, is skipped as
+assigned elsewhere and reads stuck. The standing is never judged on a pass that
+cooled an item off. An unreadable program takes no work that pass (fail
 closed); an unknown or memberless one refuses to start.
 
 ### 3.1 Preflight — what must be true BEFORE a worker claims anything
