@@ -3615,3 +3615,277 @@ test("makeCodeMovedNotice requireCodeChange: a docs-only land does not drain a d
   g("commit", "-q", "-am", "code");
   assert.strictEqual(defaulted(), g("rev-parse", "--short", "HEAD"), "a land under the published paths drains");
 });
+
+// ------------------------------------------- program-scoped work (--program) --
+// task-spor-program-scoped-factory-execution: `spor work --program <id>` is a
+// SELECTION scope over this same loop — the candidate set is the program's
+// member-of-program closure, the order is the queue's (a member another member
+// blocks is not on the page until its blocker lands), and the loop exits when
+// every member is terminal or halts, naming why, once nothing left can run.
+
+// A fake program world over the harness: `members` declare their blockers and
+// readiness, a run that finishes resolved retires its member, and `program()`
+// / the queue page are both derived from that one state — as the real queue
+// and the real program walk are both derived from one graph.
+function programHarness({ members, extraQueue = [], opts = {}, maxPasses = 20 }) {
+  const done = new Set(members.filter((m) => m.done).map((m) => m.id));
+  const blockedNow = (m) => (m.blockedBy || []).some((b) => !done.has(b));
+  let h;
+  const queue = (state) => {
+    const taken = new Set(state.dispatched.map((d) => d.id));
+    // The real ranker drops blocked items and claimed ones from the page.
+    const page = members.filter((m) => !done.has(m.id) && !blockedNow(m) && !taken.has(m.id)).map((m) => ({ id: m.id, readiness: m.human ? "human" : "agent", ...(m.human ? { readiness_reasons: ["requires human"] } : {}) }));
+    return page.concat(extraQueue.filter((it) => !taken.has(it.id)));
+  };
+  const program = async () => ({
+    found: true,
+    root_id: "task-prog",
+    truncated: false,
+    members: members.map((m) => ({
+      id: m.id,
+      bucket: done.has(m.id) ? "done" : blockedNow(m) ? "blocked" : "open",
+      status: done.has(m.id) ? "done" : "open",
+      human: m.human ? "requires human" : null,
+      blockers: (m.blockedBy || []).filter((b) => !done.has(b)),
+    })),
+  });
+  h = harness({
+    queue,
+    opts: { concurrency: 1, program: "task-prog", ...opts },
+    maxPasses,
+    extraDeps: { program },
+    // Every launched run resolves its member by the next wait.
+    onTick: (state) => {
+      for (const d of state.dispatched) {
+        const rec = state.runs.get(d.run_id);
+        if (rec && !rec.terminal) {
+          state.finish(d.run_id, { terminal_state: "resolved", terminal_enforced: true, resolved_by: `dec-${d.id}` });
+          done.add(d.id);
+        }
+      }
+    },
+  });
+  return h;
+}
+
+test("--program: two agent members run in blocks order, the human member is never claimed, and the loop halts naming it", async () => {
+  const h = programHarness({
+    members: [
+      { id: "task-second", blockedBy: ["task-first"] },
+      { id: "task-human", human: true },
+      { id: "task-first" },
+    ],
+    // Not a member: the program scope must never take it, however it ranks.
+    extraQueue: [{ id: "task-outsider", readiness: "agent" }],
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-first", "task-second"], "members only, the blocker first");
+  assert.ok(!h.dispatched.some((d) => d.id === "task-human"), "a human member is never claimed");
+  assert.match(status.stop_reason, /^program task-prog halted — 1 of 3 member\(s\) remain and none can run here: task-human \(requires human\)$/);
+  assert.ok(h.log.some((l) => /work: program task-prog halted — .*task-human \(requires human\)/.test(l)), h.log.join("\n"));
+  assert.strictEqual(status.program.outcome, "halted");
+  assert.deepStrictEqual(status.program.stuck, [{ id: "task-human", why: "requires human" }]);
+  assert.strictEqual(h.control.stopping, false, "the program ended the loop, not the test driver");
+});
+
+test("--program: a fully terminal program exits cleanly on the first pass, dispatching nothing", async () => {
+  const h = programHarness({ members: [{ id: "task-a", done: true }, { id: "task-b", done: true }], extraQueue: [{ id: "task-outsider" }] });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched, []);
+  assert.strictEqual(status.stop_reason, "program task-prog complete — all 2 member(s) terminal");
+  assert.strictEqual(status.program.outcome, "complete");
+  assert.strictEqual(h.sleeps.length, 0, "no poll wait before exiting");
+});
+
+test("--program: the program completes once its last member resolves", async () => {
+  const h = programHarness({ members: [{ id: "task-a" }, { id: "task-b", blockedBy: ["task-a"] }] });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-a", "task-b"]);
+  assert.match(status.stop_reason, /^program task-prog complete — all 2 member\(s\) terminal$/);
+});
+
+test("--program: a member blocked behind a human member halts too, naming both", async () => {
+  const h = programHarness({ members: [{ id: "task-h", human: true }, { id: "task-after", blockedBy: ["task-h"] }] });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched, []);
+  assert.match(status.stop_reason, /task-h \(requires human\); task-after \(blocked by task-h\)$/);
+});
+
+test("--program: an unsatisfiable member (refused here) halts the program instead of spinning", async () => {
+  // This box refuses the only member.
+  const st = harness({
+    queue: [{ id: "task-a", readiness: "agent" }],
+    dispatch: () => ({ ok: false, reason: "cannot dispatch task-a here: this machine can't satisfy profile-x" }),
+    opts: { concurrency: 1, program: "task-prog" },
+    extraDeps: { program: async () => ({ found: true, root_id: "task-prog", members: [{ id: "task-a", bucket: "open", status: "open", human: null, blockers: [] }] }) },
+  });
+  const status = await st.run();
+  assert.match(status.stop_reason, /halted — 1 of 1 member\(s\) remain and none can run here: task-a \(cannot dispatch task-a here: this machine can't satisfy profile-x\)$/);
+  // Not on the refusing pass itself: the page widens past a cooling item only
+  // on the NEXT fetch, so that pass has not read what lies below it.
+  assert.strictEqual(st.polls, 2, "halted on the pass after the refusal");
+  assert.deepStrictEqual(st.dispatched, []);
+});
+
+test("--program: an unreadable program takes no work and concludes nothing", async () => {
+  const h = harness({
+    queue: [{ id: "task-a", readiness: "agent" }],
+    opts: { concurrency: 1, program: "task-prog" },
+    maxPasses: 3,
+    extraDeps: { program: async () => ({ error: "server down" }) },
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched, [], "fail closed: an unscoped pass would take non-members");
+  assert.strictEqual(h.polls, 0, "the page is not even read");
+  assert.strictEqual(status.stop_reason, "stopped by the test driver");
+  assert.strictEqual(h.log.filter((l) => /cannot read program/.test(l)).length, 1, "logged once per failure streak");
+});
+
+test("--program: a program root that disappears stops the worker, saying so", async () => {
+  const h = harness({ queue: [], opts: { program: "task-prog" }, extraDeps: { program: async () => ({ found: false, root_id: "task-prog" }) } });
+  const status = await h.run();
+  assert.strictEqual(status.stop_reason, "program task-prog no longer exists");
+  assert.strictEqual(status.program.outcome, "missing");
+});
+
+test("programStanding: running while any member could still move; stuck readings otherwise", () => {
+  const m = (id, extra = {}) => ({ id, bucket: "open", status: "open", human: null, blockers: [], ...extra });
+  const page = (ids) => new Map(ids.map((id) => [id, { id, readiness: "agent" }]));
+  // On the page and not cooling: this worker could take it.
+  assert.strictEqual(workLoop.programStanding({ members: [m("a"), m("h", { human: "requires human" })] }, { page: page(["a"]) }).state, "running");
+  // Held by someone (claimed elsewhere) or busy on this box: still moving.
+  assert.strictEqual(workLoop.programStanding({ members: [m("a", { bucket: "active", status: "active" })] }).state, "running");
+  assert.strictEqual(workLoop.programStanding({ members: [m("a", { busy: true })] }).state, "running");
+  // Not on the dispatchable page at all (held for triage, a question): stuck.
+  const off = workLoop.programStanding({ members: [m("q")] }, { page: page([]) });
+  assert.strictEqual(off.state, "halted");
+  assert.match(off.stuck[0].why, /not on the dispatchable queue/);
+  // The page's own derived human readiness counts even when the node alone did not say so.
+  const nb = workLoop.programStanding({ members: [m("n")] }, { page: new Map([["n", { id: "n", readiness: "human", readiness_reasons: ["open question question-x in neighborhood"] }]]) });
+  assert.deepStrictEqual(nb.stuck, [{ id: "n", why: "open question question-x in neighborhood" }]);
+  // A cooldown that has expired is no longer stuck.
+  const skipped = new Map([["a", { reason: "refused", until: 5 }]]);
+  assert.strictEqual(workLoop.programStanding({ members: [m("a")] }, { page: page(["a"]), skipped, now: 10 }).state, "running");
+  assert.strictEqual(workLoop.programStanding({ members: [m("a")] }, { page: page(["a"]), skipped, now: 1 }).state, "halted");
+  // Assigned to ANOTHER agent (a claim writes the edge): moving elsewhere —
+  // but only for a box with an identity to compare against.
+  const claimed = { members: [m("c", { agents: ["agent-other"] })] };
+  assert.strictEqual(workLoop.programStanding(claimed, { page: page([]), selfAgent: "agent-me" }).state, "running");
+  assert.strictEqual(workLoop.programStanding(claimed, { page: page([]), selfAgent: null }).state, "halted");
+  assert.strictEqual(workLoop.programStanding({ members: [m("c", { agents: ["agent-me"] })] }, { page: page([]), selfAgent: "agent-me" }).state, "halted");
+  assert.strictEqual(workLoop.programStanding({ members: [m("c", { agents: ["agent-me", "agent-other"] })] }, { page: page([]), selfAgent: "agent-me" }).state, "halted", "also ours = ours");
+  // The edge alone outlives a lease: back on the page, skipped as assigned
+  // elsewhere, it is stuck (named), never a wait without end.
+  const elsewhere = new Map([["c", { reason: "assigned to agent agent-other", kind: "assigned-elsewhere", until: 99 }]]);
+  const stale = workLoop.programStanding({ members: [m("c", { agents: ["agent-other"] })] }, { page: page(["c"]), skipped: elsewhere, now: 1, selfAgent: "agent-me" });
+  assert.deepStrictEqual(stale.stuck, [{ id: "c", why: "assigned to agent agent-other" }]);
+  // A human member is stuck even with a foreign routing edge.
+  assert.strictEqual(workLoop.programStanding({ members: [m("h", { human: "requires human", agents: ["agent-other"] })] }, { page: page([]), selfAgent: "agent-me" }).state, "halted");
+  // Everything done (or no members): complete.
+  assert.strictEqual(workLoop.programStanding({ members: [m("a", { bucket: "done" })] }).state, "complete");
+});
+
+test("membershipClosure: the member-of-program closure only — the blocks fallback's prerequisites are not members", () => {
+  const { membershipClosure, snapshotFromGraph } = require("../lib/shell/work-program.js");
+  const env = {
+    root_id: "task-prog",
+    tree: [
+      { id: "task-a", parent: "task-prog", edge: "member-of-program", bucket: "open", depth: 1 },
+      { id: "task-sub", parent: "task-prog", edge: "member-of-program", bucket: "open", depth: 1 },
+      // task-a declares no members, so the walk falls back to its blockers:
+      { id: "task-prereq", parent: "task-a", bucket: "open", depth: 2 },
+      { id: "task-c", parent: "task-sub", edge: "member-of-program", bucket: "done", depth: 2 },
+    ],
+  };
+  assert.deepStrictEqual(membershipClosure(env).map((x) => x.id), ["task-a", "task-sub", "task-c"]);
+
+  // And over a real graph, through the kernel walk both modes share.
+  const graphLib = require("../lib/graph.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-program-"));
+  const n = (id, extra) => fs.writeFileSync(path.join(dir, `${id}.md`), `---\nid: ${id}\ntype: task\ntitle: ${id}\nsummary: ${id} summary sentence.\ndate: 2026-09-07\n${extra}---\nbody\n`);
+  n("task-prog", "status: open\n");
+  n("task-x", "status: open\nedges:\n  - {type: member-of-program, to: task-prog}\n");
+  n("task-y", "status: open\nrequires: [human]\nedges:\n  - {type: member-of-program, to: task-prog}\n");
+  n("task-z", "status: done\nedges:\n  - {type: member-of-program, to: task-prog}\n  - {type: blocks, to: task-x}\n");
+  n("task-pre", "status: open\nedges:\n  - {type: blocks, to: task-x}\n");
+  const snap = snapshotFromGraph(graphLib.loadGraph(dir), "task-prog");
+  const byId = Object.fromEntries(snap.members.map((x) => [x.id, x]));
+  assert.deepStrictEqual(Object.keys(byId).sort(), ["task-x", "task-y", "task-z"], "task-pre blocks a member but is not one");
+  assert.strictEqual(byId["task-y"].human, "requires human");
+  assert.strictEqual(byId["task-x"].bucket, "blocked");
+  assert.deepStrictEqual(byId["task-x"].blockers, ["task-pre"]);
+  assert.strictEqual(byId["task-z"].bucket, "done");
+  assert.strictEqual(snapshotFromGraph(graphLib.loadGraph(dir), "task-nope").found, false);
+});
+
+// The real CLI, local mode: members run through `spor dispatch` itself. The
+// stub worker marks its node done the way an implementer resolving it would,
+// so the program walk sees the member retire.
+function programCliFixture() {
+  const { home, repo, nodes, outfile } = cliFixture();
+  const node = (id, extra) =>
+    fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\ntype: task\nrepo: demo\ntitle: ${id} title\nsummary: The ${id} member of the delivery program fixture.\ndate: 2026-08-20\n${extra}---\nProgram member ${id}.\n`);
+  const assigned = "  - {type: assigned, to: agent-workbox, profile: profile-work}\n";
+  node("task-prog", "status: open\n");
+  node("task-p-first", `status: open\nedges:\n  - {type: member-of-program, to: task-prog}\n  - {type: blocks, to: task-p-second}\n${assigned}`);
+  node("task-p-second", `status: open\nedges:\n  - {type: member-of-program, to: task-prog}\n${assigned}`);
+  node("task-p-human", "status: open\nrequires: [human]\nedges:\n  - {type: member-of-program, to: task-prog}\n");
+  // The stub retires the node it was dispatched on (the prompt names it).
+  const stub = writeSpawnableNodeStub(home, "program-stub", `
+const fs = require("node:fs");
+const path = require("node:path");
+let prompt = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (c) => { prompt += c; });
+process.stdin.on("end", () => {
+  const id = (prompt.match(/task-p-(first|second)/) || [])[0];
+  fs.appendFileSync(process.env.WORK_OUTFILE, JSON.stringify({ id }) + "\\n");
+  if (id) {
+    const f = path.join(process.env.PROGRAM_NODES, id + ".md");
+    fs.writeFileSync(f, fs.readFileSync(f, "utf8").replace("status: open", "status: done"));
+  }
+  process.stdout.write(JSON.stringify({ kind: "message", message: { text: "done" } }) + "\\n");
+  process.exit(0);
+});
+`);
+  const cfgPath = path.join(home, "config.json");
+  const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+  cfg.dispatch.harness[HARNESS].command = stub;
+  fs.writeFileSync(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`);
+  return { home, repo, nodes, outfile };
+}
+
+test("spor work --program: the real loop dispatches the agent members in blocks order, never the human one, and halts naming it", () => {
+  const { home, nodes, outfile } = programCliFixture();
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PROGRAM_NODES: nodes, PATH: pathWithOnlyGitAndNode() };
+  const r = cli(["work", "--program", "task-prog", "--interval", "1", "--max-interval", "1", "--no-brief"], env);
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  const launched = fs.readFileSync(outfile, "utf8").trim().split("\n").map((l) => JSON.parse(l).id);
+  assert.deepStrictEqual(launched, ["task-p-first", "task-p-second"], r.stdout);
+  assert.doesNotMatch(r.stdout, /dispatched task-ready/, "non-members are never candidates");
+  assert.match(r.stdout, /work: program task-prog halted — 1 of 3 member\(s\) remain and none can run here: task-p-human \(requires human\)/);
+  const status = JSON.parse(cli(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout);
+  assert.strictEqual(status.workers[0].program.outcome, "halted");
+  assert.match(cli(["work", "--status"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout, /program:  task-prog — 1 of 3 member\(s\) not yet terminal \(halted\)\n\s+stuck: task-p-human — requires human/);
+});
+
+test("spor work --program: a fully terminal program exits cleanly; an empty or unknown one refuses to start", () => {
+  const { home, nodes, outfile } = programCliFixture();
+  for (const id of ["task-p-first", "task-p-second", "task-p-human"]) {
+    const f = path.join(nodes, `${id}.md`);
+    fs.writeFileSync(f, fs.readFileSync(f, "utf8").replace("status: open", "status: done"));
+  }
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PROGRAM_NODES: nodes, PATH: pathWithOnlyGitAndNode() };
+  const r = cli(["work", "--program", "task-prog", "--interval", "1", "--no-brief"], env);
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, /work: program task-prog complete — all 3 member\(s\) terminal/);
+  assert.match(r.stdout, /dispatched 0;/);
+  assert.ok(!fs.existsSync(outfile), "nothing launched");
+
+  const unknown = cli(["work", "--program", "task-nope", "--no-brief"], env);
+  assert.strictEqual(unknown.status, 1);
+  assert.match(unknown.stderr, /program 'task-nope' not found/);
+  const empty = cli(["work", "--program", "task-ready", "--no-brief"], env);
+  assert.strictEqual(empty.status, 1);
+  assert.match(empty.stderr, /program 'task-ready' has no members/);
+});

@@ -11751,6 +11751,12 @@ function cmdWorkStatus(cfg, { json }) {
     // the item), so it never appears in the `skipped:` list below. Surface it
     // separately so a worker starved by `--concurrency` > 1 with no
     // `dispatch.worktree` is explainable instead of looking merely idle.
+    if (w.program) {
+      const p = w.program;
+      out(`  program:  ${p.id}${p.total != null ? ` — ${p.remaining} of ${p.total} member(s) not yet terminal` : ""}${p.outcome ? ` (${p.outcome})` : ""}`);
+      for (const s of (p.stuck || []).slice(0, workLoop.SKIP_LOG_CAP)) out(`            stuck: ${s.id} — ${s.why}`);
+      if ((p.stuck || []).length > workLoop.SKIP_LOG_CAP) out(`            ...and ${p.stuck.length - workLoop.SKIP_LOG_CAP} more stuck`);
+    }
     if (w.workspace_wait) {
       out(`  workspace: busy — ${w.workspace_wait.node_id} refused (${w.workspace_wait.reason}); retrying this page next poll`);
     }
@@ -19954,11 +19960,23 @@ const COMMANDS = {
       "would gate sibling repos' items with a suite written for another checkout. An\n" +
       "out-of-scope item is skipped with the reason on stdout and in --status. With one\n" +
       "declared repo and no --project, that repo is also the default queue scope. See\n" +
-      "WORKERS.md §10.",
+      "WORKERS.md §10.\n\n" +
+      "PROGRAMS (task-spor-program-scoped-factory-execution). --program <id> runs the\n" +
+      "loop over one program umbrella: the candidate set is the transitive\n" +
+      "member-of-program closure of <id> (the same membership 'spor program' shows,\n" +
+      "without its blocks fallback), ordered by the queue itself — a member another\n" +
+      "member blocks is not dispatchable until its blocker lands. It is a SELECTION\n" +
+      "scope, not a second dispatcher: every member still goes through 'spor dispatch'\n" +
+      "and, with --factory, through the gates. The worker exits when every member is\n" +
+      "terminal, or HALTS — printing which members and why — once every remaining\n" +
+      "member needs a person, was refused or cooled off here, is blocked, or is not on\n" +
+      "the dispatchable queue. A human member is never claimed. work.project/\n" +
+      "queue.project do not narrow a program's page (an explicit --project does).",
     options: {
       project: { type: "string", value: "S", desc: "scope to a project slug (default: work.project/queue.project, else a single-repo factory's own repo, else the whole queue)" },
       accept: { type: "string", value: "P", desc: "acceptance policy: 'ready' dispatches only items explicitly stamped agent-ready (default; also work.accept/SPOR_WORK_ACCEPT); 'open' takes anything except readiness:human" },
       factory: { type: "string", value: "factory-id", desc: "the graph-resident factory definition whose gates every run must pass (default: work.factory; absent = bare loop)" },
+      program: { type: "string", value: "id", desc: "scope the loop to a program: only the root's transitive member-of-program members are candidates (queue/blocks order); exits when every member is terminal, or halts naming the members that need a person or cannot run here" },
       concurrency: { type: "string", value: "N", desc: "how many runs to keep in flight (default 1)" },
       interval: { type: "string", value: "S", desc: "seconds between polls (default 30)" },
       "max-interval": { type: "string", value: "S", desc: "backoff ceiling in seconds when idle (default 300)" },

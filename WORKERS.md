@@ -222,6 +222,29 @@ pool with zero sweep, zero scheduler (dec-cc-task-claim-lease). Bulk variants
 (`POST /v1/queue/claim|renew|release`) exist for a worker carrying more than
 one node at once (API.md §3) but are not required for a single-node worker.
 
+**Program scope (`spor work --program <id>`).** The reference worker can be
+pointed at one program umbrella instead of the whole pool
+(task-spor-program-scoped-factory-execution). It is a SELECTION scope over
+this same loop, not a second dispatcher: the candidate set is the transitive
+`member-of-program` closure of `<id>` (read off the same program envelope
+`spor program` renders, without its `blocks` fallback — a member's
+prerequisites are not members), the order is the queue's own (a member another
+member `blocks` is not on the dispatchable page until its blocker lands), and
+every member is still claimed, guarded and — with `--factory` — gated exactly
+as above. The worker exits when every member is terminal (`complete`), or
+HALTS once nothing left can move: every remaining member needs a person (its
+derived readiness is human — never claimed), was refused or cooled off here
+(an unsatisfiable profile, a policy/scope skip, a failed gate), is blocked, or
+is not on the dispatchable queue at all. The halt line names each such member
+and why, and `spor work --status` keeps it (`program.outcome`,
+`program.stuck`). A member in flight on this box, held by someone else
+(`status: active`), or — remotely, for a worker with an agent identity —
+assigned to another agent while off this worker's page (a claim writes that
+edge and its lease hides the item) is the program still moving; the edge
+alone, back on the page, is stuck. The standing is never judged on a pass that cooled an item off: the
+page widens past a cooling item only on the next fetch. An unreadable program takes no work that pass (fail
+closed); an unknown or memberless one refuses to start.
+
 ### 3.1 Preflight — what must be true BEFORE a worker claims anything
 
 An unattended worker has nobody to answer a permission prompt and nobody to
