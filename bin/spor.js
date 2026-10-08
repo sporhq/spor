@@ -10879,6 +10879,13 @@ async function cmdExecutions(cfg, { values, positionals: pos }) {
     if (x.completion.written_at) out(`  completed ${x.completion.written_at} by ${x.completion.resolver || "?"}`);
     const owed = store.outbox ? store.outbox(x.execution_id) : [];
     if (owed.length) out(`  outbox: ${owed.length} event(s) owed to the server — replayed on the pipeline's next call`);
+    // Per file, who holds it: a file whose owner is live elsewhere or cannot
+    // be judged is stranded until its owner returns (or GC), not replayed.
+    const OUTBOX_STATE = { own: "this process", shared: "shared — adopted by the next holder", adoptable: "owner gone — adopted by the next holder", live: "held by a live process — stranded until it replays or loses", unknown: "owner unknown (another machine or unreadable) — stranded" };
+    for (const f of store.outboxReport ? store.outboxReport(x.execution_id) : []) {
+      const who = f.owner && f.owner.instance != null ? ` instance ${short(f.owner.instance)}${f.owner.pid != null ? ` pid ${f.owner.pid}` : ""}${f.owner.machine ? ` on ${f.owner.machine}` : ""}` : "";
+      out(`    ${path.basename(f.file)}: ${f.lines} line(s)${who}; ${OUTBOX_STATE[f.state] || f.state}`);
+    }
     return 0;
   }
   const r = await store.list({ node_id: values.node || null, stage: values.stage || null, limit: Math.max(1, parseInt(values.limit, 10) || 50) });
@@ -14718,10 +14725,12 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
   // server never saw (a partition it ended inside), and their keys are spent
   // just the same — a successor that seeded from the server alone would mint
   // them again, and its own verdict would replay as a no-op behind the old.
+  // `owed` leaves out only a gone holder's post-loss lines, which adoption
+  // drops — every other spooled line may yet land, so its key is spent.
   const seedFromOutbox = () => {
     let owed = [];
     try {
-      owed = typeof st.outbox === "function" ? st.outbox(id) : [];
+      owed = typeof st.owed === "function" ? st.owed(id) : typeof st.outbox === "function" ? st.outbox(id) : [];
     } catch {
       owed = [];
     }
