@@ -232,35 +232,59 @@ prerequisites are not members), the order is the queue's own (a member another
 member `blocks` is not on the dispatchable page until its blocker lands), and
 every member is still claimed, guarded and — with `--factory` — gated exactly
 as above. The worker exits when every member is terminal (`complete`), or
-HALTS once nothing left can move: every remaining member needs a person (its
-derived readiness is human — never claimed), was refused or cooled off here
-(an unsatisfiable profile, a policy/scope skip, a failed gate), is blocked, or
-is not dispatchable from the queue at all (held for triage, muted, dormant,
-not queueable work). Where each member stands is read off the members
-themselves, never off the worker's capped ranked page: each pass walks the
-ranked queue with `?offset` until every open member's entry is located or the
-queue ends (`programQueueEntries`), so a member ranked below one page is still
-dispatched in queue order and never read as "off the queue"
-(issue-spor-program-standing-dispatchable-page-cap); a walk that could not read
-the whole queue (a dead read, a backend without `?offset`) concludes nothing
-that pass. The halt line names each stuck member
-and why, and `spor work --status` keeps it (`program.outcome`,
-`program.stuck`). A member in flight on this box, or held by someone else
-(`status: active`), is the program still moving. The stuck readings — needs a
-person, blocked, cooling off here — are judged FIRST, so an `assigned` edge
-never makes a stuck member look live. A foreign assignment (remotely, for a
-worker with an agent identity: an `assigned` edge to another agent) is movement
-only when backed by a live claim lease, and no lease table is readable
+HALTS once nothing left can move — and "nothing left can move" is ONE pure
+classification over a COMPLETE member read (`lib/shell/work-loop.js`
+`programStanding`), never a case-by-case reading off the worker's capped
+ranked page. Each pass walks the ranked queue with `?offset` until every open
+member's entry is located or the queue ends (`programQueueEntries`,
+issue-spor-program-standing-dispatchable-page-cap), so a member ranked below
+one page is still dispatched in queue order; the walk reports whether it was
+complete. Every non-terminal member then lands in exactly one bucket, tested
+in this order:
+
+| bucket | reading | class |
+|---|---|---|
+| `busy` | in flight on this box (a run, a gate pipeline being judged or parked here) | movable |
+| `human` | needs a person: the node's own `requires: human` / `assigned -> person-*`, or the queue's derived readiness — never claimed | stuck |
+| `blocked` | a live blocker (the program read's bucket, or the located entry's `blocked_by`) | stuck |
+| `cooling` | cooled off here after a refusal, a policy/scope skip, a failed gate, an unresolved run | stuck |
+| `held` | someone holds it (`status: active` / `in_progress`) | movable |
+| `runnable` | on this pass's dispatchable page AND eligible for THIS worker by the dispatcher's own predicate (`classifyWorkItem`: accept policy, factory repo scope, assignee, decline finding) | movable |
+| `ineligible` | on the page, but that same predicate refuses it here — the verdict is the reason (the dispatcher would skip it on exactly these grounds) | stuck |
+| `undispatchable` | located on the queue but not on the dispatchable page (held for triage, a stale backend's demoted blocked item) | stuck |
+| `claimed` | absent from a COMPLETE walk, otherwise dispatchable, with an `assigned` edge to another agent, for less than `work.runMaxMs` | movable |
+| `claim-stale` | the same, pinned past `work.runMaxMs`: a claim that never moved — named, never waited on forever | stuck |
+| `off-queue` | absent from a complete walk with no foreign claim (held for triage, muted, dormant, a question, not queueable work) | stuck |
+| `unknown` | absent from the page and the walk was NOT complete (a dead read, a backend without `?offset`, the page ceiling) | undecided |
+
+The standing is the fold over those buckets: `complete` when no member
+remains; `moving` when ANY member is movable; `halted` only when the walk was
+complete, no member is movable, and none is unknown — every remaining member
+classified stuck from a full read; `undecided` otherwise (an incomplete read,
+or an unknown member, with nothing visibly moving). An undecided pass never
+halts — the worker polls again. The halt line names each stuck member and
+why, and `spor work --status` keeps it (`program.outcome`, `program.stuck`).
+Three properties fall out of the shape: the eligibility a member is judged by
+is the dispatcher's own, so a member "on the page" the worker could never
+select is stuck rather than movement, and a runnable member ranked after any
+number of stuck ones is still movement (the classifier never stops early);
+the stuck readings come before any movement read off an assignment, so an
+`assigned` edge never makes a human or blocked member look live; and the
+foreign-claim clock is keyed per (member, assignee set), carried as an input
+and an output of the classifier rather than a side effect, and dropped the
+moment its member stops reading as `claimed` — so a claim that lapses and is
+freshly re-taken starts its own clock, and a clock from an earlier pass can
+never make a live claim read stale. (A foreign assignment is movement only
+when backed by a live claim lease, and no lease table is readable
 client-side, so the worker reads the lease off the queue itself: the ranker
 hides an item from every other viewer exactly while someone else's lease on it
-is in force, and a lapsed lease returns it to the pool. The claim reading
-therefore needs the member to be otherwise dispatchable, absent from a COMPLETE
-member walk, and pinned that way for less than `work.runMaxMs` (the same ceiling
-a worker follows its own run for); past it the member is stuck ("assigned to
-agent-x … no progress"). The edge alone, back on the page, is skipped as
-assigned elsewhere and reads stuck. The standing is never judged on a pass that
-cooled an item off. An unreadable program takes no work that pass (fail
-closed); an unknown or memberless one refuses to start.
+is in force, and a lapsed lease returns it to the pool. The edge alone, back
+on the page, is `ineligible` — assigned elsewhere — and reads stuck.) The
+standing is classified on every pass that read the program and the page, so
+the clocks it carries are always this pass's, but it is ACTED on only on a
+pass that read both in full, launched nothing, cooled nothing, and has
+nothing of this worker's in flight. An unreadable program takes no work that
+pass (fail closed); an unknown or memberless one refuses to start.
 
 ### 3.1 Preflight — what must be true BEFORE a worker claims anything
 

@@ -3748,14 +3748,14 @@ test("--program: a program root that disappears stops the worker, saying so", as
   assert.strictEqual(status.program.outcome, "missing");
 });
 
-test("programStanding: running while any member could still move; stuck readings otherwise", () => {
+test("programStanding: moving while any member could still move; stuck readings otherwise", () => {
   const m = (id, extra = {}) => ({ id, bucket: "open", status: "open", human: null, blockers: [], ...extra });
   const page = (ids) => new Map(ids.map((id) => [id, { id, readiness: "agent" }]));
   // On the page and not cooling: this worker could take it.
-  assert.strictEqual(workLoop.programStanding({ members: [m("a"), m("h", { human: "requires human" })] }, { page: page(["a"]) }).state, "running");
+  assert.strictEqual(workLoop.programStanding({ members: [m("a"), m("h", { human: "requires human" })] }, { page: page(["a"]) }).state, "moving");
   // Held by someone (claimed elsewhere) or busy on this box: still moving.
-  assert.strictEqual(workLoop.programStanding({ members: [m("a", { bucket: "active", status: "active" })] }).state, "running");
-  assert.strictEqual(workLoop.programStanding({ members: [m("a", { busy: true })] }).state, "running");
+  assert.strictEqual(workLoop.programStanding({ members: [m("a", { bucket: "active", status: "active" })] }).state, "moving");
+  assert.strictEqual(workLoop.programStanding({ members: [m("a", { busy: true })] }).state, "moving");
   // Not on the dispatchable page at all (held for triage, a question): stuck.
   const off = workLoop.programStanding({ members: [m("q")] }, { page: page([]) });
   assert.strictEqual(off.state, "halted");
@@ -3765,12 +3765,12 @@ test("programStanding: running while any member could still move; stuck readings
   assert.deepStrictEqual(nb.stuck, [{ id: "n", why: "open question question-x in neighborhood" }]);
   // A cooldown that has expired is no longer stuck.
   const skipped = new Map([["a", { reason: "refused", until: 5 }]]);
-  assert.strictEqual(workLoop.programStanding({ members: [m("a")] }, { page: page(["a"]), skipped, now: 10 }).state, "running");
+  assert.strictEqual(workLoop.programStanding({ members: [m("a")] }, { page: page(["a"]), skipped, now: 10 }).state, "moving");
   assert.strictEqual(workLoop.programStanding({ members: [m("a")] }, { page: page(["a"]), skipped, now: 1 }).state, "halted");
   // Assigned to ANOTHER agent (a claim writes the edge): moving elsewhere —
   // but only for a box with an identity to compare against.
   const claimed = { members: [m("c", { agents: ["agent-other"] })] };
-  assert.strictEqual(workLoop.programStanding(claimed, { page: page([]), selfAgent: "agent-me" }).state, "running");
+  assert.strictEqual(workLoop.programStanding(claimed, { page: page([]), selfAgent: "agent-me" }).state, "moving");
   assert.strictEqual(workLoop.programStanding(claimed, { page: page([]), selfAgent: null }).state, "halted");
   assert.strictEqual(workLoop.programStanding({ members: [m("c", { agents: ["agent-me"] })] }, { page: page([]), selfAgent: "agent-me" }).state, "halted");
   assert.strictEqual(workLoop.programStanding({ members: [m("c", { agents: ["agent-me", "agent-other"] })] }, { page: page([]), selfAgent: "agent-me" }).state, "halted", "also ours = ours");
@@ -3952,7 +3952,8 @@ test("--program: a runnable member ranked below the page cap is dispatched and t
 test("programStanding: an incomplete member walk concludes nothing about a member it did not find", () => {
   const m = { id: "a", bucket: "open", status: "open", human: null, blockers: [], agents: [] };
   const partial = workLoop.programStanding({ members: [m], queue: { complete: false, located: new Map() } }, { page: new Map() });
-  assert.strictEqual(partial.state, "running");
+  assert.strictEqual(partial.state, "undecided");
+  assert.deepStrictEqual(partial.members, [{ id: "a", bucket: "unknown", why: null }]);
   const full = workLoop.programStanding({ members: [m], queue: { complete: true, located: new Map() } }, { page: new Map() });
   assert.strictEqual(full.state, "halted");
   // Located on the queue but held for triage: stuck, saying why.
@@ -3986,10 +3987,228 @@ test("--program: a blocked member with a stale assigned edge to another agent ha
   assert.strictEqual(workLoop.programStanding({ members: [m()], queue: q }, opt({ skipped: new Map([["c", { reason: "refused", until: 99 }]]), now: 1 })).state, "halted");
   // Hidden from the whole queue, otherwise dispatchable: a live claim elsewhere —
   // until the bound runs out with no progress.
-  const since = new Map();
-  assert.strictEqual(workLoop.programStanding({ members: [m()], queue: q }, opt({ foreignSince: since, foreignHoldMs: 1000, now: 10 })).state, "running");
-  assert.strictEqual(workLoop.programStanding({ members: [m()], queue: q }, opt({ foreignSince: since, foreignHoldMs: 1000, now: 500 })).state, "running");
+  // The clock is threaded, never mutated: each reading hands back the map
+  // the next one reads.
+  let since = new Map();
+  let r = workLoop.programStanding({ members: [m()], queue: q }, opt({ foreignSince: since, foreignHoldMs: 1000, now: 10 }));
+  assert.strictEqual(r.state, "moving");
+  assert.strictEqual(since.size, 0, "input map untouched");
+  since = r.foreignSince;
+  r = workLoop.programStanding({ members: [m()], queue: q }, opt({ foreignSince: since, foreignHoldMs: 1000, now: 500 }));
+  assert.strictEqual(r.state, "moving");
+  since = r.foreignSince;
   const expired = workLoop.programStanding({ members: [m()], queue: q }, opt({ foreignSince: since, foreignHoldMs: 1000, now: 2000 }));
   assert.strictEqual(expired.state, "halted");
   assert.match(expired.stuck[0].why, /assigned to agent-other .*no progress/);
+});
+
+// ---------------- --program standing: one pure classifier -----------------
+// Two merge-gate reviews each found a false-HALT / never-halt in the case-by-
+// case standing (an on-page member read as movable without the dispatcher's
+// eligibility; a foreign-claim clock that outlived its claim; a halt taken off
+// an incomplete queue read). programStanding is now a pure fold over one
+// bucket per member: this table pins every bucket and each finding.
+test("programStanding: every member lands in exactly one bucket, and the standing is a fold over them", () => {
+  const { programStanding, PROGRAM_BUCKETS } = workLoop;
+  const m = (id, extra = {}) => ({ id, bucket: "open", status: "open", human: null, blockers: [], agents: [], ...extra });
+  const item = (id, extra = {}) => ({ id, readiness: "agent", project: "demo", ...extra });
+  const full = (located = []) => ({ complete: true, located: new Map(located.map((it) => [it.id, it])) });
+  const policy = { accept: "ready", repos: ["demo"], selfAgent: "agent-me" };
+  const cases = [
+    // [name, member, {page, queue, opts}, bucket, why-pattern]
+    ["done", m("a", { bucket: "done", status: "done" }), {}, "done", null],
+    ["busy via set", m("a"), { opts: { busy: new Set(["a"]) } }, "busy", null],
+    ["busy via snapshot flag", m("a", { busy: true }), {}, "busy", null],
+    ["human from the node", m("a", { human: "requires human" }), { page: [item("a")] }, "human", /requires human/],
+    ["human from the page's derived readiness", m("a"), { page: [item("a", { readiness: "human", readiness_reasons: ["open question question-x"] })] }, "human", /question-x/],
+    ["human from the located entry", m("a"), { queue: full([item("a", { readiness: "human" })]) }, "human", /readiness: human/],
+    ["blocked (program read)", m("a", { bucket: "blocked", blockers: ["task-x"] }), { page: [item("a")] }, "blocked", /blocked by task-x/],
+    ["blocked (located entry's blocked_by)", m("a"), { queue: full([item("a", { blocked_by: [{ id: "task-y" }] })]) }, "blocked", /blocked by task-y/],
+    ["cooling", m("a"), { page: [item("a")], opts: { skipped: new Map([["a", { reason: "refused here", until: 50 }]]), now: 10 } }, "cooling", /refused here/],
+    ["cooldown expired is not cooling", m("a"), { page: [item("a")], opts: { skipped: new Map([["a", { reason: "refused here", until: 5 }]]), now: 10 } }, "runnable", null],
+    ["held by status", m("a", { status: "in_progress" }), {}, "held", null],
+    ["held by bucket", m("a", { bucket: "active" }), {}, "held", null],
+    ["runnable: on the page and eligible", m("a"), { page: [item("a")] }, "runnable", null],
+    ["ineligible: policy (not agent-ready under accept ready)", m("a"), { page: [item("a", { readiness: "untriaged" })] }, "ineligible", /not agent-ready/],
+    ["ineligible: outside the factory repo scope", m("a"), { page: [item("a", { project: "other" })] }, "ineligible", /outside the factory's repo scope/],
+    ["ineligible: assigned to another agent, yet visible (a stale edge)", m("a", { agents: ["agent-other"] }), { page: [item("a", { assigned_agents: ["agent-other"] })] }, "ineligible", /assigned to agent agent-other/],
+    ["ineligible: live decline finding", m("a"), { page: [item("a", { findings: ["find-declined-a"] })] }, "ineligible", /decline finding/],
+    ["undispatchable: held for triage", m("a"), { queue: full([item("a", { suggest: "triage" })]) }, "undispatchable", /held for triage/],
+    ["undispatchable: on the queue, off the page", m("a"), { queue: full([item("a")]) }, "undispatchable", /not dispatchable/],
+    ["claimed elsewhere (hidden + foreign edge, within the bound)", m("a", { agents: ["agent-other"] }), { queue: full(), opts: { foreignHoldMs: 1000, now: 10 } }, "claimed", null],
+    ["claim-stale (past the bound)", m("a", { agents: ["agent-other"] }), { queue: full(), opts: { foreignHoldMs: 1000, now: 5000, foreignSince: new Map([[workLoop.programForeignKey("a", ["agent-other"]), 10]]) } }, "claim-stale", /agent-other .*no progress/],
+    ["off-queue: assigned to THIS box is not a foreign claim", m("a", { agents: ["agent-me"] }), { queue: full() }, "off-queue", /not on the dispatchable queue/],
+    ["off-queue: no identity here, a foreign edge is just an edge", m("a", { agents: ["agent-other"] }), { queue: full(), opts: { selfAgent: null } }, "off-queue", /not on the dispatchable queue/],
+    ["off-queue: complete read, nothing found", m("a"), { queue: full() }, "off-queue", /not on the dispatchable queue/],
+    ["unknown: off the page and the read was incomplete", m("a"), { queue: { complete: false, located: new Map() } }, "unknown", null],
+    ["unknown even with a foreign edge: an incomplete read says nothing about a claim", m("a", { agents: ["agent-other"] }), { queue: { complete: false, located: new Map() } }, "unknown", null],
+  ];
+  const seen = new Set();
+  for (const [name, member, { page = [], queue = undefined, opts = {} }, bucket, why] of cases) {
+    const r = programStanding({ members: [member], ...(queue ? { queue } : {}) }, { page: new Map(page.map((it) => [it.id, it])), policy, selfAgent: "agent-me", now: 100, ...opts });
+    assert.strictEqual(r.members.length, 1, name);
+    assert.strictEqual(r.members[0].bucket, bucket, `${name}: ${JSON.stringify(r.members[0])}`);
+    if (why) assert.match(r.members[0].why, why, name);
+    else assert.strictEqual(r.members[0].why, null, name);
+    // The standing follows the bucket's class, one member at a time.
+    const cls = PROGRAM_BUCKETS[bucket];
+    const expect = cls === "terminal" ? "complete" : cls === "movable" ? "moving" : cls === "stuck" ? "halted" : "undecided";
+    assert.strictEqual(r.state, expect, `${name}: ${r.state}`);
+    if (cls === "stuck") assert.deepStrictEqual(r.stuck, [{ id: "a", why: r.members[0].why }], name);
+    seen.add(bucket);
+  }
+  assert.deepStrictEqual([...seen].sort(), Object.keys(PROGRAM_BUCKETS).sort(), "every bucket is exercised");
+
+  // The fold over a mixed set: one movable member makes the program moving
+  // whatever else is stuck; all stuck from a complete read halts, naming them
+  // all; any unknown with nothing movable is undecided.
+  const stuckSet = [m("h", { human: "requires human" }), m("b", { bucket: "blocked", blockers: ["h"] })];
+  const halted = programStanding({ members: stuckSet, queue: full() }, { policy, selfAgent: "agent-me" });
+  assert.strictEqual(halted.state, "halted");
+  assert.deepStrictEqual(halted.stuck.map((s) => s.id), ["h", "b"]);
+  assert.strictEqual(programStanding({ members: [...stuckSet, m("r")], queue: full([item("r")]) }, { page: new Map([["r", item("r")]]), policy, selfAgent: "agent-me" }).state, "moving");
+  assert.strictEqual(programStanding({ members: [...stuckSet, m("u")], queue: { complete: false, located: new Map() } }, { policy, selfAgent: "agent-me" }).state, "undecided");
+});
+
+test("programStanding (finding 1): an on-page member the dispatcher would skip is stuck, not 'moving because it is on the page'; a later eligible member still moves it", () => {
+  const { programStanding } = workLoop;
+  const m = (id, extra = {}) => ({ id, bucket: "open", status: "open", human: null, blockers: [], agents: [], ...extra });
+  const policy = { accept: "ready", repos: ["demo"] };
+  const q = (items) => ({ complete: true, located: new Map(items.map((it) => [it.id, it])) });
+  // Three members on the page, none eligible for THIS worker: halted, each
+  // named with the dispatcher's own reason — the same classifyWorkItem.
+  const page = [
+    { id: "p", readiness: "untriaged", project: "demo" },
+    { id: "s", readiness: "agent", project: "other" },
+    { id: "f", readiness: "agent", project: "demo", assigned_agents: ["agent-other"] },
+  ];
+  const r = programStanding({ members: [m("p"), m("s"), m("f", { agents: ["agent-other"] })], queue: q(page) }, { page: new Map(page.map((it) => [it.id, it])), policy, selfAgent: "agent-me" });
+  assert.strictEqual(r.state, "halted");
+  assert.deepStrictEqual(r.members.map((x) => x.bucket), ["ineligible", "ineligible", "ineligible"]);
+  assert.match(r.stuck[0].why, /not agent-ready; work.accept ready/);
+  assert.match(r.stuck[1].why, /outside the factory's repo scope/);
+  assert.match(r.stuck[2].why, /assigned to agent agent-other/);
+  // ...and one eligible member RANKED LAST keeps the program moving: the
+  // classifier never stops at the first stuck member.
+  const later = [...page, { id: "z", readiness: "agent", project: "demo" }];
+  const r2 = programStanding({ members: [m("p"), m("s"), m("f", { agents: ["agent-other"] }), m("z")], queue: q(later) }, { page: new Map(later.map((it) => [it.id, it])), policy, selfAgent: "agent-me" });
+  assert.strictEqual(r2.state, "moving");
+  assert.strictEqual(r2.members.find((x) => x.id === "z").bucket, "runnable");
+  // The policy is the dispatcher's: under accept:open the untriaged member is
+  // runnable, and with no repo scope the other-repo member is too.
+  const r3 = programStanding({ members: [m("p"), m("s")], queue: q(page) }, { page: new Map(page.map((it) => [it.id, it])), policy: { accept: "open", repos: [] } });
+  assert.strictEqual(r3.state, "moving");
+  assert.deepStrictEqual(r3.members.map((x) => x.bucket), ["runnable", "runnable"]);
+});
+
+test("programStanding (finding 2): the foreign-claim clock is keyed per (member, assignee) and dropped the moment the condition stops holding", () => {
+  const { programStanding, programForeignKey } = workLoop;
+  const m = (id, extra = {}) => ({ id, bucket: "open", status: "open", human: null, blockers: [], agents: [], ...extra });
+  const hidden = { complete: true, located: new Map() };
+  const opt = (extra) => ({ page: new Map(), selfAgent: "agent-me", foreignHoldMs: 1000, ...extra });
+  // t=0: `c` claimed by agent-x while `r` keeps the program moving (runnable).
+  let r = programStanding({ members: [m("c", { agents: ["agent-x"] }), m("r")], queue: { complete: true, located: new Map([["r", { id: "r", readiness: "agent" }]]) } }, opt({ page: new Map([["r", { id: "r", readiness: "agent" }]]), now: 0, foreignSince: new Map() }));
+  assert.strictEqual(r.state, "moving");
+  assert.deepStrictEqual([...r.foreignSince.entries()], [[programForeignKey("c", ["agent-x"]), 0]]);
+  // t=100: `c` is back on the page (the lease lapsed) — the clock is dropped
+  // even though `r` still keeps the program moving (the old code only pruned
+  // on a non-moving pass).
+  r = programStanding({ members: [m("c", { agents: ["agent-x"] }), m("r")], queue: { complete: true, located: new Map([["c", { id: "c", readiness: "agent", assigned_agents: ["agent-x"] }], ["r", { id: "r", readiness: "agent" }]]) } }, opt({ page: new Map([["c", { id: "c", readiness: "agent", assigned_agents: ["agent-x"] }], ["r", { id: "r", readiness: "agent" }]]), now: 100, foreignSince: r.foreignSince }));
+  assert.strictEqual(r.state, "moving");
+  assert.strictEqual(r.foreignSince.size, 0, "a clock never outlives its claim");
+  // t=5000: a FRESH claim by agent-x hides `c` again, `r` is done. The clock
+  // starts now — not at t=0 — so it is a live claim, not a stale one.
+  r = programStanding({ members: [m("c", { agents: ["agent-x"] }), m("r", { bucket: "done" })], queue: hidden }, opt({ now: 5000, foreignSince: r.foreignSince }));
+  assert.strictEqual(r.state, "moving", "a fresh claim is not judged by a stale clock");
+  assert.strictEqual(r.members[0].bucket, "claimed");
+  assert.deepStrictEqual([...r.foreignSince.values()], [5000]);
+  // A different assignee on the same member is a different clock.
+  r = programStanding({ members: [m("c", { agents: ["agent-y"] }), m("r", { bucket: "done" })], queue: hidden }, opt({ now: 5900, foreignSince: r.foreignSince }));
+  assert.strictEqual(r.members[0].bucket, "claimed");
+  assert.deepStrictEqual([...r.foreignSince.entries()], [[programForeignKey("c", ["agent-y"]), 5900]], "agent-x's clock is gone, agent-y's starts now");
+  // The same assignee, held past the bound: stale, named.
+  r = programStanding({ members: [m("c", { agents: ["agent-y"] }), m("r", { bucket: "done" })], queue: hidden }, opt({ now: 7000, foreignSince: r.foreignSince }));
+  assert.strictEqual(r.state, "halted");
+  assert.strictEqual(r.members[0].bucket, "claim-stale");
+  // Once the program completes the map is empty.
+  r = programStanding({ members: [m("c", { bucket: "done" })] }, opt({ now: 8000, foreignSince: r.foreignSince }));
+  assert.strictEqual(r.state, "complete");
+  assert.strictEqual(r.foreignSince.size, 0);
+});
+
+test("programStanding (finding 3): an incomplete queue read never halts, whatever the stuck readings say", () => {
+  const { programStanding } = workLoop;
+  const m = (id, extra = {}) => ({ id, bucket: "open", status: "open", human: null, blockers: [], agents: [], ...extra });
+  const partial = { complete: false, located: new Map() };
+  const stuckEveryWay = [
+    m("h", { human: "requires human" }),
+    m("b", { bucket: "blocked", blockers: ["h"] }),
+    m("c"),
+  ];
+  const opts = { page: new Map(), skipped: new Map([["c", { reason: "refused", until: 99 }]]), now: 1, selfAgent: "agent-me" };
+  const r = programStanding({ members: stuckEveryWay, queue: partial }, opts);
+  assert.strictEqual(r.state, "undecided", "all three are stuck on their own terms, but the read was not complete");
+  assert.strictEqual(r.complete, false);
+  assert.deepStrictEqual(r.members.map((x) => x.bucket), ["human", "blocked", "cooling"]);
+  // The very same set from a complete read halts.
+  assert.strictEqual(programStanding({ members: stuckEveryWay, queue: { complete: true, located: new Map() } }, opts).state, "halted");
+  // And a member in flight still reads as moving under an incomplete read —
+  // movement is a fact about this box, not about the queue read.
+  assert.strictEqual(programStanding({ members: [...stuckEveryWay, m("x", { busy: true })], queue: partial }, opts).state, "moving");
+});
+
+test("--program (finding 3, in the loop): a pass whose member walk was incomplete does not halt, and the next complete one does", async () => {
+  let complete = false;
+  const snap = () => ({
+    found: true, root_id: "task-prog", truncated: false,
+    members: [{ id: "task-h", bucket: "open", status: "open", human: "requires human", blockers: [], agents: [] }],
+    queue: { complete, located: new Map() },
+  });
+  const h = harness({
+    queue: [],
+    opts: { concurrency: 1, program: "task-prog" },
+    maxPasses: 6,
+    extraDeps: { program: async () => snap() },
+    onTick: (state, pass) => { if (pass >= 2) complete = true; },
+  });
+  const status = await h.run();
+  assert.strictEqual(status.program.outcome, "halted", status.stop_reason);
+  assert.ok(h.polls >= 3, `halted only once the walk read in full (polls ${h.polls})`);
+  assert.strictEqual(h.control.stopping, false, "the program ended the loop, not the driver");
+});
+
+test("--program (finding 2, in the loop): the claim clock is carried across passes that launched something, so a lapsed-then-fresh claim is never judged stale", async () => {
+  // Pass 1: `c` is hidden under agent-x's claim; `r` is runnable and launches
+  // (so the standing is not DECIDED that pass, but it is classified, and the
+  // clock is carried). Pass 2: `r` resolved; `c` is back on the page (its
+  // lease lapsed) — skipped as assigned elsewhere, and its clock dropped.
+  // Pass 3: `c` hidden again under a FRESH claim, 20s after pass 1 and well
+  // past the 5s hold — moving (a clock started now), never "no progress".
+  let pass = 0;
+  const cItem = { id: "c", readiness: "agent", assigned_agents: ["agent-x"] };
+  const rItem = { id: "r", readiness: "agent" };
+  const members = () => [
+    { id: "c", bucket: "open", status: "open", human: null, blockers: [], agents: ["agent-x"] },
+    { id: "r", bucket: pass >= 2 ? "done" : "open", status: pass >= 2 ? "done" : "open", human: null, blockers: [], agents: [] },
+  ];
+  const located = () => (pass === 1 ? [rItem] : pass === 2 ? [cItem] : []);
+  const h = harness({
+    opts: { concurrency: 1, program: "task-prog", selfAgent: "agent-me", programForeignHoldMs: 5000, retryAfterMs: 1000 },
+    maxPasses: 3,
+    extraDeps: {
+      program: async () => { pass += 1; return { found: true, root_id: "task-prog", truncated: false, members: members(), queue: { complete: true, located: new Map(located().map((it) => [it.id, it])) } }; },
+      candidates: async () => located(),
+    },
+    onTick: (state) => {
+      state.clock += 10_000; // every wait is longer than the hold
+      state.finishAll({ terminal_state: "resolved", terminal_enforced: true, resolved_by: "dec-r" });
+    },
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["r"]);
+  assert.strictEqual(pass, 3, "three passes read the program");
+  assert.ok(h.log.some((l) => /skipping c — assigned to agent agent-x/.test(l)), h.log.join("\n"));
+  assert.strictEqual(status.program.outcome, null, status.stop_reason);
+  assert.ok(!h.log.some((l) => /no progress/.test(l)), h.log.join("\n"));
+  assert.strictEqual(status.stop_reason, "stopped by the test driver");
 });
