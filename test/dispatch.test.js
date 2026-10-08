@@ -3944,3 +3944,31 @@ test("a dispatched (judged) child never inherits either attestation signing-key 
   assert.ok(await waitForFile(outfile), "the supervised child ran");
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(outfile)), { key: null, legacy: null, keep: "ordinary-setting" });
 });
+
+// --dir is a per-dispatch override (issue-spor-dispatch-dir-rewrites-repo-map-for-cross-repo-node):
+// a checkout that demonstrably hosts a DIFFERENT repo must never remap the node's slug,
+// while a --dir that IS the node's own repo still self-registers.
+test("dispatch --dir at another repo's checkout leaves the config byte-identical", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-dirmap-"));
+  const right = fs.mkdtempSync(path.join(os.tmpdir(), "spor-dirmap-right-"));
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), "spor-dirmap-other-"));
+  require("./helpers/git.js").gitInit(other);
+  fs.writeFileSync(path.join(other, ".spor"), "project: elsewhere\n");
+  const cfgPath = path.join(home, "config.json");
+  fs.writeFileSync(cfgPath, JSON.stringify({ dispatch: { repos: { demo: right } } }));
+  const before = fs.readFileSync(cfgPath);
+  const r = run(["dispatch", "ship the widget", "--dir", other, "--slug", "demo", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: noOpClaudeStub(home) });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.deepStrictEqual(fs.readFileSync(cfgPath), before, "a cross-repo --dir must not touch config.json");
+});
+
+test("dispatch --dir at the node's own repo checkout still registers it", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-dirmap-"));
+  const own = fs.mkdtempSync(path.join(os.tmpdir(), "spor-dirmap-own-"));
+  require("./helpers/git.js").gitInit(own);
+  fs.writeFileSync(path.join(own, ".spor"), "project: demo\n");
+  const r = run(["dispatch", "ship the widget", "--dir", own, "--slug", "demo", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: noOpClaudeStub(home) });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  assert.strictEqual(fs.realpathSync(cfg.dispatch.repos.demo), fs.realpathSync(own));
+});
