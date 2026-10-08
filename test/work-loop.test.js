@@ -445,6 +445,7 @@ test("--max stops the worker once it has dispatched that many, after they finish
   assert.strictEqual(status.dispatched, 2);
   assert.match(status.stop_reason, /--max/);
   assert.strictEqual(status.outcomes.failed, 2);
+  assert.strictEqual(status.stop_code, "drained");
 });
 
 test("--once dispatches one pass, drains it, and stops without picking up more", async () => {
@@ -462,6 +463,7 @@ test("--once dispatches one pass, drains it, and stops without picking up more",
   assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-1"], "--once never starts a second round");
   assert.match(status.stop_reason, /--once/);
   assert.strictEqual(status.outcomes.resolved, 1);
+  assert.strictEqual(status.stop_code, "drained");
 });
 
 test("--once with an empty queue exits immediately rather than waiting a poll interval", async () => {
@@ -484,6 +486,7 @@ test("a stop request ends the loop and leaves in-flight runs recorded, not aband
   });
   const status = await h.run();
   assert.strictEqual(status.stop_reason, "stopped on SIGTERM");
+  assert.strictEqual(status.stop_code, "signal");
   assert.strictEqual(status.active.length, 1, "the detached run is still named on the status so it can be followed");
   assert.strictEqual(status.state, "stopped");
   assert.strictEqual(h.sleeps.length, 1, "the stop lands at the next boundary, not after another full pass");
@@ -2721,6 +2724,7 @@ test("--restart-on-land drains the in-flight work and exits once the loaded code
   assert.strictEqual(final.restart_on_land, true);
   assert.strictEqual(final.active.length, 0, "exited only after the in-flight run settled");
   assert.match(final.stop_reason, /moved past \(now abc1234\); exited for a restart \(--restart-on-land\)/);
+  assert.strictEqual(final.stop_code, "restart-on-land");
   assert.ok(h.log.some((l) => /--restart-on-land — taking no new work; exiting once the 1 run\(s\)\/pipeline\(s\) in flight settle/.test(l)), h.log.join("\n"));
   assert.ok(h.sleeps.length < 20, "the loop exited on its own, not by the test driver");
 
@@ -2737,6 +2741,7 @@ test("--restart-on-land drains the in-flight work and exits once the loaded code
   assert.deepStrictEqual(off.dispatched.map((d) => d.id), ["task-a", "task-b"]);
   assert.strictEqual("restart_on_land" in finalOff, false, "byte-identical status when off");
   assert.strictEqual(finalOff.stop_reason, "stopped by the test driver");
+  assert.strictEqual(finalOff.stop_code, "signal");
 });
 
 test("--restart-on-land with nothing in flight exits on the pass that notices the move", async () => {
@@ -3685,6 +3690,7 @@ test("--program: two agent members run in blocks order, the human member is neve
   assert.ok(h.log.some((l) => /work: program task-prog halted — .*task-human \(requires human\)/.test(l)), h.log.join("\n"));
   assert.strictEqual(status.program.outcome, "halted");
   assert.deepStrictEqual(status.program.stuck, [{ id: "task-human", why: "requires human" }]);
+  assert.strictEqual(status.stop_code, "human-required");
   assert.strictEqual(h.control.stopping, false, "the program ended the loop, not the test driver");
 });
 
@@ -3695,6 +3701,7 @@ test("--program: a fully terminal program exits cleanly on the first pass, dispa
   assert.strictEqual(status.stop_reason, "program task-prog complete — all 2 member(s) terminal");
   assert.strictEqual(status.program.outcome, "complete");
   assert.strictEqual(h.sleeps.length, 0, "no poll wait before exiting");
+  assert.strictEqual(status.stop_code, "program-terminal");
 });
 
 test("--program: the program completes once its last member resolves", async () => {
@@ -3721,6 +3728,7 @@ test("--program: an unsatisfiable member (refused here) halts the program instea
   });
   const status = await st.run();
   assert.match(status.stop_reason, /halted — 1 of 1 member\(s\) remain and none can run here: task-a \(cannot dispatch task-a here: this machine can't satisfy profile-x\)$/);
+  assert.strictEqual(status.stop_code, "unsatisfiable");
   // Not on the refusing pass itself: the page widens past a cooling item only
   // on the NEXT fetch, so that pass has not read what lies below it.
   assert.strictEqual(st.polls, 2, "halted on the pass after the refusal");
@@ -3745,6 +3753,7 @@ test("--program: a program root that disappears stops the worker, saying so", as
   const h = harness({ queue: [], opts: { program: "task-prog" }, extraDeps: { program: async () => ({ found: false, root_id: "task-prog" }) } });
   const status = await h.run();
   assert.strictEqual(status.stop_reason, "program task-prog no longer exists");
+  assert.strictEqual(status.stop_code, "program-terminal");
   assert.strictEqual(status.program.outcome, "missing");
 });
 
@@ -4211,4 +4220,8 @@ test("--program (finding 2, in the loop): the claim clock is carried across pass
   assert.strictEqual(status.program.outcome, null, status.stop_reason);
   assert.ok(!h.log.some((l) => /no progress/.test(l)), h.log.join("\n"));
   assert.strictEqual(status.stop_reason, "stopped by the test driver");
+});
+
+test("STOP_CODES is the closed stop_code enum", () => {
+  assert.deepStrictEqual([...workLoop.STOP_CODES].sort(), ["drained", "error", "human-required", "idle", "program-terminal", "restart-on-land", "signal", "unsatisfiable"]);
 });
