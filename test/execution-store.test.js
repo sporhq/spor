@@ -447,7 +447,7 @@ test("bin/spor.js, remote mode: claimExecutionHold opens the hosted execution, n
     assert.deepEqual(claim.gates, ["acceptance"]);
     assert.match(fake.state.nodes.get("task-x"), new RegExp(`^execution: ${claim.execution_id}$`, "m"), "the item's hold names the server's id");
     const opened = fake.state.requests.find((q) => q.method === "POST" && q.path === "/v1/executions");
-    assert.deepEqual(opened.body, { node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates", repo: "spor", machine: os.hostname() });
+    assert.deepEqual(opened.body, { node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates", repo: "spor", machine: os.hostname(), instance: spor.executionInstance() });
     assert.ok(fake.state.requests.some((q) => q.path.endsWith("/events") && q.body.event.type === "stage.started" && q.body.fence === 1), "stage.started rides the fence");
     assert.match(lines.join("\n"), /remote store, fence 1/);
     // Another worker: the server refuses, so does the claim.
@@ -703,6 +703,89 @@ test("legacy and pre-adapter records report nothing: no impl_claim, or an impl_c
   assert.equal(spor.reportingGateDeps(plain, null), plain, "the deps object is untouched without a reporter");
 });
 
+// The per-process INSTANCE inside the (worker, machine) owner
+// (issue-spor-execution-fence-shared-by-same-agent-processes). The parity
+// vector is the server's lib-engine/test/execution.test.js case verbatim, so
+// the client port and the hosted reducer agree on the fence arithmetic.
+test("kernel parity: a re-claim by a different process instance of the same (worker, machine) advances the fence; an instance-less claim records none", () => {
+  const LATE = later(3600);
+  const T1 = later(1);
+  const rec = kernel.claim(kernel.initExecution(SPEC, { sha256 }), { worker: "agent-one", machine: "box", instance: "p1", lease_expires_at: LATE, now: T0 }).record;
+  assert.equal(rec.owner.instance, "p1");
+  assert.equal(kernel.claim(rec, { worker: "agent-one", machine: "box", instance: "p1", lease_expires_at: LATE, now: T1 }).fence, 1, "a same-instance re-claim keeps the fence");
+  const second = kernel.claim(rec, { worker: "agent-one", machine: "box", instance: "p2", lease_expires_at: LATE, now: T1 });
+  assert.equal(second.ok, true, "a second instance of the live owner pair is admitted");
+  assert.equal(second.fence, 2);
+  assert.equal(second.record.owner.instance, "p2");
+  const ghost = kernel.applyExecutionEvent(second.record, { type: "stage.started", attempt: 1, at: T1, fence: 1 }, {});
+  assert.equal(ghost.code, "fence_stale", "the first process's writes are refused");
+  assert.equal(kernel.claim(second.record, { worker: "agent-two", machine: "box", instance: "p3", lease_expires_at: LATE, now: T1 }).code, "already_owned", "the instance never admits a different owner pair");
+  const legacy = kernel.claim(kernel.initExecution(SPEC, { sha256 }), { worker: "agent-one", machine: "box", lease_expires_at: LATE, now: T0 }).record;
+  assert.equal("instance" in legacy.owner, false);
+  assert.equal(kernel.claim(legacy, { worker: "agent-one", machine: "box", lease_expires_at: LATE, now: T1 }).fence, 1, "no instance on either side keeps the pair-only behavior");
+});
+
+test("local store: a second process instance of the same (worker, machine) re-opens at a NEW fence, the first's writes are refused, and only the same instance is echoed its fence", async () => {
+  const home = tmp("instance-local");
+  const pinRead = (id) => ({ revision: `rev-${id}`, repo: "spor" });
+  const p1 = store.openExecutionStore(null, { home, mode: "local", worker: "agent-a", machine: "box", instance: "p1", pinRead });
+  const p2 = store.openExecutionStore(null, { home, mode: "local", worker: "agent-a", machine: "box", instance: "p2", pinRead });
+  const args = { node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" };
+  const first = await p1.open(args);
+  assert.equal(first.fence, 1);
+  const id = first.execution.execution_id;
+  assert.equal(first.execution.owner.instance, "p1");
+  assert.equal((await p1.open(args)).fence, 1, "a same-instance re-open is echoed its fence");
+  const second = await p2.open(args);
+  assert.equal(second.ok, true, second.message);
+  assert.equal(second.fence, 2, "a different instance re-opening advances the fence");
+  assert.equal(second.execution.owner.instance, "p2");
+  assert.equal((await p1.event(id, { fence: 1, event: { type: "stage.started", attempt: 1 } })).code, "fence_stale");
+  assert.equal((await p1.renew(id, { fence: 1 })).code, "fence_stale");
+  assert.equal((await p2.event(id, { fence: 2, event: { type: "stage.started", attempt: 1 } })).ok, true);
+  const back = await p1.open(args);
+  assert.equal(back.fence, 3, "the first process re-opening fences the second out in turn");
+  const claimed = await p2.claim(id, {});
+  assert.equal(claimed.fence, 4, "a claim by a different instance advances it too");
+  assert.equal((await p2.claim(id, {})).fence, 4, "a same-instance re-claim keeps it");
+});
+
+test("remote adapter: every open and claim carries this process's instance (never a holder's), renew does not, and a second instance of the same owner pair fences the first out", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const p1 = store.openExecutionStore(remoteCfg(tmp("inst-a"), fake.base), { machine: "box", instance: "p1" });
+    const p2 = store.openExecutionStore(remoteCfg(tmp("inst-b"), fake.base), { machine: "box", instance: "p2" });
+    const args = { node_id: "task-x", factory: "factory-t", gates: [], boundary: "gates" };
+    const first = await p1.open(args);
+    assert.equal(first.fence, 1, JSON.stringify(first));
+    const id = first.execution.execution_id;
+    const second = await p2.open(args);
+    assert.equal(second.ok, true, JSON.stringify(second));
+    assert.equal(second.fence, 2);
+    assert.equal((await p1.renew(id, { fence: 1 })).code, "fence_stale", "the first process's lease cannot be renewed under its old fence");
+    assert.equal((await p2.claim(id, { instance: "p1" })).fence, 2, "a same-instance re-claim keeps the fence; a caller-supplied instance is ignored");
+    const posts = fake.state.requests.filter((r) => r.method === "POST" && r.path.startsWith("/v1/executions"));
+    for (const r of posts) {
+      const owning = r.path === "/v1/executions" || r.path.endsWith("/claim");
+      assert.equal("instance" in r.body, owning, `${r.path} ${owning ? "carries" : "omits"} the instance`);
+    }
+    assert.deepEqual(posts.filter((r) => r.path.endsWith("/claim")).map((r) => r.body.instance), ["p2"]);
+    // An instance-less store keeps the shipped wire body byte-for-byte.
+    const legacy = store.openExecutionStore(remoteCfg(tmp("inst-legacy"), fake.base), { machine: "box" });
+    await legacy.claim(id, {});
+    assert.equal("instance" in fake.state.requests[fake.state.requests.length - 1].body, false);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("bin/spor.js: one execution instance per process, opaque and within the server's 200-character bound", () => {
+  const a = spor.executionInstance();
+  assert.equal(typeof a, "string");
+  assert.ok(a.length > 0 && a.length <= 200);
+  assert.equal(spor.executionInstance(), a, "stable for the life of the process");
+});
+
 test("remote ownership belongs to the fixed agent and machine pair on every mutation", async () => {
   let clock = T0;
   const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") }, now: () => clock });
@@ -772,7 +855,9 @@ for (const failure of ['before-release', 'lost-ack', 'before-report', 'released-
   fs.mkdirSync(path.dirname(p.record), { recursive: true }); fs.writeFileSync(p.record, JSON.stringify(record));
   const reporter = spor.executionReporter(cfg, record, { home });
   await reporter.resume();
-  const engine = [...fake.state.engines.values()][0];
+  // Release carries no process instance (only open/claim do), so it is served
+  // by the fake's instance-less engine for this owner pair.
+  const engine = [...fake.state.engines].find(([key]) => JSON.parse(key)[2] === null)[1];
   const release = engine.release.bind(engine);
   let calls = 0;
   engine.release = async (...args) => {

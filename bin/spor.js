@@ -14588,6 +14588,19 @@ function executionPinRead(cfg) {
   };
 }
 
+// The PROCESS instance this CLI's execution opens/claims carry
+// (issue-spor-execution-fence-shared-by-same-agent-processes, EXECUTION-STATE.md
+// §4): minted once per process, so two `spor work` processes of one agent on
+// one box are distinct instances of the same (worker, machine) owner — the
+// second's open/claim advances the fence and the first's writes are refused
+// `fence_stale` — while every re-claim inside one process keeps its fence.
+// Opaque to the store; the pid is only there to make it readable.
+let EXECUTION_INSTANCE = null;
+function executionInstance() {
+  if (!EXECUTION_INSTANCE) EXECUTION_INSTANCE = `${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
+  return EXECUTION_INSTANCE;
+}
+
 // The store bin/spor.js opens: the hosted adapter in remote mode, the local
 // engine otherwise, or the one a claim STAMPED (`impl_claim.store`) so a
 // resume drives the store the pipeline was opened in.
@@ -14598,6 +14611,7 @@ function openExecutionStoreFor(cfg, { home = cfg.userConfigHome(), mode = null, 
     tenant,
     worker: executionWorkerPrincipal(cfg),
     machine: os.hostname(),
+    instance: executionInstance(),
     pinRead: executionPinRead(cfg),
     log,
   });
@@ -17547,6 +17561,9 @@ function worker() {
 }
 
 function cmdWork(cfg, args) {
+  // Mint this worker process's execution instance at startup, so every
+  // open/claim it makes for its whole life carries the one id.
+  executionInstance();
   return worker().cmdWork(cfg, args);
 }
 
@@ -20648,7 +20665,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
+module.exports = { gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
 
 if (require.main === module) {
   main()

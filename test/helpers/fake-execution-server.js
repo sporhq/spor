@@ -62,9 +62,9 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
     unavailable: false,
     engines: new Map(),
   };
-  const engineFor = (bearer, machine = null) => {
+  const engineFor = (bearer, machine = null, instance = null) => {
     const worker = workers[bearer] || `unknown-${bearer}`;
-    const key = JSON.stringify([worker, machine]);
+    const key = JSON.stringify([worker, machine, instance]);
     if (!state.engines.has(key)) {
       state.engines.set(
         key,
@@ -73,6 +73,7 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
           tenant,
           worker,
           machine,
+          instance,
           now: now || (() => new Date().toISOString()),
           pinRead: (id) => (state.nodes.has(id) ? { revision: gitBlobSha(state.nodes.get(id)), repo: "spor" } : null),
         })
@@ -116,7 +117,7 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
           if (state.unserved) return reply(res, 404, { message: "Route not found" });
           if (state.unservedEnveloped) return reply(res, 404, { error: { code: "not_found", message: "no such route", details: [] } });
           if (state.unavailable) return answer(res, { ok: false, code: "unavailable", message: "the execution store is not configured on this server" });
-          const eng = engineFor(bearer, body?.machine ?? null);
+          const eng = engineFor(bearer, body?.machine ?? null, body?.instance ?? null);
           const m = /^\/v1\/executions\/([^/]+)(?:\/(claim|renew|release|events))?$/.exec(p);
           if (req.method === "POST" && p === "/v1/executions") {
             // The server pins at open and refuses an item or factory it cannot
