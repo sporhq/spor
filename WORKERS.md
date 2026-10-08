@@ -4258,6 +4258,25 @@ and tries again. In local mode the same check runs against the local engine,
 so a second worker on one box that took over an expired execution is refused
 identically.
 
+**What an ended execution leaves behind is collected**
+(task-spor-execution-journal-gc-takeovers-and-locks). `gcExecutions`
+(lib/shell/execution-store.js), run on the session-start journal-GC throttle
+and once per `gc.intervalMs` by `spor work`, deletes a TERMINAL execution's
+takeover ledger (`<id>.takeovers.jsonl`) and empty outbox files under the
+outbox lock, and removes lock artifacts (`.lock`, `.lock.break`,
+`.lock.dead-*`, in `exec/` and `item/`) whose holder is positively gone and
+that are older than 15 minutes. An execution whose outbox holds ANY line —
+stranded, live, unknown or adoptable — is spared whole; the record, the event
+log and the workflow journals are history and stay. A person resolves such a
+file with `spor executions --discard|--adopt <exec-id> --file <tag> --yes`
+(a stranded or unknown-owner file, or any non-live file of a terminal
+execution, which discard only): the action and every line are journaled to
+`<id>.outbox-resolutions.jsonl` first, and adopt moves the lines into the
+shared outbox the next holder replays. `spor executions <id>` counts only the
+lines the next call will actually send. In personal mode, an event refused
+only because another process held the item lock is reported `unspooled`, so
+the reporter holds and re-sends it like the remote case.
+
 **What stays as it was.** A run record with no `impl_claim` is a legacy run
 (`completion.by: agent`) and opens no execution; a controller record claimed
 before this adapter (an `impl_claim` with no `store`) reports nothing and

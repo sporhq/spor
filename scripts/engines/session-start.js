@@ -311,7 +311,13 @@ async function sessionStartBase(input) {
   // fills in both. The live session id is passed so its own in-flight files are
   // never swept.
   try {
-    u.gcJournal(graph, { session: input.session_id });
+    const swept = u.gcJournal(graph, { session: input.session_id });
+    // ...and, on the same throttle, what an ENDED factory execution leaves
+    // under journal/executions/ (its takeover ledger, empty outbox files,
+    // gone holders' lock files — task-spor-execution-journal-gc-takeovers-
+    // and-locks). The store lives in the user home, which a shared-graph
+    // marker can move the graph away from. Bounded: it never waits on a lock.
+    if (swept.ran) await require(path.join(u.ROOT, "lib", "shell", "execution-store.js")).gcExecutions(u.userConfigHome());
   } catch {
     /* best effort — GC never blocks session-start */
   }

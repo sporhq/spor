@@ -10849,6 +10849,7 @@ async function launchSupervisedHarness(cfg, {
 async function cmdExecutions(cfg, { values, positionals: pos }) {
   const home = cfg.userConfigHome();
   const store = openExecutionStoreFor(cfg, { home, mode: values.local ? "local" : null, log: (l) => err(`note: ${l}`) });
+  if (values.discard != null || values.adopt != null) return resolveOutboxFromCli(store, values);
   const id = pos[0] || null;
   const json = !!values.json;
   const short = (v) => String(v || "").slice(0, 12);
@@ -10877,14 +10878,24 @@ async function cmdExecutions(cfg, { values, positionals: pos }) {
     if (x.integration) out(`  integration ${x.integration.state}${x.integration.ref ? ` onto ${x.integration.ref}` : ""}${x.integration.commit ? ` at ${short(x.integration.commit)}` : ""}`);
     for (const e of x.escalations || []) out(`  escalation ${e.node_id}${e.reason ? `: ${e.reason}` : ""}`);
     if (x.completion.written_at) out(`  completed ${x.completion.written_at} by ${x.completion.resolver || "?"}`);
-    const owed = store.outbox ? store.outbox(x.execution_id) : [];
-    if (owed.length) out(`  outbox: ${owed.length} event(s) owed to the server — replayed on the pipeline's next call`);
     // Per file, who holds it: a file whose owner is live elsewhere or cannot
-    // be judged is stranded until its owner returns (or GC), not replayed.
+    // be judged is stranded until its owner returns (or a person resolves
+    // it), not replayed — so the summary counts only the lines the next
+    // call will actually send, and names the rest separately.
+    const report = store.outboxReport ? store.outboxReport(x.execution_id) : [];
+    const replayable = report.reduce((n, f) => n + (f.replayable || 0), 0);
+    const notReplayed = report.reduce((n, f) => n + f.lines, 0) - replayable;
+    if (replayable) out(`  outbox: ${replayable} event(s) owed to the server — replayed on the pipeline's next call`);
+    const ended = report.some((f) => f.terminal);
+    if (notReplayed > 0) {
+      out(ended
+        ? `  outbox: ${notReplayed} line(s) NOT replayed — the execution is terminal, so nothing ever will; discard a file with --discard ${x.execution_id} --file <tag|basename>`
+        : `  outbox: ${notReplayed} line(s) NOT replayed (stranded, held by a live process, or dropped as post-loss) — see below; resolve a stranded file with --discard|--adopt ${x.execution_id} --file <tag>`);
+    }
     const OUTBOX_STATE = { own: "this process", shared: "shared — adopted by the next holder", adoptable: "owner gone — adopted by the next holder", live: "held by a live process — stranded until it replays or loses", unknown: "owner unknown (another machine or unreadable) — stranded", stranded: "owner gone, but a line's fence loss is undatable on this box — STRANDED for a person to judge (never adopted or deleted)" };
-    for (const f of store.outboxReport ? store.outboxReport(x.execution_id) : []) {
+    for (const f of report) {
       const who = f.owner && f.owner.instance != null ? ` instance ${short(f.owner.instance)}${f.owner.pid != null ? ` pid ${f.owner.pid}` : ""}${f.owner.machine ? ` on ${f.owner.machine}` : ""}` : "";
-      out(`    ${path.basename(f.file)}: ${f.lines} line(s)${who}; ${OUTBOX_STATE[f.state] || f.state}`);
+      out(`    ${path.basename(f.file)}: ${f.lines} line(s)${who}; ${OUTBOX_STATE[f.state] || f.state}${f.terminal && f.state !== "live" ? " — but the execution is terminal: never replayed" : ""}`);
     }
     return 0;
   }
@@ -10905,6 +10916,58 @@ async function cmdExecutions(cfg, { values, positionals: pos }) {
     out(`${x.execution_id}  ${x.stage.padEnd(14)} ${x.item.node_id}  attempt ${x.pipeline_attempt}  ${x.owner ? `${x.owner.worker} fence ${x.owner.fence} until ${x.owner.lease_expires_at}` : "unowned"}${x.boundary_reached ? "  boundary reached" : ""}`);
   }
   out(`${r.count} execution(s)${r.cached ? " (cached copies — the server was unreachable)" : ""}`);
+  return 0;
+}
+
+// `spor executions --discard|--adopt <exec-id> --file <tag> [--yes]`
+// (task-spor-execution-journal-gc-takeovers-and-locks): the person-facing
+// door for an outbox file the adapter will never touch on its own — a
+// STRANDED one (a gone holder's line whose fence loss this box cannot date),
+// one whose owner cannot be judged, or any non-live file of a TERMINAL
+// execution (nothing will ever replay it; discard only). Without --yes it only says what it
+// would do; with it, the store journals the action and every line it moves
+// or drops to `<exec>.outbox-resolutions.jsonl` before acting.
+async function resolveOutboxFromCli(store, values) {
+  if (values.discard != null && values.adopt != null) {
+    err("error: --discard and --adopt are exclusive — name one action");
+    return 1;
+  }
+  const action = values.discard != null ? "discard" : "adopt";
+  const id = String(values[action] || "").trim();
+  if (!id || !values.file) {
+    err(`error: usage: spor executions --${action} <exec-id> --file <tag|instance> [--yes]`);
+    return 1;
+  }
+  if (typeof store.resolveOutbox !== "function") {
+    err(`error: the ${store.mode} store keeps no outbox — nothing to ${action}`);
+    return 1;
+  }
+  const who = (() => {
+    try {
+      return `${os.userInfo().username}@${os.hostname()}`;
+    } catch {
+      return os.hostname();
+    }
+  })();
+  let r;
+  try {
+    r = await store.resolveOutbox(id, { action, file: values.file, by: who, dryRun: !values.yes });
+  } catch (e) {
+    err(`error: ${e && e.outboxLocked ? `${e.message} — retry shortly` : (e && e.message) || e}`);
+    return 1;
+  }
+  if (!r.ok) {
+    err(`error: ${r.code}: ${r.message}`);
+    return 1;
+  }
+  const what = action === "discard" ? "drop" : "move into the shared outbox (replayed by the next holder of the execution)";
+  const owner = r.owner && r.owner.instance != null ? ` (instance ${r.owner.instance}${r.owner.pid != null ? ` pid ${r.owner.pid}` : ""}${r.owner.machine ? ` on ${r.owner.machine}` : ""})` : "";
+  if (r.dry_run) {
+    out(`would ${what} ${r.lines} line(s) of ${path.basename(r.file)}${owner}, ${r.state}`);
+    err(`confirmation required: re-run with --yes to ${action} it (journaled to ${id}.outbox-resolutions.jsonl with every line)`);
+    return 1;
+  }
+  out(`${action === "discard" ? "discarded" : "adopted"} ${r.lines} line(s) of ${path.basename(r.file)}${owner}; journaled to ${id}.outbox-resolutions.jsonl`);
   return 0;
 }
 
@@ -11422,6 +11485,28 @@ async function withdrawHeldExecution(cfg, { nodeId, executionId, fence = null, s
     openStore: d.openStore,
     clearHold: d.clearHold,
   });
+}
+
+// The execution-journal sweep from a long-lived `spor work` process
+// (task-spor-execution-journal-gc-takeovers-and-locks): what an ENDED
+// execution leaves on this box — its takeover ledger, empty outbox files and
+// gone holders' lock artifacts — collected at most once per gc.intervalMs,
+// gated on gc.enabled like the session-start journal sweep that also runs
+// it. Fail-open: a sweep that throws is retried at the next interval.
+let EXECUTION_GC_AT = 0;
+async function gcExecutionsDue(cfg, { home = cfg.userConfigHome(), log = () => {}, now = Date.now() } = {}) {
+  if (!cfg.getBool("gc.enabled", true)) return null;
+  const interval = Number(cfg.get("gc.intervalMs", require(path.join(ROOT, "lib", "shell", "spool.js")).SPOOL_TTL.gcInterval));
+  if (EXECUTION_GC_AT && now - EXECUTION_GC_AT < interval) return null;
+  EXECUTION_GC_AT = now;
+  try {
+    const stat = await executionStore.gcExecutions(home, { now });
+    if (stat.collected.length) log(`work: collected the ledger, outbox and lock files of ${stat.collected.length} ended execution(s)`);
+    return stat;
+  } catch (e) {
+    log(`work: the execution journal sweep failed (${(e && e.message) || e}); retried next interval`);
+    return null;
+  }
 }
 
 // Re-drive every withdrawal an interrupted pass left owed (once per poll pass).
@@ -14753,6 +14838,9 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
   };
 
   const stampFence = (f, expires) => {
+    // A store answer that carries no fence never clears the one in force:
+    // events held under it would otherwise wait on nothing.
+    if (f == null || !Number.isFinite(Number(f))) return;
     fence = f;
     owned = true;
     try {
@@ -14793,6 +14881,15 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
   const answered = new WeakMap();
   let flushing = Promise.resolve();
   async function drainHeld() {
+    // Held events wait on a fence to send them under. With none (a store that
+    // answered a claim without one), they are still OWED: the flush reports
+    // itself blocked — never "flushed" — so confirm() and release() refuse
+    // rather than read an undelivered queue as empty, and it says so once.
+    if (held.length && fence == null) {
+      note("held-no-fence", `work: ${record.node_id} — execution ${id}: ${held.length} held event(s) wait on a fence this process does not hold; kept in memory, never dropped`);
+      HELD_REPORTERS.add(reporter);
+      return { ok: false, code: "not_owned", message: "no fence to send the held event(s) under" };
+    }
     while (held.length && fence != null) {
       const ev = held[0];
       const r = await deliver(ev);
@@ -17700,7 +17797,7 @@ function worker() {
       loadedCodeCommit, makeCodeMovedNotice, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, makeFactoryAvailabilityCheck, pollWorkRuns,
       reconcileCompletions, reconcileWithdrawnExecutions, renewLiveExecutions, replayAttestationDebts,
       resolveDir, retryOneEscalation, runGateAndIntegration, takeProjectWarning,
-      targetRepoDispatchCfg, warnQueueProjectOnce, workerAlive,
+      targetRepoDispatchCfg, warnQueueProjectOnce, workerAlive, gcExecutionsDue,
     });
   }
   return _worker;
@@ -20261,7 +20358,13 @@ const COMMANDS = {
       "  spor executions                 every execution, newest first\n" +
       "  spor executions --node <id>     the executions of one item\n" +
       "  spor executions <exec-id>       one execution: owner, gates, candidate, boundary\n" +
-      "  spor executions <exec-id> --events   its durable event log, oldest first",
+      "  spor executions <exec-id> --events   its durable event log, oldest first\n" +
+      "  spor executions --discard <exec-id> --file <tag> [--yes]   drop a STRANDED outbox file's lines\n" +
+      "  spor executions --adopt <exec-id> --file <tag> [--yes]     declare them owed: the next holder replays them\n\n" +
+      "A stranded outbox file (a gone process's events whose fence loss this box\n" +
+      "cannot date) is never replayed or deleted on its own; --discard/--adopt is\n" +
+      "how a person resolves it. Both need --yes, and both journal the action and\n" +
+      "every line to <exec-id>.outbox-resolutions.jsonl before acting.",
     options: {
       node: { type: "string", value: "id", desc: "only the executions of this work item" },
       stage: { type: "string", value: "stage", desc: "only executions at this stage (implementation|gating|integration|completed|refused)" },
@@ -20269,8 +20372,12 @@ const COMMANDS = {
       events: { type: "boolean", desc: "with <exec-id>: print its durable event log instead of the record" },
       local: { type: "boolean", desc: "read the machine-local store even in remote mode" },
       json: { type: "boolean", desc: "machine-readable JSON (the raw records)" },
+      discard: { type: "string", value: "exec-id", desc: "drop the lines of one stranded outbox file of this execution (with --file, --yes)" },
+      adopt: { type: "string", value: "exec-id", desc: "move one stranded outbox file's lines into the shared outbox for replay (with --file, --yes)" },
+      file: { type: "string", value: "tag", desc: "with --discard/--adopt: the outbox file — its tag, basename or owner instance" },
+      yes: { type: "boolean", desc: "with --discard/--adopt: confirm (without it, only print what would happen)" },
     },
-    examples: ["spor executions", "spor executions --node task-x", "spor executions exec-4da6d4763543a301 --events"],
+    examples: ["spor executions", "spor executions --node task-x", "spor executions exec-4da6d4763543a301 --events", "spor executions --discard exec-4da6d4763543a301 --file 1f2e3d4c5b6a7980 --yes"],
     run: (cfg, p) => cmdExecutions(cfg, p),
   },
   attestation: {
@@ -20811,7 +20918,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
+module.exports = { gcExecutionsDue, gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
 
 if (require.main === module) {
   main()
