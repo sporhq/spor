@@ -3944,3 +3944,16 @@ test("a dispatched (judged) child never inherits either attestation signing-key 
   assert.ok(await waitForFile(outfile), "the supervised child ran");
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(outfile)), { key: null, legacy: null, keep: "ordinary-setting" });
 });
+
+test("dispatch --dir is a per-dispatch override: a real run does not rewrite dispatch.repos", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-dirmap-"));
+  const right = fs.mkdtempSync(path.join(os.tmpdir(), "spor-dirmap-right-"));
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), "spor-dirmap-other-"));
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { repos: { demo: right } } }));
+  const stub = noOpClaudeStub(home);
+  const r = run(["dispatch", "ship the widget", "--dir", other, "--slug", "demo", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  assert.strictEqual(cfg.dispatch.repos.demo, right, "--dir must not remap the slug");
+  assert.ok(!Object.values(cfg.dispatch.repos).includes(other));
+});
