@@ -2994,6 +2994,7 @@ test("rerank: absent opts.rerankScores is byte-identical to the pre-rerank order
   assert.deepEqual(digestOrder(r.text), ["node-a", "node-b", "node-c", "node-d", "node-e"],
     "tied structural children keep stable insertion order; the content pick trails");
   assert.equal(r.meta.rerank, undefined, "meta.rerank is only present when rerank actually ran");
+  assert.deepEqual(r.meta.rendered_ids, ["node-a", "node-b", "node-c", "node-d", "node-e"], "digest meta lists what rendered");
 });
 
 test("rerank: an empty opts.rerankScores object behaves exactly like absent", () => {
@@ -3017,6 +3018,142 @@ test("rerank: orders pinned -> scored candidates (noul desc, score secondary) ->
   });
   assert.deepEqual(digestOrder(r.text), ["node-c", "node-b", "node-a", "node-d", "node-e"]);
   assert.deepEqual(r.meta.rerank, { applied: true, candidates: 3 });
+});
+
+// ---------- digest rerank FILTER (task-spor-filter-digest-nodes-by-jev-score) ----------
+
+test("rerank filter: rerankMinScore keeps only scored candidates at/above it, score desc, and drops the unscored remainder", () => {
+  const g = rerankFixture();
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankMinScore: 1,
+    rerankScores: {
+      "node-a": { score: 1, noul: 0.1 },   // exactly at the threshold: kept
+      "node-b": { score: 2.4, noul: 0.2 },
+      "node-c": { score: 0.6, noul: 0.9 }, // a high noul never rescues a sub-threshold score
+      "node-e": { score: 1.7, noul: 0 },   // the content pick competes on score
+      // node-d: unscored — outside the judged pool, so dropped
+    },
+  });
+  assert.deepEqual(digestOrder(r.text), ["node-b", "node-e", "node-a"]);
+  assert.deepEqual(r.meta.rerank, { applied: true, candidates: 4, kept: 3, dropped: 1, unscored: 1, min_score: 1 });
+  assert.deepEqual(r.meta.rendered_ids, ["node-b", "node-e", "node-a"]);
+});
+
+test("rerank filter: score ties fall back to noul desc", () => {
+  const g = rerankFixture();
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankMinScore: 1,
+    rerankScores: { "node-a": { score: 2, noul: 0.2 }, "node-b": { score: 2, noul: 0.8 } },
+  });
+  assert.deepEqual(digestOrder(r.text), ["node-b", "node-a"]);
+});
+
+test("rerank filter: a pool scored entirely below the threshold is relevant:false with meta saying the filter ran", () => {
+  const g = rerankFixture();
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankMinScore: 1,
+    rerankScores: { "node-a": { score: 0.2, noul: 0 }, "node-b": { score: 0.9, noul: 0.4 } },
+  });
+  assert.equal(r.relevant, false);
+  assert.equal(r.text, undefined);
+  assert.deepEqual(r.meta.rerank, { applied: true, candidates: 2, kept: 0, dropped: 2, unscored: 3, min_score: 1 });
+  assert.deepEqual(r.meta.rendered_ids, []);
+});
+
+test("rerank filter: a pinned pick still renders when the filter keeps nothing else", () => {
+  const g = rerankFixture({
+    "corr-pin.md": `---
+id: corr-pin
+type: correction
+title: Pin node-d into the digest
+target: dec-root
+pin: [node-d]
+summary: Force node-d into the digest whatever the filter decides.
+date: 2026-06-01
+---
+Pin node-d.
+`,
+  });
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankMinScore: 1,
+    rerankScores: { "node-a": { score: 0, noul: 0 } },
+  });
+  assert.equal(r.relevant, true);
+  assert.deepEqual(digestOrder(r.text), ["node-d"]);
+  assert.deepEqual(r.meta.rendered_ids, ["node-d"], "pins count as rendered");
+  assert.equal(r.meta.rerank.kept, 0);
+});
+
+test("rerank filter: a filter that keeps nothing still carries the in-scope standing corrections", () => {
+  const g = rerankFixture({
+    "corr-guide.md": `---
+id: corr-guide
+type: correction
+title: Standing guidance for dec-root
+target: dec-root
+summary: Guidance that must keep reaching the session.
+date: 2026-06-01
+---
+Always check the rollout runbook first.
+`,
+  });
+  const r = graph.compile(g, {
+    rootId: "dec-root",
+    digest: true,
+    rerankMinScore: 1,
+    rerankScores: { "node-a": { score: 0, noul: 0 } },
+  });
+  assert.equal(r.relevant, true);
+  assert.deepEqual(digestOrder(r.text), []);
+  assert.match(r.text, /Standing corrections:\n> Always check the rollout runbook first\./);
+  assert.equal(r.meta.rerank.kept, 0);
+});
+
+test("rerank filter: meta.rerank.candidates counts only nodes rendered under DIGEST_CAP", () => {
+  const long = "x".repeat(1500);
+  const extra = {};
+  for (const id of ["node-a", "node-b", "node-c", "node-d"]) {
+    extra[`${id}.md`] = `---
+id: ${id}
+type: artifact
+project: p
+title: Structural child ${id}
+summary: ${long}
+date: 2026-06-01
+---
+Body.
+`;
+  }
+  const g = rerankFixture(extra);
+  const scores = {};
+  for (const id of ["node-a", "node-b", "node-c", "node-d"]) scores[id] = { score: 2, noul: 0 };
+  const r = graph.compile(g, { rootId: "dec-root", digest: true, rerankMinScore: 1, rerankScores: scores });
+  const shown = digestOrder(r.text).length;
+  assert.ok(shown < 4, "the cap must cut at least one kept candidate for this test to mean anything");
+  assert.equal(r.meta.rerank.kept, shown);
+});
+
+test("rerank filter: rerankMinScore without rerankScores, or non-finite, changes nothing", () => {
+  const g = rerankFixture();
+  const base = graph.compile(g, { rootId: "dec-root", digest: true });
+  const noScores = graph.compile(g, { rootId: "dec-root", digest: true, rerankMinScore: 1 });
+  assert.equal(noScores.text, base.text);
+  assert.equal(noScores.meta.rerank, undefined);
+  const scores = { "node-c": { score: 3, noul: true }, "node-b": { score: 2, noul: false } };
+  const reorder = graph.compile(g, { rootId: "dec-root", digest: true, rerankScores: scores });
+  for (const bad of [null, "1", NaN, Infinity]) {
+    const r = graph.compile(g, { rootId: "dec-root", digest: true, rerankScores: scores, rerankMinScore: bad });
+    assert.equal(r.text, reorder.text, `rerankMinScore ${String(bad)} must be ignored`);
+    assert.deepEqual(r.meta.rerank, reorder.meta.rerank);
+  }
 });
 
 test("rerank: pinned picks still render first, ahead of every reranked candidate", () => {
