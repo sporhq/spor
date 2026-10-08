@@ -239,20 +239,26 @@ ranked page. Each pass walks the ranked queue with `?offset` until every open
 member's entry is located or the queue ends (`programQueueEntries`,
 issue-spor-program-standing-dispatchable-page-cap), so a member ranked below
 one page is still dispatched in queue order; the walk reports whether it was
-complete. Every non-terminal member then lands in exactly one bucket, tested
+complete. Its windows overlap and the overlap is CHECKED (each window must
+still carry the previous one's last id), and a walk that reaches the queue's
+end with members unlocated re-walks ONCE for just those members before they
+count as off the queue — complete only if that confirming walk reads to the
+end with every boundary intact, so a re-rank between two page reads cannot
+slide a member past unread and halt the program
+(issue-spor-work-program-standing-residual-edge-cases). Every non-terminal member then lands in exactly one bucket, tested
 in this order:
 
 | bucket | reading | class |
 |---|---|---|
 | `busy` | in flight on this box (a run, a gate pipeline being judged or parked here) | movable |
-| `human` | needs a person: the node's own `requires: human` / `assigned -> person-*`, or the queue's derived readiness — never claimed | stuck |
+| `human` | needs a person: the node's own `requires: human` (locally also `assigned -> person-*`), or the queue's derived readiness — never claimed | stuck |
 | `blocked` | a live blocker (the program read's bucket, or the located entry's `blocked_by`) | stuck |
 | `cooling` | cooled off here after a refusal, a policy/scope skip, a failed gate, an unresolved run | stuck |
 | `held` | someone holds it (`status: active` / `in_progress`) | movable |
 | `runnable` | on this pass's dispatchable page AND eligible for THIS worker by the dispatcher's own predicate (`classifyWorkItem`: accept policy, factory repo scope, assignee, decline finding) | movable |
 | `ineligible` | on the page, but that same predicate refuses it here — the verdict is the reason (the dispatcher would skip it on exactly these grounds) | stuck |
 | `undispatchable` | located on the queue but not on the dispatchable page (held for triage, a stale backend's demoted blocked item) | stuck |
-| `claimed` | absent from a COMPLETE walk, otherwise dispatchable, with an `assigned` edge to another agent, for less than `work.runMaxMs` | movable |
+| `claimed` | absent from a COMPLETE walk, otherwise dispatchable, with an `assigned` edge to another agent or to a person (a person's claim writes the same edge), for less than `work.runMaxMs` | movable |
 | `claim-stale` | the same, pinned past `work.runMaxMs`: a claim that never moved — named, never waited on forever | stuck |
 | `off-queue` | absent from a complete walk with no foreign claim (held for triage, muted, dormant, a question, not queueable work) | stuck |
 | `unknown` | absent from the page and the walk was NOT complete (a dead read, a backend without `?offset`, the page ceiling) | undecided |
@@ -261,8 +267,12 @@ The standing is the fold over those buckets: `complete` when no member
 remains; `moving` when ANY member is movable; `halted` only when the walk was
 complete, no member is movable, and none is unknown — every remaining member
 classified stuck from a full read; `undecided` otherwise (an incomplete read,
-or an unknown member, with nothing visibly moving). An undecided pass never
-halts — the worker polls again. The halt line names each stuck member and
+or an unknown member, with nothing visibly moving — or a membership TRUNCATED
+at one program walk, `WALK_NODES`, whose unseen members could be anything).
+An undecided pass never halts — the worker polls again. A program already too
+large refuses to start; one that grows past the walk mid-run keeps
+dispatching its visible members, says so once, and concludes nothing until it
+shrinks. The halt line names each stuck member and
 why, and `spor work --status` keeps it (`program.outcome`, `program.stuck`).
 Three properties fall out of the shape: the eligibility a member is judged by
 is the dispatcher's own, so a member "on the page" the worker could never

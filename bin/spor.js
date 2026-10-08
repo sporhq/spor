@@ -9385,10 +9385,20 @@ function ladderWidth(depth, step, maxLimit) {
 // fetchQueuePage steps, one server page each — until every asked-for id has been
 // located or the queue ends, keeping only those ids. Consecutive windows overlap
 // by a few items so a re-rank between requests (API.md §5) cannot slide a member
-// across a boundary unseen. `complete` is true only when the walk located every
-// id or read the queue to its end; a dead read, a backend that ignores ?offset,
-// or the page ceiling leaves it false, and the loop then concludes nothing about
-// a member it did not find.
+// across a boundary unseen — and the overlap is CHECKED: each overlapping window
+// must still carry the previous window's last id, else the ranking moved under
+// the walk (an item removed or demoted above the boundary by more than the
+// overlap) and an item may have slid past unread
+// (issue-spor-work-program-standing-residual-edge-cases). A walk that reached
+// the end of the queue with members still unlocated is then confirmed by ONE
+// re-walk for just those members before they are concluded off the queue —
+// the confirming walk catches a member that re-ranked upward past the read
+// position, which no id comparison can see — and only a re-walk that read to
+// the end with every boundary intact makes the walk `complete`. `complete` is
+// true only when the walk located every id or (so confirmed) read the queue to
+// its end; a dead read, a backend that ignores ?offset, a shifted confirming
+// walk, or the page ceiling leaves it false, and the loop then concludes
+// nothing about a member it did not find.
 //   -> {items: [dispatchable member entries, rank order], located: Map id ->
 //       raw entry (dispatchable or not), complete}
 const PROGRAM_QUEUE_MAX_PAGES = 100;
@@ -9396,20 +9406,41 @@ const PROGRAM_QUEUE_OVERLAP = 5;
 async function programQueueEntries(cfg, slug, ids, { maxPages = PROGRAM_QUEUE_MAX_PAGES } = {}) {
   const want = new Set(ids || []);
   const located = new Map();
-  let complete = false;
   if (!want.size) return { items: [], located, complete: true };
   const ctx = {};
-  let offset = 0;
-  for (let p = 0; p < maxPages; p++) {
-    const res = await fetchQueuePage(cfg, slug, SERVER_PAGE_MAX, ctx, offset);
-    if (res.paged === null) break; // no answer: says nothing about the queue
-    const raw = Array.isArray(res.items) ? res.items : [];
-    for (const it of raw) if (it && want.has(it.id) && !located.has(it.id)) located.set(it.id, it);
-    if (located.size >= want.size) { complete = true; break; }
-    if (!res.more) { complete = true; break; }
-    // A backend without ?offset re-serves its top page: nothing deeper is reachable.
-    if (res.paged === false || !raw.length) break;
-    offset += raw.length > PROGRAM_QUEUE_OVERLAP * 2 ? raw.length - PROGRAM_QUEUE_OVERLAP : raw.length;
+  // One pass over the queue for the ids in `look` not yet located ->
+  // {ended: read to the queue's end, shifted: a checked boundary moved}.
+  const walk = async (look) => {
+    let offset = 0;
+    let tail = null; // the previous overlapping window's last id
+    let shifted = false;
+    for (let p = 0; p < maxPages; p++) {
+      const res = await fetchQueuePage(cfg, slug, SERVER_PAGE_MAX, ctx, offset);
+      if (res.paged === null) return { ended: false, shifted }; // no answer: says nothing about the queue
+      const raw = Array.isArray(res.items) ? res.items : [];
+      if (tail !== null && !raw.some((it) => it && it.id === tail)) shifted = true;
+      tail = null;
+      for (const it of raw) if (it && look.has(it.id) && !located.has(it.id)) located.set(it.id, it);
+      if ([...look].every((id) => located.has(id))) return { ended: true, shifted, found: true };
+      if (!res.more) return { ended: true, shifted };
+      // A backend without ?offset re-serves its top page: nothing deeper is reachable.
+      if (res.paged === false || !raw.length) return { ended: false, shifted };
+      if (raw.length > PROGRAM_QUEUE_OVERLAP * 2) {
+        const last = raw[raw.length - 1];
+        tail = last && last.id ? last.id : null;
+        offset += raw.length - PROGRAM_QUEUE_OVERLAP;
+      } else {
+        offset += raw.length;
+      }
+    }
+    return { ended: false, shifted };
+  };
+  let complete = false;
+  const first = await walk(want);
+  if (first.found) complete = true;
+  else if (first.ended) {
+    const confirm = await walk(new Set([...want].filter((id) => !located.has(id))));
+    complete = !!confirm.found || (confirm.ended && !confirm.shifted);
   }
   const ranked = [...located.values()];
   return { items: winnowQueuePage(ranked), located, complete };

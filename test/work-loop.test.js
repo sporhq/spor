@@ -2956,7 +2956,7 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
 // It is also why the LADDER stops at 100 remotely — the carried width has to be
 // a width one GET can serve, or the poll it is carried into costs two.
 const STUB_PAGE_MAX = 100;
-function offsetQueueStub(allItems) {
+function offsetQueueStub(allItems, { onRequest = null } = {}) {
   const http = require("node:http");
   const requests = [];
   const srv = http.createServer((req, res) => {
@@ -2967,6 +2967,8 @@ function offsetQueueStub(allItems) {
       // The offset the CLIENT asked for — `null` when it sent none, so a test
       // can tell "offset=0" from "no offset at all".
       requests.push({ limit, offset: p.has("offset") ? Number(p.get("offset")) : null });
+      // A test may re-rank the queue between requests (it mutates allItems).
+      if (onRequest) onRequest(requests.length);
       const from = Math.max(0, Number(p.get("offset")) || 0);
       const page = allItems.slice(from, from + Math.min(limit, STUB_PAGE_MAX));
       const end = from + page.length;
@@ -4224,4 +4226,119 @@ test("--program (finding 2, in the loop): the claim clock is carried across pass
 
 test("STOP_CODES is the closed stop_code enum", () => {
   assert.deepStrictEqual([...workLoop.STOP_CODES].sort(), ["drained", "error", "human-required", "idle", "program-terminal", "restart-on-land", "signal", "unsatisfiable"]);
+});
+
+// ---------------- --program standing: the residual edge cases ---------------
+// issue-spor-work-program-standing-residual-edge-cases, from the third merge
+// gate's review of 74012b5.
+
+// 1. A person's claim writes `assigned -> person-*` just as an agent's writes
+// `assigned -> agent-*`. Read as a human signal off the node alone, a member a
+// person on another machine is actively working (hidden from the queue by
+// their lease) halted a second person's --program run. It is a claim now:
+// movement while the queue hides it, bounded like a foreign agent claim; a
+// VISIBLE person-assigned member is still `human` by the queue's own readiness.
+test("--program (residual 1): a live person claim is time-bounded movement, not human-stuck", async () => {
+  const { humanFromNode } = require("../lib/shell/work-program.js");
+  const fm = { id: "c", type: "task", edges: [{ type: "assigned", to: "person-bob" }] };
+  assert.strictEqual(humanFromNode(fm), null, "the edge alone is not a human signal remotely");
+  assert.strictEqual(humanFromNode({ ...fm, requires: ["human"] }), "requires human");
+
+  const { programStanding } = workLoop;
+  const m = (extra = {}) => ({ id: "c", bucket: "open", status: "open", human: null, blockers: [], agents: [], persons: ["person-bob"], ...extra });
+  const hidden = { complete: true, located: new Map() };
+  // Hidden from a complete walk: claimed — with or without an agent identity here.
+  for (const selfAgent of ["agent-me", null]) {
+    const r = programStanding({ members: [m()], queue: hidden }, { page: new Map(), selfAgent, foreignHoldMs: 1000, now: 10 });
+    assert.strictEqual(r.state, "moving", String(selfAgent));
+    assert.strictEqual(r.members[0].bucket, "claimed");
+  }
+  // ...bounded: pinned past the hold it is named, never waited on forever.
+  const key = workLoop.programForeignKey("c", ["person-bob"]);
+  const stale = programStanding({ members: [m()], queue: hidden }, { page: new Map(), selfAgent: "agent-me", foreignHoldMs: 1000, now: 5000, foreignSince: new Map([[key, 10]]) });
+  assert.strictEqual(stale.state, "halted");
+  assert.match(stale.stuck[0].why, /assigned to person-bob .*no progress/);
+  // Visible on the queue (no lease in force): the edge is routing, and the
+  // queue's derived readiness says a person must act.
+  const visible = { complete: true, located: new Map([["c", { id: "c", readiness: "human", readiness_reasons: ["assigned to person-bob"] }]]) };
+  const routed = programStanding({ members: [m()], queue: visible }, { page: new Map(), selfAgent: "agent-me" });
+  assert.deepStrictEqual(routed.stuck, [{ id: "c", why: "assigned to person-bob" }]);
+
+  // And through the loop: the program does not halt while the claim is live.
+  const snap = { found: true, root_id: "task-prog", truncated: false, members: [m()], queue: hidden };
+  const h = harness({ queue: [], opts: { concurrency: 1, program: "task-prog", selfAgent: "agent-me" }, maxPasses: 3, extraDeps: { program: async () => snap } });
+  const status = await h.run();
+  assert.strictEqual(status.program.outcome, null, status.stop_reason);
+  assert.strictEqual(status.stop_reason, "stopped by the test driver");
+});
+
+// 2. The offset walk overlapped its windows but never CHECKED the overlap: a
+// re-rank between two requests that slid the boundary by more than the overlap
+// skipped a member unread, and the walk still reported `complete` — so the
+// member read as off the queue.
+test("--program (residual 2): a member skipped by a re-rank between pages is found by the confirming re-walk, and a walk that keeps shifting concludes nothing", async () => {
+  const { programQueueEntries } = sporCli;
+  // 250 items; the member task-101 sits just past the first window (100).
+  let all = queueItems(250);
+  let shiftOn = new Set([2]);
+  const { srv, base, requests } = await offsetQueueStub(all, {
+    onRequest: (n) => {
+      // Before request n: 20 items above the boundary resolve, so everything
+      // slides up 20 — past the 5-item overlap — carrying task-101 into the
+      // range the walk has already read.
+      if (shiftOn.has(n)) all.splice(0, 20);
+    },
+  });
+  try {
+    const cfg = offsetCfg(base);
+    const walk = await programQueueEntries(cfg, null, ["task-101"]);
+    assert.ok(walk.located.has("task-101"), "the confirming walk found the member the shift slid past");
+    assert.strictEqual(walk.complete, true);
+    assert.deepStrictEqual(walk.items.map((it) => it.id), ["task-101"]);
+
+    // A member that is genuinely gone, under a queue that shifts during the
+    // confirming walk too: nothing is concluded about it.
+    all.splice(0, all.length, ...queueItems(250));
+    requests.length = 0;
+    shiftOn = new Set([2, 5]); // the first walk's 2nd request, the re-walk's 2nd
+    const shifting = await programQueueEntries(cfg, null, ["task-nope"]);
+    assert.strictEqual(shifting.complete, false, JSON.stringify(requests));
+    // ...and with a stable queue the same absence is concluded.
+    all.splice(0, all.length, ...queueItems(250));
+    shiftOn = new Set();
+    const stable = await programQueueEntries(cfg, null, ["task-nope"]);
+    assert.strictEqual(stable.complete, true);
+    assert.strictEqual(stable.located.size, 0);
+  } finally {
+    srv.close();
+  }
+});
+
+// 3. The startup check refuses a program larger than one program walk, but a
+// membership that GROWS past WALK_NODES afterwards skipped the standing
+// entirely: the loop dispatched from the truncated list and never decided. A
+// truncated snapshot is now `undecided` — never complete, never halted — and
+// the loop says so once.
+test("--program (residual 3): a membership that grows past one program walk after startup is undecided and logged once", async () => {
+  const { programStanding } = workLoop;
+  const done = { id: "a", bucket: "done", status: "done", human: null, blockers: [], agents: [] };
+  const stuck = { id: "h", bucket: "open", status: "open", human: "requires human", blockers: [], agents: [] };
+  const q = { complete: true, located: new Map() };
+  assert.strictEqual(programStanding({ members: [done], queue: q }).state, "complete");
+  assert.strictEqual(programStanding({ members: [done], queue: q, truncated: true }).state, "undecided", "unseen members may remain");
+  assert.strictEqual(programStanding({ members: [stuck], queue: q }).state, "halted");
+  const t = programStanding({ members: [stuck], queue: q, truncated: true });
+  assert.strictEqual(t.state, "undecided", "unseen members may be runnable");
+  assert.strictEqual(t.truncated, true);
+
+  // Every member the walk saw is stuck — untruncated, that halts on pass 1.
+  const h = harness({
+    queue: [],
+    opts: { concurrency: 1, program: "task-prog" },
+    maxPasses: 4,
+    extraDeps: { program: async () => ({ found: true, root_id: "task-prog", truncated: true, members: [stuck], queue: q }) },
+  });
+  const status = await h.run();
+  assert.strictEqual(status.program.outcome, null, `a truncated membership never halts: ${status.stop_reason}`);
+  assert.strictEqual(h.log.filter((l) => /grown past one program walk/.test(l)).length, 1, h.log.join("\n"));
 });
