@@ -16,19 +16,22 @@ Governing decision: dec-spor-work-execution-provider-contract. Companion
 specs: [WORKERS.md](WORKERS.md) (the worker protocol, the prompt contract
 §4, the execution store §10.15), [API.md](API.md) (REST/MCP).
 
-**Status.** This is the contract only. The `local` provider extraction
-(task-spor-work-local-provider-refactor), the subprocess stdio
-binding (task-spor-execution-provider-stdio-binding), the in-environment runner
+**Status.** The `local` provider extraction
+(task-spor-work-local-provider-refactor), the in-environment runner
 (task-spor-attempt-bundle-run) and the server's attempt handle and
 attempt-scoped token are separate items. None of them is shipped yet, so
-`spor work` behaves today exactly as WORKERS.md describes. The conformance
+`spor work` behaves today exactly as WORKERS.md describes. The subprocess
+stdio binding (§12, `lib/shell/providers/stdio.js`) is shipped, with the
+`examples/providers/stdio-echo/` reference provider and `spor provider check
+<id>`; no worker drives a binding yet. The conformance
 suite every binding must pass is shipped:
 `lib/shell/provider-conformance.js` (`runConformance(provider, {home,
 driver})`), proven against the synthetic providers in
 `test/fixtures/providers/` by `test/provider-conformance.test.js`. The
 capability matcher (§3.1, `satisfiesAttempt` in `lib/kernel/satisfiability.js`)
 is shipped, and `spor capabilities providers [--attempt <spec.json>]` prints
-each provider's describe() and, given a spec, why it would be refused.
+each provider's describe() — the built-in `local` one and every provider
+declared on the machine (§12.1) — and, given a spec, why it would be refused.
 
 ## 1. Two seams, three layers
 
@@ -538,3 +541,149 @@ while a sandbox is inactive, which is why §10 says re-mint.
 
 All four answer the same six operations and pass the same conformance suite.
 None of them adds vendor code to `lib/`.
+
+## 12. The subprocess binding: JSON over stdio
+
+The first binding lets anyone write a provider in any language without
+touching spor: a program that reads one JSON request per line on stdin and
+writes one JSON response per line on stdout. The worker half is
+`lib/shell/providers/stdio.js` (`openStdioProvider`); the reference provider is
+`examples/providers/stdio-echo/` (Node, zero dependencies), which passes the
+whole conformance suite through the binding.
+
+### 12.1 Declaring a provider
+
+A provider is declared on the machine that runs it, exactly like a declared
+harness (`dispatch.harness.<id>`), in the user `$SPOR_HOME/config.json` or the
+global `$XDG_CONFIG_HOME/spor/config.json`:
+
+```
+{
+  "dispatch": {
+    "provider": {
+      "stdio-echo": {
+        "command": "node",
+        "args": ["/opt/spor/examples/providers/stdio-echo/provider.js", "--root", "/var/tmp/stdio-echo"],
+        "env": { "VAULT_ADDR": "https://vault.internal" },
+        "timeout_ms": 30000
+      }
+    }
+  }
+}
+```
+
+| key | meaning |
+|---|---|
+| `command` | The program to run: an absolute path, or a bare name resolved on `PATH`. A relative path is refused. |
+| `args` | Optional. Its arguments, verbatim. |
+| `env` | Optional. String values added to the child's environment. It may not name a Spor credential (`SPOR_TOKEN`, `SPOR_*_KEY`, …). |
+| `timeout_ms` | Optional, default 30000. How long one request may go unanswered (§12.4). |
+
+Any other key is refused, and so is the id `local` (the built-in provider).
+The key is machine-local: a committed repo `.spor.json` that sets
+`dispatch.provider` has it stripped with a warning, because a repo or graph
+write must never choose what a machine executes. The id the declaration uses
+must be the id the provider names itself in `hello` (§12.2).
+
+`spor capabilities providers` lists each declared provider's describe() beside
+`local`'s; a declaration that is malformed, or a provider that cannot answer,
+is listed with its error. `spor provider check <id>` runs the conformance suite
+against it (§12.5).
+
+### 12.2 Lifetime, handshake and framing
+
+**One process per binding instance.** Opening a binding spawns nothing. The
+first request spawns the command and runs the handshake, and every later
+request rides the same process until the binding is closed. A worker opens one
+binding per pass and closes it at the end of the pass; a CLI verb opens one per
+invocation. Closing ends the child's stdin, which is its cue to exit; after a
+grace period it is killed. So a provider whose environments must outlive a
+pass keeps what it needs to find them again somewhere other than its own
+memory — the next pass is a new process.
+
+**Handshake.** The binding's first line is `hello`; the provider answers with
+the contract version it speaks and its own id:
+
+```
+→ {"contract_version":1,"id":"stdio-echo-1-1","op":"hello","params":{"contract_version":1}}
+← {"id":"stdio-echo-1-1","ok":true,"result":{"contract_version":1,"provider_id":"stdio-echo"}}
+```
+
+Another `contract_version`, or a `hello` the provider refuses, ends the process
+and answers the caller `contract_version_unsupported` with a message naming
+both versions. A `provider_id` other than the declared id answers
+`provider_mismatch`. No operation is sent until the handshake passes.
+
+**Framing.** Each operation is one request line (`{contract_version, id, op,
+params}`, the §2 envelope) and one response line (`{id, ok, result}` or `{id,
+ok, error: {code, message, retryable}}`). A response may leave
+`contract_version` off; the binding fills it in. Unknown fields are ignored at
+every level. The binding mints its own request ids, so several requests may be
+in flight and answered in any order. The provider's stderr is not part of the
+protocol: each line is mirrored into the worker's log as `[provider <id>]
+<line>`.
+
+### 12.3 What the binding answers when the provider cannot
+
+| code | when | retryable |
+|---|---|---|
+| `contract_version_unsupported` | `hello` answered another version, or refused ours. | no |
+| `provider_mismatch` | `hello` named a provider id other than the declared one. | no |
+| `provider_protocol_error` | A stdout line that is not JSON, not a response envelope, answers an id that was never sent, or runs past 1 MiB without a newline. The stream can no longer be trusted to line up, so the process is killed. | no |
+| `provider_exited` | The process exited, or could not be started, with the request in flight. The next request spawns a new process. | yes |
+| `provider_timeout` | The request went unanswered for `timeout_ms`. The process is killed. | yes |
+| `secret_by_value` | The request carries a secret value (§12.6). Refused before anything is spawned or written. | no |
+| `invalid_request` | The request fails the contract's validation. Refused before anything is spawned or written. | no |
+
+A submit (or restore) is the exception. If the process dies or hangs with one
+in flight, whether the provider acted on it is unknown, so the binding does not
+answer a refusal. It reports a lost reply (`LostReply`, carrying the code
+above), and the worker holds and reconciles under the persisted key exactly as
+§6 says.
+
+### 12.4 Lost on crash
+
+When the process exits unexpectedly, or is killed for a protocol error or a
+hang, every handle this binding instance holds is **lost** with it: every
+handle it submitted or was handed in a request, and has not released. From
+then on the binding answers those handles itself and never asks the provider
+again: `observe` reports `lost` (with a `detail` naming why), `cancel` answers
+`lost`, `collect` answers a null manifest, and `release` succeeds. A respawned
+process that forgot the environment therefore cannot move a terminal state
+(§5). An exit is noticed at once; a hang after `timeout_ms`. A planned
+`close()` is not a crash and loses nothing, so the next pass may adopt the
+handles.
+
+### 12.5 `spor provider check`
+
+`spor provider check <id> [--json]` opens the binding, runs every conformance
+scenario (`lib/shell/provider-conformance.js`) against a scratch home that it
+then removes, and exits 0 only when every scenario passes. The capability
+matcher is the real one (§3.1). The driver it uses, `stdioDriver`, makes three
+conventions a provider under check should honour:
+
+- An attempt whose `prompt_bundle_ref` has a `/hold/` path segment keeps
+  running until it is cancelled. The cancel scenarios need one.
+- Every repo in the attempt carries a `url`, so a provider offering `repos:
+  ["*"]` matches.
+- The crash scenario kills the provider **process**, so it checks the
+  binding's lost-on-crash semantics (§12.4) for every provider.
+
+### 12.6 Secrets never cross stdio by value
+
+The attempt names its secrets by reference (`secrets[].ref`) and its Spor
+credential as `spor.token_ref` (§4.2, §4.3). The provider resolves each
+reference in its own vault, and its `secret_delivery` capability says how the
+value reaches the sandbox. The binding checks every request before it is
+written, and before a process is spawned for it. It answers
+`secret_by_value` when it finds any of these:
+
+- a secret entry or `spor` block carrying a value, or a `ref` that is not a
+  reference (the §4.2 validator);
+- a credential-shaped string anywhere in the line (a GitHub, GitLab, Slack,
+  Anthropic or AWS key shape);
+- a value the worker itself holds: its Spor credentials from the environment
+  and the token the config cascade resolved.
+
+The refusal names the field, never the value. The child's environment is the
+worker's with every Spor credential removed, plus the declaration's `env`.

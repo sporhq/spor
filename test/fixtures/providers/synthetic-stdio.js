@@ -5,10 +5,12 @@
 // across a process boundary exactly as it drives an in-process one.
 //
 // This is deliberately the bare envelope stream, not the stdio BINDING
-// (task-spor-execution-provider-stdio-binding owns the version handshake,
-// dispatch.provider.<id> declaration and lost-on-crash semantics). When that
-// binding lands, this fixture should be driven through it instead of the
-// minimal client below.
+// (lib/shell/providers/stdio.js: the version handshake, the
+// dispatch.provider.<id> declaration, lost-on-crash). Its `fixture.*` control
+// ops ride outside the contract, which the binding refuses to send, and its
+// crash marks ONE environment lost while the process lives on — a different
+// crash than the binding's process kill. The binding is proven against the
+// stdio-echo example in test/provider-stdio.test.js.
 //
 // Run as a script it is the provider: `node synthetic-stdio.js
 // [--broken-idempotency]`. Two test-only ops ride the same stream outside the

@@ -84,6 +84,8 @@ const dispatchLib = lazyModule(path.join(ROOT, "lib", "shell", "dispatch.js"));
 const workLib = lazyModule(path.join(ROOT, "lib", "shell", "work.js"));
 const sat = lazyModule(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 const providerContract = lazyModule(path.join(ROOT, "lib", "kernel", "provider-contract.js"));
+const stdioProviders = lazyModule(path.join(ROOT, "lib", "shell", "providers", "stdio.js"));
+const providerConformance = lazyModule(path.join(ROOT, "lib", "shell", "provider-conformance.js"));
 const workLoop = lazyModule(path.join(ROOT, "lib", "shell", "work-loop.js"));
 const gatesKernel = lazyModule(path.join(ROOT, "lib", "kernel", "gates.js"));
 const candidateKernel = lazyModule(path.join(ROOT, "lib", "kernel", "candidate.js"));
@@ -18406,12 +18408,67 @@ function localProviderResources(cfg) {
   return res;
 }
 
-// cmdCapabilitiesProviders — `spor capabilities providers`. Today the one
-// configured provider is `local`; a machine-declared provider joins this list
-// with its binding (task-spor-execution-provider-stdio-binding). With
-// --attempt, the spec is validated against the contract and matched against
-// each provider (satisfiesAttempt); exit 1 when no provider can run it.
-function cmdCapabilitiesProviders(cfg, { attemptPath, json }) {
+// The values a provider request line must never carry beyond what the binding
+// already reads from the environment: the token the cascade resolved (a
+// store tenant's, which no env var holds).
+function providerKnownSecrets(cfg) {
+  try {
+    const t = cfg.token();
+    return typeof t === "string" && t ? [t] : [];
+  } catch {
+    return [];
+  }
+}
+
+// Open the stdio binding for one declared provider (PROVIDERS.md §12). The
+// provider's stderr is mirrored to ours, prefixed with its id.
+function openDeclaredProvider(cfg, declaration) {
+  return stdioProviders.openStdioProvider(declaration, { knownSecrets: providerKnownSecrets(cfg), log: (line) => err(line) });
+}
+
+// Each machine-declared provider's describe(), through its binding: a row
+// {provider_id, binding: "stdio", contract_version, capabilities} or, for a
+// declaration that is malformed or a provider that cannot answer,
+// {provider_id, binding: "stdio", error}.
+async function describeDeclaredProviders(cfg) {
+  const rows = [];
+  for (const [id, decl] of stdioProviders.providerDeclarations(cfg)) {
+    if (!decl.ok) {
+      rows.push({ provider_id: id, binding: "stdio", error: decl.error });
+      continue;
+    }
+    const p = openDeclaredProvider(cfg, decl.declaration);
+    try {
+      const res = await p.request({ contract_version: providerContract.CONTRACT_VERSION, id: `describe-${id}`, op: "describe", params: {} });
+      if (!res.ok) {
+        rows.push({ provider_id: id, binding: "stdio", error: `${res.error.code}: ${res.error.message}` });
+        continue;
+      }
+      const v = providerContract.validate("describe-result", res.result);
+      if (!v.ok) rows.push({ provider_id: id, binding: "stdio", error: `describe answered an invalid result: ${v.errors.join("; ")}` });
+      else if (res.result.provider_id !== id) rows.push({ provider_id: id, binding: "stdio", error: `describe names provider ${JSON.stringify(res.result.provider_id)}, not ${id}` });
+      else {
+        // Every axis but isolation/lifecycle defaults to empty (PROVIDERS.md §3).
+        const empty = Object.fromEntries(["harnesses", "reachable_mcp", "skills", "plugins", "tools", "repos", "egress", "secret_delivery", "deny"].map((k) => [k, []]));
+        rows.push({ ...res.result, capabilities: { ...empty, ...res.result.capabilities }, binding: "stdio" });
+      }
+    } catch (e) {
+      rows.push({ provider_id: id, binding: "stdio", error: String((e && e.message) || e) });
+    } finally {
+      await p.close();
+    }
+  }
+  return rows;
+}
+
+// cmdCapabilitiesProviders — `spor capabilities providers`: the built-in
+// `local` provider plus every machine-declared `dispatch.provider.<id>`,
+// described through its stdio binding (task-spor-execution-provider-stdio-
+// binding). With --attempt, the spec is validated against the contract and
+// matched against each provider (satisfiesAttempt); exit 1 when no provider
+// can run it. A declared provider that cannot describe itself is listed with
+// its error and never matches.
+async function cmdCapabilitiesProviders(cfg, { attemptPath, json }) {
   let attempt = null;
   if (attemptPath) {
     let text;
@@ -18434,17 +18491,21 @@ function cmdCapabilitiesProviders(cfg, { attemptPath, json }) {
       return 1;
     }
   }
-  const providers = [localProviderDescribe(cfg, { tools: attempt && Array.isArray(attempt.tools) ? attempt.tools : [] })];
-  const rows = providers.map((d) => (attempt ? { ...d, match: sat.satisfiesAttempt(d.capabilities, attempt) } : d));
-  const anyOk = !attempt || rows.some((r) => r.match.ok);
+  const providers = [localProviderDescribe(cfg, { tools: attempt && Array.isArray(attempt.tools) ? attempt.tools : [] }), ...(await describeDeclaredProviders(cfg))];
+  const rows = providers.map((d) => (attempt && !d.error ? { ...d, match: sat.satisfiesAttempt(d.capabilities, attempt) } : d));
+  const anyOk = !attempt || rows.some((r) => r.match && r.match.ok);
   if (json) {
     out(JSON.stringify({ providers: rows }, null, 2));
     return anyOk ? 0 : 1;
   }
   const list = (v) => (v && v.length ? v.join(", ") : "(none)");
   for (const r of rows) {
+    if (r.error) {
+      out(`provider ${r.provider_id} (${r.binding}): UNAVAILABLE — ${r.error}`);
+      continue;
+    }
     const c = r.capabilities;
-    out(`provider ${r.provider_id} (contract v${r.contract_version})`);
+    out(`provider ${r.provider_id} (contract v${r.contract_version}${r.binding ? `, ${r.binding} binding` : ""})`);
     out(`  isolation:       ${list(c.isolation)}`);
     out(`  lifecycle:       ${list(c.lifecycle)}`);
     out(`  harnesses:       ${list(c.harnesses)}`);
@@ -18468,6 +18529,59 @@ function cmdCapabilitiesProviders(cfg, { attemptPath, json }) {
   }
   if (!anyOk) err("no configured provider can run this attempt — refusing (an attempt is never substituted onto a provider that does not match)");
   return anyOk ? 0 : 1;
+}
+
+// cmdProvider — `spor provider check <id> [--json]`: run the execution-provider
+// conformance suite (lib/shell/provider-conformance.js) against a machine-
+// declared provider through its stdio binding, against a scratch home that is
+// removed afterwards. The driver is the binding's own (`stdioDriver`: `crash`
+// kills the provider process, so crash-lost exercises the binding's
+// lost-on-crash semantics for ANY provider). The matcher is the real one
+// (satisfiesAttempt).
+// Exit 0 only when every scenario passes (a capability-gated skip is not a
+// failure); 1 otherwise.
+async function cmdProvider(cfg, args) {
+  const json = args.includes("--json");
+  const rest = args.filter((a) => a !== "--json");
+  const usage = () => {
+    err("usage: spor provider check <id> [--json]");
+    return 1;
+  };
+  if (rest[0] !== "check" || !rest[1] || rest[1].startsWith("-") || rest.length > 2) return usage();
+  const id = rest[1];
+  const decl = stdioProviders.providerDeclarations(cfg).get(id);
+  if (!decl) {
+    err(`no provider '${id}' is declared on this machine — declare ${stdioProviders.declarationKey(id)} = {command, args} in ${path.join(cfg.userConfigHome(), "config.json")} (PROVIDERS.md §12)`);
+    return 1;
+  }
+  if (!decl.ok) {
+    err(decl.error);
+    return 1;
+  }
+  const p = openDeclaredProvider(cfg, decl.declaration);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), `spor-provider-check-${id}-`));
+  const driver = providerConformance.stdioDriver(p, { timeoutMs: decl.declaration.timeoutMs });
+  let report;
+  try {
+    report = await providerConformance.runConformance(p, { home, driver, matcher: (caps, attempt) => sat.satisfiesAttempt(caps, attempt) });
+  } finally {
+    await p.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+  if (json) {
+    out(JSON.stringify({ provider: id, binding: "stdio", ...report }, null, 2));
+    return report.ok ? 0 : 1;
+  }
+  out(`provider ${id} (stdio binding): conformance contract v${providerContract.CONTRACT_VERSION}`);
+  for (const r of report.results) {
+    if (!r.ok) out(`  FAIL  ${r.name} — ${r.error}`);
+    else if (r.skipped) out(`  skip  ${r.name} — ${r.skipped}`);
+    else out(`  ok    ${r.name} — ${r.title}`);
+  }
+  const failed = report.results.filter((r) => !r.ok).length;
+  if (failed) err(`provider ${id} failed ${failed} of ${report.results.length} conformance scenario(s)`);
+  else out(`provider ${id} passed the conformance suite (${report.results.length} scenarios)`);
+  return report.ok ? 0 : 1;
 }
 
 // cmdCapabilitiesPublish — push this box's EFFECTIVE capabilities to the team
@@ -20664,6 +20778,26 @@ const COMMANDS = {
       `  axes: ${sat.CAP_AXES.join(", ")}`,
     examples: ["spor capabilities", "spor capabilities allow-mcp spor", "spor capabilities publish", "spor capabilities show agent-anthony-laptop", "spor capabilities hosts profile-docs-writer"],
     run: (cfg, args) => cmdCapabilities(cfg, args),
+  },
+
+  provider: {
+    group: "Dispatch (background agents)", parse: "raw",
+    args: "check <id> [--json]",
+    summary: "run the execution-provider conformance suite against a declared provider",
+    help:
+      "An execution provider answers WHERE an attempt runs (PROVIDERS.md). A third-\n" +
+      "party provider is a subprocess speaking newline-delimited JSON on stdio, declared\n" +
+      "on THIS machine (never in a committed .spor.json) under dispatch.provider.<id>:\n\n" +
+      "  {\"dispatch\": {\"provider\": {\"stdio-echo\": {\"command\": \"node\",\n" +
+      "    \"args\": [\"/abs/examples/providers/stdio-echo/provider.js\"], \"timeout_ms\": 30000}}}}\n\n" +
+      "  spor provider check <id>   spawn it, handshake (hello, contract_version 1), and\n" +
+      "                             run every conformance scenario against a scratch home:\n" +
+      "                             idempotent submit, lost-reply reconcile, observe/collect,\n" +
+      "                             cancel, release, crash -> lost, refusal, adoption\n\n" +
+      "Exit 0 only when every scenario passes. `spor capabilities providers` lists each\n" +
+      "declared provider's describe(). PROVIDERS.md §12 specifies the binding.",
+    examples: ["spor provider check stdio-echo", "spor provider check stdio-echo --json"],
+    run: (cfg, args) => cmdProvider(cfg, args),
   },
 
   // --- Other ---

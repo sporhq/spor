@@ -133,6 +133,8 @@ spor capabilities              # this machine's dispatch capability map (harness
                                #   probe | set <axis> <v…> | allow-mcp <m…> | deny <profile-id…> | clear
                                #   providers [--attempt <spec.json>] — each execution provider's describe()
                                #   and, given an attempt spec, why it would be refused (PROVIDERS.md)
+spor provider check <id>       # (either mode) run the execution-provider conformance suite against a
+                               #   machine-declared dispatch.provider.<id> over its stdio binding (PROVIDERS.md §12)
 spor claim <node-id>           # manually take the heartbeat-renewed lease on a task (POST .../claim) —
                                #   yours-in-progress, out of teammates' queues (dec-cc-task-claim-lease)
 spor renew <node-id>           # heartbeat your live claim, bumping its expiry (POST .../renew)
