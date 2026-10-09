@@ -299,6 +299,98 @@ pass that read both in full, launched nothing, cooled nothing, and has
 nothing of this worker's in flight. An unreadable program takes no work that
 pass (fail closed); an unknown or memberless one refuses to start.
 
+**Program run requests (`spor work --serve program`, alias `--program-runs`).**
+A person pressing "Start" on a program leaves a durable, SERVER-held run
+request — a program, an admitted cohort of its members and a factory pinned
+at Start (spor-server PROGRAM-RUN-WORKER.md, dec-spor-program-run-worker-
+bridge). `--serve program` makes the reference worker take work ONLY from one
+such run it owns (task-spor-chatgpt-run-worker-adapter). It is the `program`
+scope of a general `--serve` source (queue and node scopes are not built and
+are refused by name), and it is the same loop and the same launch door — no
+second dispatcher: lib/shell/program-runs.js is the source (a REST client plus
+a one-run state machine), the loop consults it once per pass, and every member
+still goes through `deps.dispatch` → `cmdDispatch` with all its guards.
+
+- **Requirements.** Remote mode (the run, its lease and the admission door
+  live in the server's state store), an armed `--factory`, and a factory that
+  completes by the CONTROLLER (admission is the execution open, which only a
+  controller-completion factory makes). Each refuses at startup.
+- **Claim and advertise.** With no owned run, each pass lists
+  `GET /v1/program-runs?claimable=true&factory=<id>`, filters LOCALLY (the run
+  has admitted members open, this box can read the definition the run is
+  pinned to, and the factory's integration requirement is satisfiable here —
+  the server never decides a machine can do work), and claims the first with
+  `POST /:id/claim {machine, instance, capabilities}`. The parent lease is owned
+  by (worker, machine, instance): the worker from the credential,
+  `os.hostname()`, and the loop's per-process `workerId` — so two processes
+  with one agent on one box are two owners, and the second is refused
+  `already_owned`. The advertisement (factory + revision, concurrency, code
+  stamp, repos, provider, and the machine's capability atoms in the vocabulary
+  `satisfies()` matches profiles against) is a description, bounded under the
+  server's 16KB limit; every dispatch still runs its own satisfiability check.
+- **Every pass renews** the owned run (`POST /:id/renew`), which is how the
+  worker learns the run's global state, its admitted remainder (`remaining`,
+  graph truth) and any end the server decided. A renew refused for ownership
+  (`not_owned`, `fence_stale`, `lease_expired`) is `local.lease_lost`: the run is
+  dropped WITHOUT a release (it is no longer ours to release) and nothing more
+  is admitted; in-flight children keep their own execution leases. A server
+  that does not answer keeps the claim but admits nothing until it does
+  (`local.server_unreachable`). A `run_terminal` answer (completed, drained,
+  cancelled) drops the run and the worker polls for another.
+- **Candidates** are queue eligibility ∩ the run's program closure ∩ its
+  admitted cohort (minus any member drain released) ∩ this machine's scope —
+  the `--program` selection with the cohort intersected in
+  (`scopeSnapshotToRun`), so page widening, the accept policy, the factory's
+  repo scope, the human floor and every dispatch guard apply unchanged.
+- **Admission.** Each dispatch's execution open carries `program_run {run_id,
+  fence, instance}` (`admitThrough` → `claimExecutionHold`); the server opens
+  the execution and records it as the run's child in one transaction, or
+  refuses. A refusal of the admission door itself (`admission_code`, never an
+  execution-level refusal about the one item, such as a locally handed-off
+  execution) for the RUN's reasons (`run_paused`, `run_draining`,
+  `factory_drift`, or an ownership code) stops admissions for the pass and is
+  never cooled onto the member; `not_admitted`/`factory_mismatch` are the
+  item's own refusals and cool it like any other. A server that does not serve
+  `/v1/executions` is a refusal under a run — never the machine-local fallback
+  a plain controller open takes, since that child would be one the run never
+  admitted. The dispatch claim carries `machine` and `instance` too, so the
+  server's dispatch guard can tell two claimants sharing one principal apart.
+- **The `admitting` predicate** (run `running`, readable, and nothing local
+  holding admissions) gates FRESH dispatch (step 3b) only. The resume of
+  parked or orphaned gate pipelines (3a), harvest and gates continue through a
+  pause or a drain, so a draining run's children settle and the run reaches
+  `drained`.
+- **Factory drift.** The per-pass reload is NARROWED: the worker tracks HEAD,
+  but the `factory` binding new admissions and pinned children's fix cycles
+  read stays the run's pin. A HEAD whose tuple (`{factory_revision, gates:
+  [{id, node_id, revision}]}`, `pinTupleOf`, spelled as the server's
+  `pinFactory` spells it) differs from the run's current pin is reported once
+  as `drift.observed` and stops admissions here at once; the server re-reads
+  and pauses the run until a person adopts. The worker's word is a trigger,
+  not evidence: where the server's re-read finds NO drift (`drifted: false`),
+  its verdict wins and admissions resume. A renew refused for any reason other
+  than ownership, `run_terminal` or `not_found` keeps the claim and admits
+  nothing until the server answers, rather than hiding the run for a TTL. A worker that claims a run pinned
+  BEHIND HEAD (restarted mid-run) reads the pinned nodes from `GET
+  /:id/factory` and parses them through the same `loadFactoryDefinition`
+  validator (its `nodes` override) — a definition it cannot read is
+  `local.factory_unreadable` and the run is released.
+- **Local never implies global.** A local stop — signal, `--max`, `--once`,
+  `--restart-on-land` — reports its local reason as an advisory
+  `worker.observed` event and RELEASES the run, which keeps its global state;
+  a restarted worker is a new instance and claims it at the next fence (after
+  a hard kill, once the old lease lapses). A program standing never ends a
+  serve worker: `complete` is only this box's reading (the server's own
+  `completed` arrives on a renew), and `halted` splits on why — members stuck
+  only HERE (cooling after a refusal here, ineligible by this worker's policy
+  or scope) are `local.no_capable_member`:
+  reported, the run released for a capable machine and cooled locally; members
+  stuck for a global reason (a person's call, a blocker) leave the run held and
+  visible, which the server's `blocked` overlay reports. Nothing local is ever
+  written as run state, and nothing about a launch is persisted for the source:
+  a restart re-derives its whole view from the server's run read and this box's
+  own run journal (`spor work --status` shows the owned run under `serve`).
+
 ### 3.1 Preflight — what must be true BEFORE a worker claims anything
 
 An unattended worker has nobody to answer a permission prompt and nobody to

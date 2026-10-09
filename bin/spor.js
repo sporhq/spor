@@ -9758,6 +9758,16 @@ async function claimDispatch(cfg, nodeId, session, dispatch) {
   const body = {};
   if (session) body.session = session;
   if (dispatch) body.dispatch = dispatch;
+  // WHICH box and process is claiming (task-spor-chatgpt-run-worker-adapter):
+  // the dispatch guard can otherwise tell two claimants apart only by their
+  // credential's principal, so two worker processes sharing one agent — or a
+  // person's own `spor dispatch` beside a program-run worker — read as one.
+  // Sent so the server's guard CAN key on them; today's server ignores both
+  // (its guard compares the worker principal and the dispatch nonce only).
+  if (dispatch) {
+    body.machine = os.hostname();
+    body.instance = executionInstance();
+  }
   const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/claim`, body, { timeoutMs: 6000 });
   if (r.ok) return { ok: true, lease: r.json && r.json.lease };
   // 409 = the node can't be claimed right now — a live lease held by ANOTHER
@@ -11657,7 +11667,7 @@ async function reconcileWithdrawnExecutions(cfg, { home = cfg.userConfigHome(), 
 // leave the protected suite alone, resolve last (lib/shell/worker-contract.js).
 // `spor dispatch` on its own stays byte-identical — a person aiming one agent
 // at one node writes their own instructions; an unattended loop cannot.
-async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home = cfg.userConfigHome(), log = () => {}, cmdDispatch: cmdDispatchOverride = null } = {}) {
+async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home = cfg.userConfigHome(), log = () => {}, cmdDispatch: cmdDispatchOverride = null, programRun = null } = {}) {
   const values = { ...passthrough, node: item.id };
   if (!values.profile && item.profile) values.profile = item.profile;
   // `implementation.profile` — the factory's lane default — is the LOWEST-
@@ -11691,9 +11701,12 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
   // case (openPipelineCandidates). A bare worker stamps nothing, and its runs
   // are never adopted.
   const gateFactory = factory && factory.id ? { gate_factory: factory.id } : null;
+  // A program run admits children only through the execution open (§2.2):
+  // an agent-completion factory opens none, so it can never run a member.
+  if (programRun && !controller) return { ok: false, reason: `a program run admits members only under a controller-completion factory; '${factory && factory.id}' completes by the agent` };
   if (!controller) return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { ...(gateFactory ? { recordFields: gateFactory } : {}), ...(factory ? { factory } : {}), ...dispatchOpts });
-  const held = await claimExecutionHold(cfg, item, factory, { home, log });
-  if (!held.ok) return { ok: false, reason: held.reason };
+  const held = await claimExecutionHold(cfg, item, factory, { home, log, ...(programRun ? { programRun } : {}) });
+  if (!held.ok) return { ok: false, reason: held.reason, ...(held.admission_code ? { admission_code: held.admission_code, message: held.message || null } : {}) };
   // The provider attempt handle (task-spor-work-attempt-handle-adoption,
   // PROVIDERS.md §6): an execution this claim RE-took (a restarted worker, a
   // takeover) may already record where its attempt runs. A recorded handle is
@@ -12149,6 +12162,20 @@ function cmdWorkStatus(cfg, { json }) {
       for (const s of (p.stuck || []).slice(0, workLoop.SKIP_LOG_CAP)) out(`            stuck: ${s.id} — ${s.why}`);
       if ((p.stuck || []).length > workLoop.SKIP_LOG_CAP) out(`            ...and ${p.stuck.length - workLoop.SKIP_LOG_CAP} more stuck`);
     }
+    // The serve source (`--serve program`): the owned run's GLOBAL state as the
+    // server last reported it, kept apart from this worker's LOCAL reason —
+    // one never reads as the other (PROGRAM-RUN-WORKER.md §7).
+    if (w.serve) {
+      const sv = w.serve;
+      out(
+        `  serve:    ${sv.scope || "program"} — ${
+          sv.run_id
+            ? `run ${sv.run_id} (program ${sv.program_id || "?"}) ${sv.state || "?"} at fence ${sv.fence}, ${sv.admitting ? "admitting" : `not admitting${sv.holding ? ` (${sv.holding})` : ""}`}${sv.remaining != null ? `, ${sv.remaining} admitted member(s) open` : ""}${sv.blocked ? `, blocked: ${Object.keys(sv.blocked).join("/")}` : ""}`
+            : "no run owned"
+        }`
+      );
+      if (sv.local_reason && sv.local_reason.reason) out(`            local: ${sv.local_reason.reason}${sv.local_reason.detail ? ` — ${sv.local_reason.detail}` : ""} (this worker only; never run state)`);
+    }
     if (w.workspace_wait) {
       out(`  workspace: busy — ${w.workspace_wait.node_id} refused (${w.workspace_wait.reason}); retrying this page next poll`);
     }
@@ -12301,8 +12328,14 @@ function cmdWorkStatus(cfg, { json }) {
 // the worker (cmdWork refuses to start): an operator who declared gates and
 // mistyped them must not get a silently ungated worker — that is the one
 // failure mode enforcement-in-code exists to remove.
-async function loadFactoryDefinition(cfg, id) {
+async function loadFactoryDefinition(cfg, id, { nodes = null } = {}) {
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  // `nodes` (task-spor-chatgpt-run-worker-adapter): a Map id -> {raw,
+  // revision} to read the factory and its gates FROM instead of the graph's
+  // HEAD — a program run's PINNED definition (GET /v1/program-runs/:id/factory
+  // serves each node at its pinned revision), parsed by this same validator so
+  // a pinned definition can never be laxer than a live one.
+  const readNode = nodes ? async (_cfg, nid) => nodes.get(nid) || null : resolveNode;
   const parse = (raw, file) => {
     try {
       return graphLib.parseFrontmatter(raw, file);
@@ -12310,7 +12343,7 @@ async function loadFactoryDefinition(cfg, id) {
       return {};
     }
   };
-  const node = await resolveNode(cfg, id);
+  const node = await readNode(cfg, id);
   if (!node || !node.raw) {
     return { factory: null, errors: [`factory definition '${id}' could not be read from the graph`] };
   }
@@ -12350,7 +12383,7 @@ async function loadFactoryDefinition(cfg, id) {
   const gateRevisions = {};
   const explainedRefs = new Set(); // refs whose problem we already reported below
   for (const ref of gatesKernel.factoryRefs(parsed.body || "")) {
-    const gn = await resolveNode(cfg, ref);
+    const gn = await readNode(cfg, ref);
     if (!gn || !gn.raw) continue; // resolveGates reports the missing reference itself
     if (gn.revision) gateRevisions[ref] = gn.revision;
     const pg = parse(gn.raw, `${ref}.md`);
@@ -12418,7 +12451,7 @@ async function loadFactoryDefinition(cfg, id) {
         if (seen.has(priorId)) continue;
         seen.add(priorId);
         renamedFrom.push(priorId);
-        const priorNode = await resolveNode(cfg, priorId);
+        const priorNode = await readNode(cfg, priorId);
         if (!priorNode || !priorNode.raw) continue;
         const priorParsed = parse(priorNode.raw, `${priorId}.md`);
         if ((priorParsed.type || "") !== "factory") continue; // not a factory rename hop
@@ -14759,7 +14792,7 @@ function implBudgetStamp(impl) {
 // the item BEFORE the implementer is dispatched, and the claim pins the run
 // record is created with (`ctx.recordFields`). Returns the recordFields, or a
 // refusal — an unroutable item (H2): no hold, no launch, cooled by the loop.
-async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHome(), log = () => {} } = {}) {
+async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHome(), log = () => {}, programRun = null } = {}) {
   // The EXECUTION STORE (task-spor-client-execution-store-adapter,
   // EXECUTION-STATE.md §8): the execution is OPENED there first — the hosted
   // `POST /v1/executions` in remote mode (the server pins the definition,
@@ -14770,7 +14803,12 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
   // attempt), so a local execution and a hosted one describe the same thing.
   let store = openExecutionStoreFor(cfg, { home, log });
   const gates = (factory.gates || []).map((g) => ({ id: g.id, node_id: g.source && g.source !== "inline" ? String(g.source) : null, rejudge_on_repin: g.rejudgeOnRepin !== false }));
-  const openArgs = { node_id: item.id, factory: factory.id, gates, boundary: factory.completion.after, repo: item.project || null };
+  // `programRun` — the parent run's ADMISSION binding {run_id, fence,
+  // instance} (PROGRAM-RUN-WORKER.md §5): the server opens the execution and
+  // records it as the run's child in one transaction, or refuses (the run is
+  // paused/draining, this worker lost the run lease, the member is not
+  // admitted, the factory drifted). Absent, the open is today's, byte-for-byte.
+  const openArgs = { node_id: item.id, factory: factory.id, gates, boundary: factory.completion.after, repo: item.project || null, ...(programRun ? { program_run: programRun } : {}) };
   let opened = await store.open(openArgs);
   // A server that does not serve the surface (an older version, or one with
   // no execution store configured) is not a refusal: coordination state for
@@ -14778,6 +14816,11 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
   // store it opened so a resume goes back to the same one. A server that is
   // merely unreachable is a refusal — nothing authoritative starts without an
   // execution nobody else can be holding (§8 rule 3).
+  // ...except under a program run: admission IS the server's open, and a
+  // machine-local execution would be a child the run never admitted.
+  if (!opened.ok && opened.unserved && store.mode === "remote" && programRun) {
+    return { ok: false, kind: "store", code: "not_served", reason: `the server does not serve /v1/executions (${opened.message}); a program run cannot admit ${item.id}` };
+  }
   if (!opened.ok && opened.unserved && store.mode === "remote") {
     log(`work: ${item.id} — the server does not serve /v1/executions (${opened.message}); this execution's coordination state is machine-local`);
     store = openExecutionStoreFor(cfg, { home, log, mode: "local" });
@@ -14789,7 +14832,11 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
     // locally, so the re-open never advances the winner's fence — the item is
     // the winner's, exactly a foreign hold.
     const foreign = opened.code === "execution_open" || !!opened.handed_off;
-    return { ok: false, kind: foreign ? "foreign-hold" : "store", ...(opened.handed_off ? { handed_off: true } : {}), reason: `execution store refused ${item.id}: ${opened.code}: ${opened.message}${foreign && opened.execution ? ` (execution ${opened.execution.execution_id})` : ""}` };
+    // `admission_code` names a refusal of the RUN's admission door only: a
+    // locally handed-off execution (`handed_off`, this process lost THAT
+    // item's execution earlier) refuses with an execution code that says
+    // nothing about the run and must never read as losing the run lease.
+    return { ok: false, kind: foreign ? "foreign-hold" : "store", ...(programRun && !opened.handed_off && opened.code ? { admission_code: opened.code, message: opened.message || null } : {}), ...(opened.handed_off ? { handed_off: true } : {}), reason: `execution store refused ${item.id}: ${opened.code}: ${opened.message}${foreign && opened.execution ? ` (execution ${opened.execution.execution_id})` : ""}` };
   }
   let fence = opened.fence;
   let execution = opened.execution;
@@ -20996,12 +21043,24 @@ const COMMANDS = {
       "terminal, or HALTS — printing which members and why — once every remaining\n" +
       "member needs a person, was refused or cooled off here, is blocked, or is not on\n" +
       "the dispatchable queue. A human member is never claimed. work.project/\n" +
-      "queue.project do not narrow a program's page (an explicit --project does).",
+      "queue.project do not narrow a program's page (an explicit --project does).\n\n" +
+      "PROGRAM RUN REQUESTS (task-spor-chatgpt-run-worker-adapter). --serve program\n" +
+      "(alias --program-runs) makes the loop take work ONLY from a program run a\n" +
+      "person started on the server: it claims one run pinned to its --factory\n" +
+      "(a parent lease owned by this process), renews it every pass, and admits\n" +
+      "only that run's admitted members — each through the execution open, which the\n" +
+      "server fences on the run lease. Pause and drain stop fresh admissions only;\n" +
+      "gates and resumed pipelines keep going. A local stop (signal, --max, --once,\n" +
+      "--restart-on-land) RELEASES the run, which keeps its global state; a run\n" +
+      "none of whose members can run here is released for a capable machine. Only\n" +
+      "the server completes a run. See WORKERS.md §3, 'Program run requests'.",
     options: {
       project: { type: "string", value: "S", desc: "scope to a project slug (default: work.project/queue.project, else a single-repo factory's own repo, else the whole queue)" },
       accept: { type: "string", value: "P", desc: "acceptance policy: 'ready' dispatches only items explicitly stamped agent-ready (default; also work.accept/SPOR_WORK_ACCEPT); 'open' takes anything except readiness:human" },
       factory: { type: "string", value: "factory-id", desc: "the graph-resident factory definition whose gates every run must pass (default: work.factory; absent = bare loop)" },
       program: { type: "string", value: "id", desc: "scope the loop to a program: only the root's transitive member-of-program members are candidates (queue/blocks order); exits when every member is terminal, or halts naming the members that need a person or cannot run here" },
+      serve: { type: "string", value: "scope", desc: "take work from durable server-held requests instead of the queue: 'program' serves program run requests (one owned run at a time, admitted members only; needs a controller-completion --factory and a team server)" },
+      "program-runs": { type: "boolean", desc: "alias for --serve program" },
       concurrency: { type: "string", value: "N", desc: "how many runs to keep in flight (default 1)" },
       interval: { type: "string", value: "S", desc: "seconds between polls (default 30)" },
       "max-interval": { type: "string", value: "S", desc: "backoff ceiling in seconds when idle (default 300)" },
