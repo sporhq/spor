@@ -194,7 +194,7 @@ for (const stage of ["journaled", "parts", "root"]) {
     const v2src = source("art-doc", { edit: " (v2)" });
     dieAt(h, v2src, v1.snapshot, stage);
     // A dead publisher's lock and intent are left behind.
-    assert.ok(fs.existsSync(path.join(journal(h), "art-doc.lock")));
+    assert.ok(fs.readdirSync(journal(h)).some((f) => f.startsWith("art-doc.lock-")));
     assert.ok(fs.existsSync(path.join(journal(h), "art-doc.publish.json")));
     const mid = get(h, "art-doc").document;
     assert.strictEqual(mid.complete, true, "never a mix");
@@ -217,13 +217,64 @@ for (const stage of ["journaled", "parts", "root"]) {
   });
 }
 
-test("local: a live publication's lock is a conflict, never waited on", () => {
+test("local: a live publication's lock is a conflict; a dead holder's is ignored and pruned", () => {
   const h = home();
   fs.mkdirSync(journal(h), { recursive: true });
-  fs.writeFileSync(path.join(journal(h), "art-doc.lock"), JSON.stringify({ pid: process.ppid, ticks: null, at: Date.now(), token: "x" }));
+  const live = path.join(journal(h), `art-doc.lock-${process.ppid}-${Date.now()}-ab12`);
+  fs.writeFileSync(live, "");
   const r = put(h, source("art-doc"));
   assert.strictEqual(r.code, "conflict");
   assert.match(r.message, /another publication of 'art-doc' is in progress/);
+  assert.ok(!fs.existsSync(path.join(nodes(h), "art-doc.md")));
+  assert.ok(fs.existsSync(live), "never another contender's lock to delete");
+  fs.unlinkSync(live);
+  // A dead pid past the horizon: ignored by every contender, then reaped.
+  const dead = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout;
+  const stale = path.join(journal(h), `art-doc.lock-${dead}-${Date.now() - documentShell.LOCK_TTL_MS - 1000}-cd34`);
+  fs.writeFileSync(stale, "");
+  assert.strictEqual(put(h, source("art-doc")).status, "created");
+  assert.ok(!fs.existsSync(stale));
+  assert.deepStrictEqual(fs.readdirSync(journal(h)), [], "our own lock is released");
+});
+
+test("local: a second publisher arriving mid-publication is refused and cannot touch the first's parts", () => {
+  const h = home();
+  const v1 = put(h, source("art-doc"));
+  let second = null;
+  const first = put(h, source("art-doc", { edit: " A" }), v1.snapshot, {
+    at: (stage) => {
+      if (stage !== "parts") return;
+      // Another process (a lock held by this pid is this pid's own to ignore).
+      const script = `
+        const d = require(${JSON.stringify(SHELL)});
+        const r = d.putDocument(${JSON.stringify(nodes(h))}, {
+          node: ${JSON.stringify(source("art-doc", { edit: " B" }))}, snapshot: ${JSON.stringify(v1.snapshot)},
+          journalDir: ${JSON.stringify(journal(h))},
+        });
+        process.stdout.write(JSON.stringify(r));`;
+      second = JSON.parse(spawnSync(process.execPath, ["-e", script], { encoding: "utf8" }).stdout);
+    },
+  });
+  assert.deepStrictEqual([second.ok, second.code], [false, "conflict"]);
+  assert.strictEqual(first.status, "updated");
+  const read = get(h, "art-doc").document;
+  assert.ok(read.complete, "the first publication's root names parts that all stand");
+  assert.match(read.body, /Paragraph 3 A/);
+});
+
+test("local restart recovery: a root that landed and then moved keeps its parts (the landed revision stays whole)", () => {
+  const h = home({ git: true });
+  const v1 = put(h, source("art-doc"));
+  const v2src = source("art-doc", { edit: " (v2)" });
+  dieAt(h, v2src, v1.snapshot, "root");
+  const landed = documentShell.readNodeFile(nodes(h), "art-doc").revision;
+  // The root moves through another door before any publication recovers.
+  fs.writeFileSync(path.join(nodes(h), "art-doc.md"), "---\nid: art-doc\ntype: artifact\ntitle: T\nsummary: s\n---\nreplaced\n");
+  const rec = documentShell.recoverPublication(nodes(h), journal(h), "art-doc");
+  assert.deepStrictEqual([rec.outcome, rec.removed], ["kept", []]);
+  const pinned = get(h, "art-doc", landed);
+  assert.ok(pinned.ok && pinned.document.complete, "the revision that landed still reads whole");
+  assert.strictEqual(content.documentCore(pinned.document.body), core(v2src));
 });
 
 // ---------- the CLI doors ----------
@@ -260,4 +311,43 @@ test("cli: put-document validates pieces against the graph and takes a whole get
   const badSnap = cli(h, ["put-document", "-", "--snapshot", "{\"root\":\"art-doc\"}"], source("art-doc"));
   assert.strictEqual(badSnap.status, 1);
   assert.match(badSnap.stderr, /invalid document snapshot/);
+});
+
+// ---------- goldens: the port answers what spor-server answers ----------
+// Recorded from the server's OWN documentGeneration / readDocument by
+// test/helpers/record-document-goldens.js; inputs are the cases beside them.
+// The parity rows in mode-parity.test.js compare this module with itself
+// through the stub, so THIS is what pins it to the server.
+test("goldens: documentGeneration and the chain read match spor-server byte-for-byte", () => {
+  const goldens = require("./fixtures/document-generations/goldens.json");
+  const cases = require("./fixtures/document-generations/cases.js");
+  const h = (t) => require("node:crypto").createHash("sha256").update(String(t), "utf8").digest("hex");
+  const PREFIXES = { decision: ["dec-"], artifact: ["art-"], task: ["task-"], person: ["person-"] };
+  assert.strictEqual(goldens.generations.length, cases.generations.length);
+  cases.generations.forEach((c, i) => {
+    const want = goldens.generations[i];
+    assert.strictEqual(want.name, c.name);
+    const type = /\ntype: (\w+)/.exec(c.source.replace(/\r/g, ""))[1];
+    const r = content.documentGeneration(c.source, { prefixes: PREFIXES[type], today: c.today });
+    const got = r.ok
+      ? { ok: true, id: r.id, digest: r.digest, bytes: r.bytes, root_sha256: h(r.root), parts: r.parts.map((p) => ({ id: p.id, sha256: h(p.raw) })) }
+      : { ok: false, message: r.message };
+    assert.deepStrictEqual(got, want.expect, c.name);
+  });
+  const fm = require("../lib/kernel/frontmatter.js");
+  const reads = cases.reads();
+  assert.strictEqual(goldens.reads.length, reads.length);
+  reads.forEach((c, i) => {
+    const want = goldens.reads[i];
+    assert.strictEqual(want.name, c.name);
+    const node = (raw) => ({ raw, frontmatter: fm.parseFrontmatter(raw, "x.md") });
+    const root = node(c.pinned || c.files[c.root]);
+    const r = content.readDocumentChain(root, (id) => (c.files[id] ? node(c.files[id]) : null), { pinned: !!c.pinned });
+    // The server names the pinned revision it read; the kernel leaves that to
+    // the caller (the shell's answer carries it), so set it aside.
+    const { revision: _rev, body_sha256, ...expect } = want.expect;
+    const { body, ...got } = r;
+    assert.deepStrictEqual(got, expect, c.name);
+    assert.strictEqual(h(body), body_sha256, `${c.name}: body`);
+  });
 });

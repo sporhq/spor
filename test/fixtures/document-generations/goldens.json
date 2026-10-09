@@ -1,0 +1,232 @@
+{
+  "recorded_from": "spor-server@b9594d3",
+  "generations": [
+    {
+      "name": "multi-part decision, astral text, edges",
+      "expect": {
+        "ok": true,
+        "id": "dec-foo",
+        "digest": "748fff14f18206039da02892f3d9fd985a6bea7398d05d032a5db36825c0f1ea",
+        "bytes": 38491,
+        "root_sha256": "cf043a24e4f4565be0488e4b6578ded63a946dfef2fa9135077baa16d64c5404",
+        "parts": [
+          {
+            "id": "art-decision-foo-g748fff14-2",
+            "sha256": "da680c6e6a04b2793e91beb4e9f2e2aa939cce553b4e116c138eafa6e4e79707"
+          },
+          {
+            "id": "art-decision-foo-g748fff14-3",
+            "sha256": "eed82a17b0bfb356552c3907795d477407fca6753c730e301b3e500120840944"
+          },
+          {
+            "id": "art-decision-foo-g748fff14-4",
+            "sha256": "567e04dc41af6501498ca12422990994f86b1927dd53ea2fbd75cd40e4103d19"
+          },
+          {
+            "id": "art-decision-foo-g748fff14-5",
+            "sha256": "d1d746693614f3c813657af0ab2aca49711234142b760f6f28b3cdbbf027a6c3"
+          }
+        ]
+      }
+    },
+    {
+      "name": "fitting body replaces spill stamps",
+      "expect": {
+        "ok": true,
+        "id": "art-small",
+        "digest": "7e2e6dcff29af8ad6739aa1004ef7b42d319eff908018b4058a3ab4aed5524f2",
+        "bytes": 10,
+        "root_sha256": "83967c8dbd925889217f3c1ca72d4cc4ec27f599c0a25fa8387ff2cb1a20fdb3",
+        "parts": []
+      }
+    },
+    {
+      "name": "CRLF source",
+      "expect": {
+        "ok": true,
+        "id": "art-crlf",
+        "digest": "9a7105c49fde3fb305cc312489062f37d5e017dc97a81bb30c24aafdd5e779af",
+        "bytes": 14999,
+        "root_sha256": "c941abf5c9a7113e5c954c7dc09b3ed41511193f17fac925e92ae5d0aef21292",
+        "parts": [
+          {
+            "id": "art-crlf-g9a7105c4-2",
+            "sha256": "7d9dbfc31f33703e0ed44ebcd9a8864b7098a3470d0d96b031ed4460260329fb"
+          }
+        ]
+      }
+    },
+    {
+      "name": "near-limit id fits a hashed base",
+      "expect": {
+        "ok": true,
+        "id": "art-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "digest": "09ef7eb5c2cd6571647475fd220c7b88426cf645dd18a063ad27b4c8f1f180a6",
+        "bytes": 20000,
+        "root_sha256": "529f3e3ef07b6213d7e1f7f5dbe8f7bc06397cb0f88cea6824b943608baefd36",
+        "parts": [
+          {
+            "id": "art-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-497b1ffa8e-g09ef7eb5-2",
+            "sha256": "4c2318b148ab3aaa5e0d0935bcc303f36c8c58ddebc182db66df4224ecdd9ad7"
+          },
+          {
+            "id": "art-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-497b1ffa8e-g09ef7eb5-3",
+            "sha256": "baf9948cb510a44ec58fcfed9d56852b2063dcbe3f4e2f11693735f0014aa523"
+          }
+        ]
+      }
+    },
+    {
+      "name": "frontmatter ending in a blank line",
+      "expect": {
+        "ok": true,
+        "id": "art-blank",
+        "digest": "230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5",
+        "bytes": 4,
+        "root_sha256": "5942019061f10e497146cd64f3cfffe696c8aa5248088e5ea0aad7b65396a916",
+        "parts": []
+      }
+    },
+    {
+      "name": "person host, folded summary, no date",
+      "expect": {
+        "ok": true,
+        "id": "person-carol",
+        "digest": "24da641b07f7b8e527c7e68afc5841149bb6b9738dd55843d5ec19dc3d89926f",
+        "bytes": 13390,
+        "root_sha256": "fc26f4c22f1eefb398c076eadb4b2e0ed60b7f16c2da9ceed9279e6021d83a4c",
+        "parts": [
+          {
+            "id": "art-person-carol-g24da641b-2",
+            "sha256": "b7967d1c8ec59d135d02d2767cda124ac3aa18b68a4c07da4ec0cb1b6e38c6a1"
+          }
+        ]
+      }
+    },
+    {
+      "name": "a root carrying a part stamp is refused",
+      "expect": {
+        "ok": false,
+        "message": "a document root may not carry continuation_of — those mark a continuation part"
+      }
+    }
+  ],
+  "reads": [
+    {
+      "name": "complete generation",
+      "expect": {
+        "parts": [
+          "art-decision-foo-g748fff14-2",
+          "art-decision-foo-g748fff14-3",
+          "art-decision-foo-g748fff14-4",
+          "art-decision-foo-g748fff14-5"
+        ],
+        "complete": true,
+        "generation": "748fff14f18206039da02892f3d9fd985a6bea7398d05d032a5db36825c0f1ea",
+        "body_sha256": "f28f3be498a5c6d2de5205c668a1d0e8203b1418dd162fa5428f7fbcb4d51be3"
+      }
+    },
+    {
+      "name": "missing part",
+      "expect": {
+        "parts": [
+          "art-decision-foo-g748fff14-2"
+        ],
+        "complete": false,
+        "generation": "748fff14f18206039da02892f3d9fd985a6bea7398d05d032a5db36825c0f1ea",
+        "missing": "art-decision-foo-g748fff14-3",
+        "body_sha256": "855329ee8a9ee6443252c2bd2c5e9dac90167e935a5a7e89d0c1bebcf94188ab"
+      }
+    },
+    {
+      "name": "edited part fails the digest",
+      "expect": {
+        "parts": [
+          "art-decision-foo-g748fff14-2",
+          "art-decision-foo-g748fff14-3",
+          "art-decision-foo-g748fff14-4",
+          "art-decision-foo-g748fff14-5"
+        ],
+        "complete": false,
+        "generation": "748fff14f18206039da02892f3d9fd985a6bea7398d05d032a5db36825c0f1ea",
+        "integrity_failed": true,
+        "body_sha256": "fa564d9d4f999767061ef7e4f14951f0c4466db22ffb448107b2196cc230ec10"
+      }
+    },
+    {
+      "name": "re-stamped part is foreign",
+      "expect": {
+        "parts": [],
+        "complete": false,
+        "generation": "748fff14f18206039da02892f3d9fd985a6bea7398d05d032a5db36825c0f1ea",
+        "missing": "art-decision-foo-g748fff14-2",
+        "body_sha256": "ecb6247ecb531ea5699fabf0bc9f74360e44856d811869a85dc88d15fbd22645"
+      }
+    },
+    {
+      "name": "broken header",
+      "expect": {
+        "parts": [],
+        "complete": false,
+        "generation": "748fff14f18206039da02892f3d9fd985a6bea7398d05d032a5db36825c0f1ea",
+        "missing": "art-decision-foo-g748fff14-2",
+        "body_sha256": "ecb6247ecb531ea5699fabf0bc9f74360e44856d811869a85dc88d15fbd22645"
+      }
+    },
+    {
+      "name": "pinned generation root",
+      "expect": {
+        "parts": [
+          "art-decision-foo-g748fff14-2",
+          "art-decision-foo-g748fff14-3",
+          "art-decision-foo-g748fff14-4",
+          "art-decision-foo-g748fff14-5"
+        ],
+        "complete": true,
+        "revision": "30c33422383c1aa1e050f80e8698d561a02bc8c0",
+        "generation": "748fff14f18206039da02892f3d9fd985a6bea7398d05d032a5db36825c0f1ea",
+        "body_sha256": "f28f3be498a5c6d2de5205c668a1d0e8203b1418dd162fa5428f7fbcb4d51be3"
+      }
+    },
+    {
+      "name": "legacy spill, prefix stamp holds",
+      "expect": {
+        "parts": [
+          "art-leg-2"
+        ],
+        "complete": true,
+        "body_sha256": "a55ddea09aef31a92739b08b1cc951b4bcf33fe43b19acf347d2e333109ad03b"
+      }
+    },
+    {
+      "name": "legacy spill, prefix stamp broken",
+      "expect": {
+        "parts": [
+          "art-leg-2"
+        ],
+        "complete": false,
+        "integrity_failed": true,
+        "body_sha256": "d3eaffc6c99cbbccb2c7478dee855ba92825c467d13a174153e9ffbe574895d3"
+      }
+    },
+    {
+      "name": "pinned legacy spill is not reproducible",
+      "expect": {
+        "parts": [],
+        "complete": false,
+        "revision": "b59b12cce64dd2ca08054d968a98bf411eed30ff",
+        "missing": "art-leg-2",
+        "history_unavailable": true,
+        "body_sha256": "136c34700276f488aa54305213857b726124a9a62873865696c4881484977723"
+      }
+    },
+    {
+      "name": "ordinary node",
+      "expect": {
+        "parts": [],
+        "complete": true,
+        "body_sha256": "9a2f039a17125dc48a54818854504003a3517d39e732bf9648339477fd49774c"
+      }
+    }
+  ]
+}
