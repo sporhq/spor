@@ -20,10 +20,13 @@ specs: [WORKERS.md](WORKERS.md) (the worker protocol, the prompt contract
 (task-spor-work-local-provider-refactor), the capability matcher
 (task-spor-execution-provider-capability-vocabulary), the subprocess stdio
 binding (task-spor-execution-provider-stdio-binding), the in-environment runner
-(task-spor-attempt-bundle-run), the conformance suite
-(task-spor-execution-provider-conformance-suite) and the server's attempt
-handle and attempt-scoped token are separate items. None of them is shipped
-yet, so `spor work` behaves today exactly as WORKERS.md describes.
+(task-spor-attempt-bundle-run) and the server's attempt handle and
+attempt-scoped token are separate items. None of them is shipped yet, so
+`spor work` behaves today exactly as WORKERS.md describes. The conformance
+suite every binding must pass is shipped:
+`lib/shell/provider-conformance.js` (`runConformance(provider, {home,
+driver})`), proven against the synthetic providers in
+`test/fixtures/providers/` by `test/provider-conformance.test.js`.
 
 ## 1. Two seams, three layers
 
@@ -199,7 +202,7 @@ environment must hold and nothing the provider could leak:
 
 | field | meaning |
 |---|---|
-| `attempt_id` | The execution **instance**: the claiming process (WORKERS.md §10.15). One execution may see several attempts. |
+| `attempt_id` | The execution **instance**: the claiming process (WORKERS.md §10.15). One execution may see several attempts. It names the instance that SUBMITTED the attempt and stays that across a worker restart: an adopting instance never re-derives it (§6). |
 | `execution_id`, `fence` | The execution record this attempt serves and the fence it was claimed under. Everything the attempt writes back is checked against both. |
 | `tenant`, `node_id` | The org the attempt's graph writes land in, and the item it works. |
 | `harness` | `{id, version?}`, the harness adapter to run in the environment. |
@@ -354,7 +357,11 @@ under an advanced fence. If the record carries `attempt.submitted`, it
 **adopts** the live attempt by that handle (observe, collect, release) instead
 of submitting again. If it carries only the persisted key and request (the
 previous instance died while holding), it reconciles exactly as above and then
-adopts. Either way the old fence's attempt token is dead; how the adopted
+adopts. Either way the environment keeps the identity it was submitted with:
+the adopter re-sends the persisted request byte for byte (its own
+`attempt_id` and fence under the persisted key is a different attempt, so
+`idempotency_conflict`), and the manifest it collects names the submitting
+instance's `attempt_id` and `fence`, not its own. The old fence's attempt token is dead; how the adopted
 environment gets a token for the new fence is the server's attempt-token
 contract (task-spor-server-attempt-scoped-token), not a resubmit.
 
