@@ -211,6 +211,97 @@ The fix is to let the log **roll over**, not to grow one node forever:
 This is the same shape as any other multi-part document; it just needed
 naming so it stops being reinvented ad hoc per artifact.
 
+## Rich content and assets
+
+An artifact can opt in to richer content and binary assets through OPTIONAL
+flat-scalar frontmatter keys (task-spor-chatgpt-content-contracts). They reuse
+the artifact type and the existing primitives: no nested frontmatter, no
+paragraph-level nodes, no new node type. A node with none of these keys reads
+and validates exactly as it did before, byte for byte. The rules live in
+`lib/kernel/content.js`, and the seed `schema-artifact` `validate()` refuses
+inconsistent values at the write door. A graph-resident `schema-artifact`
+overrides that seed rule like any other.
+
+| key | value | meaning |
+|---|---|---|
+| `content_format` | `markdown` \| `text` | `markdown` is CommonMark + GFM, the only format whose `spor-asset:` image embeds mean anything. `text` is plain. Absent = a legacy body, read as before, embedding nothing. |
+| `asset_digest` | `sha256:<64 lowercase hex>` | makes the node an **asset descriptor**: it names immutable bytes held OUTSIDE graph Git (`$SPOR_HOME/assets/` locally, a per-tenant object store hosted; dec-spor-chatgpt-asset-storage-contract-2026-10-08) |
+| `asset_media_type` | `image/png` \| `image/jpeg` \| `image/gif` \| `image/webp` | the verified type (SVG is refused because it can carry script) |
+| `asset_bytes`, `asset_width`, `asset_height` | positive integers | size and pixel dimensions |
+| `asset_alt` | text, ≤1000 chars (optional) | alt text. The caption is the node's own `summary`, and provenance is its edges and attribution stamps. |
+| `doc_sha256` + `doc_bytes` | 64 hex + integer | a long-document **generation root** (the server's document-generation stamps) |
+| `doc_generation` | 64 hex | a generation **part**; needs `continuation_of` and never sits beside `doc_sha256` |
+| `selection` | a `spor-source:` / `spor-image:` URI | one exact selection the node is about (below) |
+
+The five required asset keys come together or not at all, and any other
+`asset_*` key is refused as a typo. Only shape is checked at the door. That the
+bytes really hash to the digest is the upload path's single streaming
+verification, and only that path writes a descriptor. That a root's
+`doc_sha256` matches the reassembled body is the reader's exact-body check
+(`get_node follow_continuations`).
+
+**Asset URIs.** A markdown body embeds an asset with inline image syntax:
+`![alt](spor-asset:<descriptor-id>)`. Add `@sha256:<hex>` to the URI to pin the
+exact bytes. The descriptor id is the stable handle: it is what a `uses-asset`
+edge points at, and it survives a re-upload of the bytes. The pin is evidence
+of exactly which image the author saw. Only inline images OUTSIDE code count as
+embeds. A URI inside a fenced code block (```` ``` ```` or `~~~`), an inline
+code span or an HTML comment, behind a backslash escape, or in a plain link
+`[x](spor-asset:…)` is an example or a reference, never an embedding. Indented
+(4-space) code blocks and reference-style images are not recognized, so put
+examples in a fence.
+
+**`uses-asset` (candidate edge).** A document carries one `uses-asset` edge to
+each descriptor it embeds. Its schema ships in the candidate pack
+(`schema-edge-uses-asset`, below), so the type is inert until a graph adopts it
+and a DIFFERENT identity activates it. Its weight (0.3, low because a widely
+embedded asset must not become a briefing hub) comes from the registry and
+never from code. `content.reconcileAssetEdges` reports drift between the body
+and the edges: an embed with no edge, an edge with no embed, a malformed URI,
+or a pin the descriptor no longer names. The strict phase after activation
+enforces it. To adopt: `spor schema adopt schema-edge-uses-asset` (`status:
+proposed`), then a second identity flips it `active`. `--activate` is the
+solo/local form.
+
+**Four identities, four meanings.** They are never interchangeable:
+
+- A node **revision** is the git blob sha of the node FILE, frontmatter
+  included. It is what every read returns and what every update CASes on. An
+  edge or status write moves it even though the text did not change.
+- **`doc_sha256`** is the sha256 (hex) of the document's canonical body CORE:
+  the stored body with leading newlines and trailing whitespace trimmed,
+  continuations reassembled. Many revisions can share one digest.
+- **`doc_generation`** on a part is the `doc_sha256` of the whole document that
+  part is a slice of, not a digest of the part itself.
+- **`asset_digest`** is the sha256 of an asset's BYTES, spelled `sha256:<hex>`.
+
+**Document snapshots.** A snapshot is `{root, revision, doc_sha256?, doc_bytes?,
+parts: [{id, revision}]}`, meaning one exact document as it was read. For a
+generation root the parts are immutable and content-addressed, so the root
+revision alone pins the text. The part revisions are corroborating evidence,
+and the parts must be the generation's `-g<tag>-<n>` ids in order. For a legacy
+spill the parts are mutable, so their own revisions are what make the snapshot
+exact (`content.validateDocumentSnapshot`).
+
+**Selections.** A selection binds an exact range of an exact thing, as a JSON
+object or as one canonical scalar URI. The scalar form lets a follow-up task
+carry the evidence as a flat `selection:` key beside its origin edges:
+
+```
+spor-source:<node-id>@<revision>[?doc=<doc_sha256>]#utf16=<start>,<end>
+spor-image:<descriptor-id>@sha256:<hex>[#xywh=<x>,<y>,<w>,<h>]
+```
+
+Source offsets are **UTF-16 code units**, which is what a JS string, a DOM
+`Range` and host selection APIs count. They index the document CORE of the
+exact revision named, are half-open `[start, end)` and non-empty, and never
+split a surrogate pair (`😀` is 2 units, 4 UTF-8 bytes; `content.utf8Range`
+converts for a byte-oriented reader). The optional `doc` digest makes a
+legacy-spill selection detectably stale. Image regions are integer pixels of
+the exact asset digest, in Media Fragments `xywh` form, and must fit within the
+descriptor's dimensions. `content.parseSelection` accepts only the canonical
+spelling (no leading zeros, no empty `doc=`), so one selection has one string.
+
 ## Completing work needs a durable why (the resolver gate)
 
 A `task` reaching `done`, or an `issue` reaching `resolved`, requires a **live
@@ -494,8 +585,9 @@ refuses without `--force`. When a candidate stabilizes it is promoted into the
 seed pack at a release; the resident copy then shadows the seed (the
 stale-override warning above) and should be retired (`status: retired`).
 
-Three candidates ship today: `schema-edge-member-of-program` (program
-membership as its own edge type) and the pair the **software-factory gate
+Four candidates ship today: `schema-edge-member-of-program` (program
+membership as its own edge type), `schema-edge-uses-asset` (a document's
+inclusion of an asset descriptor — "Rich content and assets" above), and the pair the **software-factory gate
 pipeline** reads — `schema-factory` and `schema-gate`
 (task-spor-work-gate-pipeline). A `type: factory` node declares, in a fenced
 JSON payload, the ordered gate list a worker enforces between claim and resolve
@@ -1270,6 +1362,7 @@ against a query language, never drafted from a capture or a distilled transcript
 | `resolves`       | 0.9    | this node fixes/closes the target                |
 | `blocks`         | 0.7    | target cannot proceed until this node does       |
 | `member-of-program` | 0.7 | this node is a member of the target program umbrella (inverse `has-program-member`); pure topology, independent of gating; `capturable: false` |
+| `uses-asset` | 0.3 | this document embeds the target asset descriptor (inverse `asset-used-by`); CANDIDATE schema, inert until adopted and activated; `capturable: false` (see "Rich content and assets") |
 | `answers`        | 0.7    | this node answers that question (inverse `answered-by`); pulls the answer through the asker's next compile |
 | `assigned`       | 0.5    | work is assigned to this person OR agent (the explicit-routing edge; an agent target may carry a `profile:` per-assignment override) |
 | `reviewed-by`    | 0.5    | this person reviewed and approved the node — counts toward a policy quorum |

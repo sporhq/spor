@@ -2,7 +2,7 @@
 id: schema-artifact
 type: schema
 kind: node-schema
-schema_version: 2026.09.06.1
+schema_version: 2026.10.09.1
 title: Seed schema for artifact nodes
 summary: Node schema for the artifact type — a document, spec, module, or build product worth referencing, optionally carrying a delivery-stage status when it represents a change. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -139,6 +139,32 @@ have silently flipped this type to edge-verified and read genuinely
 status-retired work as unattested. Declaration only — enforcement stays in the
 hooks — no stored-shape change, no upgrade chain.
 
+Rich content and asset descriptors (2026.10.09.1,
+task-spor-chatgpt-content-contracts): OPTIONAL flat-scalar keys an artifact may
+carry; a node with none of them is exactly what it was. `validate()` refuses
+inconsistent values; `lib/kernel/content.js` is the readable twin of these
+rules (sandboxed code cannot require it), pinned to the same verdicts by
+`test/content.test.js`. GRAPH.md "Rich content and assets" is the contract.
+
+- `content_format` — `markdown` (CommonMark + GFM; `spor-asset:` inline image
+  embeds mean something) or `text` (plain). Absent = a legacy body, read as
+  before, embedding nothing.
+- Asset descriptor — `asset_digest` (`sha256:<64 hex>` over the BYTES, which
+  live outside graph Git), `asset_media_type` (`image/png|jpeg|gif|webp`; no
+  SVG), `asset_bytes`, `asset_width`, `asset_height` (positive integers):
+  all five or none, plus optional `asset_alt`. Any other `asset_*` key is a
+  typo and is refused.
+- Document stamps — `doc_sha256` + `doc_bytes` together (a generation root),
+  `doc_generation` (a part: needs `continuation_of`, never beside
+  `doc_sha256`), each 64 lowercase hex. Shape only: the exact-body check needs
+  the reassembled document and stays with the reader.
+- `selection` — one canonical `spor-source:` or `spor-image:` selection URI
+  (UTF-16 source range of an exact document revision, or a pixel region of an
+  exact asset digest).
+
+Write-time only, every key optional, no stored-shape change: backward-readable,
+no upgrade chain.
+
 ```json
 {
   "node_type": "artifact",
@@ -213,7 +239,96 @@ function statusReason(next) {
 // common case for a plain doc) is allowed.
 export function validate(node) {
   const s = ((node && node.status) || "").toLowerCase();
-  if (s === "" || VALID.indexOf(s) !== -1) return [];
-  return [statusReason(s)];
+  const errs = s === "" || VALID.indexOf(s) !== -1 ? [] : [statusReason(s)];
+  return errs.concat(contentErrors(node || {}));
+}
+
+// The content contract (task-spor-chatgpt-content-contracts) — an inline
+// mirror of lib/kernel/content.js validateContentFields, same rules and same
+// messages; test/content.test.js pins the two together. Every key is optional:
+// a node carrying none of them returns [].
+const FORMATS = ["markdown", "text"];
+const MEDIA = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+const ASSET_REQ = ["asset_digest", "asset_media_type", "asset_bytes", "asset_width", "asset_height"];
+const ASSET_ALL = ASSET_REQ.concat(["asset_alt"]);
+const ID_RE = /^[a-z0-9][a-z0-9-]*$/;
+const HEX64 = /^[0-9a-f]{64}$/;
+const REV_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+const UINT = /^(?:0|[1-9][0-9]*)$/;
+function str(v) { return v == null ? "" : String(v); }
+function present(v) { return v != null && String(v) !== ""; }
+function validId(id) { return typeof id === "string" && id.length <= 200 && ID_RE.test(id); }
+function uint(v, allowZero) {
+  const t = typeof v === "number" ? (Number.isInteger(v) ? String(v) : "") : str(v);
+  if (!UINT.test(t)) return null;
+  const n = Number(t);
+  if (!Number.isSafeInteger(n) || (!allowZero && n === 0)) return null;
+  return n;
+}
+function selectionError(uri) {
+  const src = /^spor-source:([^@?#]+)@([^?#]+)(?:\?doc=([^#]*))?#utf16=([^,]*),(.*)$/.exec(uri);
+  const img = src ? null : /^spor-image:([^@#]+)@(sha256:[^#]*)(?:#xywh=([^,]*),([^,]*),([^,]*),(.*))?$/.exec(uri);
+  if (!src && !img) return "'" + uri + "' is not a spor-source: or spor-image: selection URI";
+  const errs = [];
+  let canon;
+  if (src) {
+    if (!validId(src[1])) errs.push("selection node '" + src[1] + "' is not a node id");
+    if (!REV_RE.test(src[2])) errs.push("selection revision '" + src[2] + "' must be a git blob sha (40 or 64 hex)");
+    if (present(src[3]) && !HEX64.test(src[3])) errs.push("selection doc_sha256 must be 64 lowercase hex");
+    const a = uint(src[4], true), b = uint(src[5], true);
+    if (a === null || b === null) errs.push("selection start/end must be non-negative integer UTF-16 offsets");
+    else if (a >= b) errs.push("selection range [" + a + ", " + b + ") is empty or reversed");
+    if (errs.length) return errs.join("; ");
+    canon = "spor-source:" + src[1] + "@" + src[2] + (present(src[3]) ? "?doc=" + src[3] : "") + "#utf16=" + a + "," + b;
+  } else {
+    if (!validId(img[1])) errs.push("selection asset '" + img[1] + "' is not a node id");
+    if (!DIGEST_RE.test(img[2])) errs.push("selection digest must be sha256:<64 lowercase hex>");
+    let region = "";
+    if (img[3] !== undefined) {
+      const x = uint(img[3], true), y = uint(img[4], true), w = uint(img[5], false), h = uint(img[6], false);
+      if (x === null || y === null || w === null || h === null) errs.push("selection region needs integer x,y >= 0 and w,h >= 1");
+      else region = "#xywh=" + x + "," + y + "," + w + "," + h;
+    }
+    if (errs.length) return errs.join("; ");
+    canon = "spor-image:" + img[1] + "@" + img[2] + region;
+  }
+  return canon === uri ? null : "'" + uri + "' is not in canonical form";
+}
+function contentErrors(f) {
+  const errs = [];
+  if (present(f.content_format) && FORMATS.indexOf(str(f.content_format)) === -1) {
+    errs.push("content_format '" + str(f.content_format) + "' is not one of " + FORMATS.join(", ") + " (omit it for a legacy body)");
+  }
+  const keys = Object.keys(f).filter(function (k) { return k.indexOf("asset_") === 0 && present(f[k]); });
+  if (keys.length) {
+    keys.forEach(function (k) {
+      if (ASSET_ALL.indexOf(k) === -1) errs.push("unknown asset key '" + k + "' (known: " + ASSET_ALL.join(", ") + ")");
+    });
+    const missing = ASSET_REQ.filter(function (k) { return !present(f[k]); });
+    if (missing.length) errs.push("asset descriptor is missing " + missing.join(", ") + " (an asset descriptor carries all of " + ASSET_REQ.join(", ") + ")");
+    if (present(f.asset_digest) && !DIGEST_RE.test(str(f.asset_digest))) errs.push("asset_digest '" + str(f.asset_digest) + "' must be sha256:<64 lowercase hex>");
+    if (present(f.asset_media_type) && MEDIA.indexOf(str(f.asset_media_type)) === -1) {
+      errs.push("asset_media_type '" + str(f.asset_media_type) + "' is not one of " + MEDIA.join(", "));
+    }
+    ["asset_bytes", "asset_width", "asset_height"].forEach(function (k) {
+      if (present(f[k]) && uint(f[k], false) === null) errs.push(k + " '" + str(f[k]) + "' must be a positive integer");
+    });
+    if (present(f.asset_alt) && str(f.asset_alt).length > 1000) errs.push("asset_alt is over 1000 chars");
+  }
+  const hasDigest = present(f.doc_sha256), hasBytes = present(f.doc_bytes);
+  if (hasDigest !== hasBytes) errs.push("doc_sha256 and doc_bytes come together (a generation root carries both)");
+  if (hasDigest && !HEX64.test(str(f.doc_sha256))) errs.push("doc_sha256 '" + str(f.doc_sha256) + "' must be 64 lowercase hex");
+  if (hasBytes && uint(f.doc_bytes, true) === null) errs.push("doc_bytes '" + str(f.doc_bytes) + "' must be a non-negative integer");
+  if (present(f.doc_generation)) {
+    if (!HEX64.test(str(f.doc_generation))) errs.push("doc_generation '" + str(f.doc_generation) + "' must be 64 lowercase hex");
+    if (!present(f.continuation_of)) errs.push("doc_generation marks a generation PART and needs continuation_of");
+    if (hasDigest) errs.push("doc_generation (a part) and doc_sha256 (a root) are mutually exclusive");
+  }
+  if (present(f.selection)) {
+    const e = selectionError(str(f.selection));
+    if (e) errs.push("selection: " + e);
+  }
+  return errs;
 }
 ```

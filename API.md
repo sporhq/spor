@@ -58,6 +58,26 @@ graph's git repo. What a client sees:
   proposal's last author (the self-approval ban).
 - Successful writes return `{status, id, revision, warnings}`
   (`status: created|updated|skipped`).
+- **Rich content and asset fields** (GRAPH.md "Rich content and assets",
+  `lib/kernel/content.js`). An artifact may carry the optional flat keys
+  `content_format` (`markdown|text`), the asset-descriptor set (`asset_digest`
+  `sha256:<hex>`, `asset_media_type`, `asset_bytes`, `asset_width`,
+  `asset_height`, optional `asset_alt`), the generation stamps (`doc_sha256` +
+  `doc_bytes`, `doc_generation`), and one canonical `selection` URI
+  (`spor-source:<id>@<revision>[?doc=<hex>]#utf16=<s>,<e>` or
+  `spor-image:<id>@sha256:<hex>[#xywh=x,y,w,h]`). They ride `get_node` /
+  `get_nodes` / `GET /v1/nodes/{id}` / `GET /v1/export` as ordinary frontmatter,
+  so the source text and every caption stay readable through CLI and MCP with
+  no new route. Inconsistent values fail the seed `schema-artifact`
+  `validate()` as `invalid_node`: a partial descriptor, an unknown `asset_*`
+  key, SVG, a non-canonical selection, or `doc_generation` without
+  `continuation_of`. A graph-resident `schema-artifact` overrides that rule.
+  Absent keys change nothing. Selection offsets are UTF-16 code units into the
+  document core; `revision` is the node-file blob sha (what updates CAS on),
+  never `doc_sha256` (the body's content digest). A body's `spor-asset:` image
+  embeds pair with `uses-asset` edges once that candidate edge schema is
+  adopted and active. Until then, `uses-asset` is an unknown edge type and the
+  door rejects it like any other.
 
 ## 2. MCP surface (`/mcp`)
 
