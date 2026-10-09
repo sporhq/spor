@@ -464,7 +464,10 @@ test("a provider refusal echoing the delivered token is masked in the answer the
   const p = bind(declaration);
   const res = await p.request(req("deliver_credential", { handle, credential: credential() }));
   assert.equal(res.ok, false);
-  assert.equal(res.error.message, "cannot store spor_att_(redacted)");
+  // The shared redactor (any spor_att_ shape) or the delivered-value mask:
+  // either way the token is gone.
+  assert.match(res.error.message, /^cannot store (\*\*\*|spor_att_\(redacted\))$/);
+  assert.ok(!res.error.message.includes(TOKEN));
 });
 
 test("a later answer echoing a delivered token (an observe detail) is masked too", async () => {
@@ -488,7 +491,7 @@ test("deliver_credential refuses before spawn: the worker's own credential, any 
     [credential({ note: "ghp_abcdefghijklmnopqrstuvwxyz0123" }), "secret_by_value"],
     [{ ...credential(), extra: "s3cret-value-held-by-worker" }, "secret_by_value"],
     // only an attempt token is delivered by value — a PAT, a GitHub token, junk
-    [credential({ value: "spor_pat_0123456789abcdef0123" }), "invalid_request"],
+    [credential({ value: "spor_pat_0123456789abcdef0123" }), "secret_by_value"],
     [credential({ value: "ghp_abcdefghijklmnopqrstuvwxyz0123" }), "secret_by_value"],
     // another credential's shape behind the attempt-token prefix
     [credential({ value: "spor_att_ghp_abcdefghijklmnopqrstuvwxyz0123" }), "secret_by_value"],
