@@ -12,6 +12,9 @@
 // A real provider swaps the runner for `spor attempt run <bundle>` in its
 // environment. An attempt whose prompt_bundle_ref has a `/hold/` segment keeps
 // running until cancelled, so the conformance suite can exercise cancel.
+// `deliver_credential` writes the attempt-scoped Spor token to the file the
+// runner's SPOR_TOKEN_FILE names (`<dir>/spor-token`, 0600, replaced
+// atomically) — the one value a provider is ever handed (PROVIDERS.md §4.3).
 "use strict";
 const { spawn, execFileSync } = require("child_process");
 const fs = require("fs");
@@ -78,7 +81,7 @@ function serve() {
     describe: () => ({
       provider_id: ID,
       contract_version: 1,
-      capabilities: { harnesses: ["echo"], tools: ["git", "node"], repos: ["*"], egress: [], isolation: ["worktree"], secret_delivery: [], lifecycle: ["cancel", "force-cancel"], max_deadline_ms: 3600000 },
+      capabilities: { harnesses: ["echo"], tools: ["git", "node"], repos: ["*"], egress: [], isolation: ["worktree"], secret_delivery: [], lifecycle: ["cancel", "force-cancel", "deliver_credential"], max_deadline_ms: 3600000 },
     }),
     submit: ({ attempt, idempotency_key: key }) => {
       const canon = JSON.stringify(attempt);
@@ -93,7 +96,7 @@ function serve() {
       fs.writeFileSync(path.join(dir, "attempt.json"), canon);
       const e = { handle: { provider: ID, id }, canon, attempt, dir, accepted_at: now() };
       settle(e, "running");
-      e.child = spawn(process.execPath, [__filename, "--run", dir], { stdio: ["pipe", "ignore", "inherit"] });
+      e.child = spawn(process.execPath, [__filename, "--run", dir], { stdio: ["pipe", "ignore", "inherit"], env: { ...process.env, SPOR_TOKEN_FILE: path.join(dir, "spor-token") } });
       e.child.on("exit", (code, signal) => {
         e.child = null;
         if (e.state === "running" || e.state === "stopping") settle(e, "finished", signal ? { signal } : { code });
@@ -125,6 +128,16 @@ function serve() {
         if (e.child) e.child.kill("SIGTERM");
       }
       return { state: e.state };
+    },
+    deliver_credential: ({ handle, credential }) => {
+      const e = find({ handle });
+      if (e.fence != null && credential.fence < e.fence) throw new Refusal("stale_credential", `environment ${handle.id} already holds the token for fence ${e.fence}`);
+      const file = path.join(e.dir, "spor-token");
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, `${credential.value}\n`, { mode: 0o600 });
+      fs.renameSync(tmp, file);
+      e.fence = credential.fence;
+      return { delivered: true };
     },
     release: (p) => {
       if (p.handle && released.has(p.handle.id)) return { released: true };

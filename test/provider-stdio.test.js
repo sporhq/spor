@@ -125,7 +125,7 @@ test("spor provider check stdio-echo passes the suite against a scratch home; ca
   const r = run(["provider", "check", "stdio-echo"]);
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /ok +crash-lost/);
-  assert.match(r.stdout, /provider stdio-echo passed the conformance suite \(11 scenarios\)/);
+  assert.match(r.stdout, /provider stdio-echo passed the conformance suite \(12 scenarios\)/);
 
   const j = run(["provider", "check", "stdio-echo", "--json"]);
   assert.equal(j.status, 0, j.stderr);
@@ -439,4 +439,91 @@ test("a command that cannot start: provider_exited, nothing held, a submit is re
     await q.close();
     assert.equal((await pending).error.code, "provider_exited");
   }
+});
+
+// ------------------------------------------------- deliver_credential
+
+const TOKEN = "spor_att_v1_acme_0123456789abcdefABCDEF";
+const credential = (over = {}) => ({ kind: "spor-attempt-token", ref: "spor-attempt-token://exec-0123456789abcdef/2", value: TOKEN, fence: 2, ...over });
+
+test("deliver_credential is the one value exception: the attempt token crosses stdio at exactly that field, and a provider echoing it on stderr is masked", async () => {
+  const { declaration } = fakeProvider(`
+    process.stderr.write("got " + msg.params.credential.value + "\\n");
+    out({ id: msg.id, ok: true, result: { delivered: true } });`);
+  const p = bind(declaration, { knownSecrets: ["s3cret-value-held-by-worker"] });
+  const res = await p.request(req("deliver_credential", { handle, credential: credential() }));
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(res.result, { delivered: true });
+  await p.close();
+  assert.ok(p.logged.some((l) => l === "[provider fake] got spor_att_(redacted)"), p.logged.join("|"));
+  assert.ok(!p.logged.some((l) => l.includes(TOKEN)), "the delivered token never reaches the worker's log");
+});
+
+test("a provider refusal echoing the delivered token is masked in the answer the worker sees", async () => {
+  const { declaration } = fakeProvider(`out({ id: msg.id, ok: false, error: { code: "internal", message: "cannot store " + msg.params.credential.value } });`);
+  const p = bind(declaration);
+  const res = await p.request(req("deliver_credential", { handle, credential: credential() }));
+  assert.equal(res.ok, false);
+  assert.equal(res.error.message, "cannot store spor_att_(redacted)");
+});
+
+test("a later answer echoing a delivered token (an observe detail) is masked too", async () => {
+  const { declaration } = fakeProvider(`
+    if (msg.op === "deliver_credential") { globalThis.tok = msg.params.credential.value; return out({ id: msg.id, ok: true, result: { delivered: true } }); }
+    out({ id: msg.id, ok: true, result: { state: "running", since: "2026-10-09T10:00:00Z", detail: "using " + globalThis.tok } });`);
+  const p = bind(declaration);
+  assert.equal((await p.request(req("deliver_credential", { handle, credential: credential() }))).ok, true);
+  const res = await p.request(req("observe", { handle }));
+  assert.equal(res.result.detail, "using spor_att_(redacted)");
+});
+
+test("deliver_credential refuses before spawn: the worker's own credential, any other credential shape, a value elsewhere in the line, a non-token value", async () => {
+  const { declaration, marker } = fakeProvider(`out({ id: msg.id, ok: true, result: { delivered: true } });`);
+  const held = "spor_att_heldbytheworker0123456789";
+  const p = bind(declaration, { knownSecrets: [held, "s3cret-value-held-by-worker"] });
+  const refusals = [
+    // the exception admits the token minted FOR the attempt, never the worker's own
+    [credential({ value: held }), "secret_by_value"],
+    // the rest of the line is still scanned
+    [credential({ note: "ghp_abcdefghijklmnopqrstuvwxyz0123" }), "secret_by_value"],
+    [{ ...credential(), extra: "s3cret-value-held-by-worker" }, "secret_by_value"],
+    // only an attempt token is delivered by value — a PAT, a GitHub token, junk
+    [credential({ value: "spor_pat_0123456789abcdef0123" }), "invalid_request"],
+    [credential({ value: "ghp_abcdefghijklmnopqrstuvwxyz0123" }), "secret_by_value"],
+    // another credential's shape behind the attempt-token prefix
+    [credential({ value: "spor_att_ghp_abcdefghijklmnopqrstuvwxyz0123" }), "secret_by_value"],
+    // the reference names the fence the credential claims
+    [credential({ fence: 3 }), "invalid_request"],
+    [credential({ ref: "vault://acme/token" }), "invalid_request"],
+    [credential({ kind: "github-token" }), "invalid_request"],
+  ];
+  for (const [c, code] of refusals) {
+    const res = await p.request(req("deliver_credential", { handle, credential: c }));
+    assert.equal(res.ok, false, JSON.stringify(c));
+    assert.equal(res.error.code, code, `${JSON.stringify(c)}: ${res.error.message}`);
+    assert.doesNotMatch(res.error.message, /heldbytheworker|s3cret-value|ghp_abc|spor_pat_0123/);
+  }
+  assert.equal(fs.existsSync(marker), false, "nothing was spawned");
+  // The same value on any OTHER op is still a secret by value.
+  assert.equal(stdio.secretRefusal(req("observe", { handle: { provider: "fake", id: TOKEN } }), [TOKEN]) !== null, true);
+  assert.equal(stdio.secretRefusal(req("deliver_credential", { handle, credential: credential() })), null);
+});
+
+test("stdio-echo writes the delivered token to the runner's SPOR_TOKEN_FILE and refuses an older fence", async () => {
+  const root = scratch("spor-echo-root-");
+  const p = bind(declare("stdio-echo", { command: process.execPath, args: [ECHO, "--root", root] }));
+  const a = attempt({ prompt_bundle_ref: "https://example.invalid/hold/p.tar", secrets: [] });
+  const sub = await p.request(req("submit", { idempotency_key: "key-credential-1", attempt: a }));
+  assert.equal(sub.ok, true, JSON.stringify(sub));
+  const h = sub.result.handle;
+  const file = path.join(root, h.id, "spor-token");
+  assert.equal((await p.request(req("deliver_credential", { handle: h, credential: credential({ ref: "spor-attempt-token://exec-0123456789abcdef/1", fence: 1, value: `${TOKEN}one` }) }))).ok, true);
+  assert.equal(fs.readFileSync(file, "utf8").trim(), `${TOKEN}one`);
+  if (process.platform !== "win32") assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.equal((await p.request(req("deliver_credential", { handle: h, credential: credential() }))).ok, true);
+  assert.equal(fs.readFileSync(file, "utf8").trim(), TOKEN);
+  const stale = await p.request(req("deliver_credential", { handle: h, credential: credential({ ref: "spor-attempt-token://exec-0123456789abcdef/1", fence: 1, value: `${TOKEN}one` }) }));
+  assert.equal(stale.error && stale.error.code, "stale_credential");
+  assert.equal(fs.readFileSync(file, "utf8").trim(), TOKEN, "a stale delivery never moves the environment back");
+  await p.request(req("release", { handle: h }));
 });

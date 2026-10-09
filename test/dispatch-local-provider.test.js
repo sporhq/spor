@@ -310,7 +310,11 @@ function conformanceSetup() {
 test("the local provider passes the conformance suite over real supervisor launches", async () => {
   const { home, provider, driver } = conformanceSetup();
   const report = await conf.runConformance(provider, { home, driver, matcher: sat.satisfiesAttempt });
-  assert.deepStrictEqual(report.results.filter((r) => !r.ok || r.skipped), [], JSON.stringify(report.results, null, 2));
+  // `local` takes no attempt-token delivery — its harness runs under this
+  // worker's own launch (PROVIDERS.md §4.3) — so credential-rotation is the one
+  // scenario it skips, and it says why.
+  assert.deepStrictEqual(report.results.filter((r) => !r.ok || (r.skipped && r.name !== "credential-rotation")), [], JSON.stringify(report.results, null, 2));
+  assert.match(report.results.find((r) => r.name === "credential-rotation").skipped, /does not advertise lifecycle 'deliver_credential'/);
   assert.strictEqual(report.ok, true);
   assert.deepStrictEqual(report.results.map((r) => r.name), [...conf.SCENARIO_NAMES]);
   assert.strictEqual(provider.environments(), 0, "every scenario released what it submitted");

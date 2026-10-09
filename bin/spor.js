@@ -11915,7 +11915,13 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
           request: { attempt: spec, machine: os.hostname() }, augment, log,
         });
         if (attemptResult.handle != null) {
-          PROVIDER_ATTEMPTS.set(held.executionId, { store: attemptStore, fence: held.fence, attempt: 1, client, node_id: item.id, handle: attemptResult.handle, key: attemptResult.key || null, env: attemptResult.env || null });
+          // The attempt token (PROVIDERS.md §4.3): minted for this fence and
+          // handed to the environment through deliver_credential — a no-op for
+          // a provider that takes none (`local`, whose harness runs under this
+          // worker's own launch). A delivery that did not land is owed to the
+          // per-pass sweep.
+          const delivered = attemptResult.ok ? await deliverHeldAttemptToken({ store: attemptStore, held, handle: attemptResult.handle, client, item, log }) : null;
+          PROVIDER_ATTEMPTS.set(held.executionId, { store: attemptStore, fence: held.fence, attempt: 1, client, node_id: item.id, handle: attemptResult.handle, key: attemptResult.key || null, env: attemptResult.env || null, ...(delivered && delivered.settled ? {} : { credentialPending: true }) });
         }
         return attemptResult;
       }
@@ -11949,6 +11955,18 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
     }
   }
   return launched;
+}
+
+// Deliver the attempt-scoped token to a submitted or ADOPTED environment
+// (PROVIDERS.md §4.3/§6): an adopting instance holds a new fence, the old
+// fence's token died with the advance, and the environment gets the new
+// fence's token through the same deliver_credential operation — never a
+// resubmit. `settled` is whether anything is still owed.
+async function deliverHeldAttemptToken({ store, held, handle, client, item, log = () => {} }) {
+  const d = await providerAttempts.deliverAttemptToken({ store, executionId: held.executionId, fence: held.fence, handle, client });
+  if (d.ok) log(`work: ${item.id} — delivered the attempt token for fence ${held.fence} of ${held.executionId}${d.token_id ? ` (token ${d.token_id})` : ""}${d.reissue_of ? `, re-issued for ${d.reissue_of}` : ""}`);
+  else if (!d.unsupported) log(`work: ${item.id} — the attempt token for fence ${held.fence} of ${held.executionId} was not delivered: ${d.reason}${d.transient ? "; retried next pass" : ""}`);
+  return { ...d, settled: !!(d.ok || d.unsupported || d.refused) };
 }
 
 // The attempts this PROCESS submitted or adopted through a provider
@@ -12013,7 +12031,8 @@ async function resumeProviderAttempt(cfg, { item, held, store, home, log = () =>
       /* best effort — the heartbeat re-reads the store's fence */
     }
   }
-  PROVIDER_ATTEMPTS.set(held.executionId, { store, fence: held.fence, attempt: 1, client, node_id: item.id });
+  const delivered = await deliverHeldAttemptToken({ store, held, handle: r.handle, client, item, log });
+  PROVIDER_ATTEMPTS.set(held.executionId, { store, fence: held.fence, attempt: 1, client, node_id: item.id, ...(delivered.settled ? {} : { handle: r.handle, credentialPending: true }) });
   log(`work: ${item.id} — adopted the live local attempt (run ${String(runId).slice(0, 8)}) execution ${held.executionId} already records${r.reconciled ? ", reconciled under its persisted submit key" : ""}; nothing re-dispatched`);
   return { ok: true, adopted: true, run: { run_id: runId, harness: rec.harness || null, launch_mode: rec.launch_mode || null, node_id: item.id, record_path: dispatchRuns.runPaths(home, runId).record } };
 }
@@ -21540,7 +21559,8 @@ const COMMANDS = {
       "        attempt.json  the attempt spec    prompt/   the WORKERS.md §4 prompt\n" +
       "        repos.json    pinned commits      env.json  non-secret harness settings\n" +
       "      Secrets never ride a bundle: they are named by reference and the provider\n" +
-      "      delivers them (the attempt token as SPOR_TOKEN / SPOR_DISPATCH_CHILD_TOKEN).\n" +
+      "      delivers them (the attempt token through deliver_credential, as the file\n" +
+      "      SPOR_TOKEN_FILE names; SPOR_DISPATCH_CHILD_TOKEN / SPOR_TOKEN as a fallback).\n" +
       "      --ref pins the commit (default HEAD of the mapped checkout), --branch the\n" +
       "      branch the attempt commits to (default spor/<node-id>-<exec>-f<fence>, one\n" +
       "      per attempt), --deadline its wall\n" +

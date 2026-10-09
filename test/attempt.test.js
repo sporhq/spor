@@ -150,6 +150,43 @@ test("round trip: attempt build, then attempt run with a stub harness, yields a 
   assert.strictEqual(rec.cwd, path.join(f.home, "work", "demo"));
 });
 
+test("attempt run hands the harness the token SPOR_TOKEN_FILE holds, ahead of the environment's, and refuses before launch when the file holds anything else", async () => {
+  const f = await fixture();
+  const out = path.join(f.home, "bundle");
+  const b = cli(["attempt", "build", f.execution.execution_id, "--out", out, "--no-brief", "--permission-mode", "bypassPermissions"], { SPOR_HOME: f.home }, f.repo);
+  assert.strictEqual(b.status, 0, b.stdout + b.stderr);
+  // A server-bound attempt (the build above is a local-mode one): its token
+  // arrives through the provider's deliver_credential, as a file.
+  const attemptFile = path.join(out, "attempt.json");
+  const attempt = JSON.parse(fs.readFileSync(attemptFile, "utf8"));
+  attempt.spor = { server: "https://spor.attempt.invalid", token_ref: `spor-attempt-token://${attempt.execution_id}/${attempt.fence}` };
+  fs.writeFileSync(attemptFile, JSON.stringify(attempt, null, 2));
+  const seen = path.join(f.home, "token-seen");
+  const stub = writeSpawnableNodeStub(f.home, "claude-token", `
+    require("fs").writeFileSync(${JSON.stringify(seen)}, process.env.SPOR_TOKEN || "");
+    process.stdin.resume();
+    process.stdin.on("end", () => {
+      process.stdout.write(JSON.stringify({ type: "result", result: "nothing to do" }) + "\\n");
+      process.exit(0);
+    });
+  `);
+  const tokenFile = path.join(f.home, "spor-token");
+  const delivered = "spor_att_v1_demo_deliveredThroughTheFile0123";
+  fs.writeFileSync(tokenFile, `${delivered}\n`, { mode: 0o600 });
+  const runEnv = { SPOR_HOME: f.home, SPOR_CLAUDE_CMD: stub, GIT_CONFIG_GLOBAL: f.gitconfig, SPOR_TOKEN_FILE: tokenFile, SPOR_DISPATCH_CHILD_TOKEN: "spor_att_the_environment_fallback_0123" };
+  const r = cli(["attempt", "run", out], runEnv, f.home);
+  assert.notStrictEqual(r.status, 2, r.stdout + r.stderr);
+  assert.strictEqual(fs.readFileSync(seen, "utf8"), delivered, "the harness ran under the delivered token, not the environment's");
+
+  fs.writeFileSync(tokenFile, "spor_pat_a_personal_token_0123456789\n");
+  const again = cli(["attempt", "run", out, "--workdir", path.join(f.home, "work2"), "--out", path.join(f.home, "result2")], runEnv, f.home);
+  assert.strictEqual(again.status, 2, again.stdout + again.stderr);
+  const lines = statusLines(again.stdout);
+  assert.match(lines.find((l) => l.state === "failed").detail, /does not hold an attempt-scoped Spor token/);
+  assert.doesNotMatch(again.stdout + again.stderr, /spor_pat_a_personal/);
+  assert.ok(!fs.existsSync(path.join(f.home, "result2", "report.md")), "nothing was launched");
+});
+
 test("a tarball bundle round-trips byte-for-byte through readBundle", async () => {
   const f = await fixture();
   const tarPath = path.join(f.home, "attempt.tar");

@@ -46,6 +46,13 @@ capability matcher (§3.1, `satisfiesAttempt` in `lib/kernel/satisfiability.js`)
 is shipped, and `spor capabilities providers [--attempt <spec.json>]` prints
 each provider's describe() — the built-in `local` one and every provider
 declared on the machine (§12.1) — and, given a spec, why it would be refused.
+The attempt token's hand-off (§4.3) is shipped too: the worker mints the
+token and hands it to the provider through `deliver_credential` after every
+submit and adoption (`deliverAttemptToken` in
+`lib/shell/provider-attempts.js`), the stdio binding exempts exactly that
+field from its secret refusal (§12.6), `spor attempt run` reads
+`SPOR_TOKEN_FILE` (§13.1), and the conformance suite's `credential-rotation`
+scenario pins delivery, rotation on a re-fence and the old token's refusal.
 
 ## 1. Two seams, three layers
 
@@ -82,6 +89,8 @@ a secret entry is CLOSED to exactly `{name, ref}`, since an unknown key there
 is a value riding where a reference belongs. The `spor` block stays open but
 must not carry a value-bearing key (`value`, `secret`, `plaintext`, `token`,
 `password`, `data`). See §4.2.
+The one operation that does carry a value, `deliver_credential`, carries exactly
+one kind of it — the attempt-scoped Spor token — at exactly one field (§4.3).
 
 The contract is transport-neutral. A binding (subprocess JSON-over-stdio
 first, then HTTP) carries one **request** and one **response** per operation:
@@ -123,7 +132,8 @@ string and `retryable` says whether the same request may simply be sent again:
 
 Known codes are `invalid_request`, `contract_version_unsupported`,
 `unsupported_operation`, `unsatisfiable`, `idempotency_conflict`,
-`unknown_handle`, `unavailable` (transient) and `internal`. A worker reads any
+`unknown_handle`, `unavailable` (transient), `stale_credential` (§4.3) and
+`internal`. A worker reads any
 other code as `internal`.
 
 ## 3. Operations
@@ -139,6 +149,7 @@ other code as `internal`.
 | `suspend`, `resume` | `{handle}` | observe-result | Optional (§10). |
 | `checkpoint` | `{handle}` | `{checkpoint: {id, created_at}}` | Optional. |
 | `restore` | `{handle, checkpoint_id, idempotency_key}` | submit-result | Optional. Returns a NEW handle. |
+| `deliver_credential` | `{handle, credential}` | `{delivered: true}` | Optional, advertised under `lifecycle`. Puts the attempt token in the environment (§4.3). The only operation that carries a value. |
 
 A **handle** is `{provider, id}` plus any provider-private fields. The worker
 persists it on the execution record exactly as returned and hands it back
@@ -304,9 +315,74 @@ entry is refused:
 attempt: a token issued by the server when the attempt is admitted. It is bound
 to (agent, execution, fence, instance), it expires with the worker's lease, it
 is one-shot per fence, and it is refused after release, a terminal state or a
-fence advance (task-spor-server-attempt-scoped-token). The provider delivers it
-like any other secret. A long-lived personal access token never enters a
-sandbox.
+fence advance (task-spor-server-attempt-scoped-token). A long-lived personal
+access token never enters a sandbox.
+
+**The worker mints it; the provider delivers it** (dec-spor-provider-
+credential-review-signoff-2026-10-09 (g)). Once a submit has returned a
+handle, the worker mints the token for the execution and fence it holds
+(`POST /v1/executions/:id/attempt-token`, spor-server EXECUTION-STATE.md
+§4.1) and hands it to the provider through `deliver_credential`. That
+operation is the **one value exception** to §4.2: it carries the token itself,
+at exactly `params.credential.value`, and nothing else ever does. The
+provider writes it into the environment as a file, readable only by the
+attempt, and points the runner's `SPOR_TOKEN_FILE` at it (§13.1).
+
+```json provider-contract=request
+{
+  "contract_version": 1,
+  "id": "req-7",
+  "op": "deliver_credential",
+  "params": {
+    "handle": { "provider": "container", "id": "ctr-7f3a", "host": "builder-2" },
+    "credential": {
+      "kind": "spor-attempt-token",
+      "ref": "spor-attempt-token://exec-3f9c0a1b2c3d4e5f/4",
+      "value": "spor_att_v1_acme_q3Zr9TfX2bLm0WcY8nHkPd",
+      "fence": 4,
+      "expires_at": "2026-10-09T14:00:00Z"
+    }
+  }
+}
+```
+
+```json provider-contract=response:deliver_credential
+{ "contract_version": 1, "id": "req-7", "ok": true, "result": { "delivered": true } }
+```
+
+- `kind` is `spor-attempt-token`, the only kind. `value` must be an attempt
+  token (`spor_att_…`), so a worker's own long-lived token can never ride the
+  exception; `ref` is the token's reference as the attempt names it, and
+  `fence` must be the fence that reference names.
+- A provider advertises the operation as `deliver_credential` in
+  `capabilities.lifecycle`. A worker never sends it to a provider that did not
+  (the `local` provider does not: its harness runs under the worker's own
+  launch).
+- **Idempotent.** Re-sending the delivery already made (a lost reply) answers
+  `delivered` again. The worker keeps the plaintext in memory only, so a re-send
+  carries the SAME token; a worker that lost it revokes the fence's token and
+  mints afresh (the server allows one live token per fence).
+- **Never backwards.** A delivery under an OLDER fence than one the
+  environment already holds answers `stale_credential`, and the environment
+  keeps the newer token.
+- **Rotation.** A restarted or takeover worker adopts the environment under an
+  advanced fence (§6). The fence advance tombstoned the old token on the
+  server, so the adopter mints a token for its own fence and delivers it
+  through the same operation. Nothing is resubmitted.
+- A delivery that did not land is owed: the worker's per-pass sweep re-sends
+  it until the provider answers.
+- **What rotation reaches.** A re-delivery replaces the token in the
+  environment's file, and a runner that has not launched its harness yet
+  reads the new one. A harness ALREADY running keeps the token it was launched
+  with: the runner reads the file once, before launch, and hands the value to
+  the harness (its environment, its MCP config). Rotating the credential of a
+  running harness needs the harness side to re-read `SPOR_TOKEN_FILE`, which
+  is not built yet. Today the work loop follows only `local` attempts, which
+  take no delivery, so the adoption path is exercised by the conformance suite
+  rather than by a running worker.
+- A provider's refusal or stderr that echoes a delivered value is masked
+  before it reaches the worker's log, and the worker never puts the token in a
+  result, a record or a log line.
 
 ### 4.4 How the spec is derived
 
@@ -517,9 +593,9 @@ adopts. Either way the environment keeps the identity it was submitted with:
 the adopter re-sends the persisted request byte for byte (its own
 `attempt_id` and fence under the persisted key is a different attempt, so
 `idempotency_conflict`), and the manifest it collects names the submitting
-instance's `attempt_id` and `fence`, not its own. The old fence's attempt token is dead; how the adopted
-environment gets a token for the new fence is the server's attempt-token
-contract (task-spor-server-attempt-scoped-token), not a resubmit.
+instance's `attempt_id` and `fence`, not its own. The old fence's attempt
+token is dead; the adopter mints one for its own fence and delivers it with
+`deliver_credential` (§4.3), never a resubmit.
 
 ## 7. Collect before release; the result manifest
 
@@ -614,7 +690,8 @@ worker.
 ## 10. The optional environment extension
 
 `suspend`, `resume`, `checkpoint` and `restore` exist only on providers that
-advertise them in `capabilities.lifecycle`. A worker never calls one that was
+advertise them in `capabilities.lifecycle` (so does `deliver_credential`,
+§4.3, which is advertised the same way). A worker never calls one that was
 not advertised. If it does, the provider answers `unsupported_operation`. These
 operations differ enough between platforms (Azure memory/disk suspend, E2B
 pause, exe.dev none) that assuming them would be wrong somewhere. `restore`
@@ -823,11 +900,23 @@ the store, because the execution record has no event for it yet. The driver it u
 conventions a provider under check should honour:
 
 - An attempt whose `prompt_bundle_ref` has a `/hold/` path segment keeps
-  running until it is cancelled. The cancel scenarios need one.
+  running until it is cancelled. The cancel scenarios and
+  `credential-rotation` need one.
 - Every repo in the attempt carries a `url`, so a provider offering `repos:
   ["*"]` matches.
 - The crash scenario kills the provider **process**, so it checks the
   binding's lost-on-crash semantics (§12.4) for every provider.
+
+`credential-rotation` runs when the provider advertises `deliver_credential`
+(it is skipped, and reported, otherwise). Through the worker's own delivery
+door and a stand-in for the server's token authority, it delivers the token,
+restarts the worker under an advanced fence, adopts the handle with no
+submit, delivers the new fence's token, and checks that the authority now
+refuses the old one, that re-delivering the old one is `stale_credential`,
+that a re-send of the new one is idempotent, and that an unknown handle is
+`unknown_handle`. A driver that can read the environment's token
+(`credential(handle)`, the in-process fixtures do) also checks the
+environment holds the right one after each step.
 
 ### 12.6 Secrets never cross stdio by value
 
@@ -847,6 +936,14 @@ written, and before a process is spawned for it. It answers
   and the token the config cascade resolved.
 
 The refusal names the field, never the value.
+
+**The one exemption** is `deliver_credential`'s `params.credential.value`
+(§4.3): that field, and only it, is left out of the scan, because it is the
+attempt token being delivered. It is held to the attempt-token shape instead,
+and it is still refused when it is a credential the worker itself holds — the
+exception admits the token minted for the attempt, never the worker's own. A
+delivered value that the provider later writes to stderr is masked in the
+worker's log.
 
 The child's environment is an **allowlist**, not the worker's environment with
 credentials scrubbed out. A worker's environment routinely holds
@@ -894,9 +991,15 @@ An attempt whose prompt rides inside the bundle names it with
 
 **Secrets never ride a bundle.** The attempt names its secrets by reference
 (§4.2) and its Spor credential as `spor.token_ref` (§4.3). The provider
-delivers the values through its declared `secret_delivery` channel. The
-attempt-scoped Spor token reaches the runner's environment as `SPOR_TOKEN` or
-`SPOR_DISPATCH_CHILD_TOKEN`, and the runner hands it to the harness. A bundle
+delivers secret values through its declared `secret_delivery` channel. The
+attempt-scoped Spor token arrives through `deliver_credential` (§4.3) as a
+file: the runner reads the file `SPOR_TOKEN_FILE` names FIRST, and only with
+no `SPOR_TOKEN_FILE` set falls back to `SPOR_DISPATCH_CHILD_TOKEN` or
+`SPOR_TOKEN` in its environment. It hands the token to the harness. The
+worker mints the token only after the submit returned a handle, so the runner
+may start first: an attempt bound to a server waits (up to 120 seconds) for
+the file to appear, and refuses before launch if it never does or if it holds
+anything but an attempt token (`spor_att_…`). A bundle
 is refused, by `build` before it is written and by `run` before anything is
 checked out, when it carries any of these:
 

@@ -13,8 +13,9 @@
 // stdio-echo example in test/provider-stdio.test.js.
 //
 // Run as a script it is the provider: `node synthetic-stdio.js
-// [--broken-idempotency]`. Two test-only ops ride the same stream outside the
-// contract: `fixture.crash {handle}` and `fixture.environments {}`.
+// [--broken-idempotency]`. Three test-only ops ride the same stream outside the
+// contract: `fixture.crash {handle}`, `fixture.environments {}` and
+// `fixture.credential {handle}`.
 // Required as a module it exports startSyntheticStdio() -> {provider, driver,
 // close}.
 
@@ -41,6 +42,8 @@ if (require.main === module) {
     if (msg.op === "fixture.crash") {
       impl.fixture.crash(msg.params.handle);
       res = { id: msg.id, ok: true, result: {} };
+    } else if (msg.op === "fixture.credential") {
+      res = { id: msg.id, ok: true, result: { value: impl.fixture.credential(msg.params.handle) } };
     } else if (msg.op === "fixture.environments") {
       res = { id: msg.id, ok: true, result: { count: impl.fixture.environments() } };
     } else {
@@ -96,6 +99,7 @@ function startSyntheticStdio({ args = [] } = {}) {
     driver: syntheticDriver({
       crash: (handle) => control("fixture.crash", { handle }),
       environments: async () => (await control("fixture.environments")).count,
+      credential: async (handle) => (await control("fixture.credential", { handle })).value,
     }),
     close() {
       child.stdin.end();

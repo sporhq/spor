@@ -650,10 +650,11 @@ one does. Its parts sit beside it as `session.md`, `briefing.md` and
 pinned repos (`repos.json`) and optional non-secret harness settings
 (`env.json`).
 
-A bundle never carries a secret. The attempt-scoped Spor token reaches the
-environment through the provider's declared `secret_delivery` channel, as
-`SPOR_TOKEN` or `SPOR_DISPATCH_CHILD_TOKEN`, and a bundle carrying a value is
-refused.
+A bundle never carries a secret. The worker mints the attempt-scoped Spor
+token and hands it to the provider through `deliver_credential` (PROVIDERS.md
+§4.3), which writes it to the file `SPOR_TOKEN_FILE` names; the runner reads
+that first, else `SPOR_TOKEN` or `SPOR_DISPATCH_CHILD_TOKEN`. A bundle carrying
+a value is refused.
 
 ## 5. Machine capability declaration (optional, for routed dispatch)
 

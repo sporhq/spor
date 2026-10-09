@@ -14,7 +14,10 @@
 // `brokenIdempotency: true` is the deliberately broken fixture: every submit
 // creates a new environment, key or no key. `manifestRepo` overrides the
 // repo a collected manifest names (a provider naming a repo the attempt never
-// asked for, which the suite must refuse).
+// asked for, which the suite must refuse). `brokenCredential: "accept-stale"`
+// takes a delivery under an older fence than one already delivered (an
+// environment moved back to a dead token), which the suite must refuse.
+// `credentials: false` advertises no deliver_credential.
 
 const crypto = require("node:crypto");
 const { bindInProcess, ProviderError } = require("../../../lib/shell/provider-conformance");
@@ -29,7 +32,7 @@ function candidateFor(attempt) {
   return { commit: sha1(`commit\u0000${id}`), tree: sha1(`tree\u0000${id}`) };
 }
 
-function createSyntheticImpl({ providerId = "synthetic", brokenIdempotency = false, manifestRepo = null, capabilities = {}, now = () => new Date().toISOString() } = {}) {
+function createSyntheticImpl({ providerId = "synthetic", brokenIdempotency = false, brokenCredential = null, credentials = true, manifestRepo = null, capabilities = {}, now = () => new Date().toISOString() } = {}) {
   const envs = new Map(); // id -> env
   const byKey = new Map(); // idempotency key -> id
   let next = 0;
@@ -46,7 +49,7 @@ function createSyntheticImpl({ providerId = "synthetic", brokenIdempotency = fal
     egress: [],
     isolation: ["container"],
     secret_delivery: ["file"],
-    lifecycle: ["cancel", "force-cancel"],
+    lifecycle: ["cancel", "force-cancel", ...(credentials ? ["deliver_credential"] : [])],
     max_deadline_ms: 4 * 60 * 60 * 1000,
     ...capabilities,
   };
@@ -148,8 +151,27 @@ function createSyntheticImpl({ providerId = "synthetic", brokenIdempotency = fal
       env.released = true;
       return { released: true };
     },
+    // The attempt token lands in the environment (here: on its record — a
+    // real provider writes the file SPOR_TOKEN_FILE names). Keyed on the
+    // fence: an older fence than the one held is stale.
+    ...(credentials
+      ? {
+          deliver_credential({ handle, credential }) {
+            const env = find(handle);
+            if (env.credential && credential.fence < env.credential.fence && brokenCredential !== "accept-stale") {
+              throw new ProviderError("stale_credential", `environment ${handle.id} already holds the token for fence ${env.credential.fence}`);
+            }
+            env.credential = { fence: credential.fence, value: credential.value };
+            return { delivered: true };
+          },
+        }
+      : {}),
     // Test-only controls, outside the contract.
     fixture: {
+      credential(handle) {
+        const env = envs.get(handle.id);
+        return env && env.credential ? env.credential.value : null;
+      },
       crash(handle) {
         const env = envs.get(handle.id);
         if (env) env.crashed = true;
@@ -170,6 +192,7 @@ function syntheticDriver(fixture) {
     candidate: candidateFor,
     crash: (handle) => fixture.crash(handle),
     environments: () => fixture.environments(),
+    ...(fixture.credential ? { credential: (handle) => fixture.credential(handle) } : {}),
   };
 }
 

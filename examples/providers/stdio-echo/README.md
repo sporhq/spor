@@ -61,5 +61,10 @@ directory behind.
   commit, and only with a reference something other than the environment can
   fetch.
 - `release` is idempotent.
+- `deliver_credential` writes the attempt-scoped Spor token to the file the
+  environment's `SPOR_TOKEN_FILE` names, replacing the previous one
+  atomically, and refuses a token for an older fence than the one it holds
+  (`stale_credential`). It is the only operation that carries a credential
+  value; every other secret travels by reference.
 - Anything written to stderr shows up in the worker's log as
   `[provider stdio-echo] …`; stdout carries protocol lines only.
