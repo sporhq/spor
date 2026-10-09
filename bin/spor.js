@@ -18863,7 +18863,7 @@ async function describeDeclaredProviders(cfg) {
       else if (res.result.provider_id !== id) rows.push({ provider_id: id, binding: "stdio", error: `describe names provider ${JSON.stringify(res.result.provider_id)}, not ${id}` });
       else {
         // Every axis but isolation/lifecycle defaults to empty (PROVIDERS.md §3).
-        const empty = Object.fromEntries(["harnesses", "reachable_mcp", "skills", "plugins", "tools", "repos", "egress", "secret_delivery", "deny"].map((k) => [k, []]));
+        const empty = Object.fromEntries(["harnesses", "reachable_mcp", "skills", "plugins", "tools", "repos", "egress", "secret_delivery", "secret_schemes", "deny"].map((k) => [k, []]));
         rows.push({ ...res.result, capabilities: { ...empty, ...res.result.capabilities }, binding: "stdio" });
       }
     } catch (e) {
@@ -18930,6 +18930,7 @@ async function cmdCapabilitiesProviders(cfg, { attemptPath, json }) {
     out(`  repos:           ${list(c.repos)}`);
     out(`  egress:          ${c.egress.includes("*") ? "unrestricted" : list(c.egress)}`);
     out(`  secret_delivery: ${list(c.secret_delivery)}`);
+    out(`  secret_schemes:  ${list(c.secret_schemes)}`);
     const res = c.resources || {};
     out(`  resources:       ${["cpu", "memory_mb", "disk_mb"].filter((k) => res[k] != null).map((k) => `${k} ${res[k]}`).join(", ") || "(none declared)"}`);
     out(`  deny:            ${list(c.deny)}`);

@@ -311,6 +311,7 @@ function providerCaps(over) {
     egress: ["api.anthropic.com", "github.com"],
     isolation: ["container"],
     secret_delivery: ["file", "egress-inject"],
+    secret_schemes: ["vault"],
     lifecycle: ["cancel", "force-cancel", "suspend"],
     resources: { cpu: 4, memory_mb: 8192, disk_mb: 20480 },
     max_deadline_ms: 6 * 3600 * 1000,
@@ -368,7 +369,7 @@ test("satisfiesAttempt: secret_delivery egress-inject against a provider declari
 });
 
 test("satisfiesAttempt: isolation vm against the local provider is refused, and a stronger kind is never substituted", () => {
-  const local = { harnesses: ["claude-code"], reachable_mcp: ["spor"], skills: ["brief"], plugins: ["spor@spor"], tools: ["git", "node"], repos: ["acme-api"], egress: ["*"], isolation: ["worktree"], secret_delivery: ["file"], lifecycle: ["cancel", "force-cancel"], resources: { cpu: 8, memory_mb: 16384 } };
+  const local = { harnesses: ["claude-code"], reachable_mcp: ["spor"], skills: ["brief"], plugins: ["spor@spor"], tools: ["git", "node"], repos: ["acme-api"], egress: ["*"], isolation: ["worktree"], secret_delivery: ["file"], secret_schemes: ["vault"], lifecycle: ["cancel", "force-cancel"], resources: { cpu: 8, memory_mb: 16384 } };
   const r = sat.satisfiesAttempt(local, attempt({ isolation: "vm" }), { now: NOW });
   assert.strictEqual(r.ok, false);
   assert.deepStrictEqual(r.axes, ["isolation"]);
@@ -391,8 +392,9 @@ test("satisfiesAttempt: every profile + environment axis names its own failure",
     { now: NOW }
   );
   assert.strictEqual(r.ok, false);
-  assert.deepStrictEqual(r.axes, ["harnesses", "reachable_mcp", "skills", "plugins", "tools", "repos", "egress", "secret_delivery", "resources", "lifecycle", "deadline"]);
+  assert.deepStrictEqual(r.axes, ["harnesses", "reachable_mcp", "skills", "plugins", "tools", "repos", "egress", "secret_delivery", "secret_schemes", "resources", "lifecycle", "deadline"]);
   const text = r.reasons.join("\n");
+  assert.match(text, /secret_schemes: secret reference scheme\(s\) not resolved by this provider: GITHUB_TOKEN \(vault:\/\/\)/);
   assert.match(text, /harnesses: harness 'claude-code' not offered/);
   assert.match(text, /tools: tool\(s\) on PATH not offered: git, node/);
   assert.match(text, /repos: cannot check out acme-api/);
@@ -465,7 +467,7 @@ test("satisfiesAttempt: a present-but-malformed attempt field refuses on its axi
   assert.deepStrictEqual(axesOf({ secrets: "x" }), ["secret_delivery"]);
   assert.deepStrictEqual(axesOf({ profile: 7 }), ["deny"]);
   assert.deepStrictEqual(axesOf({}), [], "the well-formed baseline passes");
-  assert.deepStrictEqual(sat.ATTEMPT_AXES, ["deny", "harnesses", "reachable_mcp", "skills", "plugins", "tools", "repos", "egress", "secret_delivery", "isolation", "resources", "lifecycle", "deadline"]);
+  assert.deepStrictEqual(sat.ATTEMPT_AXES, ["deny", "harnesses", "reachable_mcp", "skills", "plugins", "tools", "repos", "egress", "secret_delivery", "secret_schemes", "isolation", "resources", "lifecycle", "deadline"]);
 });
 
 test("satisfiesAttempt: satisfies() is untouched for the profile path", () => {

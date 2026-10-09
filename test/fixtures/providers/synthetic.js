@@ -49,6 +49,7 @@ function createSyntheticImpl({ providerId = "synthetic", brokenIdempotency = fal
     egress: [],
     isolation: ["container"],
     secret_delivery: ["file"],
+    secret_schemes: ["vault"],
     lifecycle: ["cancel", "force-cancel", ...(credentials ? ["deliver_credential"] : [])],
     max_deadline_ms: 4 * 60 * 60 * 1000,
     ...capabilities,

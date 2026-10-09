@@ -276,10 +276,10 @@ test("the runner reads SPOR_TOKEN_FILE first, falls back to the environment, and
   assert.deepEqual(await resolve({ SPOR_TOKEN: "env-token" }), { token: "env-token", source: "env" });
   assert.deepEqual(await resolve({ SPOR_DISPATCH_CHILD_TOKEN: "child", SPOR_TOKEN: "env" }), { token: "child", source: "env" });
   // the file wins over the environment
-  fs.writeFileSync(file, `${TOKEN}\n`);
+  fs.writeFileSync(file, `${TOKEN}\n`, { mode: 0o600 });
   assert.deepEqual(await resolve({ SPOR_TOKEN_FILE: file, SPOR_TOKEN: "env-token" }), { token: TOKEN, source: "file" });
   // anything but an attempt token in the file is refused, never echoed
-  fs.writeFileSync(file, "spor_pat_0123456789abcdef0123\n");
+  fs.writeFileSync(file, "spor_pat_0123456789abcdef0123\n", { mode: 0o600 });
   const bad = await resolve({ SPOR_TOKEN_FILE: file });
   assert.match(bad.error, /does not hold an attempt-scoped Spor token/);
   assert.doesNotMatch(bad.error, /spor_pat_0123/);
@@ -291,7 +291,7 @@ test("the runner reads SPOR_TOKEN_FILE first, falls back to the environment, and
     waitMs: 60000,
     pollMs: 1,
     sleep: async () => {
-      if (++slept === 3) fs.writeFileSync(late, TOKEN);
+      if (++slept === 3) fs.writeFileSync(late, TOKEN, { mode: 0o600 });
     },
   });
   assert.deepEqual(got, { token: TOKEN, source: "file" });
@@ -299,4 +299,22 @@ test("the runner reads SPOR_TOKEN_FILE first, falls back to the environment, and
   const missing = path.join(dir, "never");
   assert.match((await resolve({ SPOR_TOKEN_FILE: missing })).error, /the attempt token never arrived/);
   assert.deepEqual(await resolve({ SPOR_TOKEN_FILE: missing }, { needed: false }), { token: "", source: "file" });
+});
+
+test("the runner refuses a SPOR_TOKEN_FILE readable beyond its owner, without reading or echoing it", { skip: process.platform === "win32" && "no POSIX mode bits" }, async () => {
+  const dir = scratch();
+  const file = path.join(dir, "spor-token");
+  fs.writeFileSync(file, `${TOKEN}\n`, { mode: 0o600 });
+  const resolve = (env) => attemptRunner.resolveAttemptToken(env, { waitMs: 0, pollMs: 1 });
+  assert.deepEqual(await resolve({ SPOR_TOKEN_FILE: file }), { token: TOKEN, source: "file" });
+  fs.chmodSync(file, 0o400);
+  assert.deepEqual(await resolve({ SPOR_TOKEN_FILE: file }), { token: TOKEN, source: "file" });
+  for (const mode of [0o644, 0o640, 0o604, 0o620]) {
+    fs.chmodSync(file, mode);
+    const r = await resolve({ SPOR_TOKEN_FILE: file });
+    assert.match(r.error, new RegExp(`grants access beyond its owner \\(mode ${mode.toString(8).padStart(4, "0")}\\) — the attempt token must be written 0600`), mode.toString(8));
+    assert.doesNotMatch(r.error, /spor_att_/);
+  }
+  // a directory is not a token file
+  assert.match((await resolve({ SPOR_TOKEN_FILE: dir })).error, /is not a regular file/);
 });

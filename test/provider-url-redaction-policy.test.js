@@ -105,16 +105,86 @@ test("query, fragment and path tokens are refused in every reference field, and 
   assert.match(errorsOf(attempt({ prompt_bundle_ref: `https://b.example/p.tar?X-Amz-Signature=${OPAQUE}` })).join("\n"), /prompt_bundle_ref: "https:\/\/b\.example\/p\.tar\?<redacted>" is not a reference/);
 });
 
-test("spor.server is an origin only; spor.token_ref names an attempt token", () => {
-  for (const server of ["https://api.sporhq.io", "https://api.sporhq.io/", "http://127.0.0.1:8787", "file:///home/me/.spor/nodes"]) {
+test("spor.server is a server base (an origin, optionally under a path prefix); spor.token_ref names an attempt token", () => {
+  for (const server of [
+    "https://api.sporhq.io", "https://api.sporhq.io/", "http://127.0.0.1:8787", "file:///home/me/.spor/nodes",
+    // a tenant served behind a reverse proxy: what remote.base() yields
+    "https://proxy.example/spor", "https://proxy.example:8443/teams/acme/spor/",
+  ]) {
     assert.deepEqual(errorsOf(attempt({ spor: { server, token_ref: "spor-attempt-token://exec-0123456789abcdef/1" } })), [], server);
   }
-  for (const server of ["https://api.sporhq.io/v1", `https://api.sporhq.io/?t=${OPAQUE}`, "https://u:p@api.sporhq.io"]) {
+  for (const server of [
+    `https://api.sporhq.io/?t=${OPAQUE}`, `https://api.sporhq.io/spor#${OPAQUE}`, "https://u:p@api.sporhq.io",
+    `https://api.sporhq.io/spor/${OPAQUE}@evil.example`, "https://api.sporhq.io//spor", "ftp://api.sporhq.io",
+  ]) {
     const errs = errorsOf(attempt({ spor: { server, token_ref: "spor-attempt-token://exec-0123456789abcdef/1" } }));
-    assert.match(errs.join("\n"), /spor\.server: .* is not a reference — a server origin/, server);
+    assert.match(errs.join("\n"), /spor\.server: .* is not a reference — a server base/, server);
     assert.ok(!errs.join("\n").includes(OPAQUE));
   }
   assert.match(errorsOf(attempt({ spor: { server: "https://api.sporhq.io", token_ref: "vault://x/token" } })).join("\n"), /spor\.token_ref: .* attempt-token reference/);
+});
+
+test("spor.server and spor.token_ref are held to the credential-shape rule, and never echo it", () => {
+  const server = `https://${SK_LIVE}.example.com`;
+  const s = errorsOf(attempt({ spor: { server, token_ref: "spor-attempt-token://exec-0123456789abcdef/1" } }));
+  assert.match(s.join("\n"), /spor\.server: \(value withheld\) is not a reference/);
+  assert.match(errorsOf(attempt({ spor: { server: `https://proxy.example/${SPOR_PAT}`, token_ref: "spor-attempt-token://exec-0123456789abcdef/1" } })).join("\n"), /spor\.server: \(value withheld\)/);
+  const t = errorsOf(attempt({ spor: { server: "https://api.sporhq.io", token_ref: `spor-attempt-token://${SPOR_PAT}/1` } }));
+  assert.match(t.join("\n"), /spor\.token_ref: \(value withheld\) is not a reference/);
+  for (const e of [...s, ...t]) assert.ok(!e.includes(SK_LIVE) && !e.includes(SPOR_PAT), e);
+});
+
+test("a spor.server refused for its shape alone is reported as the wrong shape, not as a secret by value", () => {
+  const wrong = attempt({ spor: { server: "ftp://api.sporhq.io/spor", token_ref: "spor-attempt-token://exec-0123456789abcdef/1" } });
+  const bundle = bundleLib.verifyBundle(bundleLib.createBundle({ attempt: wrong, prompt: "do it" }), { env: {} });
+  assert.equal(bundle.secret, false);
+  assert.match(bundle.errors.join("\n"), /attempt\.json spor\.server: "ftp:\/\/api\.sporhq\.io\/spor" is not a reference — a server base/);
+  assert.doesNotMatch(bundle.errors.join("\n"), /by value/);
+  const req = (a) => ({ contract_version: 1, id: "s", op: "submit", params: { idempotency_key: "key-12345678", attempt: a } });
+  assert.equal(stdio.secretRefusal(req(wrong)), null);
+  // A server that DOES carry a value (userinfo, a query) is still a secret refusal.
+  for (const server of ["https://u:p@api.sporhq.io", `https://api.sporhq.io/?t=${OPAQUE}`]) {
+    const leaky = attempt({ spor: { server, token_ref: "spor-attempt-token://exec-0123456789abcdef/1" } });
+    assert.match(stdio.secretRefusal(req(leaky)), /secret by value, not by reference \(at params\.attempt\.spor\.server\)/, server);
+    const b = bundleLib.verifyBundle(bundleLib.createBundle({ attempt: leaky, prompt: "do it" }), { env: {} });
+    assert.equal(b.secret, true, server);
+    assert.ok(!b.errors.join("\n").includes(OPAQUE));
+  }
+});
+
+test("secret refs are matched against the provider's registry of vault schemes", () => {
+  const caps = (over = {}) => ({ harnesses: ["echo"], repos: ["*"], egress: [], isolation: ["worktree"], lifecycle: [], secret_delivery: ["file"], secret_schemes: ["vault", "op", "env-ref"], ...over });
+  const secrets = (...refs) => attempt({ secrets: refs.map((ref, i) => ({ name: `S${i}`, ref })) });
+  assert.equal(sat.satisfiesAttempt(caps(), secrets("vault://acme/gh", "op://Team/gh/token", "env-ref://GH")).ok, true);
+  assert.equal(sat.satisfiesAttempt(caps(), attempt({ secrets: [] })).ok, true, "no secrets asks nothing");
+  assert.equal(sat.satisfiesAttempt(caps({ secret_schemes: [] }), attempt({ secrets: [] })).ok, true);
+  // a typo'd scheme refuses, naming the secret and the scheme
+  const typo = sat.satisfiesAttempt(caps(), secrets("vault://acme/gh", "valut://acme/npm"));
+  assert.equal(typo.ok, false);
+  assert.deepEqual(typo.axes, ["secret_schemes"]);
+  assert.match(typo.reasons[0], /^secret_schemes: secret reference scheme\(s\) not resolved by this provider: S1 \(valut:\/\/\) \(this provider resolves: vault, op, env-ref\)$/);
+  // a provider that declares no registry resolves nothing
+  const none = sat.satisfiesAttempt(caps({ secret_schemes: undefined }), secrets("vault://acme/gh"));
+  assert.match(none.reasons.join("\n"), /secret_schemes: .*S0 \(vault:\/\/\) \(this provider resolves: nothing\)/);
+  // a scheme that is itself credential-shaped is withheld, as is a ref with no scheme
+  const shaped = sat.satisfiesAttempt(caps(), secrets(`${SK_LIVE}://x`, SK_PROJ));
+  assert.match(shaped.reasons.join("\n"), /S0 \(scheme withheld\), S1 \(scheme withheld\)/);
+  assert.ok(!shaped.reasons.join("\n").includes(SK_LIVE) && !shaped.reasons.join("\n").includes(SK_PROJ));
+  // the registry is part of describe(): scheme names, lowercase
+  const describe = (secret_schemes) => pc.validate("describe-result", { provider_id: "p", contract_version: 1, capabilities: { isolation: ["worktree"], lifecycle: [], secret_schemes } });
+  assert.deepEqual(describe(["vault", "env-ref", "azure-keyvault"]).errors, []);
+  assert.equal(describe(["vault://"]).ok, false);
+  assert.equal(describe(["Vault"]).ok, false);
+});
+
+test("deliver_credential's credential is closed: no key beside kind, ref, value, fence, expires_at", () => {
+  const handle = { provider: "p", id: "h" };
+  const credential = { kind: "spor-attempt-token", ref: "spor-attempt-token://exec-0123456789abcdef/1", value: SPOR_ATT, fence: 1 };
+  const req = (c) => pc.validateRequest({ contract_version: 1, id: "d", op: "deliver_credential", params: { handle, credential: c } });
+  assert.deepEqual(req(credential).errors, []);
+  assert.deepEqual(req({ ...credential, expires_at: "2099-01-01T00:00:00Z" }).errors, []);
+  const extra = req({ ...credential, [OPAQUE]: "x" });
+  assert.deepEqual(extra.errors, ["params.credential: carries a key other than kind, ref, value, fence, expires_at (name withheld) — a delivery carries the attempt token and its reference, nothing else"]);
 });
 
 test("a candidate locator is a file/https/ssh reference with no query", () => {
@@ -226,7 +296,7 @@ function handle(msg) {
 });
 
 test("`*` repo admission refuses a url outside the allowed shapes, by slug", () => {
-  const caps = { harnesses: ["echo"], repos: ["*"], egress: [], isolation: ["worktree"], lifecycle: [], secret_delivery: ["file"] };
+  const caps = { harnesses: ["echo"], repos: ["*"], egress: [], isolation: ["worktree"], lifecycle: [], secret_delivery: ["file"], secret_schemes: ["vault"] };
   const ok = sat.satisfiesAttempt(caps, attempt({ repos: [{ slug: "other", commit: "a".repeat(40), branch: "b", url: "git@github.com:acme/other.git" }] }));
   assert.equal(ok.ok, true, ok.reasons && ok.reasons.join("; "));
   const r = sat.satisfiesAttempt(caps, attempt({ repos: [{ slug: "other", commit: "a".repeat(40), branch: "b", url: `https://github.com/acme/other.git?access_token=${OPAQUE}` }] }));

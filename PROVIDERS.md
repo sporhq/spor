@@ -84,9 +84,11 @@ human-readable message. It never guesses.
 
 **Unknown fields are ignored**, at every level and in both directions. A v1
 reader that meets a field a later revision added must not refuse the message.
-That is why only one schema in the module declares `additionalProperties`:
+That is why only two schemas in the module declare `additionalProperties`:
 a secret entry is CLOSED to exactly `{name, ref}`, since an unknown key there
-is a value riding where a reference belongs. The `spor` block stays open but
+is a value riding where a reference belongs, and `deliver_credential`'s
+`credential` is CLOSED to `{kind, ref, value, fence, expires_at}`, since it is
+the one object that carries a value and nothing else may ride beside it. The `spor` block stays open but
 must not carry a value-bearing key (`value`, `secret`, `plaintext`, `token`,
 `password`, `data`). See §4.2.
 The one operation that does carry a value, `deliver_credential`, carries exactly
@@ -172,6 +174,7 @@ again.
     "egress": ["api.anthropic.com", "api.sporhq.io", "github.com", "registry.npmjs.org"],
     "isolation": ["container"],
     "secret_delivery": ["file"],
+    "secret_schemes": ["vault", "op"],
     "lifecycle": ["cancel", "force-cancel"],
     "resources": { "cpu": 4, "memory_mb": 8192, "disk_mb": 20480 },
     "max_deadline_ms": 14400000
@@ -202,6 +205,7 @@ axis, and so does a missing `isolation`.
 | `repos` | Every `attempt.repos[]` slug is in `repos`, or `repos` holds `"*"` (the provider clones any repo) and the entry carries a `url`. A pin the entry carries is honoured: a `commit` that is not a full object name, an empty `branch`, or one slug pinned twice to different commits/branches refuses. |
 | `egress` | `attempt.egress.allow` is a subset of `egress`, or `egress` holds `"*"` (unrestricted). An empty allow list (none) always matches; an allow list naming `"*"` (unrestricted) matches only a `"*"` provider. |
 | `secret_delivery` | One of `attempt.secret_delivery` (the modes that can serve this attempt) is offered. With no `secret_delivery` stated, an attempt carrying `secrets[]` needs some mode, and one with none needs nothing. Stated empty, an attempt carrying `secrets[]` has no delivery path and is refused. |
+| `secret_schemes` | Every `secrets[].ref`'s scheme (`vault` in `vault://acme/gh`) is in `secret_schemes`, the provider's registry of the vault schemes it resolves (§4.2). A provider that declares none resolves no reference, so any secret refuses; an attempt with no secrets asks nothing. The refusal names the secret, never its reference. |
 | `isolation` | `attempt.isolation` is in `isolation`, **exactly**. A stronger kind is not offered in its place, because handing back a different environment than the spec names is a substitution. |
 | `resources` | Each requested floor is at most the provider's ceiling. A floor against a ceiling the provider does not declare is refused. |
 | `lifecycle` | `attempt.lifecycle` (the operations the attempt needs) is a subset of `lifecycle`. |
@@ -297,9 +301,31 @@ SHAPE (`REFERENCE_FORMATS` in lib/kernel/provider-contract.js):
 |---|---|
 | `repos[].url` | `https://host/path`, `ssh://[login@]host/path`, scp-style `login@host:path` |
 | candidate `reference.locator` | `file://`, `https://`, `ssh://` |
-| `spor.server` | an origin only — `http(s)://host[:port]` (a local graph: its `file:///` nodes dir) |
+| `spor.server` | a server base — `http(s)://host[:port]` with an optional path prefix (`https://host/spor`, a tenant behind a reverse proxy — what the worker's configured server resolves to); a local graph: its `file:///` nodes dir |
 | `spor.token_ref` | `spor-attempt-token://<execution>/<fence>` |
 | `secrets[].ref`, `prompt_bundle_ref`, `report_ref`, `log_refs[]`, evidence `ref` | any `<scheme>://…` reference |
+
+`spor.server` and `spor.token_ref` are held to the credential-shape rule too
+(`https://sk-live-….example.com`, `spor-attempt-token://spor_pat_…/1` are
+refused). A refusal of either that carries no value — a path where an origin
+belonged, a scheme the field does not take — is reported as the wrong shape,
+never as "a secret by value".
+
+**Which vaults a reference may name is the provider's registry.** A provider's
+`describe()` lists the schemes it resolves as `capabilities.secret_schemes`
+(`["vault", "op", "env-ref"]`); an attempt whose `secrets[].ref` names any
+other scheme is refused by the matcher (§3.1) before it is submitted, so a
+typo (`valut://…`) is a refusal at the worker, not a lookup failure inside the
+environment.
+
+**What the shape rule cannot see.** Credentials are recognized by a KNOWN
+prefix only (`ghp_`, `glpat-`, `xox?-`, `sk-…`, `AKIA`, `spor_att_`,
+`spor_pat_`, …). An opaque token written as a plain path segment
+(`https://host/3f9a7c…/repo.git`, `vault://acme/9d2b…`) has no shape that
+tells it from an id, so no reference check — and no `redact` — can detect it.
+The defence there is the rule's other half: a reference names WHERE a value
+lives, and a field that would need an opaque token in its path to work is a
+field this contract does not admit.
 
 A refusal never quotes the value: userinfo, query and fragment are cut and a
 value still carrying a credential shape is withheld. So this
@@ -998,8 +1024,10 @@ no `SPOR_TOKEN_FILE` set falls back to `SPOR_DISPATCH_CHILD_TOKEN` or
 `SPOR_TOKEN` in its environment. It hands the token to the harness. The
 worker mints the token only after the submit returned a handle, so the runner
 may start first: an attempt bound to a server waits (up to 120 seconds) for
-the file to appear, and refuses before launch if it never does or if it holds
-anything but an attempt token (`spor_att_…`). A bundle
+the file to appear, and refuses before launch if it never does, if it holds
+anything but an attempt token (`spor_att_…`), or if it is not a regular file
+private to its owner (any group or other permission bit set — write it `0600`;
+Windows, which has no POSIX mode bits, is not checked). A bundle
 is refused, by `build` before it is written and by `run` before anything is
 checked out, when it carries any of these:
 
