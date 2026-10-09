@@ -13,6 +13,8 @@ const path = require("node:path");
 const conf = require("../lib/shell/provider-conformance");
 const candidate = require("../lib/kernel/candidate");
 const sat = require("../lib/kernel/satisfiability");
+const executionStore = require("../lib/shell/execution-store");
+const providerAttempts = require("../lib/shell/provider-attempts");
 const { createSyntheticProvider } = require("./fixtures/providers/synthetic");
 const { startSyntheticStdio } = require("./fixtures/providers/synthetic-stdio");
 
@@ -216,11 +218,16 @@ test("adoption under a new instance: the re-derived attempt is a conflict and th
   const { provider, driver } = createSyntheticProvider();
   const home = scratch();
   await conf.runScenario(provider, "adopt-new-instance", { home, driver });
-  const dir = path.join(home, "provider-conformance", "adopt-new-instance");
-  const [file] = fs.readdirSync(dir);
-  const rec = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
-  assert.equal(rec.submitting.request.attempt.attempt_id, "conf-worker-a:1");
-  assert.equal(rec.submitted.existing, true);
+  // The worker-side record is the REAL execution record (provider-attempts.js
+  // over the local execution store), not a suite stand-in.
+  const store = executionStore.localExecutionEngine({ home: path.join(home, "provider-conformance", "adopt-new-instance"), tenant: "conformance" });
+  const listed = await store.list({ limit: 10 });
+  assert.equal(listed.executions.length, 1);
+  const row = providerAttempts.providerRow(listed.executions[0], 1);
+  assert.equal(row.id, "synthetic");
+  assert.equal(row.request.attempt.attempt_id, "conf-worker-a:1");
+  assert.ok(row.handle, "the reconciled handle is on the execution record");
+  assert.equal(listed.executions[0].owner.fence, 3, "two restarts advanced the fence twice");
 });
 
 test("submitMatched never sends an attempt the matcher refuses", async () => {

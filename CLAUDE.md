@@ -1044,7 +1044,14 @@ recorded from the inline launch (re-record with `SPOR_GOLDEN_RECORD=1` only
 for a deliberate change, and say so), and drives the provider through the
 conformance suite over real supervisor launches. The harness adapter's argv
 stays the dispatcher's; the provider gets the finished launch on the
-provider-private `attempt.local` block. `dispatch.provider` is one
+provider-private `attempt.local` block. What it is SUBMITTED is the derived
+attempt spec (`lib/kernel/attempt-spec.js`, PROVIDERS.md §4.4 —
+task-spor-work-derive-attempt-spec-on-dispatch): profile + pinned factory +
+item + request (`--isolation`), matched against the provider's describe() with
+`satisfiesAttempt` BEFORE any claim/worktree/launch, refusing naming the axis;
+the work loop's attempt driver binds the execution identity and validates the
+whole spec against the contract schema before persisting the submit key.
+`spor attempt build` reads the plan through the same `attemptInputs` door. `dispatch.provider` is one
 machine-local map (`default` + `<id>` bindings, `noRepo` like
 `dispatch.harness`). The provider ATTEMPT HANDLE is persisted on the
 execution record (task-spor-work-attempt-handle-adoption,

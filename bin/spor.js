@@ -84,6 +84,8 @@ const dispatchLib = lazyModule(path.join(ROOT, "lib", "shell", "dispatch.js"));
 const workLib = lazyModule(path.join(ROOT, "lib", "shell", "work.js"));
 const sat = lazyModule(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 const providerContract = lazyModule(path.join(ROOT, "lib", "kernel", "provider-contract.js"));
+const mcpConfigLib = lazyModule(path.join(ROOT, "lib", "shell", "mcp-config.js"));
+const attemptSpecKernel = lazyModule(path.join(ROOT, "lib", "kernel", "attempt-spec.js"));
 const stdioProviders = lazyModule(path.join(ROOT, "lib", "shell", "providers", "stdio.js"));
 const attemptBundle = lazyModule(path.join(ROOT, "lib", "shell", "attempt-bundle.js"));
 const attemptRunner = lazyModule(path.join(ROOT, "lib", "shell", "attempt.js"));
@@ -10460,27 +10462,13 @@ function writeDispatchMcpConfig(cfg, { token, key }) {
   fs.mkdirSync(dir, { recursive: true });
   sweepStaleMcpConfigs(dir);
   const file = path.join(dir, `mcp-${key}.json`);
-  const conf = {
-    mcpServers: {
-      spor: {
-        type: "http",
-        url: `${remote.base(cfg)}/mcp`,
-        headers: { Authorization: `Bearer ${token}` },
-      },
-    },
-  };
-  // 0600: the file holds a live bearer token. Create with O_EXCL (wx) so a
-  // pre-placed file or symlink at this path is REFUSED rather than written
-  // through, and the file is 0600 from creation (no widen-then-narrow window).
-  // The uuid filename makes a real collision a non-issue; a stale leftover was
-  // swept above.
-  const fd = fs.openSync(file, "wx", 0o600);
-  try {
-    fs.writeSync(fd, JSON.stringify(conf, null, 2) + "\n");
-  } finally {
-    fs.closeSync(fd);
-  }
-  return file;
+  // The ONE config shape (lib/shell/mcp-config.js), shared with `spor
+  // attempt run`: the Spor MCP at this server with the run's token. Written
+  // 0600 with O_EXCL — a pre-placed file or symlink at this path is REFUSED
+  // rather than written through. The uuid filename makes a real collision a
+  // non-issue; a stale leftover was swept above.
+  const { conf } = mcpConfigLib.mcpConfigFor([mcpConfigLib.SPOR_MCP_NAME], { server: remote.base(cfg), token });
+  return mcpConfigLib.writeMcpConfigFile(file, conf);
 }
 
 // Best-effort cleanup: remove dispatch mcp-config files older than a day. The
@@ -11596,7 +11584,7 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
   // case (openPipelineCandidates). A bare worker stamps nothing, and its runs
   // are never adopted.
   const gateFactory = factory && factory.id ? { gate_factory: factory.id } : null;
-  if (!controller) return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { ...(gateFactory ? { recordFields: gateFactory } : {}), ...dispatchOpts });
+  if (!controller) return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { ...(gateFactory ? { recordFields: gateFactory } : {}), ...(factory ? { factory } : {}), ...dispatchOpts });
   const held = await claimExecutionHold(cfg, item, factory, { home, log });
   if (!held.ok) return { ok: false, reason: held.reason };
   // The provider attempt handle (task-spor-work-attempt-handle-adoption,
@@ -11613,7 +11601,18 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
     ? async ({ providerId, impl, attempt, augment }) => {
         const client = providerAttempts.inProcessClient(providerId, impl);
         const instance = executionInstance();
-        const spec = { ...attempt, execution_id: held.executionId, fence: held.fence, attempt_id: instance };
+        // The derived spec (lib/kernel/attempt-spec.js) gains the execution
+        // this claim holds — its identity and the attempt token's reference —
+        // and only now is it a complete attempt, so only now is it held to the
+        // contract schema: an invalid spec is refused before the key is
+        // persisted, and so before anything is sent or created.
+        const claim = (held.recordFields && held.recordFields.impl_claim) || {};
+        const spec = attemptSpecKernel.bindExecution(attempt, { attempt_id: instance, execution_id: held.executionId, fence: held.fence, tenant: claim.tenant || "local" });
+        const invalid = attemptSpecKernel.attemptSpecErrors(spec);
+        if (invalid.length) {
+          attemptResult = { ok: false, refused: true, reason: `the derived attempt spec is not a valid attempt (${invalid.join("; ")}); nothing was sent` };
+          return attemptResult;
+        }
         // `machine` binds the persisted submit to THIS box: a `local`
         // environment (and the run records its key -> handle table lives in)
         // exists here alone, so a takeover on another box must read the
@@ -11629,7 +11628,7 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
         return attemptResult;
       }
     : null;
-  const launched = await dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { recordFields: { ...(held.recordFields || {}), ...(gateFactory || {}) }, ...(submitAttempt ? { submitAttempt } : {}), ...dispatchOpts });
+  const launched = await dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { recordFields: { ...(held.recordFields || {}), ...(gateFactory || {}) }, factory, ...(submitAttempt ? { submitAttempt } : {}), ...dispatchOpts });
   // Unknown acceptance HOLDS: the submit key is on the record and an
   // environment may exist, so the execution and its hold stand and the next
   // dispatch of this item reconciles under the persisted key (above) instead
@@ -11843,7 +11842,7 @@ async function dispatchThroughLocked(cfg, values, positionals = [], opts = {}) {
     // opts.cmdDispatch: test-only seam, defaulting to the real cmdDispatch —
     // see dispatchWorkItem's cmdDispatchOverride.
     const runDispatch = opts.cmdDispatch || cmdDispatch;
-    code = await runDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true, unattended: true, allowAttended: !!opts.allowAttended, recordFields: opts.recordFields || null, ...(opts.submitAttempt ? { submitAttempt: opts.submitAttempt } : {}) });
+    code = await runDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true, unattended: true, allowAttended: !!opts.allowAttended, recordFields: opts.recordFields || null, ...(opts.factory ? { factory: opts.factory } : {}), ...(opts.submitAttempt ? { submitAttempt: opts.submitAttempt } : {}) });
   } catch (e) {
     // A throw AFTER the launch (the post-launch session capture and bind are
     // network calls) still means an agent is running and holding a lease —
@@ -18741,50 +18740,52 @@ async function cmdAttemptBuild(cfg, args) {
   // declares (dispatch.harness.<id> is machine-local), so it is not refused on
   // this box's say-so: the runner resolves it there, and refuses it — posture
   // included — before launch if it cannot.
-  if (plan.harnessAdapter && plan.postureCheck && plan.postureCheck.warning) err(plan.postureCheck.warning);
-  if (plan.harnessAdapter && plan.postureCheck && !plan.postureCheck.ok) {
-    err(`spor attempt build: ${plan.postureCheck.reason}.`);
-    err(`  ${plan.postureCheck.hint}`);
+  // What the attempt is derived from, read through the dispatcher's one
+  // plan -> attempt-inputs door rather than the plan's internals.
+  const inputs = attemptDispatcher().attemptInputs(cfg, plan);
+  if (inputs.harnessResolved && inputs.posture && inputs.posture.warning) err(inputs.posture.warning);
+  if (inputs.harnessResolved && inputs.posture && !inputs.posture.ok) {
+    err(`spor attempt build: ${inputs.posture.reason}.`);
+    err(`  ${inputs.posture.hint}`);
     return 1;
   }
-  const repoDir = plan.res.dir;
-  const slug = plan.res.slug;
+  const repoDir = inputs.repo.dir;
+  const slug = inputs.repo.slug;
   const rev = values.ref || "HEAD";
-  const commitOut = u.git(repoDir, ["rev-parse", "--verify", "--quiet", `${rev}^{commit}`]);
-  const commit = commitOut == null ? "" : String(commitOut).trim();
-  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commit)) {
-    err(`spor attempt build: '${rev}' does not name a commit in ${repoDir}`);
-    return 1;
-  }
-  // The CONFIGURED origin url, not this box's insteadOf rewrite of it: the
-  // bundle's url is cloned from inside another environment.
-  const remoteUrl = candidatePublish.resolveRemoteUrl("origin", repoDir, { raw: true });
-  let url = remoteUrl.ok && !candidatePublish.portableRemoteRefusal(remoteUrl.url) ? remoteUrl.url : null;
-  // A credential in the origin url (`https://x-access-token:<tok>@host/…`, a CI
-  // checkout's shape) never rides the bundle: the url is pinned without it,
-  // and the provider supplies the repo credential itself. A url that cannot be
-  // proven credential-free is not pinned at all.
-  if (url && !providerContract.isCredentialFreeReference(url)) {
-    url = providerContract.stripReferenceUserinfo(url);
-    err(url
-      ? `warning: ${repoDir}'s origin url carries credentials — the bundle pins it without them`
-      : `warning: ${repoDir}'s origin url cannot be proven free of credentials — the bundle pins ${slug} without a url`);
-  }
-  if (!url) err(`warning: ${repoDir} has no portable 'origin' url — the bundle pins ${slug} without one, so 'spor attempt run' needs --repo ${slug}=<path|url> and cannot publish a candidate`);
-  const server = cfg.mode() === "remote" ? remote.base(cfg) : require("url").pathToFileURL(cfg.nodesDir()).href;
-  const built = attemptBundle.bundleFromPlan({
-    execution: x,
-    plan,
+  const owner = x.owner || null;
+  // The attempt spec, DERIVED (lib/kernel/attempt-spec.js) exactly as `spor
+  // dispatch` derives the one it gates its launch on: the plan's profile,
+  // the factory pinned for the execution (its implementation budget bounds
+  // the deadline unless --deadline says otherwise), the item and its
+  // checkout pinned at --ref, plus the request flags.
+  // The MCP axis is the PROFILE's here: whether the building machine has an
+  // agent identity configured says nothing about the environment that will
+  // run the bundle, so it must not change what the bundle asks for.
+  const { spec: attempt, pin } = dispatchLib.deriveDispatchAttempt(cfg, { ...inputs, sporMcp: false }, {
+    ref: rev,
+    // The CONFIGURED origin url, not this box's insteadOf rewrite of it: the
+    // bundle's url is cloned from inside another environment.
+    rawOrigin: true,
     // Per ATTEMPT by default: every attempt of one item pushing one branch
     // would make a re-attempt (built from a base without the last one's
     // commits) or a superseded fence's late push refuse the other's candidate.
-    repo: { slug, commit, branch: values.branch || `spor/${x.item.node_id}-${x.execution_id.slice(5, 13)}-f${x.owner && x.owner.fence}`, url },
-    server,
-    deadline: new Date(Date.now() + deadlineMs).toISOString().replace(/\.\d{3}Z$/, "Z"),
-    isolation,
-    egress: values.egress || [],
-    tools: values.tool || [],
+    branch: values.branch || `spor/${x.item.node_id}-${x.execution_id.slice(5, 13)}-f${owner && owner.fence}`,
+    request: { isolation, egress: values.egress || [], tools: values.tool || [], ...(values.deadline != null ? { deadlineMs } : {}) },
+    factory: loaded.factory,
+    execution: owner && Number.isInteger(owner.fence)
+      ? { attempt_id: String(owner.instance || owner.worker), execution_id: x.execution_id, fence: owner.fence, tenant: String(x.tenant) }
+      : null,
   });
+  if (!pin.commit) {
+    err(`spor attempt build: '${rev}' does not name a commit in ${repoDir}`);
+    return 1;
+  }
+  // A credential in the origin url (`https://x-access-token:<tok>@host/…`, a CI
+  // checkout's shape) never rides the bundle: the url is pinned without it,
+  // and the provider supplies the repo credential itself.
+  if (pin.credentialed) err(`warning: ${repoDir}'s origin url carries credentials — the bundle pins it without them`);
+  if (!pin.url) err(`warning: ${repoDir} has no portable 'origin' url — the bundle pins ${slug} without one, so 'spor attempt run' needs --repo ${slug}=<path|url> and cannot publish a candidate`);
+  const built = attemptBundle.bundleFromPlan({ execution: x, attempt, inputs });
   if (built.error) {
     err(`spor attempt build: ${built.error}`);
     return 1;
@@ -18806,7 +18807,7 @@ async function cmdAttemptBuild(cfg, args) {
   else {
     out(`bundle:  ${written.path} (${written.kind})`);
     out(`attempt: ${built.bundle.attempt.attempt_id} of ${x.execution_id}, fence ${built.bundle.attempt.fence}, ${x.item.node_id}`);
-    out(`harness: ${built.bundle.attempt.harness.id}; repo ${slug} @ ${commit.slice(0, 12)} -> ${built.bundle.attempt.repos[0].branch}`);
+    out(`harness: ${built.bundle.attempt.harness.id}; repo ${slug} @ ${pin.commit.slice(0, 12)} -> ${built.bundle.attempt.repos[0].branch}`);
   }
   return 0;
 }
@@ -20721,6 +20722,7 @@ const COMMANDS = {
       agent: { type: "string", value: "A", desc: "claude --agent (harness agent DEFINITION — NOT the Spor identity; see --as)" },
       profile: { type: "string", value: "profile-id", desc: "profile to run under; checked against this machine's capabilities (overrides the assigned/default profile)" },
       provider: { type: "string", value: "provider-id", desc: "execution provider to run under (WHERE the attempt runs; default dispatch.provider.default, else local; an unknown id is refused)" },
+      isolation: { type: "string", value: "kind", desc: "isolation the attempt asks its environment for (worktree|container|vm; default worktree); matched exactly against the provider, refused if not offered" },
       name: { type: "string", value: "N", desc: "dispatch run name (passed to Claude; tracked locally for Codex)" },
       template: { type: "string", value: "F", desc: "prompt template file (placeholders above)" },
       full: { type: "boolean", desc: "full briefing instead of the digest" },

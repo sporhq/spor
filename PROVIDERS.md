@@ -32,7 +32,10 @@ any side effect and by `spor work` at startup, never silently run under
 the pre-provider launch byte-identical: `test/dispatch-local-provider.test.js`
 pins the run record, job file, prompt bytes, journal layout and stdout against
 a golden recorded from the inline launch, and drives the provider through the
-conformance suite over real supervisor launches. The loop still reads run
+conformance suite over real supervisor launches. Every dispatch submits the
+DERIVED attempt spec (§4.4): `executeDispatch` derives it and matches it
+against the provider's describe() with `satisfiesAttempt` before anything is
+claimed, created or launched. The loop still reads run
 records itself; `observe`/`collect`/`cancel`/`release` are exercised by the
 suite and become the loop's own reads with the attempt-handle work. The
 conformance suite every binding must pass is
@@ -195,8 +198,9 @@ axis, and so does a missing `isolation`.
 ## 4. The attempt spec
 
 The attempt spec is **derived, never hand-written**. The worker builds it from
-the resolved profile, the pinned factory and the item. It names everything the
-environment must hold and nothing the provider could leak:
+the resolved profile, the pinned factory and the item (§4.4 says how, field by
+field). It names everything the environment must hold and nothing the provider
+could leak:
 
 ```json provider-contract=attempt-spec
 {
@@ -287,6 +291,48 @@ is one-shot per fence, and it is refused after release, a terminal state or a
 fence advance (task-spor-server-attempt-scoped-token). The provider delivers it
 like any other secret. A long-lived personal access token never enters a
 sandbox.
+
+### 4.4 How the spec is derived
+
+One pure function, `deriveAttemptSpec` in `lib/kernel/attempt-spec.js`,
+derives every attempt, and both doors call it: `spor dispatch`
+(`executeDispatch` in `lib/shell/dispatch.js`, through `attemptInputs(cfg,
+plan)` and `deriveDispatchAttempt`) and `spor attempt build` (§13.2). So a
+dispatched attempt and a bundled one cannot describe one item two ways.
+
+| field | derived from |
+|---|---|
+| `node_id` | The item. A free-text dispatch has none. |
+| `harness`, `model` | The harness adapter the dispatcher resolved, and the effective model (`--model`, else the profile's). |
+| `profile`, `mcp`, `skills`, `plugins` | The resolved profile's id and runtime lists. When the launch wires the Spor MCP for an agent identity (remote mode), `spor` joins `mcp` even if the profile does not name it. |
+| `tools` | `git`, which every attempt needs to commit its candidate, plus any the request names (`spor attempt build --tool`). |
+| `repos` | The item's checkout: the commit at `HEAD` (or `--ref`), the branch the attempt commits to (a dispatch worktree's branch, else the checked-out branch; `spor attempt build` defaults to one branch per attempt), and the portable `origin` URL with any credential stripped. A checkout git cannot read pins nothing, and is still matched on every other axis. |
+| `egress` | The request's allow list (`spor attempt build --egress`). Empty otherwise. |
+| `secrets` | Always empty: no profile or factory names a secret reference yet. When a source gains them they ride here by reference (§4.2). |
+| `spor` | The graph the attempt writes into: the server, or a local graph's `nodes/` as a `file://` reference. |
+| `deadline` | The request's (`--deadline`), else the pinned factory's `implementation.budget.run_max_ms`, else the worker's `work.runMaxMs`. |
+| `isolation` | The request's (`spor dispatch --isolation`, `spor attempt build --isolation`). `worktree` for a dispatch that names none. |
+| `attempt_id`, `execution_id`, `fence`, `tenant`, `spor.token_ref` | Bound by `bindExecution` from the execution the worker holds. A person's own `spor dispatch` has no execution, so its spec is match-only and never sent as a contract message. The work loop's attempt driver binds the execution and then validates the whole spec against the contract schema before it persists the submit key. |
+
+The dispatch matches the spec against the chosen provider's describe() with
+`satisfiesAttempt` (§3.1). A mismatch is refused before anything is claimed,
+created or launched, and every failing axis is named:
+
+```
+cannot dispatch iso-run: the local execution provider cannot run this attempt —
+  isolation: 'container' is not offered (this provider offers: worktree)
+  nothing was claimed, created or launched; the assignment is unchanged (…).
+```
+
+The `local` provider's describe() at the dispatch door is the box as the
+dispatcher just resolved it: the fresh capability probe the profile matcher
+used, the harness the dispatcher built a launch for, the checkout it
+resolved, and in remote mode the Spor MCP. So the attempt matcher and the
+profile matcher never disagree about one machine. On `local` the attempt
+gate refuses only what a request asks for and the box cannot give (today,
+an isolation kind other than `worktree`, or a tool not on `PATH`). Every
+accepted dispatch launches byte-identically
+(`test/dispatch-local-provider.test.js`).
 
 ## 5. The observe state machine
 
@@ -746,7 +792,13 @@ derives carries a `profile`, `secret_delivery`, `lifecycle` and a repo pinned
 to a full commit and branch. Graceful `cancel` is exercised whatever
 `lifecycle` advertises, since `cancel` is a required operation (§3); only the
 forced cancel is gated on `force-cancel`. A collected manifest must name the
-attempt's identity and a `candidate.repo` the attempt asked for. The driver it uses, `stdioDriver`, makes three
+attempt's identity and a `candidate.repo` the attempt asked for. The worker-side halves the
+scenarios check (persist the key before the send, reconcile a held submit,
+adopt across a restart) are the worker's own `submitAttempt`
+(`lib/shell/provider-attempts.js`) over a real execution in a scratch local
+execution store. A restart is a new store instance re-claiming the execution
+under an advanced fence. Only the collected manifest is kept in a file beside
+the store, because the execution record has no event for it yet. The driver it uses, `stdioDriver`, makes three
 conventions a provider under check should honour:
 
 - An attempt whose `prompt_bundle_ref` has a `/hold/` path segment keeps
@@ -822,9 +874,12 @@ write it by hand:
   the owning instance as `attempt_id`, the tenant and the item. An execution
   with no live owner is refused.
 - **What runs.** From the dispatch plan for the item, which is the same
-  read-only plan `spor dispatch --print` resolves: the harness, the model, the
+  read-only plan `spor dispatch --print` resolves, read through the
+  dispatcher's `attemptInputs(cfg, plan)` and derived by the same
+  `deriveAttemptSpec` a dispatch uses (§4.4): the harness, the model, the
   profile and its runtime needs, the compiled briefing, and the factory's
-  worker contract as the task. The attempt is unattended, so a harness posture
+  worker contract as the task. The deadline is `--deadline`, else the
+  factory's implementation budget, else `work.runMaxMs`. The attempt is unattended, so a harness posture
   that would stop at its first write is refused, as it is for a worker's
   dispatch. Pass the posture, for example `--permission-mode
   bypassPermissions` for Claude Code. `run` checks the same rule again.
@@ -835,6 +890,16 @@ write it by hand:
   published candidate.
 - **The graph.** `spor.server` is the server, or, for a local-mode attempt, the
   graph's `nodes/` directory as a `file://` reference.
+
+**One repo per attempt (a v1 limitation).** The derivation pins exactly one
+repo, the item's own checkout, so `attempt.repos` has one entry, the runner
+launches the harness in that checkout, and the manifest holds one candidate
+(§7: `candidate` is a single object). The schema already admits several
+`repos`, and `spor attempt run` checks every one of them out, but the harness
+runs in the first and only the first repo's candidate is collected. A
+cross-repo attempt is therefore not expressible yet. Supporting it means a
+manifest with one candidate per repo, which is a contract revision rather than
+a field added to v1.
 
 ### 13.3 `spor attempt run <bundle>`
 
@@ -847,7 +912,11 @@ This runs on the sandbox side. In order:
    fails **before launch**, naming the repo and the reason.
 3. It resolves the harness adapter by `harness.id` and builds its argv with the
    bundle's harness settings. The settings are validated, translated and
-   defaulted exactly as `spor dispatch` does it.
+   defaulted exactly as `spor dispatch` does it. The attempt's `mcp` axis
+   decides the MCP config: when it names `spor` and the attempt token is
+   present, the runner writes the same Spor MCP config `spor dispatch` writes
+   (`lib/shell/mcp-config.js`). Any other name on the axis is provided by the
+   environment, which the provider's `reachable_mcp` already promised.
 4. It launches the harness under the supervisor and relays the run as status
    lines on stdout.
 

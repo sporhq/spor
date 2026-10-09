@@ -469,6 +469,7 @@ test("driver: a lost reply surfaces as a LostReply-shaped hold, never a refusal"
   const spor = require("../bin/spor.js");
   const gatesKernel = require("../lib/kernel/gates.js");
   const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const attemptSpecKernel = require("../lib/kernel/attempt-spec.js");
 
   const nodeFile = (id, type, extra = "") => `---\nid: ${id}\ntype: ${type}\nproject: spor\ntitle: Title of ${id}\nsummary: Summary of ${id}.\ndate: 2026-09-06\nstatus: open\n${extra}---\n\nBody.\n`;
   function graphHome() {
@@ -501,7 +502,13 @@ test("driver: a lost reply surfaces as a LostReply-shaped hold, never a refusal"
     };
     const cmdDispatch = async (fcfg, { values }, ctx) => {
       calls.door += 1;
-      const r = await ctx.submitAttempt({ providerId: "local", impl, attempt: { contract_version: 1, node_id: values.node, harness: { id: "fake" } }, augment: (p) => ({ ...p, attempt: { ...p.attempt, local: { live: true } } }) });
+      // The real door hands the DERIVED spec (lib/kernel/attempt-spec.js);
+      // the driver binds the execution and validates it against the schema.
+      const attempt = attemptSpecKernel.deriveAttemptSpec({
+        nodeId: values.node, harness: "fake", repos: [{ slug: "spor", commit: "a".repeat(40), branch: "main" }],
+        server: "file:///tmp/spor-nodes", now: Date.parse(T0), defaultRunMaxMs: 3600000,
+      });
+      const r = await ctx.submitAttempt({ providerId: "local", impl, attempt, augment: (p) => ({ ...p, attempt: { ...p.attempt, local: { live: true } } }) });
       if (!(r.ok || (r.held && r.handle != null))) return 1;
       ctx.onLaunch({ run_id: r.handle.id, harness: "fake", launch_mode: "supervised-jsonl", node_id: values.node, record_path: dispatchRuns.runPaths(home, r.handle.id).record });
       return 0;
@@ -526,6 +533,8 @@ test("driver: a lost reply surfaces as a LostReply-shaped hold, never a refusal"
     assert.equal(row.idempotency_key, door.calls.submits[0]);
     assert.equal(row.request.attempt.execution_id, ex.execution_id, "the persisted request carries the execution identity");
     assert.equal("local" in row.request.attempt, false, "the live launch block is never persisted");
+    assert.deepEqual(attemptSpecKernel.attemptSpecErrors(row.request.attempt), [], "the persisted request is a complete, valid attempt spec");
+    assert.equal(row.request.attempt.spor.token_ref, `spor-attempt-token://${ex.execution_id}/1`);
     const second = await spor.dispatchWorkItem(cfg, { id: "task-x" }, {}, { factory, home: dir, log: (l) => lines.push(l), cmdDispatch: door.cmdDispatch });
     assert.equal(second.ok, true, lines.join("\n"));
     assert.equal(second.adopted, true);
