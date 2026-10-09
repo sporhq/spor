@@ -19,5 +19,8 @@
   {"name":"reference image outside inline profile", "source":"![caption][shot]\n\n[shot]: spor-asset:art-shot", "rendered":[], "scanned":[]},
   {"name":"indented code scanner gap", "source":"    ![caption](spor-asset:art-shot)", "rendered":[], "scanned":["art-shot"], "gap":"The portable scanner treats indented code as an embed."},
   {"name":"continued quote destination scanner gap", "source":"> ![caption](\n> spor-asset:art-shot)", "rendered":["art-shot"], "scanned":[], "gap":"The portable scanner does not continue destinations through blockquote prefixes."},
-  {"name":"generic HTML block scanner gap", "source":"<div>\n![caption](spor-asset:art-shot)\n</div>", "rendered":[], "scanned":["art-shot"], "gap":"The portable scanner does not recognize CommonMark generic HTML blocks."}
+  {"name":"generic HTML block scanner gap", "source":"<div>\n![caption](spor-asset:art-shot)\n</div>", "rendered":[], "scanned":["art-shot"], "gap":"The portable scanner does not recognize CommonMark generic HTML blocks."},
+  {"name":"indented HTML continues a paragraph", "source":"para\n    <div>\n![caption](spor-asset:art-shot)", "rendered":["art-shot"], "scanned":["art-shot"]},
+  {"name":"raw HTML block closes inside a list item", "source":"- <script>\n  </script>\n  ![caption](spor-asset:art-shot)", "rendered":["art-shot"], "scanned":["art-shot"]},
+  {"name":"quote marker does not continue an unquoted destination", "source":"![caption](\n> spor-asset:art-shot)", "rendered":[], "scanned":[]}
 ]

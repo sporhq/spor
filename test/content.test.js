@@ -386,11 +386,32 @@ test("embeds: indented code, HTML blocks and quote-continued destinations", () =
   assert.deepEqual(ids(`<div>\n${img}\n\n${img}`), ["art-a"]);
   assert.deepEqual(ids(`text\n<span>\n${img}`), ["art-a"]);
   assert.deepEqual(ids(`<span>\n${img}`), []);
-  assert.deepEqual(ids(`<?php\n${img}\n\n${img}`), ["art-a"]);
+  // raw HTML blocks (types 1-5) run to their closer, not the blank line
+  assert.deepEqual(ids(`<?php\n${img}\n\n${img}`), []);
+  assert.deepEqual(ids(`<?php\n${img}\n?>\n${img}`), ["art-a"]);
+  assert.deepEqual(ids(`<![CDATA[\n${img}\n]]>\n${img}`), ["art-a"]);
+  assert.deepEqual(ids(`<!X\n${img}\n>\n${img}`), ["art-a"]);
+  // HTML blocks are container-aware: 4+ columns in is paragraph text, the
+  // closer is matched inside a list item, and the block ends with its container
+  assert.deepEqual(ids(`para\n    <div>\n${img}`), ["art-a"]);
+  assert.deepEqual(ids(`- <script>\n  </script>\n  ${img}`), ["art-a"]);
+  assert.deepEqual(ids(`> <script>\n> </script>\n> ${img}`), ["art-a"]);
+  assert.deepEqual(ids(`- <div>\n${img}`), ["art-a"]);
+  assert.deepEqual(ids(`> <div>\n${img}`), ["art-a"]);
+  assert.deepEqual(ids(`- a\n\n  <div>\n${img}`), ["art-a"]);
+  // an inline construct never crosses a block: a stray backtick before an HTML block
+  assert.deepEqual(ids(`1. \`\n<![CDATA[\n${img}`), []);
   // destinations continue through quote prefixes, ranges are UTF-16 offsets into the source
   const src = "😀\n> ![c](\n> spor-asset:art-q\n> \"t\"\n> )\n";
   const [e] = content.extractAssetEmbeds(src);
   assert.equal(e.id, "art-q");
   assert.equal(src.slice(e.start, e.end), "![c](\n> spor-asset:art-q\n> \"t\"\n> )");
   assert.deepEqual(ids("> ![c](\n>\n> spor-asset:art-q)"), []);
+  // a `>` past the paragraph's container opens a new blockquote, ending the destination
+  assert.deepEqual(ids("![c](\n> spor-asset:art-q)"), []);
+  assert.deepEqual(ids("![c](\n>spor-asset:art-q)"), []);
+  assert.deepEqual(ids("> ![c](\n> > spor-asset:art-q)"), []);
+  assert.deepEqual(ids("# ![c](\nspor-asset:art-q)"), []);
+  assert.deepEqual(ids("> ![c](\nspor-asset:art-q)"), ["art-q"]);
+  assert.deepEqual(ids(">> ![c](\n> spor-asset:art-q)"), ["art-q"]);
 });
