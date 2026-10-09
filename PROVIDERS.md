@@ -415,6 +415,21 @@ different values is `invalid_event`. A second submit for the same attempt
 under a different handle or key is `attempt_handle_conflict`: adopt what the
 record names.
 
+The attempt index on these three events is **canonical**: a positive integer,
+or a string of decimal digits naming one (`"01"` is attempt 1). It is
+normalized before the replay key is derived, so `1` and `"01"` are one attempt
+on the log as on the record, and the journal stores the integer. Anything else
+(a fraction, an exponent, a boolean, an empty string) is `invalid_event`. A live
+`attempt.submitted` with no prior `attempt.submitting` for that attempt is also
+`invalid_event`: the submit key and request must be durable before any handle,
+or a successor has nothing to reconcile under. Replaying a journal written
+before these rules keeps its raw spelling, raw keys and request-less rows, so
+it still rebuilds, and a live exact retry of one of its raw-keyed rows reads as
+a replay (dec-spor-server-execution-attempt-index-canonical). The other event
+families (`gate.*`, `stage.*`, `integration.*`, `rescue.*`, and the server's
+`deploy.*`) still derive their keys from the raw attempt value; normalizing
+those is a separate change, since it moves golden keys.
+
 The work loop holds a submit whose acceptance is unknown in place. The
 execution and the item's hold stand, nothing is marked failed, and the next
 dispatch of the item re-sends the persisted request under the persisted key.
@@ -426,7 +441,13 @@ run is reported as `blocked.orphaned` in `spor work --status`. It is never
 dispatched here.
 
 **Adoption.** A restarted worker re-claims the execution as a new instance
-under an advanced fence. If the record carries `attempt.submitted`, it
+under an advanced fence. Before it acts on anything the record holds (adopting
+a handle or re-sending a persisted submit), it makes a fenced write: a renew
+of the execution lease under its own fence. Reading the record proves nothing
+about ownership, because a fenced-out worker reads the same record. A renew
+the store refuses (`fence_stale`, `lease_expired`) or cannot confirm (offline)
+means nothing is adopted or re-sent and the attempt is held, so a stale fence
+holder is refused at adoption, not at its next `attempt.observed`. If the record carries `attempt.submitted`, it
 **adopts** the live attempt by that handle (observe, collect, release) instead
 of submitting again. If it carries only the persisted key and request (the
 previous instance died while holding), it reconciles exactly as above and then

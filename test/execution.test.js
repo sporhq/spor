@@ -64,6 +64,9 @@ function applyAll(record, events, seen = new Set()) {
 
 const HANDLE = { provider: "container", id: "ctr-7f3a", host: "builder-2" };
 const SUBMIT_KEY = "exec-x/1/wrk-a1b2:4211:1696850000";
+// Every live attempt.submitted follows the attempt.submitting that persisted its
+// submit key and request (PROVIDERS.md §6).
+const SUBMITTING = { type: "attempt.submitting", attempt: 1, provider: "container", idempotency_key: SUBMIT_KEY, request: { op: "submit" }, at: T0, fence: 1 };
 
 test("kernel: attempt.submitting -> submitted -> observed -> stage.observed round-trips the provider handle", () => {
   const { record, results } = applyAll(opened(), [
@@ -88,7 +91,7 @@ test("kernel: attempt.submitting -> submitted -> observed -> stage.observed roun
 
 test("kernel: the same handle again replays; a different handle — even under a laundered key — is attempt_handle_conflict", () => {
   const sub = { type: "attempt.submitted", attempt: 1, provider: "container", handle: HANDLE, idempotency_key: SUBMIT_KEY, at: T1, fence: 1 };
-  const { record, seen } = applyAll(opened(), [sub]);
+  const { record, seen } = applyAll(opened(), [SUBMITTING, sub]);
   const dup = kernel.applyExecutionEvent(record, { ...sub, handle: { host: "builder-2", id: "ctr-7f3a", provider: "container" } }, { seen });
   assert.equal(dup.replayed, true);
   assert.equal(kernel.applyExecutionEvent(record, { ...sub, handle: { ...HANDLE, id: "ctr-other" } }, { seen }).code, "attempt_handle_conflict");
@@ -109,6 +112,7 @@ test("kernel: observe needs a handle, journals transitions not polls, and a term
   const base = opened();
   assert.equal(kernel.applyExecutionEvent(base, { type: "attempt.observed", attempt: 1, state: "running", at: T1, fence: 1 }).code, "invalid_event");
   const { record, seen, results } = applyAll(base, [
+    SUBMITTING,
     { type: "attempt.submitted", attempt: 1, provider: "container", handle: HANDLE, idempotency_key: SUBMIT_KEY, at: T1, fence: 1 },
     { type: "attempt.observed", attempt: 1, state: "running", at: T1, fence: 1 },
     { type: "attempt.observed", attempt: 1, state: "running", at: T2, fence: 1 },
@@ -116,15 +120,15 @@ test("kernel: observe needs a handle, journals transitions not polls, and a term
     { type: "attempt.observed", attempt: 1, state: "running", at: T3, fence: 1 },
     { type: "attempt.observed", attempt: 1, state: "lost", at: T3, fence: 1 },
   ]);
-  assert.equal(results[2].replayed, true);
-  assert.equal(results[4].replayed, undefined);
+  assert.equal(results[3].replayed, true);
+  assert.equal(results[5].replayed, undefined);
   assert.equal(record.attempts[0].provider.observed_seq, 4);
   assert.equal(kernel.applyExecutionEvent(record, { type: "attempt.observed", attempt: 1, state: "running", at: T3, fence: 1 }, { seen }).code, "invalid_event");
 });
 
 test("kernel: a fenced-out writer's conflicting submit hears fence_stale, never a handle to adopt; replay is deterministic and a plain record carries no provider", () => {
   const sub = { type: "attempt.submitted", attempt: 1, provider: "container", handle: HANDLE, idempotency_key: SUBMIT_KEY, at: T1, fence: 1 };
-  const { record, seen } = applyAll(opened(), [sub]);
+  const { record, seen } = applyAll(opened(), [SUBMITTING, sub]);
   const c = kernel.claim(record, { worker: "agent-two", machine: "box-2", lease_expires_at: "2026-09-06T23:00:00.000Z", now: "2026-09-06T00:00:00.000Z" });
   assert.equal(c.fence, 2);
   assert.deepEqual(c.record.attempts[0].provider.handle, HANDLE);
@@ -133,7 +137,96 @@ test("kernel: a fenced-out writer's conflicting submit hears fence_stale, never 
   assert.equal("provider" in applyAll(opened(), evs).record.attempts[0], false);
 });
 
+// The canonical attempt index and submitted-requires-submitting
+// (issue-spor-execution-attempt-event-key-normalization; mirrors the server's
+// lib-engine/test/execution.test.js rows for dec-spor-server-execution-attempt-
+// index-canonical).
+
+test("kernel: attempt index is canonical before the replay key: 1 and \"01\" are one attempt; a non-integer is refused", () => {
+  const sub = { type: "attempt.submitted", attempt: 1, provider: "container", handle: HANDLE, idempotency_key: SUBMIT_KEY, env: { image: "img:1" }, at: T1, fence: 1 };
+  const { record, seen, results } = applyAll(opened(), [{ ...SUBMITTING, attempt: "01" }, sub]);
+  for (const r of results) assert.equal(r.ok, true, r.message);
+  assert.equal(results[0].idempotency_key, `${record.execution_id}:attempt.submitting:1`);
+  assert.equal(kernel.derivedEventKey(record, { ...sub, attempt: "01" }), `${record.execution_id}:attempt.submitted:1`);
+  assert.equal(kernel.eventKey(record, { ...sub, attempt: "01" }), `${record.execution_id}:attempt.submitted:1`);
+  // "01" re-sends replay attempt 1's events — never overwrite its env…
+  const again = kernel.applyExecutionEvent(record, { ...sub, attempt: "01", env: { image: "img:2" } }, { seen });
+  assert.equal(again.replayed, true);
+  assert.deepEqual(record.attempts[0].provider.env, { image: "img:1" });
+  // …nor inflate observed_seq on a repeated poll.
+  const obs = applyAll(record, [
+    { type: "attempt.observed", attempt: 1, state: "running", at: T2, fence: 1 },
+    { type: "attempt.observed", attempt: "01", state: "running", at: T2, fence: 1 },
+    { type: "attempt.observed", attempt: "001", state: "running", at: T3, fence: 1 },
+  ], seen);
+  assert.deepEqual(obs.results.map((r) => !!r.replayed), [false, true, true]);
+  assert.equal(obs.record.attempts[0].provider.observed_seq, 1);
+  assert.equal(obs.record.attempts.length, 1);
+  for (const bad of [1.5, "1.0", "1e0", "", "0", 0, -1, true, null, " 1"]) {
+    const r = kernel.applyExecutionEvent(opened(), { ...SUBMITTING, attempt: bad }, { seen: new Set() });
+    assert.equal(r.code, "invalid_event", `attempt ${JSON.stringify(bad)} is refused`);
+  }
+  assert.deepEqual([1, "01", "7", 0, "1.0", 2.5, true].map(kernel.attemptIndex), [1, 1, 7, null, null, null, null]);
+});
+
+test("kernel: a live attempt.submitted with no prior attempt.submitting is refused; historical replay keeps the legacy row", () => {
+  const sub = { type: "attempt.submitted", attempt: 1, provider: "container", handle: HANDLE, idempotency_key: SUBMIT_KEY, at: T1, fence: 1 };
+  const live = kernel.applyExecutionEvent(opened(), sub, { seen: new Set() });
+  assert.equal(live.ok, false);
+  assert.equal(live.code, "invalid_event");
+  assert.match(live.message, /attempt\.submitting/);
+  const legacy = kernel.applyExecutionEvent(opened(), sub, { seen: new Set(), historicalReplay: true });
+  assert.equal(legacy.ok, true, legacy.message);
+  assert.deepEqual(legacy.record.attempts[0].provider.handle, HANDLE);
+  assert.equal(legacy.record.attempts[0].provider.request, null);
+});
+
+test("kernel: a journal written before the canonical index replays under its raw keys, and an exact retry of one of its rows replays", () => {
+  // The pre-normalization bug, as journaled: "01" submitting, then submitted
+  // under 1 AND re-sent under "1.0" (two rows, two raw keys).
+  const legacy = [
+    { ...SUBMITTING, attempt: "01" },
+    { type: "attempt.submitted", attempt: 1, provider: "container", handle: HANDLE, idempotency_key: SUBMIT_KEY, env: { image: "img:1" }, at: T1, fence: 1 },
+    { type: "attempt.submitted", attempt: "1.0", provider: "container", handle: HANDLE, idempotency_key: SUBMIT_KEY, env: { image: "img:2" }, at: T1, fence: 1 },
+  ];
+  let record = opened();
+  const seen = new Set();
+  for (const ev of legacy) {
+    const r = kernel.applyExecutionEvent(record, ev, { seen, historicalReplay: true });
+    assert.equal(r.ok, true, r.message);
+    assert.equal(r.replayed, undefined, "every legacy row is its own journal entry");
+    record = r.record;
+    seen.add(r.idempotency_key);
+  }
+  assert.ok(seen.has(`${record.execution_id}:attempt.submitting:01`));
+  assert.ok(seen.has(`${record.execution_id}:attempt.submitted:1.0`));
+  assert.equal(record.attempts.length, 1);
+  // A live exact retry of a raw-keyed row is that row, not a new one.
+  const retry = kernel.applyExecutionEvent(record, { ...legacy[0], at: T2 }, { seen });
+  assert.equal(retry.replayed, true);
+  assert.equal(retry.idempotency_key, `${record.execution_id}:attempt.submitting:01`);
+  // A non-integer spelling is history only: live, it is refused.
+  assert.equal(kernel.applyExecutionEvent(record, { ...legacy[2], at: T2 }, { seen }).code, "invalid_event");
+});
+
 // ---------------------------------------------------------------- 2. stores
+
+test("local store: a provider event is journaled under its canonical attempt index, and the log rebuilds the record", async () => {
+  const home = tmp("canon");
+  const eng = store.localExecutionEngine({ home, worker: "w", machine: "m", instance: "i1" });
+  const o = await eng.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }] });
+  const id = o.execution.execution_id;
+  assert.equal((await eng.event(id, { fence: o.fence, event: { type: "attempt.submitting", attempt: "01", provider: "synthetic", idempotency_key: SUBMIT_KEY, request: {} } })).ok, true);
+  const orphanSubmitted = await eng.event(id, { fence: o.fence, event: { type: "attempt.submitted", attempt: 2, provider: "synthetic", handle: "h2", submit_idempotency_key: SUBMIT_KEY } });
+  assert.equal(orphanSubmitted.code, "invalid_event", "a handle with no persisted submit is refused");
+  assert.equal((await eng.event(id, { fence: o.fence, event: { type: "attempt.submitted", attempt: "1", provider: "synthetic", handle: "h", submit_idempotency_key: SUBMIT_KEY } })).ok, true);
+  const rows = store.readEvents(home, "local", id).filter((e) => kernel.ATTEMPT_PROVIDER_EVENTS.includes(e.type));
+  assert.deepEqual(rows.map((e) => [e.attempt, e.idempotency_key]), [
+    [1, `${id}:attempt.submitting:1`],
+    [1, `${id}:attempt.submitted:1`],
+  ]);
+  assert.deepStrictEqual(store.rebuildFromEvents(home, "local", id), store.readRecord(home, "local", id));
+});
 
 test("local store: the provider key is journaled as submit_idempotency_key and the log rebuilds the record", async () => {
   const home = tmp("local");
@@ -314,6 +407,47 @@ test("driver: an attempt recorded under a provider this box does not run is clas
   assert.deepEqual(knobs.sent, []);
   const swept = await attempts.sweepProviderAttempts({ store: eng, configured: ["local"] });
   assert.deepEqual(swept.orphaned.map((o) => o.node_id), ["task-x"]);
+});
+
+test("driver: a stale fence holder is refused AT adoption — nothing adopted, and the store's renew is the fenced step", async () => {
+  const home = tmp("stale-adopt");
+  const { client, knobs } = syntheticClient();
+  const first = await openLocal(home, "i1");
+  const key = attempts.mintSubmitKey({ executionId: first.id, attempt: 1, fence: first.fence, instance: "i1" });
+  assert.equal((await attempts.submitAttempt({ store: first.eng, executionId: first.id, fence: first.fence, client, key, request: REQUEST })).ok, true);
+  // A takeover: a second instance re-claims and advances the fence.
+  const second = await openLocal(home, "i2");
+  assert.ok(second.fence > first.fence);
+  // The first instance reads the same record (the handle is on it) but its
+  // fence is gone: it is refused at adoption, not at its next observe.
+  const stale = await attempts.submitAttempt({ store: first.eng, executionId: first.id, fence: first.fence, client, key: "ignored-key-xyz", request: REQUEST });
+  assert.equal(stale.ok, false);
+  assert.equal(stale.held, true);
+  assert.equal(stale.fenced, true);
+  assert.equal(stale.code, "fence_stale");
+  assert.equal(stale.ownershipLost, true);
+  assert.equal(stale.handle, undefined, "a fenced-out caller is handed no handle to follow");
+  // The live holder still adopts.
+  const adopted = await attempts.submitAttempt({ store: second.eng, executionId: second.id, fence: second.fence, client, key: "ignored-key-xyz", request: REQUEST });
+  assert.equal(adopted.adopted, true, adopted.reason);
+  assert.deepEqual(knobs.sent, [key], "neither look re-sent anything");
+});
+
+test("driver: a stale fence holder is refused before a RECONCILE re-send, and an unconfirmable renew sends nothing", async () => {
+  const home = tmp("stale-reconcile");
+  const { client, knobs } = syntheticClient();
+  knobs.dropReply = 1;
+  const first = await openLocal(home, "i1");
+  const key = attempts.mintSubmitKey({ executionId: first.id, attempt: 1, fence: first.fence, instance: "i1" });
+  assert.equal((await attempts.submitAttempt({ store: first.eng, executionId: first.id, fence: first.fence, client, key, request: REQUEST })).acceptance, "unknown");
+  const offline = { ...first.eng, renew: async () => ({ ok: false, code: "transport", message: "offline" }) };
+  const unconfirmed = await attempts.submitAttempt({ store: offline, executionId: first.id, fence: first.fence, client, key, request: REQUEST });
+  assert.equal(unconfirmed.fenced, true);
+  assert.equal(unconfirmed.ownershipLost, false);
+  await openLocal(home, "i2");
+  const stale = await attempts.submitAttempt({ store: first.eng, executionId: first.id, fence: first.fence, client, key, request: REQUEST });
+  assert.equal(stale.code, "fence_stale");
+  assert.deepEqual(knobs.sent, [key], "no re-send under a fence that could not be confirmed");
 });
 
 test("driver: a lost reply surfaces as a LostReply-shaped hold, never a refusal", async () => {
