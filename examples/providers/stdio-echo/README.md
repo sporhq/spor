@@ -8,7 +8,15 @@ Each attempt "runs" in its own scratch directory: a runner process commits the
 attempt spec to a fresh git repository there, and that commit is the
 candidate. stdio-echo runs no harness and resolves no secret. A real provider
 replaces the runner with `spor attempt run <bundle>` inside the environment it
-builds (a container, a VM), and publishes the branch to the repo's `url`.
+builds, such as a container or a VM ([PROVIDERS.md §13](../../../PROVIDERS.md)).
+That runner checks the pinned repos out, runs the harness, and pushes the branch
+to the repo's `url` before a manifest names it.
+
+stdio-echo keeps its own echo runner on purpose. `spor provider check` drives
+it with attempts that pin synthetic commits in repos that do not exist. No
+environment can check those out, so `spor attempt run` would refuse every one
+of them before launch, and the conformance suite would only ever see the
+refusal.
 
 ## Try it
 

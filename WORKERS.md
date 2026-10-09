@@ -544,6 +544,25 @@ briefing before acting non-trivially, per AGENTS.md's standing instruction to
 every session working this graph, and (b) knows which node it is working on,
 so its terminal report (§6) can name it.
 
+### 4.1 The attempt bundle
+
+When an attempt runs in an environment an execution provider provisioned
+rather than on the worker's box, this prompt travels in a portable **attempt
+bundle** (PROVIDERS.md §13). `spor attempt build <execution-id>` derives the
+bundle from the execution record, the item's dispatch plan and the factory's
+worker contract. `spor attempt run <bundle>` executes it in the environment
+with the unchanged harness adapters. The bundle's `prompt/prompt.md` is
+exactly the string above, so a sandboxed worker sees the same context a local
+one does. Its parts sit beside it as `session.md`, `briefing.md` and
+`task.md`. The bundle also carries the attempt spec (`attempt.json`), the
+pinned repos (`repos.json`) and optional non-secret harness settings
+(`env.json`).
+
+A bundle never carries a secret. The attempt-scoped Spor token reaches the
+environment through the provider's declared `secret_delivery` channel, as
+`SPOR_TOKEN` or `SPOR_DISPATCH_CHILD_TOKEN`, and a bundle carrying a value is
+refused.
+
 ## 5. Machine capability declaration (optional, for routed dispatch)
 
 A worker box may **publish** what it can run so a routing layer can pick a

@@ -243,6 +243,13 @@ function conformanceSetup() {
   const home = scratchHome("spor-lprov-conf-");
   const repo = gitRepo("spor-lprov-conf-repo-");
   git(repo, ["remote", "add", "origin", "https://conformance.spor.invalid/conformance.git"]);
+  // The origin is REACHABLE: collect publishes the candidate branch there and
+  // reads it back before naming it (task-spor-attempt-bundle-run): the
+  // remote's PUSH url is a scratch bare repo, its fetch url (the locator a
+  // manifest names) stays https.
+  const origin = fs.mkdtempSync(path.join(os.tmpdir(), "spor-lprov-origin-"));
+  git(origin, ["init", "-q", "--bare"]);
+  git(repo, ["config", "remote.origin.pushurl", origin]);
   fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({
     dispatch: { repos: { conformance: repo }, capabilities: { declared: { harnesses: ["claude-code"] } } },
   }));
@@ -297,7 +304,7 @@ function conformanceSetup() {
     pollIntervalMs: 100,
     maxPolls: 600,
   };
-  return { home, repo, cfg, provider, driver, lines };
+  return { home, repo, origin, cfg, provider, driver, lines };
 }
 
 test("the local provider passes the conformance suite over real supervisor launches", async () => {
@@ -309,8 +316,8 @@ test("the local provider passes the conformance suite over real supervisor launc
   assert.strictEqual(provider.environments(), 0, "every scenario released what it submitted");
 });
 
-test("the local provider's collect names the candidate the harness committed, through the repo's origin", async () => {
-  const { home, repo, provider, driver } = conformanceSetup();
+test("the local provider's collect publishes the candidate the harness committed to the repo's origin, then names it", async () => {
+  const { home, repo, origin, provider, driver } = conformanceSetup();
   const r = await conf.runScenario(provider, "observe-collect", { home, driver, matcher: sat.satisfiesAttempt });
   assert.strictEqual(r.skipped, undefined);
   // Drive one more attempt by hand to look at the manifest itself.
@@ -343,6 +350,7 @@ test("the local provider's collect names the candidate the harness committed, th
   assert.deepStrictEqual(col.manifest.candidate.reference, {
     kind: "branch", locator: "https://conformance.spor.invalid/conformance.git", ref: `refs/heads/${attempt.local.name}`, commit: head,
   });
+  assert.strictEqual(git(origin, ["rev-parse", `refs/heads/${attempt.local.name}`]).trim(), head, "the branch was pushed to the origin before the manifest named it");
   assert.ok(col.manifest.log_refs[0].startsWith("file://"), "the log is referenced");
   const rel = (await provider.request({ contract_version: 1, id: "x", op: "release", params: { handle } })).result;
   assert.deepStrictEqual(rel, { released: true, worktree: { removed: true } });

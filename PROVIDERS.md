@@ -18,8 +18,9 @@ specs: [WORKERS.md](WORKERS.md) (the worker protocol, the prompt contract
 
 **Status.** The contract, the `local` provider and the resolution rule are
 shipped; the subprocess stdio binding
-(§12, `lib/shell/providers/stdio.js`, with `examples/providers/stdio-echo/` and `spor provider check <id>`; no worker drives a binding yet) is shipped too; the in-environment runner
-(task-spor-attempt-bundle-run), the worker's persisted attempt handle
+(§12, `lib/shell/providers/stdio.js`, with `examples/providers/stdio-echo/` and `spor provider check <id>`; no worker drives a binding yet) is shipped too, and so are
+the attempt bundle and the in-environment runner `spor attempt build|run` (§13,
+`lib/shell/attempt-bundle.js` + `lib/shell/attempt.js`); the worker's persisted attempt handle
 (task-spor-work-attempt-handle-adoption) and the server's attempt-scoped token
 are separate items. `spor work` therefore behaves today exactly as WORKERS.md
 describes: every launch goes through the one door (`executeDispatch` in
@@ -554,10 +555,11 @@ id, and the key→handle table lives in memory until the worker persists handles
 (launching → `provisioning`, running → `running`, a closed record → `finished`
 with the harness exit, a vanished one → `lost`, and a non-terminal record whose
 supervisor is demonstrably gone → `lost`); `collect` answers the branch's HEAD
-once it moved past the launch's base commit, referenced through the repo's
-`origin` URL (a manifest must be fetchable off the environment, so a repo with
-no `origin` has no manifest and says why), plus the report and log as `file://`
-references; `cancel` is SIGTERM to the supervisor's process group (identity-
+once it moved past the launch's base commit, PUSHED to the repo's `origin` (its
+push URL when one is set) and read back before the manifest names it by the
+fetch URL — the same honest publication `spor attempt run` makes (§13), so a
+repo with no `origin`, or a push that does not land, has no manifest and says
+why — plus the report and log as `file://` references; `cancel` is SIGTERM to the supervisor's process group (identity-
 gated), `force` the TERM-then-KILL stop with the record closed as cancelled;
 `release` stops anything still running and removes the worktree this submit
 created. Secrets are not materialized, since the harness runs with the
@@ -569,7 +571,7 @@ records, same journal paths, same prompt bytes — and
 `submit` runs a labelled container (`spor.execution=<id>`, `spor.fence=<n>`)
 from an image carrying `spor` and the harness, mounts each resolved secret as
 a file, applies the egress allowlist with a network policy or a proxy, and
-starts `spor attempt run <bundle>`. The label gives `submit` idempotency: an
+starts `spor attempt run <bundle>` (§13). The label gives `submit` idempotency: an
 existing container with the key's label is returned with `existing: true`.
 `observe` maps the container state onto §5 and relays the runner's status
 stream. `collect` reads the manifest the runner wrote to a mounted volume.
@@ -747,3 +749,110 @@ written, and before a process is spawned for it. It answers
 
 The refusal names the field, never the value. The child's environment is the
 worker's with every Spor credential removed, plus the declaration's `env`.
+
+## 13. The attempt bundle and `spor attempt run`
+
+A provider that runs an attempt somewhere other than the worker's own box ships
+the attempt in as a **bundle** and runs it there with `spor attempt run`. The
+runner reuses the harness adapters unchanged: the same registry, the same
+machine-declared `dispatch.harness.<id>` bindings, the same supervisor, run
+record, log and report a local dispatch makes. Only the environment differs.
+
+### 13.1 The bundle
+
+A bundle is a directory, or the same tree as a POSIX ustar archive (`.tar`):
+
+| file | holds |
+|---|---|
+| `attempt.json` | The attempt spec (§4). It must validate against the `attempt-spec` schema. |
+| `prompt/prompt.md` | The exact prompt the harness receives on stdin (WORKERS.md §4). |
+| `prompt/session.md`, `briefing.md`, `task.md` | The parts it was assembled from, when known. These are descriptive; the runner reads only `prompt.md`. |
+| `repos.json` | `{"bundle_format": 1, "repos": [{slug, commit, branch, url?}]}`, the pinned checkouts. These must agree with `attempt.repos` exactly. |
+| `env.json` | Optional, non-secret settings: `{"env": {NAME: value}, "harness": {permission_mode?, sandbox?, approval_policy?, read_only?}}`. |
+
+An attempt whose prompt rides inside the bundle names it with
+`prompt_bundle_ref: "spor-bundle://prompt/"`.
+
+**Secrets never ride a bundle.** The attempt names its secrets by reference
+(§4.2) and its Spor credential as `spor.token_ref` (§4.3). The provider
+delivers the values through its declared `secret_delivery` channel. The
+attempt-scoped Spor token reaches the runner's environment as `SPOR_TOKEN` or
+`SPOR_DISPATCH_CHILD_TOKEN`, and the runner hands it to the harness. A bundle
+is refused, by `build` before it is written and by `run` before anything is
+checked out, when it carries any of these:
+
+- a secret entry or `spor` block with a value;
+- a credential-shaped string in any file, the prompt included;
+- an `env.json` name that reads as a credential (`*_TOKEN`, `*_SECRET`, `*_API_KEY`, …);
+- a value the process itself holds as a Spor credential.
+
+The refusal names the file and field. It never echoes the value.
+
+### 13.2 `spor attempt build <execution-id> --out <dir|file.tar>`
+
+This runs on the worker side. It derives the bundle and never asks anyone to
+write it by hand:
+
+- **Identity.** From the execution record: `execution_id`, the owner's fence,
+  the owning instance as `attempt_id`, the tenant and the item. An execution
+  with no live owner is refused.
+- **What runs.** From the dispatch plan for the item, which is the same
+  read-only plan `spor dispatch --print` resolves: the harness, the model, the
+  profile and its runtime needs, the compiled briefing, and the factory's
+  worker contract as the task.
+- **The pin.** The mapped checkout's commit (`--ref`, default `HEAD`) and its
+  portable `origin` URL. The attempt commits to `--branch` (default
+  `spor/<node-id>`).
+- **The graph.** `spor.server` is the server, or, for a local-mode attempt, the
+  graph's `nodes/` directory as a `file://` reference.
+
+### 13.3 `spor attempt run <bundle>`
+
+This runs on the sandbox side. In order:
+
+1. It verifies the bundle (§13.1).
+2. It clones every repo from its `url` into `--workdir/<slug>` and checks it
+   out at the pinned commit on the attempt's branch. `--repo <slug>=<path|url>`
+   clones from a mirror instead. A repo that cannot be checked out at its pin
+   fails **before launch**, naming the repo and the reason.
+3. It resolves the harness adapter by `harness.id` and builds its argv with the
+   bundle's harness settings. The settings are validated, translated and
+   defaulted exactly as `spor dispatch` does it.
+4. It launches the harness under the supervisor and relays the run as status
+   lines on stdout.
+
+Each status line is an observe-result (§5) with `kind`, `at` and `run_id`
+added. Unknown fields are ignored, so every line validates:
+
+```json provider-contract=observe-result
+{
+  "kind": "status",
+  "state": "running",
+  "since": "2026-10-09T10:04:11Z",
+  "at": "2026-10-09T10:04:12Z",
+  "run_id": "3f0c2a9e-6d1b-4c55-9a3e-2b7d8e1f4a60"
+}
+```
+
+The states run `pending` (bundle verified) → `provisioning` (checkouts, then
+the supervisor starting) → `running` → `stopping` (the harness exited or was
+told to stop, and the candidate is being collected) → `finished`, with the
+harness exit. A refusal before launch is a single `failed`. A SIGTERM to the
+runner, or the attempt's `deadline` passing, stops the harness through the
+supervisor and then collects what is there.
+
+At exit the runner **publishes the candidate honestly**. It pushes the
+checkout's HEAD, if it moved past the pin, to `refs/heads/<branch>` at the
+repo's `url`, never forced, and reads the ref back. Only then does a manifest
+name it (§7). It writes the collect-result to `--out/manifest.json` beside
+`status.jsonl`, `report.md` and `harness.jsonl`, and prints it as the last
+stdout line, `{"kind": "result", …collect-result}`. The exit code mirrors the
+manifest: `0` means a manifest; `1` means no candidate (the attempt produced
+nothing, or it could not be published); `2` means the attempt was refused
+before launch.
+
+The `local` provider (§11) uses the same path in-process. It wraps the launch
+a dispatch built as an in-memory bundle, launches it through the same door, and
+reads and collects through the same functions. So an attempt behaves the same
+whether it runs on the worker's box or in a provider's sandbox.
+

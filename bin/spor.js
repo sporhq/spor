@@ -85,6 +85,8 @@ const workLib = lazyModule(path.join(ROOT, "lib", "shell", "work.js"));
 const sat = lazyModule(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 const providerContract = lazyModule(path.join(ROOT, "lib", "kernel", "provider-contract.js"));
 const stdioProviders = lazyModule(path.join(ROOT, "lib", "shell", "providers", "stdio.js"));
+const attemptBundle = lazyModule(path.join(ROOT, "lib", "shell", "attempt-bundle.js"));
+const attemptRunner = lazyModule(path.join(ROOT, "lib", "shell", "attempt.js"));
 const providerConformance = lazyModule(path.join(ROOT, "lib", "shell", "provider-conformance.js"));
 // The `local` execution provider: its describe() lives with the provider
 // (lib/shell/providers/local.js, task-spor-work-local-provider-refactor).
@@ -11146,8 +11148,11 @@ function harnessReadOnlyPostures() {
 // the module sees.
 let _dispatcher = null;
 function dispatcher() {
-  if (!_dispatcher) {
-    _dispatcher = dispatchLib.createDispatcher({
+  if (!_dispatcher) _dispatcher = dispatchLib.createDispatcher(dispatcherHost());
+  return _dispatcher;
+}
+function dispatcherHost() {
+  return {
     err, out, acquireLocalDispatchLock, agentIdGuess, autoRouteToFleetHost, badNodeIdReason,
     claimDispatch, compileBriefing, createDispatchWorktree, dirHostsSlug, dispatchAgentId,
     dispatchDeclineFindingCheck, dispatchReadinessCheck, dispatchResolutionReason,
@@ -11156,9 +11161,7 @@ function dispatcher() {
     releaseLocalDispatchLock, removeDispatchWorktree, renderLaunchArg, renderTemplate,
     reportFleetHosts, resolveDir, resolveDispatchProfile, resolveNode, shellQuote,
     targetRepoDispatchCfg, topQueueItem, worktreeName, writeDispatchMcpConfig,
-    });
-  }
-  return _dispatcher;
+  };
 }
 
 function cmdDispatch(cfg, args, ctx = null) {
@@ -18651,6 +18654,189 @@ async function cmdProvider(cfg, args) {
   return report.ok ? 0 : 1;
 }
 
+// `spor attempt build|run` (task-spor-attempt-bundle-run, PROVIDERS.md §13):
+// the two halves of an attempt that runs somewhere a provider provisioned.
+// `build` is the WORKER side — it derives the portable bundle (attempt spec,
+// prompt, pinned repos, non-secret settings; never a secret) from an execution
+// record, the dispatch plan for its item and the factory's worker contract.
+// `run` is the SANDBOX side — it verifies the bundle, checks the repos out at
+// their pins, launches the harness under the supervisor with the unchanged
+// adapter, relays status lines on stdout and leaves the result manifest.
+const ATTEMPT_USAGE =
+  "usage: spor attempt build <execution-id> --out <dir|file.tar> [--branch <b>] [--ref <rev>] [--deadline <dur>] [--isolation worktree|container|vm] [--egress <host>]... [--tool <bin>]... [--profile <id>] [--model <m>] [--permission-mode <m>] [--sandbox <s>] [--approval-policy <p>] [--no-brief] [--local] [--json]\n" +
+  "       spor attempt run <bundle> [--workdir <dir>] [--out <dir>] [--repo <slug>=<path|url>]...";
+
+async function cmdAttempt(cfg, args) {
+  const sub = args[0];
+  if (sub === "build") return cmdAttemptBuild(cfg, args.slice(1));
+  if (sub === "run") return cmdAttemptRun(cfg, args.slice(1));
+  err(ATTEMPT_USAGE);
+  return 1;
+}
+
+function parseAttemptArgs(args, options) {
+  try {
+    return parseArgs({ args, options, allowPositionals: true, strict: true });
+  } catch (e) {
+    err(`spor attempt: ${e.message}`);
+    err(ATTEMPT_USAGE);
+    return null;
+  }
+}
+
+async function cmdAttemptBuild(cfg, args) {
+  const parsed = parseAttemptArgs(args, {
+    out: { type: "string" }, branch: { type: "string" }, ref: { type: "string" }, deadline: { type: "string" },
+    isolation: { type: "string" }, egress: { type: "string", multiple: true }, tool: { type: "string", multiple: true },
+    profile: { type: "string" }, model: { type: "string" }, "permission-mode": { type: "string" }, sandbox: { type: "string" },
+    "approval-policy": { type: "string" }, "no-brief": { type: "boolean" }, local: { type: "boolean" }, json: { type: "boolean" },
+  });
+  if (!parsed) return 1;
+  const { values, positionals } = parsed;
+  const id = positionals[0];
+  if (!id || positionals.length > 1 || !values.out) {
+    err(ATTEMPT_USAGE);
+    return 1;
+  }
+  const isolation = values.isolation || "container";
+  if (!providerContract.ISOLATION_KINDS.includes(isolation)) {
+    err(`spor attempt build: --isolation must be one of ${providerContract.ISOLATION_KINDS.join(", ")}`);
+    return 1;
+  }
+  const deadlineMs = values.deadline != null ? parseDurationMs(values.deadline) : cfg.getNum("work.runMaxMs", 86400000);
+  if (!deadlineMs) {
+    err(`spor attempt build: --deadline '${values.deadline}' is not a duration (30m, 4h, 1d)`);
+    return 1;
+  }
+  const store = openExecutionStoreFor(cfg, { mode: values.local ? "local" : null, log: (l) => err(`note: ${l}`) });
+  const got = await store.get(id);
+  if (!got.ok) {
+    err(`spor attempt build: ${got.transport ? `offline — ${got.message}` : `${got.code}: ${got.message}`}`);
+    return 1;
+  }
+  const x = got.execution;
+  if (x.terminal) {
+    err(`spor attempt build: execution ${x.execution_id} is terminal (${x.stage}) — there is no attempt left to run`);
+    return 1;
+  }
+  // The worker contract the factory states, exactly as `spor work` hands it
+  // to an implementer (WORKERS.md §4 part 4).
+  const loaded = await loadFactoryDefinition(cfg, x.factory.node_id);
+  if (!loaded.factory) {
+    err(`spor attempt build: the execution's factory could not be loaded: ${(loaded.errors || []).join("; ")}`);
+    return 1;
+  }
+  const passthrough = { node: x.item.node_id, print: true };
+  for (const k of ["profile", "model", "permission-mode", "sandbox", "approval-policy", "no-brief"]) if (values[k] != null) passthrough[k] = values[k];
+  // The plan is READ-ONLY (it may print, and nothing else): its diagnostic
+  // lines go to stderr so stdout carries only this verb's own answer.
+  const plan = await attemptDispatcher().planDispatch(cfg, { values: passthrough, positionals: [workerContract({ nodeId: x.item.node_id, factory: loaded.factory })] }, { carryTask: true, supervisedOnly: true, unattended: true });
+  if (typeof plan === "number") return plan;
+  const repoDir = plan.res.dir;
+  const slug = plan.res.slug;
+  const rev = values.ref || "HEAD";
+  const commitOut = u.git(repoDir, ["rev-parse", "--verify", "--quiet", `${rev}^{commit}`]);
+  const commit = commitOut == null ? "" : String(commitOut).trim();
+  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commit)) {
+    err(`spor attempt build: '${rev}' does not name a commit in ${repoDir}`);
+    return 1;
+  }
+  const remoteUrl = candidatePublish.resolveRemoteUrl("origin", repoDir);
+  const url = remoteUrl.ok && !candidatePublish.portableRemoteRefusal(remoteUrl.url) ? remoteUrl.url : null;
+  if (!url) err(`warning: ${repoDir} has no portable 'origin' url — the bundle pins ${slug} without one, so 'spor attempt run' needs --repo ${slug}=<path|url> and cannot publish a candidate`);
+  const server = cfg.mode() === "remote" ? remote.base(cfg) : require("url").pathToFileURL(cfg.nodesDir()).href;
+  const built = attemptBundle.bundleFromPlan({
+    execution: x,
+    plan,
+    repo: { slug, commit, branch: values.branch || `spor/${x.item.node_id}`, url },
+    server,
+    deadline: new Date(Date.now() + deadlineMs).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    isolation,
+    egress: values.egress || [],
+    tools: values.tool || [],
+  });
+  if (built.error) {
+    err(`spor attempt build: ${built.error}`);
+    return 1;
+  }
+  const held = [remote.token(cfg)].filter(Boolean);
+  const verdict = attemptBundle.verifyBundle(built.bundle, { knownSecrets: held });
+  if (!verdict.ok) {
+    err(`spor attempt build: the bundle would be refused — ${verdict.errors.join("; ")}`);
+    return 1;
+  }
+  let written;
+  try {
+    written = attemptBundle.writeBundle(built.bundle, values.out);
+  } catch (e) {
+    err(`spor attempt build: ${e.message}`);
+    return 1;
+  }
+  if (values.json) out(JSON.stringify({ bundle: written.path, kind: written.kind, files: written.files, attempt: built.bundle.attempt }, null, 2));
+  else {
+    out(`bundle:  ${written.path} (${written.kind})`);
+    out(`attempt: ${built.bundle.attempt.attempt_id} of ${x.execution_id}, fence ${built.bundle.attempt.fence}, ${x.item.node_id}`);
+    out(`harness: ${built.bundle.attempt.harness.id}; repo ${slug} @ ${commit.slice(0, 12)} -> ${built.bundle.attempt.repos[0].branch}`);
+  }
+  return 0;
+}
+
+async function cmdAttemptRun(cfg, args) {
+  const parsed = parseAttemptArgs(args, { workdir: { type: "string" }, out: { type: "string" }, repo: { type: "string", multiple: true } });
+  if (!parsed) return 1;
+  const { values, positionals } = parsed;
+  if (positionals.length !== 1) {
+    err(ATTEMPT_USAGE);
+    return 1;
+  }
+  const src = path.resolve(positionals[0]);
+  // The default work and result dirs sit BESIDE the bundle, never inside it.
+  const base = path.dirname(src);
+  const sources = {};
+  for (const spec of values.repo || []) {
+    const eq = spec.indexOf("=");
+    if (eq <= 0) {
+      err(`spor attempt run: --repo '${spec}' is not <slug>=<path|url>`);
+      return 1;
+    }
+    const v = spec.slice(eq + 1);
+    sources[spec.slice(0, eq)] = /^[a-z][a-z0-9+.-]*:\/\//i.test(v) ? v : path.resolve(v);
+  }
+  // A provider's cancel arrives as a signal: wind the run down (the collect
+  // window), then report and exit as usual.
+  const stopSignal = { stop: null };
+  const onSignal = (sig) => {
+    stopSignal.stop = `the runner received ${sig}`;
+  };
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+  try {
+    const { code } = await attemptRunner.runAttempt({
+      cfg,
+      src,
+      workDir: path.resolve(values.workdir || path.join(base, "work")),
+      outDir: path.resolve(values.out || path.join(base, "result")),
+      sources,
+      host: { launchSupervisedHarness },
+      emit: (line) => out(JSON.stringify(line)),
+      knownSecrets: [remote.token(cfg)].filter(Boolean),
+      stopSignal,
+    });
+    return code;
+  } finally {
+    process.removeListener("SIGTERM", onSignal);
+    process.removeListener("SIGINT", onSignal);
+  }
+}
+
+// A dispatcher whose plan output goes to stderr (`spor attempt build` keeps
+// stdout for its own answer); everything else is the CLI's dispatcher host.
+let _attemptDispatcher = null;
+function attemptDispatcher() {
+  if (!_attemptDispatcher) _attemptDispatcher = dispatchLib.createDispatcher({ ...dispatcherHost(), out: err });
+  return _attemptDispatcher;
+}
+
 // cmdCapabilitiesPublish — push this box's EFFECTIVE capabilities to the team
 // server's fleet scheduler (POST /v1/agents/{id}/capabilities,
 // task-spor-remote-fleet-scheduler). The published body is the same
@@ -20869,6 +21055,41 @@ const COMMANDS = {
       "declared provider's describe(). PROVIDERS.md §12 specifies the binding.",
     examples: ["spor provider check stdio-echo", "spor provider check stdio-echo --json"],
     run: (cfg, args) => cmdProvider(cfg, args),
+  },
+  attempt: {
+    group: "Dispatch (background agents)", parse: "raw",
+    args: "build <execution-id> --out <dir|file.tar> [...] | run <bundle> [--workdir <d>] [--out <d>] [--repo <slug>=<src>]...",
+    summary: "build a portable attempt bundle, or run one inside a provider's environment",
+    help:
+      "The two halves of an attempt that runs where an execution provider put it\n" +
+      "(PROVIDERS.md §13).\n\n" +
+      "  spor attempt build <execution-id> --out <dir|file.tar>\n" +
+      "      WORKER side. Derives the attempt bundle from the execution record (identity,\n" +
+      "      fence, tenant, item), the dispatch plan for its item (harness, model,\n" +
+      "      profile, compiled briefing) and the factory's worker contract:\n" +
+      "        attempt.json  the attempt spec    prompt/   the WORKERS.md §4 prompt\n" +
+      "        repos.json    pinned commits      env.json  non-secret harness settings\n" +
+      "      Secrets never ride a bundle: they are named by reference and the provider\n" +
+      "      delivers them (the attempt token as SPOR_TOKEN / SPOR_DISPATCH_CHILD_TOKEN).\n" +
+      "      --ref pins the commit (default HEAD of the mapped checkout), --branch the\n" +
+      "      branch the attempt commits to (default spor/<node-id>), --deadline its wall\n" +
+      "      clock (default work.runMaxMs), --isolation the environment kind (container).\n\n" +
+      "  spor attempt run <bundle>\n" +
+      "      SANDBOX side. Verifies the bundle (a bundle carrying a secret value is\n" +
+      "      refused), checks every repo out at its pinned commit under --workdir (default\n" +
+      "      <bundle>/../work; --repo <slug>=<path|url> clones from a mirror instead of\n" +
+      "      the pinned url), runs the harness under the supervisor and prints one status\n" +
+      "      line per state on stdout ({kind: status, state, since, at, run_id, detail} —\n" +
+      "      an observe-result) and, at exit, {kind: result, ...collect-result}. The\n" +
+      "      candidate branch is pushed to the repo's url and read back before the\n" +
+      "      manifest names it. --out (default <bundle>/../result) receives\n" +
+      "      manifest.json, status.jsonl, report.md and harness.jsonl.\n" +
+      "      Exit 0: a manifest. 1: no candidate. 2: refused before launch.",
+    examples: [
+      "spor attempt build exec-3f9c0a1b2c3d4e5f --out /tmp/attempt.tar",
+      "spor attempt run /tmp/attempt.tar --workdir /work --out /result",
+    ],
+    run: (cfg, args) => cmdAttempt(cfg, args),
   },
 
   // --- Other ---
