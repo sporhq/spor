@@ -168,6 +168,7 @@ test("a declaration is refused loudly: relative command, unknown key, reserved i
     command: "/usr/bin/p",
     args: [],
     env: { VAULT_ADDR: "https://v" },
+    inheritEnv: [],
     timeoutMs: stdio.DEFAULT_TIMEOUT_MS,
   });
   assert.ok(REPO_FORBIDDEN_PATHS.includes("dispatch.provider"), "a committable .spor.json can never declare what a machine executes");
@@ -309,6 +310,95 @@ test("the provider's stderr is mirrored with its id; the child env carries no Sp
   const q = bind(declaration, { env: { ...hermeticEnv(), SPOR_TOKEN: "worker-token-abcdef" } });
   const leak = await q.request(req("observe", { handle: { provider: "fake", id: "worker-token-abcdef" } }));
   assert.equal(leak.error.code, "secret_by_value");
+});
+
+test("inherit_env is a list of variable names and may not opt a Spor credential back in", () => {
+  const n = stdio.normalizeProviderDeclaration;
+  assert.match(n("p", { command: "p", inherit_env: "AWS_PROFILE" }).error, /inherit_env must be an array of environment variable names/);
+  assert.match(n("p", { command: "p", inherit_env: ["NOT-A-NAME"] }).error, /inherit_env must be an array/);
+  assert.match(n("p", { command: "p", inherit_env: ["SPOR_ADMIN_TOKEN"] }).error, /inherit_env names SPOR_ADMIN_TOKEN — a Spor credential never reaches a provider/);
+  assert.deepEqual(n("p", { command: "p", inherit_env: ["AWS_PROFILE", "AWS_PROFILE"] }).declaration.inheritEnv, ["AWS_PROFILE"]);
+});
+
+test("the child environment is an allowlist: base names, LC_*, opted-in names, then the declaration's env", () => {
+  const worker = {
+    PATH: "/usr/bin",
+    HOME: "/home/w",
+    LANG: "C.UTF-8",
+    LC_ALL: "C",
+    LC_CTYPE: "C",
+    TZ: "UTC",
+    TMPDIR: "/tmp",
+    GITHUB_TOKEN: "ghp_x",
+    ANTHROPIC_API_KEY: "sk-ant-x",
+    OPENAI_API_KEY: "sk-x",
+    AWS_ACCESS_KEY_ID: "AKIA",
+    AWS_SECRET_ACCESS_KEY: "s",
+    AWS_PROFILE: "dev",
+    SPOR_TOKEN: "t",
+    SPOR_SERVER: "https://s",
+    SystemRoot: "C:\\Windows",
+  };
+  const decl = (raw) => declare("p", { command: "/usr/bin/p", ...raw });
+  assert.deepEqual(stdio.providerChildEnv(decl({}), worker, "linux"), {
+    PATH: "/usr/bin",
+    HOME: "/home/w",
+    LANG: "C.UTF-8",
+    LC_ALL: "C",
+    LC_CTYPE: "C",
+    TZ: "UTC",
+    TMPDIR: "/tmp",
+  });
+  const opted = stdio.providerChildEnv(decl({ inherit_env: ["AWS_PROFILE", "NOT_SET_HERE"], env: { HOME: "/srv/p", VAULT_ADDR: "https://v" } }), worker, "linux");
+  assert.equal(opted.AWS_PROFILE, "dev");
+  assert.equal(opted.HOME, "/srv/p", "the declaration's env wins over an inherited value");
+  assert.equal(opted.VAULT_ADDR, "https://v");
+  assert.equal("NOT_SET_HERE" in opted, false);
+  assert.equal(opted.AWS_SECRET_ACCESS_KEY, undefined);
+  // A hand-built declaration cannot opt a Spor credential in either.
+  const handBuilt = stdio.providerChildEnv({ id: "p", command: "p", args: [], env: { SPOR_TOKEN: "x" }, inheritEnv: ["SPOR_TOKEN"] }, worker, "linux");
+  assert.equal("SPOR_TOKEN" in handBuilt, false);
+  // Windows: the start-up essentials ride along, matched case-insensitively.
+  const win = stdio.providerChildEnv(decl({ inherit_env: ["aws_profile"] }), { ...worker, Path: "C:\\bin" }, "win32");
+  assert.equal(win.SystemRoot, "C:\\Windows");
+  assert.equal(win.Path, "C:\\bin");
+  assert.equal(win.AWS_PROFILE, "dev");
+  assert.equal(win.GITHUB_TOKEN, undefined);
+});
+
+test("a spawned provider sees no ambient credential unless its declaration opts the name in", async () => {
+  const { declaration } = fakeProvider(`
+    const pick = ["GITHUB_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "SPOR_TOKEN", "VAULT_ADDR", "PATH"];
+    const seen = {};
+    for (const k of pick) seen[k] = process.env[k] === undefined ? null : process.env[k];
+    out({ id: msg.id, ok: true, result: { provider_id: "fake", contract_version: 1, capabilities: { isolation: ["vm"], lifecycle: [] }, seen } });`);
+  const env = {
+    ...hermeticEnv(),
+    GITHUB_TOKEN: "gh-value",
+    ANTHROPIC_API_KEY: "anthropic-value",
+    OPENAI_API_KEY: "openai-value",
+    AWS_ACCESS_KEY_ID: "aws-id-value",
+    AWS_SECRET_ACCESS_KEY: "aws-secret-value",
+    SPOR_TOKEN: "worker-token-abcdef",
+  };
+  const plain = bind({ ...declaration, env: { VAULT_ADDR: "https://vault.invalid" } }, { env });
+  const a = (await plain.request(req("describe"))).result.seen;
+  assert.deepEqual(a, {
+    GITHUB_TOKEN: null,
+    ANTHROPIC_API_KEY: null,
+    OPENAI_API_KEY: null,
+    AWS_ACCESS_KEY_ID: null,
+    AWS_SECRET_ACCESS_KEY: null,
+    SPOR_TOKEN: null,
+    VAULT_ADDR: "https://vault.invalid",
+    PATH: env.PATH === undefined ? null : env.PATH,
+  });
+  const optedIn = bind({ ...declaration, inheritEnv: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] }, { env });
+  const b = (await optedIn.request(req("describe"))).result.seen;
+  assert.equal(b.AWS_ACCESS_KEY_ID, "aws-id-value");
+  assert.equal(b.AWS_SECRET_ACCESS_KEY, "aws-secret-value");
+  assert.equal(b.GITHUB_TOKEN, null);
+  assert.equal(b.SPOR_TOKEN, null);
 });
 
 test("a planned close does not mark held handles lost; a closed binding refuses", async () => {

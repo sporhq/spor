@@ -693,6 +693,7 @@ global `$XDG_CONFIG_HOME/spor/config.json`:
         "command": "node",
         "args": ["/opt/spor/examples/providers/stdio-echo/provider.js", "--root", "/var/tmp/stdio-echo"],
         "env": { "VAULT_ADDR": "https://vault.internal" },
+        "inherit_env": ["HTTPS_PROXY", "NO_PROXY"],
         "timeout_ms": 30000
       }
     }
@@ -705,6 +706,7 @@ global `$XDG_CONFIG_HOME/spor/config.json`:
 | `command` | The program to run: an absolute path, or a bare name resolved on `PATH`. A relative path is refused. |
 | `args` | Optional. Its arguments, verbatim. |
 | `env` | Optional. String values added to the child's environment. It may not name a Spor credential (`SPOR_TOKEN`, `SPOR_*_KEY`, …). |
+| `inherit_env` | Optional. Names of worker environment variables the child inherits beyond the base allowlist (§12.6). A name the worker does not have set is skipped. It may not name a Spor credential. |
 | `timeout_ms` | Optional, default 30000. How long one request may go unanswered (§12.4). |
 
 Any other key is refused, and so is the id `local` (the built-in provider).
@@ -824,8 +826,28 @@ written, and before a process is spawned for it. It answers
 - a value the worker itself holds: its Spor credentials from the environment
   and the token the config cascade resolved.
 
-The refusal names the field, never the value. The child's environment is the
-worker's with every Spor credential removed, plus the declaration's `env`.
+The refusal names the field, never the value.
+
+The child's environment is an **allowlist**, not the worker's environment with
+credentials scrubbed out. A worker's environment routinely holds
+`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AWS_*` and whatever
+else its operator exported, and a scrub list only removes what it names. The
+child gets, in order:
+
+1. the base allowlist from the worker's environment: `PATH`, `HOME`, `LANG`,
+   every `LC_*`, `TZ`, `TMPDIR` (on Windows also `SYSTEMROOT`, `WINDIR`,
+   `COMSPEC`, `PATHEXT`, `TEMP`, `TMP`, `USERPROFILE`, matched
+   case-insensitively, because a Windows process cannot reliably start
+   without them);
+2. every name the declaration lists in `inherit_env`, when the worker has it
+   set;
+3. the declaration's `env`, which wins over both.
+
+Nothing else is inherited. A Spor credential is never in the result, whatever
+asked for it. A provider that needs a cloud credential names it in
+`inherit_env`. Better, it resolves the credential itself from its own vault, so
+the worker's copy never reaches it. The built-in `local` provider (§11) spawns
+no provider process and is unchanged.
 
 ## 13. The attempt bundle and `spor attempt run`
 
