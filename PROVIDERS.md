@@ -559,7 +559,11 @@ once it moved past the launch's base commit, PUSHED to the repo's `origin` (its
 push URL when one is set) and read back before the manifest names it by the
 fetch URL — the same honest publication `spor attempt run` makes (§13), so a
 repo with no `origin`, or a push that does not land, has no manifest and says
-why — plus the report and log as `file://` references; `cancel` is SIGTERM to the supervisor's process group (identity-
+why. The fetch URL is the CONFIGURED `remote.origin.url` (never this box's
+`insteadOf` rewrite of it), its userinfo stripped; a URL that cannot be proven
+credential-free is withheld, and with it the manifest. A push URL that differs
+from the fetch URL is assumed to feed it (a push mirror): the read-back proves
+the push landed, not that the fetch URL already serves it — plus the report and log as `file://` references; `cancel` is SIGTERM to the supervisor's process group (identity-
 gated), `force` the TERM-then-KILL stop with the record closed as cancelled;
 `release` stops anything still running and removes the worktree this submit
 created. Secrets are not materialized, since the harness runs with the

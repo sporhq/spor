@@ -633,6 +633,17 @@ test("a checkout's own scp-style origin (git remote get-url) is normalized too, 
   assert.strictEqual(r.url, "ssh://git@github.com/sporhq/spor.git");
 });
 
+test("resolveRemoteUrl {raw: true} reads the configured url, not this box's insteadOf rewrite of it", (t) => {
+  const repo = producerRepo(t);
+  repo.g("remote", "add", "origin", "https://git.example/spor.git");
+  repo.g("config", "url./srv/mirror/.insteadOf", "https://git.example/");
+  assert.strictEqual(publisher.resolveRemoteUrl("origin", repo.dir).url, "/srv/mirror/spor.git", "get-url applies the rewrite");
+  assert.strictEqual(publisher.resolveRemoteUrl("origin", repo.dir, { raw: true }).url, "https://git.example/spor.git");
+  repo.g("remote", "set-url", "origin", "git@github.com:sporhq/spor.git");
+  assert.strictEqual(publisher.resolveRemoteUrl("origin", repo.dir, { raw: true }).url, "ssh://git@github.com/sporhq/spor.git", "scp-style is normalized either way");
+  assert.strictEqual(publisher.resolveRemoteUrl("nope", repo.dir, { raw: true }).ok, false);
+});
+
 test("portableRemoteRefusal admits ssh:// (branch reference) beside file:// and https://", () => {
   assert.strictEqual(publisher.portableRemoteRefusal("ssh://git@github.com/sporhq/spor.git"), null);
   assert.strictEqual(publisher.portableRemoteRefusal("file:///store/x"), null);

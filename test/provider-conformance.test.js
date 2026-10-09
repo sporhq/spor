@@ -177,6 +177,14 @@ test("the suite's default matcher is the real satisfiesAttempt, and the derived 
   await conf.runScenario(named.provider, "refuse-unsatisfiable", { home: scratch(), driver: named.driver });
 });
 
+test("the derived attempt names a profile the provider does not deny", async () => {
+  const { provider, driver } = createSyntheticProvider({ capabilities: { deny: ["profile-conformance", "profile-conformance-2"] } });
+  const seen = [];
+  const spy = (caps, attempt) => (seen.push(attempt), sat.satisfiesAttempt(caps, attempt));
+  await conf.runScenario(provider, "refuse-unsatisfiable", { home: scratch(), driver, matcher: spy });
+  assert.equal(seen[0].profile, "profile-conformance-3");
+});
+
 test("cancel-graceful runs even when lifecycle does not list cancel — cancel is a required operation", async () => {
   const { provider, driver } = createSyntheticProvider({ capabilities: { lifecycle: [] } });
   const r = await conf.runScenario(provider, "cancel-graceful", { home: scratch(), driver });

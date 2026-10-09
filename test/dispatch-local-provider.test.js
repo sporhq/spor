@@ -399,6 +399,64 @@ test("the local provider strips a credential from the origin URL before it reach
   }
 });
 
+// Submit a completing attempt, wait for it to finish, collect, release.
+async function runToCollect(provider, driver, key) {
+  const base = {
+    contract_version: 1, attempt_id: "w:1", execution_id: `exec-${"d".repeat(16)}`, fence: 1, tenant: "t", node_id: "task-x",
+    harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: [],
+    repos: [{ slug: "conformance", commit: "b".repeat(40), branch: "x" }], egress: { allow: [] }, secrets: [],
+    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://x/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
+    isolation: "worktree", prompt_bundle_ref: "https://x.invalid/p.tar",
+  };
+  const res = await provider.request({ contract_version: 1, id: "s", op: "submit", params: { attempt: driver.attempt(base, "complete"), idempotency_key: key } });
+  assert.strictEqual(res.ok, true, JSON.stringify(res));
+  const handle = res.result.handle;
+  try {
+    let obs;
+    for (let i = 0; i < 600; i++) {
+      obs = (await provider.request({ contract_version: 1, id: "o", op: "observe", params: { handle } })).result;
+      if (obs.state === "finished") break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.strictEqual(obs.state, "finished", JSON.stringify(obs));
+    return (await provider.request({ contract_version: 1, id: "c", op: "collect", params: { handle } })).result;
+  } finally {
+    await provider.request({ contract_version: 1, id: "x", op: "release", params: { handle } });
+  }
+}
+
+test("the local provider WITHHOLDS an origin URL it cannot prove credential-free: no locator, no manifest, no leak (issue-spor-provider-url-redaction-fail-open)", async () => {
+  const { repo, provider, driver } = conformanceSetup();
+  git(repo, ["remote", "set-url", "origin", "https://ci-bot:s3cr3t tok@conformance.spor.invalid/conformance.git"]);
+  const col = await runToCollect(provider, driver, "withhold-key-1");
+  assert.strictEqual(col.manifest, null, JSON.stringify(col));
+  assert.match(col.no_candidate.reason, /cannot be proven free of credentials/);
+  assert.doesNotMatch(JSON.stringify(col), /s3cr3t|ci-bot/);
+  assert.deepStrictEqual(pc.validate("collect-result", col).errors, []);
+});
+
+test("the local provider says a filesystem-path origin is not portable, rather than blaming a credential", async () => {
+  const { repo, origin, provider, driver } = conformanceSetup();
+  git(repo, ["remote", "set-url", "origin", origin]);
+  const col = await runToCollect(provider, driver, "path-key-1");
+  assert.strictEqual(col.manifest, null, JSON.stringify(col));
+  assert.match(col.no_candidate.reason, /is not an absolute URI/);
+  assert.doesNotMatch(col.no_candidate.reason, /credentials/);
+});
+
+test("the local provider names the CONFIGURED origin url, not this box's insteadOf rewrite of it", async () => {
+  const { home, repo, provider, driver } = conformanceSetup();
+  // The fetch url is rewritten onto a local path for this box only; the push
+  // still goes to the pushurl bare repo.
+  const elsewhere = fs.mkdtempSync(path.join(home, "rewritten-"));
+  git(repo, ["config", `url.${elsewhere}.insteadOf`, "https://conformance.spor.invalid/"]);
+  assert.strictEqual(git(repo, ["remote", "get-url", "origin"]).trim().startsWith(elsewhere), true, "the rewrite is in force");
+  const col = await runToCollect(provider, driver, "raw-key-1");
+  assert.ok(col.manifest, JSON.stringify(col));
+  assert.strictEqual(col.manifest.candidate.reference.locator, "https://conformance.spor.invalid/conformance.git");
+  assert.deepStrictEqual(pc.validate("collect-result", col).errors, []);
+});
+
 test("createLocalProvider refuses a host missing a helper, naming it", () => {
   const { cfg } = conformanceSetup();
   assert.throws(() => createLocalProvider({ cfg, host: { out() {}, err() {}, createDispatchWorktree() {}, removeDispatchWorktree() {} } }), /host is missing launchSupervisedHarness/);

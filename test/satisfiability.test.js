@@ -517,3 +517,35 @@ test("the contract validator redacts refused references; stripReferenceUserinfo 
   assert.strictEqual(pc.stripReferenceUserinfo("ssh://git@github.com/a.git"), "ssh://git@github.com/a.git", "a bare ssh login is an account, not a credential");
   assert.strictEqual(pc.stripReferenceUserinfo("ssh://ghp_abcdefghijklmnopqrstuvwxyz@github.com/a.git"), "ssh://github.com/a.git");
 });
+
+test("stripReferenceUserinfo fails CLOSED: a url it cannot prove credential-free is null, never passed through", () => {
+  for (const v of [
+    "https://user:tok @github.com/a.git", // whitespace hides the userinfo from the delimiter
+    "https://user:tok@git hub.com/a.git", // still not a reference once stripped
+    "user:ghp_abcdefghijklmnopqrstuvwxyz@github.com:o/r.git", // scp-style, no scheme
+    "git@github.com:o/r.git", // scp-style, not a reference until normalized
+    "ghp_abcdefghijklmnopqrstuvwxyz",
+    "",
+    null,
+    42,
+  ]) {
+    assert.strictEqual(pc.stripReferenceUserinfo(v), null, JSON.stringify(v));
+  }
+  assert.strictEqual(pc.isCredentialFreeReference("https://github.com/a.git"), true);
+  assert.strictEqual(pc.isCredentialFreeReference("https://tok@github.com/a.git"), false);
+});
+
+test("satisfiesAttempt: `*` repo admission refuses a credential-bearing url without quoting it", () => {
+  const leak = "hunter2pass";
+  for (const url of [`https://bob:${leak}@github.com/acme/other.git`, `https://bob:${leak} @github.com/acme/other.git`, `bob:${leak}@github.com:acme/other.git`]) {
+    const repos = [{ slug: "other", commit: "4b825dc642cb6eb9a060e54bf8d69288fbee4904", branch: "b", url }];
+    const r = sat.satisfiesAttempt(providerCaps({ repos: ["*"] }), { ...attempt(), repos }, { now: NOW });
+    assert.strictEqual(r.ok, false, url);
+    assert.deepStrictEqual(r.axes, ["repos"], url);
+    assert.match(r.reasons[0], /cannot check out other: its url is not a credential-free reference \(value withheld\)/);
+    assert.ok(!r.reasons.join(" ").includes(leak), r.reasons.join("; "));
+  }
+  // A provider naming the slug outright checks it out by name: the url is not what admits it.
+  const named = [{ slug: "acme-api", commit: "4b825dc642cb6eb9a060e54bf8d69288fbee4904", branch: "b", url: "https://bob:x@github.com/acme/api.git" }];
+  assert.ok(sat.satisfiesAttempt(providerCaps({ repos: ["acme-api", "*"] }), { ...attempt(), repos: named }, { now: NOW }).ok);
+});

@@ -197,6 +197,30 @@ test("verifyBundle refuses a bundle carrying a plaintext secret value, naming wh
   assert.strictEqual(bundleLib.verifyBundle(leaking, { env: { SPOR_TOKEN: held } }).secret, true);
 });
 
+test("verifyBundle refuses an unknown key in a secret entry or the spor block, naming where and never echoing it", () => {
+  const value = "opaque-credential-value-123";
+  for (const b of [
+    goodBundle({ secrets: [{ name: "GITHUB_TOKEN", ref: "vault://x/gh", credentials: value }] }),
+    goodBundle({ spor: { server: "https://api.spor.invalid", token_ref: "spor-attempt-token://x/1", bearer: value } }),
+  ]) {
+    const v = bundleLib.verifyBundle(b, { env: {} });
+    assert.strictEqual(v.ok, false, JSON.stringify(b));
+    assert.strictEqual(v.secret, true, v.errors.join("; "));
+    assert.match(v.errors.join("; "), /attempt\.json (secrets\[0\]|spor): unknown key/);
+    assert.ok(!v.errors.join(" ").includes(value), "the refusal never echoes the value");
+  }
+  assert.deepStrictEqual(bundleLib.verifyBundle(goodBundle({ secrets: [{ name: "GITHUB_TOKEN", ref: "vault://x/gh" }] }), { env: {} }).errors, []);
+});
+
+test("attempt run masks a credential in a malformed --repo spec", () => {
+  const home = tmp("spor-attempt-repo-spec-");
+  bundleLib.writeBundle(goodBundle(), path.join(home, "b"));
+  const r = cli(["attempt", "run", path.join(home, "b"), "--repo", "https://bob:hunter2pass@github.com/x/y.git"], { SPOR_HOME: home }, home);
+  assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /--repo "https:\/\/\*\*\*@github\.com\/x\/y\.git" is not <slug>=<path\|url>/);
+  assert.ok(!(r.stdout + r.stderr).includes("hunter2pass"));
+});
+
 test("attempt run refuses a bundle carrying a secret before anything is checked out or launched", async () => {
   const home = tmp("spor-attempt-secret-");
   const bundle = goodBundle({ secrets: [{ name: "GITHUB_TOKEN", ref: "vault://x/gh", value: "plaintext" }] });

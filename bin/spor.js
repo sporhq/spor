@@ -18756,14 +18756,19 @@ async function cmdAttemptBuild(cfg, args) {
     err(`spor attempt build: '${rev}' does not name a commit in ${repoDir}`);
     return 1;
   }
-  const remoteUrl = candidatePublish.resolveRemoteUrl("origin", repoDir);
+  // The CONFIGURED origin url, not this box's insteadOf rewrite of it: the
+  // bundle's url is cloned from inside another environment.
+  const remoteUrl = candidatePublish.resolveRemoteUrl("origin", repoDir, { raw: true });
   let url = remoteUrl.ok && !candidatePublish.portableRemoteRefusal(remoteUrl.url) ? remoteUrl.url : null;
   // A credential in the origin url (`https://x-access-token:<tok>@host/…`, a CI
   // checkout's shape) never rides the bundle: the url is pinned without it,
-  // and the provider supplies the repo credential itself.
-  if (url && /^https?:\/\/[^/?#]*@/i.test(url)) {
-    url = url.replace(/^(https?:\/\/)[^/?#]*@/i, "$1");
-    err(`warning: ${repoDir}'s origin url carries credentials — the bundle pins it without them`);
+  // and the provider supplies the repo credential itself. A url that cannot be
+  // proven credential-free is not pinned at all.
+  if (url && !providerContract.isCredentialFreeReference(url)) {
+    url = providerContract.stripReferenceUserinfo(url);
+    err(url
+      ? `warning: ${repoDir}'s origin url carries credentials — the bundle pins it without them`
+      : `warning: ${repoDir}'s origin url cannot be proven free of credentials — the bundle pins ${slug} without a url`);
   }
   if (!url) err(`warning: ${repoDir} has no portable 'origin' url — the bundle pins ${slug} without one, so 'spor attempt run' needs --repo ${slug}=<path|url> and cannot publish a candidate`);
   const server = cfg.mode() === "remote" ? remote.base(cfg) : require("url").pathToFileURL(cfg.nodesDir()).href;
@@ -18821,7 +18826,7 @@ async function cmdAttemptRun(cfg, args) {
   for (const spec of values.repo || []) {
     const eq = spec.indexOf("=");
     if (eq <= 0) {
-      err(`spor attempt run: --repo '${spec}' is not <slug>=<path|url>`);
+      err(`spor attempt run: --repo ${attemptBundle.redact(JSON.stringify(spec))} is not <slug>=<path|url>`);
       return 1;
     }
     const v = spec.slice(eq + 1);
