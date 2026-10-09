@@ -134,20 +134,46 @@ function normalize(text, { runId, home, repo, stub }) {
   t = t.split(path.basename(repo).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")).join("<SLUG>");
   t = t.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z/g, "<TS>");
   t = t.replace(/\d{4}-\d{2}-\d{2}/g, "<DATE>");
-  t = t.replace(new RegExp(`"(runner_pid|child_pid|runner_started_ticks|child_started_ticks|rev)": \\d+`, "g"), '"$1": <N>');
+  // `rev` (the count of record puts) is deliberately NOT normalized: an extra
+  // record write in the launch is exactly the kind of drift this pins.
+  t = t.replace(new RegExp(`"(runner_pid|child_pid|runner_started_ticks|child_started_ticks)": \\d+`, "g"), '"$1": <N>');
   t = t.replace(new RegExp(esc(process.execPath), "g"), "<NODE>");
   return t;
 }
 
-// One golden dispatch: a free-text task into a worktree with a stub harness,
-// observed to its terminal record. Returns the normalized capture.
-function goldenDispatch() {
+// The two golden shapes: a free-text task into a worktree, and a NODE dispatch
+// into the shared checkout (`--no-worktree`, the other half of submit's
+// branches, with the node fields on the record and job file).
+const GOLDENS = {
+  worktree: {
+    file: GOLDEN,
+    args: ["dispatch", "golden provider equivalence task", "--no-brief", "--worktree", "--name", "golden-run"],
+    worktree: true,
+  },
+  node: {
+    file: path.join(__dirname, "fixtures", "providers", "local-golden-node.json"),
+    args: ["dispatch", "task-golden", "--no-brief", "--no-worktree", "--name", "golden-run"],
+    worktree: false,
+  },
+};
+
+// One golden dispatch with a stub harness, observed to its terminal record.
+// Returns the normalized capture.
+function goldenDispatch(shape = GOLDENS.worktree) {
   const home = scratchHome();
   const repo = gitRepo();
+  fs.writeFileSync(
+    path.join(home, "nodes", "task-golden.md"),
+    `---\nid: task-golden\ntype: task\nrepo: golden\ntitle: Golden provider equivalence node\nsummary: A fixture task the golden node dispatch runs, stamped to the scratch repo.\ndate: 2026-10-01\n---\nDo the golden work.\n`,
+  );
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { repos: { golden: repo } } }));
+  // The node shape dispatches INTO the mapped checkout, whose identity must
+  // match the node's `repo: golden` stamp (the slug→path corruption guard).
+  if (!shape.worktree) fs.writeFileSync(path.join(repo, ".spor"), "project: golden\n");
   const stub = writeSpawnableNodeStub(home, "claude-golden", 'process.stdout.write(""); process.exit(0);');
   const runner = capturingRunner(home);
   const r = runCli(
-    ["dispatch", "golden provider equivalence task", "--no-brief", "--worktree", "--name", "golden-run"],
+    shape.args,
     { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_DISPATCH_RUNNER_CMD: runner.file },
     repo,
   );
@@ -170,25 +196,27 @@ function goldenDispatch() {
       worktree: {
         dir: normalize(path.join(repo, ".claude", "worktrees", "golden-run"), ctx),
         exists: fs.existsSync(path.join(repo, ".claude", "worktrees", "golden-run")),
-        branch: git(repo, ["rev-parse", "--abbrev-ref", "golden-run"]).trim(),
+        branch: shape.worktree ? git(repo, ["rev-parse", "--abbrev-ref", "golden-run"]).trim() : null,
       },
     };
     return { capture, home, repo };
   });
 }
 
-test("golden: the local provider's dispatch is byte-identical to the pre-refactor launch", async () => {
-  const { capture } = await goldenDispatch();
-  if (process.env.SPOR_GOLDEN_RECORD === "1") {
-    fs.mkdirSync(path.dirname(GOLDEN), { recursive: true });
-    fs.writeFileSync(GOLDEN, JSON.stringify(capture, null, 2) + "\n");
-    return;
-  }
-  const golden = JSON.parse(fs.readFileSync(GOLDEN, "utf8"));
-  for (const key of ["stdout", "stderr", "record", "job", "prompt", "journal", "worktree"]) {
-    assert.deepStrictEqual(capture[key], golden[key], `${key} differs from the recorded golden`);
-  }
-});
+for (const [name, shape] of Object.entries(GOLDENS)) {
+  test(`golden (${name}): the local provider's dispatch is byte-identical to the pre-refactor launch`, async () => {
+    const { capture } = await goldenDispatch(shape);
+    if (process.env.SPOR_GOLDEN_RECORD === "1") {
+      fs.mkdirSync(path.dirname(shape.file), { recursive: true });
+      fs.writeFileSync(shape.file, JSON.stringify(capture, null, 2) + "\n");
+      return;
+    }
+    const golden = JSON.parse(fs.readFileSync(shape.file, "utf8"));
+    for (const key of ["stdout", "stderr", "record", "job", "prompt", "journal", "worktree"]) {
+      assert.deepStrictEqual(capture[key], golden[key], `${key} differs from the recorded golden`);
+    }
+  });
+}
 
 // ------------------------------------------------------------- conformance
 
@@ -360,6 +388,14 @@ test("spor dispatch --provider missing refuses loudly naming the id, before any 
   assert.strictEqual(r.status, 1, r.stdout + r.stderr);
   assert.match(r.stderr, /cannot dispatch: unknown execution provider 'missing' \(from --provider\)/);
   assert.ok(!fs.existsSync(path.join(home, "journal")), "nothing was written");
+  // An EMPTY flag value (an unset shell variable, quoted) names nothing and is
+  // refused too — never read as unset and routed to the default.
+  const empty = runCli(["dispatch", "some task text", "--no-brief", "--print", "--provider", ""], { SPOR_HOME: home }, repo);
+  assert.strictEqual(empty.status, 1, empty.stdout + empty.stderr);
+  assert.match(empty.stderr, /cannot dispatch: an empty execution provider id \(from --provider\)/);
+  const emptyWork = runCli(["work", "--print", "--provider", ""], { SPOR_HOME: home }, repo);
+  assert.strictEqual(emptyWork.status, 1, emptyWork.stdout + emptyWork.stderr);
+  assert.match(emptyWork.stderr, /spor work: an empty execution provider id \(from --provider\)/);
 });
 
 test("spor dispatch --print: the default provider adds no line; an explicit one is named", () => {
@@ -398,4 +434,66 @@ test("a committable .spor.json cannot bind an execution provider (machine-local 
   const r = runCli(["dispatch", "some task text", "--no-brief", "--print"], { SPOR_HOME: home }, repo);
   assert.strictEqual(r.status, 0, r.stdout + r.stderr);
   assert.doesNotMatch(r.stdout, /^provider:/m);
+});
+
+test("a record the local provider closes carries the outcome dimension: cancelled on cancel, vanished on a crashed release", async () => {
+  const { home, provider, driver } = conformanceSetup();
+  const base = (n) => ({
+    contract_version: 1, attempt_id: `w:${n}`, execution_id: `exec-${String(n).repeat(16)}`, fence: 1, tenant: "t", node_id: "task-x",
+    harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: [],
+    repos: [{ slug: "conformance", commit: "b".repeat(40), branch: "x" }], egress: { allow: [] }, secrets: [],
+    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://x/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
+    isolation: "worktree", prompt_bundle_ref: "https://x.invalid/p.tar",
+  });
+  const req = async (op, params, id = op) => {
+    const res = await provider.request({ contract_version: 1, id, op, params });
+    assert.strictEqual(res.ok, true, JSON.stringify(res));
+    return res.result;
+  };
+  const untilRunning = async (handle) => {
+    for (let i = 0; i < 600; i++) {
+      const o = await req("observe", { handle });
+      if (o.state === "running") return o;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.fail("never reached running");
+  };
+  const record = (handle) => JSON.parse(fs.readFileSync(path.join(home, "journal", "dispatch", `${handle.id}.run.json`), "utf8"));
+
+  // A forced cancel: the record is closed as a cancel, with the unenforced
+  // outcome every other terminal writer stamps, and the reaped child noted.
+  const a = await req("submit", { attempt: driver.attempt(base(1), "hold"), idempotency_key: "shape-cancel" });
+  await untilRunning(a.handle);
+  const c = await req("cancel", { handle: a.handle, force: true });
+  assert.strictEqual(c.state, "finished");
+  const cancelled = record(a.handle);
+  assert.strictEqual(cancelled.state, "failed");
+  assert.strictEqual(cancelled.termination_class, "cancelled");
+  assert.strictEqual(cancelled.termination_signal, "provider-force-cancel");
+  assert.strictEqual(cancelled.terminal_state, "failed");
+  assert.strictEqual(cancelled.terminal_enforced, false);
+  assert.match(cancelled.terminal_note, /cancelled through the local provider/);
+  assert.strictEqual(cancelled.child_reaped, true);
+  await req("release", { handle: a.handle });
+
+  // A crashed supervisor released: never cancelled, so the record reads
+  // vanished — a crash torn down, not a cancel.
+  const b = await req("submit", { attempt: driver.attempt(base(2), "hold"), idempotency_key: "shape-crash" });
+  await untilRunning(b.handle);
+  driver.crash(b.handle);
+  for (let i = 0; i < 600; i++) {
+    if ((await req("observe", { handle: b.handle })).state === "lost") break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.strictEqual((await req("observe", { handle: b.handle })).state, "lost");
+  const rel = await req("release", { handle: b.handle });
+  assert.strictEqual(rel.released, true);
+  const vanished = record(b.handle);
+  assert.strictEqual(vanished.state, "vanished");
+  assert.strictEqual(vanished.termination_class, "vanished");
+  assert.strictEqual(vanished.termination_signal, "supervisor-gone");
+  assert.strictEqual(vanished.terminal_state, "failed");
+  assert.strictEqual(vanished.terminal_enforced, false);
+  assert.strictEqual(vanished.child_reaped, true, "the orphaned harness child was reaped on release");
+  assert.strictEqual(provider.environments(), 0);
 });

@@ -1,0 +1,19 @@
+{
+  "stdout": "run:     <RUN> (Claude Code supervisor running)\nlog:     <HOME>/journal/dispatch/<RUN>.log\nreport:  <HOME>/journal/dispatch/<RUN>.report.md\n",
+  "stderr": "",
+  "record": "{\n  \"run_id\": \"<RUN>\",\n  \"node_id\": \"task-golden\",\n  \"name\": \"golden-run\",\n  \"harness\": \"claude-code\",\n  \"launch_mode\": \"supervised-jsonl\",\n  \"state\": \"done\",\n  \"cwd\": \"<REPO>\",\n  \"created_at\": \"<TS>\",\n  \"item_repo\": \"golden\",\n  \"log_path\": \"<HOME>/journal/dispatch/<RUN>.log\",\n  \"report_path\": \"<HOME>/journal/dispatch/<RUN>.report.md\",\n  \"release_node\": null,\n  \"server\": null,\n  \"rev\": 5,\n  \"rev_at\": \"<TS>\",\n  \"runner_pid\": <N>,\n  \"runner_started_ticks\": <N>,\n  \"child_pid\": <N>,\n  \"started_at\": \"<TS>\",\n  \"child_started_ticks\": <N>,\n  \"terminal_state\": \"reported\",\n  \"terminal_enforced\": false,\n  \"terminal_note\": \"no team graph to verify against — the terminal-state contract is enforced only against a Spor server (local-mode dispatch is unenforced)\",\n  \"exit_code\": 0,\n  \"signal\": null,\n  \"finished_at\": \"<TS>\",\n  \"termination_class\": \"completed\",\n  \"termination_signal\": \"supervised-exit\",\n  \"termination_reason\": \"the supervised child exited 0\",\n  \"contract_pending\": false\n}\n",
+  "job": "{\n  \"run_id\": \"<RUN>\",\n  \"harness\": \"claude-code\",\n  \"command\": \"<HOME>/claude-golden.js\",\n  \"args\": [\n    \"-p\",\n    \"--output-format\",\n    \"stream-json\",\n    \"--verbose\",\n    \"--name\",\n    \"golden-run\"\n  ],\n  \"cwd\": \"<REPO>\",\n  \"record_path\": \"<HOME>/journal/dispatch/<RUN>.run.json\",\n  \"prompt_path\": \"<HOME>/journal/dispatch/<RUN>.prompt\",\n  \"log_path\": \"<HOME>/journal/dispatch/<RUN>.log\",\n  \"report_path\": \"<HOME>/journal/dispatch/<RUN>.report.md\",\n  \"scratch_path\": \"<HOME>/journal/dispatch/<RUN>.scratch\",\n  \"server\": null,\n  \"local_nodes_dir\": \"<HOME>/nodes\",\n  \"renew_node\": \"task-golden\",\n  \"node_id\": \"task-golden\",\n  \"release_node\": null,\n  \"project\": \"golden\"\n}\n",
+  "prompt": "> **Spor session project:** `golden`. If you file a question with `ask_question` (or `POST /v1/questions`) that has no clear `mentions:`, pass `project: \"golden\"` so it is stamped to this project rather than defaulting to the asker's home project.\n\nWork on task-golden — Golden provider equivalence node. The compiled Spor briefing above is your standing context.",
+  "journal": [
+    "dispatch/",
+    "dispatch/<RUN>.log",
+    "dispatch/<RUN>.run.json",
+    "dispatch-lock/",
+    "workspace/"
+  ],
+  "worktree": {
+    "dir": "<REPO>/.claude/worktrees/golden-run",
+    "exists": false,
+    "branch": null
+  }
+}
