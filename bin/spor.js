@@ -18732,17 +18732,17 @@ async function cmdAttemptBuild(cfg, args) {
   // lines go to stderr so stdout carries only this verb's own answer.
   const plan = await attemptDispatcher().planDispatch(cfg, { values: passthrough, positionals: [workerContract({ nodeId: x.item.node_id, factory: loaded.factory })] }, { carryTask: true, supervisedOnly: true, unattended: true });
   if (typeof plan === "number") return plan;
-  // The plan ran as a preview, so the guards a real dispatch enforces after it
-  // are enforced here. Not this box's satisfiability or harness binary — the
-  // PROVIDER's environment runs the attempt, and its matcher decides that —
-  // but a harness spor cannot launch at all, and the unattended write posture:
-  // nobody in a sandbox answers a permission prompt.
-  if (!plan.supportedHarness) {
-    err(`spor attempt build: harness '${plan.harness}' is not one spor can launch`);
-    return 1;
-  }
-  if (plan.postureCheck && plan.postureCheck.warning) err(plan.postureCheck.warning);
-  if (plan.postureCheck && !plan.postureCheck.ok) {
+  // The plan ran as a preview, so the guard a real dispatch enforces after it
+  // is enforced here: the unattended write posture — nobody in a sandbox
+  // answers a permission prompt. Not this box's satisfiability or harness
+  // binary: the PROVIDER's environment runs the attempt, and its matcher (and
+  // the runner) decide that.
+  // A harness with no adapter HERE may be one the provider's environment
+  // declares (dispatch.harness.<id> is machine-local), so it is not refused on
+  // this box's say-so: the runner resolves it there, and refuses it — posture
+  // included — before launch if it cannot.
+  if (plan.harnessAdapter && plan.postureCheck && plan.postureCheck.warning) err(plan.postureCheck.warning);
+  if (plan.harnessAdapter && plan.postureCheck && !plan.postureCheck.ok) {
     err(`spor attempt build: ${plan.postureCheck.reason}.`);
     err(`  ${plan.postureCheck.hint}`);
     return 1;
@@ -18761,8 +18761,8 @@ async function cmdAttemptBuild(cfg, args) {
   // A credential in the origin url (`https://x-access-token:<tok>@host/…`, a CI
   // checkout's shape) never rides the bundle: the url is pinned without it,
   // and the provider supplies the repo credential itself.
-  if (url && /^https?:\/\/[^/@]+@/i.test(url)) {
-    url = url.replace(/^(https?:\/\/)[^/@]+@/i, "$1");
+  if (url && /^https?:\/\/[^/?#]*@/i.test(url)) {
+    url = url.replace(/^(https?:\/\/)[^/?#]*@/i, "$1");
     err(`warning: ${repoDir}'s origin url carries credentials — the bundle pins it without them`);
   }
   if (!url) err(`warning: ${repoDir} has no portable 'origin' url — the bundle pins ${slug} without one, so 'spor attempt run' needs --repo ${slug}=<path|url> and cannot publish a candidate`);

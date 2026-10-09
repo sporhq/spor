@@ -297,6 +297,14 @@ test("a credential in a repo url is refused by shape and never echoed by the ref
   assert.strictEqual(v.ok, false);
   assert.ok(!v.errors.join(" ").includes(leak), v.errors.join("; "));
   assert.match(v.errors.join(" "), /https:\/\/\*\*\*@github\.com/);
+  // Every userinfo spelling the contract refuses is masked, and a huge refused
+  // value cannot make the masking slow.
+  for (const [raw, gone] of [["\"https:///tok123@host/r\"", "tok123"], ["https:\\\\tok@host", "tok@"], ["\"https://bob:p\\\"w@host\"", "bob"], ["https://a:b@c@d/x", "c@"]]) {
+    assert.ok(!bundleLib.redact(raw).includes(gone), `${raw} -> ${bundleLib.redact(raw)}`);
+  }
+  const started = Date.now();
+  bundleLib.redact("x" + "a:".repeat(200000));
+  assert.ok(Date.now() - started < 2000, "redact is bounded");
 });
 
 test("attempt run refuses a result directory that already holds a run, overwriting nothing", () => {
