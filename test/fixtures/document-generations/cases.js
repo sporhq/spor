@@ -1,6 +1,8 @@
 // The inputs the document goldens are recorded over (see
 // test/helpers/record-document-goldens.js). Pure data; goldens.json holds the
-// server's answers.
+// server's answers. Every MULTI-part case carries a `date:` — the server dates
+// an undated document's parts from the real clock, which the recorder cannot
+// pin, so an undated multi-part case could only be re-recorded on one day.
 const paras = (n, word = "Paragraph", extra = "") =>
   Array.from({ length: n }, (_, i) => `${word} ${i + 1}${extra} — é 😀 \`x\`.`).join("\n\n");
 const fm = (lines) => `---\n${lines.join("\n")}\n---\n`;
@@ -16,8 +18,8 @@ const generations = [
     source: fm([`id: art-${"a".repeat(195)}`, "type: artifact", "title: L", "summary: s", "date: 2026-10-01"]) + "z".repeat(20000) + "\n" },
   { name: "frontmatter ending in a blank line", today: "2026-10-09",
     source: "---\nid: art-blank\ntype: artifact\ntitle: T\n\n---\nbody\n" },
-  { name: "person host, folded summary, no date", today: "2026-10-09",
-    source: fm(["id: person-carol", "type: person", "title: Carol", "summary: a long", "  folded summary"]) + "\n" + paras(500, "Note") + "\n" },
+  { name: "person host, folded summary", today: "2026-10-09",
+    source: fm(["id: person-carol", "type: person", "title: Carol", "summary: a long", "  folded summary", "date: 2026-10-02"]) + "\n" + paras(500, "Note") + "\n" },
   { name: "a root carrying a part stamp is refused", today: "2026-10-09",
     source: fm(["id: art-x", "type: artifact", "title: X", "summary: s", "continuation_of: art-y"]) + "body\n" },
 ];

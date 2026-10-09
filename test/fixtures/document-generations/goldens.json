@@ -88,17 +88,17 @@
       }
     },
     {
-      "name": "person host, folded summary, no date",
+      "name": "person host, folded summary",
       "expect": {
         "ok": true,
         "id": "person-carol",
         "digest": "24da641b07f7b8e527c7e68afc5841149bb6b9738dd55843d5ec19dc3d89926f",
         "bytes": 13390,
-        "root_sha256": "fc26f4c22f1eefb398c076eadb4b2e0ed60b7f16c2da9ceed9279e6021d83a4c",
+        "root_sha256": "a2aeee253db42a6df3235bb4d14b0fd0d5e3f04b74c4681a0e3cab653e096ebb",
         "parts": [
           {
             "id": "art-person-carol-g24da641b-2",
-            "sha256": "b7967d1c8ec59d135d02d2767cda124ac3aa18b68a4c07da4ec0cb1b6e38c6a1"
+            "sha256": "6596bde81a32ccfde386aaa11f28a96c99fdffb1cf11562c0df1d388952690e5"
           }
         ]
       }
