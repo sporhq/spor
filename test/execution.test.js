@@ -433,6 +433,29 @@ test("driver: a stale fence holder is refused AT adoption — nothing adopted, a
   assert.deepEqual(knobs.sent, [key], "neither look re-sent anything");
 });
 
+test("driver: a stale fence holder re-sending an already-observed state is NOT told ok — the replay is fence-checked, and the sweep stops following it", async () => {
+  const home = tmp("stale-observe-replay");
+  const first = await openLocal(home, "i1");
+  const id = first.id;
+  await first.eng.event(id, { fence: first.fence, event: { type: "attempt.submitting", attempt: 1, provider: "synthetic", submit_idempotency_key: SUBMIT_KEY, request: {} } });
+  await first.eng.event(id, { fence: first.fence, event: { type: "attempt.submitted", attempt: 1, provider: "synthetic", handle: HANDLE, submit_idempotency_key: SUBMIT_KEY } });
+  const client = { id: "synthetic", observe: async () => ({ state: "running" }) };
+  const live = await attempts.observeAttempt({ store: first.eng, executionId: id, fence: first.fence, client });
+  assert.equal(live.recorded, true, "a fresh observation under the live fence is recorded");
+  const again = await attempts.observeAttempt({ store: first.eng, executionId: id, fence: first.fence, client });
+  assert.equal(again.recorded, true, "a replay by the live holder still reads recorded");
+  const second = await openLocal(home, "i2");
+  assert.ok(second.fence > first.fence);
+  const stale = await attempts.observeAttempt({ store: first.eng, executionId: id, fence: first.fence, client });
+  assert.equal(stale.ok, true);
+  assert.equal(stale.recorded, false, "the replay is not proof the stale fence still owns the execution");
+  assert.equal(stale.code, "fence_stale");
+  const owned = new Map([[id, { fence: first.fence, attempt: 1, client, node_id: "task-x" }]]);
+  const swept = await attempts.sweepProviderAttempts({ store: first.eng, owned, configured: ["synthetic"] });
+  assert.deepEqual(swept.busy, [], "the fenced-out sweep no longer holds the node busy");
+  assert.equal(owned.size, 0, "and drops the attempt for the new owner to relay");
+});
+
 test("driver: a stale fence holder is refused before a RECONCILE re-send, and an unconfirmable renew sends nothing", async () => {
   const home = tmp("stale-reconcile");
   const { client, knobs } = syntheticClient();

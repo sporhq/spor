@@ -9,6 +9,11 @@ const fs = require("fs");
 const path = require("path");
 const u = require("./util");
 
+// The execution-journal sweep's wall-clock bound inside the SessionStart hook
+// (issue-spor-execution-store-residual-hardening): past it the sweep stops
+// between files and the next throttled sweep carries on.
+const EXECUTION_GC_BUDGET_MS = 2000;
+
 // The /spor:spor preload instruction LEADS every usage string (and so every
 // session-start envelope, all modes): Spor's CLI syntax, node/edge format, and
 // MCP/REST surface aren't in the model's training, so any graph operation
@@ -316,8 +321,10 @@ async function sessionStartBase(input) {
     // under journal/executions/ (its takeover ledger, empty outbox files,
     // gone holders' lock files — task-spor-execution-journal-gc-takeovers-
     // and-locks). The store lives in the user home, which a shared-graph
-    // marker can move the graph away from. Bounded: it never waits on a lock.
-    if (swept.ran) await require(path.join(u.ROOT, "lib", "shell", "execution-store.js")).gcExecutions(u.userConfigHome());
+    // marker can move the graph away from. Bounded: it never waits on a lock,
+    // and a time budget stops it between files on a large journal — the next
+    // sweep carries on (issue-spor-execution-store-residual-hardening).
+    if (swept.ran) await require(path.join(u.ROOT, "lib", "shell", "execution-store.js")).gcExecutions(u.userConfigHome(), { budgetMs: EXECUTION_GC_BUDGET_MS });
   } catch {
     /* best effort — GC never blocks session-start */
   }

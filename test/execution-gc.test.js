@@ -480,3 +480,169 @@ test("gc: one sweep at a time per home — a sweep that finds another running is
   assert.equal(after.skipped, undefined);
   assert.equal(fs.existsSync(path.join(dir, "task-x.json.lock.dead-x")), false);
 });
+
+// ---------- 6. residual hardening (issue-spor-execution-store-residual-hardening) ----------
+
+// A gone holder's outbox file planted directly, one line per fence given.
+function plantGoneOutbox(b, id, instance, fences) {
+  const file = store.outboxPath(b.home, "remote", id, tag(instance));
+  const by = { instance, machine: "box", pid: deadPidNow(), ticks: null };
+  const queued = new Date(Date.now() - 60000).toISOString();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, fences.map((fence, n) => JSON.stringify({ event: { type: "gate.settled", gate_id: "acceptance", attempt: n + 1, state: "failed" }, queued_at: queued, fence, by })).join("\n") + "\n");
+  return file;
+}
+
+test("report: with NO ledger and NO cached record, a gone holder's file mixing fences is reported STRANDED (as the next holder would find it); a single-fence file stays adoptable", async () => {
+  const b = await box("noledger");
+  try {
+    const A = b.open("pA");
+    const o = await A.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+    const id = o.execution.execution_id;
+    // Nothing on the box dates any fence: no ledger line, no cached copy.
+    fs.rmSync(store.takeoverPath(b.home, "remote", id), { force: true });
+    for (const tn of store.tenants(b.home)) fs.rmSync(store.recordPath(b.home, tn, id), { force: true });
+    const mixed = plantGoneOutbox(b, id, "pX-mixed", [1, 2]);
+    const R = b.open("pR");
+    assert.deepEqual(R.outboxReport(id).map((f) => [path.basename(f.file), f.state, f.replayable]), [[path.basename(mixed), "stranded", 0]]);
+    fs.rmSync(mixed);
+    const single = plantGoneOutbox(b, id, "pX-single", [2, 2]);
+    assert.deepEqual(R.outboxReport(id).map((f) => [path.basename(f.file), f.state, f.replayable]), [[path.basename(single), "adoptable", 2]]);
+  } finally {
+    await b.fake.close();
+  }
+});
+
+test("gc: a corrupt, non-object or MIS-FILED cached copy is unjudgeable — the execution is spared, never collected on its say-so", async () => {
+  const b = await box("badcache");
+  try {
+    const { id, B } = await twoGrants(b);
+    assert.equal((await B.release(id, { fence: 2 })).ok, true);
+    const copy = store.recordPath(b.home, "acme", id);
+    const good = fs.readFileSync(copy, "utf8");
+    for (const bad of ["{not json", JSON.stringify(["released"]), JSON.stringify({ released_at: T0 }), JSON.stringify({ ...JSON.parse(good), execution_id: "exec-0000000000000000" })]) {
+      fs.writeFileSync(copy, bad);
+      const stat = await store.gcExecutions(b.home);
+      assert.deepEqual(stat.collected, [], bad);
+      assert.deepEqual(stat.spared, [{ id, reason: "unreadable record" }], bad);
+      assert.ok(fs.existsSync(store.takeoverPath(b.home, "remote", id)), bad);
+    }
+    // A STALE copy (the server ended it; the box last saw it live) waits.
+    fs.writeFileSync(copy, JSON.stringify({ ...JSON.parse(good), released_at: undefined, stage: "gates" }));
+    assert.deepEqual((await store.gcExecutions(b.home)).collected, []);
+    assert.ok(fs.existsSync(store.takeoverPath(b.home, "remote", id)));
+    fs.writeFileSync(copy, good);
+    assert.deepEqual((await store.gcExecutions(b.home)).collected, [id]);
+  } finally {
+    await b.fake.close();
+  }
+});
+
+test("gc retention: a long-ended REMOTE execution's cached copy and workflow journals expire once nothing is owed for it; a recent one, an owed one and LOCAL history stay", async () => {
+  const b = await box("retain");
+  try {
+    const { id, B } = await twoGrants(b);
+    assert.equal((await B.release(id, { fence: 2 })).ok, true);
+    const dir = execDir(b.home, "acme");
+    fs.writeFileSync(path.join(dir, `${id}.gates-a1.workflow.jsonl`), "{}\n");
+    fs.writeFileSync(path.join(dir, `${id}.workflow.jsonl`), "{}\n");
+    const xFile = plantGoneOutbox(b, id, "pX-owed", [2]);
+    const later = Date.now() + store.EXECUTION_RETAIN_MS + 60000;
+    // Owed: an outbox line holds it (in the LABEL partition, not the record's).
+    let stat = await store.gcExecutions(b.home, { now: later });
+    assert.deepEqual(stat.expired, []);
+    assert.ok(fs.existsSync(store.recordPath(b.home, "acme", id)));
+    fs.rmSync(xFile);
+    // Recent: ended inside the horizon.
+    stat = await store.gcExecutions(b.home);
+    assert.deepEqual(stat.collected, [id]);
+    assert.deepEqual(stat.expired, []);
+    assert.deepEqual(filesOf(b.home, id), [`acme/${id}.gates-a1.workflow.jsonl`, `acme/${id}.json`, `acme/${id}.workflow.jsonl`]);
+    // Long ended and owing nothing: the copies go.
+    stat = await store.gcExecutions(b.home, { now: later });
+    assert.deepEqual(stat.expired, [id], JSON.stringify(stat));
+    assert.deepEqual(filesOf(b.home, id), []);
+    // LOCAL history is the only record, and the item pointer numbers attempts.
+    const home = tmp("retain-local");
+    const st = store.openExecutionStore(null, { home, mode: "local", worker: "agent-a", machine: "box", instance: "pL-retain", pinRead: (n) => ({ revision: `rev-${n}`, repo: "spor" }) });
+    const o = await st.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+    assert.equal((await st.release(o.execution.execution_id, { fence: o.fence })).ok, true);
+    const before = [...fs.readdirSync(execDir(home, "local")), ...fs.readdirSync(path.join(home, "journal", "executions", "local", "item"))].sort();
+    const localStat = await store.gcExecutions(home, { now: later });
+    assert.deepEqual(localStat.expired, []);
+    assert.deepEqual([...fs.readdirSync(execDir(home, "local")), ...fs.readdirSync(path.join(home, "journal", "executions", "local", "item"))].sort(), before);
+  } finally {
+    await b.fake.close();
+  }
+});
+
+test("gc budget: a sweep past its time budget stops between files and says so; the next pass carries on", async () => {
+  const home = tmp("budget");
+  const dir = path.join(home, "journal", "executions", "local", "item");
+  plantDeadLock(path.join(dir, "task-x.json.lock.dead-x"));
+  plantDeadLock(path.join(dir, "task-y.json.lock.dead-y"));
+  const stopped = await store.gcExecutions(home, { budgetMs: 0 });
+  assert.equal(stopped.truncated, true);
+  assert.equal(stopped.removed, 0, "nothing was touched past the budget");
+  let calls = 0;
+  const partial = await store.gcExecutions(home, { budgetMs: 1, clock: () => (calls++ < 4 ? 0 : 10) });
+  assert.equal(partial.truncated, true);
+  assert.equal(partial.removed, 1, "one lock base swept before the budget ran out");
+  const rest = await store.gcExecutions(home);
+  assert.equal(rest.truncated, undefined);
+  assert.deepEqual(fs.readdirSync(dir), []);
+});
+
+test("gc: a breaker-removal guard left by a clearer that died is collected once stale; a live one (and the breaker it guards) is not", async () => {
+  const home = tmp("breaker-guard");
+  const dir = path.join(home, "journal", "executions", "local", "item");
+  const base = path.join(dir, "task-x.json");
+  plantLiveLock(`${base}.lock.break.clear`);
+  plantDeadLock(`${base}.lock.break`);
+  await store.gcExecutions(home);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ["task-x.json.lock.break", "task-x.json.lock.break.clear"], "a live clearer holds the guard: the sweep does not remove the breaker under it");
+  fs.rmSync(`${base}.lock.break.clear`);
+  plantDeadLock(`${base}.lock.break.clear`);
+  await store.gcExecutions(home);
+  assert.deepEqual(fs.readdirSync(dir), [], "the dead guard goes, then the dead breaker through it");
+});
+
+test("remote: a stale fence holder re-sending an already-observed state is not told it is recorded — the server's replay answer is fence-checked", async () => {
+  const b = await box("observe-replay");
+  try {
+    const attempts = require("../lib/shell/provider-attempts.js");
+    const A = b.open("pA");
+    const o = await A.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+    const id = o.execution.execution_id;
+    const key = "exec-x/1/remote-replay";
+    assert.equal((await A.event(id, { fence: 1, event: { type: "attempt.submitting", attempt: 1, provider: "synthetic", submit_idempotency_key: key, request: {} } })).ok, true);
+    assert.equal((await A.event(id, { fence: 1, event: { type: "attempt.submitted", attempt: 1, provider: "synthetic", handle: { provider: "synthetic", id: "syn-1" }, submit_idempotency_key: key } })).ok, true);
+    const client = { id: "synthetic", observe: async () => ({ state: "running" }) };
+    assert.equal((await attempts.observeAttempt({ store: A, executionId: id, fence: 1, client })).recorded, true);
+    assert.equal((await attempts.observeAttempt({ store: A, executionId: id, fence: 1, client })).recorded, true, "the live holder's replay still reads recorded");
+    await pause(5);
+    const B = b.open("pB");
+    assert.equal((await B.claim(id, { takeover: true })).fence, 2);
+    const stale = await attempts.observeAttempt({ store: A, executionId: id, fence: 1, client });
+    assert.equal(stale.recorded, false, JSON.stringify(stale));
+    assert.equal(stale.code, "fence_stale");
+  } finally {
+    await b.fake.close();
+  }
+});
+
+test("local store: the item lock's cross-process wait is bounded by the engine's itemLock budget", async () => {
+  const home = tmp("itemlock-budget");
+  const st = store.openExecutionStore(null, { home, mode: "local", worker: "agent-a", machine: "box", instance: "pL-budget", itemLock: { attempts: 3, waitMs: 5 }, pinRead: (n) => ({ revision: `rev-${n}`, repo: "spor" }) });
+  const o = await st.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+  const child = holdLockInChild(store.itemPath(home, "local", "task-x"));
+  await child.ready();
+  try {
+    const t0 = Date.now();
+    const r = await st.event(o.execution.execution_id, { fence: o.fence, event: { type: "stage.observed", attempt: 1, state: "running" } });
+    assert.equal(r.unspooled, true, JSON.stringify(r));
+    assert.ok(Date.now() - t0 < 1500, `gave up after ${Date.now() - t0}ms, not the ~5s default`);
+  } finally {
+    await child.release();
+  }
+});

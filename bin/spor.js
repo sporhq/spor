@@ -11815,14 +11815,19 @@ async function withdrawHeldExecution(cfg, { nodeId, executionId, fence = null, s
 // gated on gc.enabled like the session-start journal sweep that also runs
 // it. Fail-open: a sweep that throws is retried at the next interval.
 let EXECUTION_GC_AT = 0;
+// The sweep's wall-clock bound per pass: a large journal is swept over
+// several passes rather than stalling one loop pass.
+const EXECUTION_GC_BUDGET_MS = 10000;
 async function gcExecutionsDue(cfg, { home = cfg.userConfigHome(), log = () => {}, now = Date.now() } = {}) {
   if (!cfg.getBool("gc.enabled", true)) return null;
   const interval = Number(cfg.get("gc.intervalMs", require(path.join(ROOT, "lib", "shell", "spool.js")).SPOOL_TTL.gcInterval));
   if (EXECUTION_GC_AT && now - EXECUTION_GC_AT < interval) return null;
   EXECUTION_GC_AT = now;
   try {
-    const stat = await executionStore.gcExecutions(home, { now });
+    const stat = await executionStore.gcExecutions(home, { now, budgetMs: EXECUTION_GC_BUDGET_MS });
     if (stat.collected.length) log(`work: collected the ledger, outbox and lock files of ${stat.collected.length} ended execution(s)`);
+    if (stat.expired.length) log(`work: expired the cached copies of ${stat.expired.length} long-ended execution(s)`);
+    if (stat.truncated) log(`work: the execution journal sweep hit its ${EXECUTION_GC_BUDGET_MS}ms budget; the next sweep carries on`);
     return stat;
   } catch (e) {
     log(`work: the execution journal sweep failed (${(e && e.message) || e}); retried next interval`);

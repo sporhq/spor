@@ -92,3 +92,28 @@ test('filesystem exclusion survives awaited callbacks and a rejected callback re
   assert.equal((await second).value, 'next');
   assert.equal(fs.existsSync(`${file}.lock`), false);
 });
+
+test('a breaker whose own process died is cleared by the next acquirer (no 15-minute wait); one guarding a LIVE moved lock still fails closed', async t => {
+  const home = setup(t), file = path.join(home, 'item');
+  const { withLocalExecutionLock } = require(lockModule);
+  const os = require('node:os');
+  const gone = () => { const r = require('node:child_process').spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }); return { host: os.hostname(), pid: Number(r.stdout), ticks: null, token: require('node:crypto').randomUUID() }; };
+  // A breaker died mid-break, over a lock whose holder is gone too.
+  fs.writeFileSync(`${file}.lock.break`, JSON.stringify(gone()));
+  fs.writeFileSync(`${file}.lock`, JSON.stringify(gone()));
+  const t0 = Date.now();
+  assert.equal((await withLocalExecutionLock(file, () => 'recovered', { attempts: 50, waitMs: 1 })).value, 'recovered');
+  assert.ok(Date.now() - t0 < 2000);
+  assert.deepEqual(fs.readdirSync(home).sort(), [], 'no breaker, lock or moved copy left behind');
+  // A dead breaker that may have been restoring a LIVE holder's moved lock
+  // is not judgeable here: the lock fails closed and nothing is touched.
+  fs.writeFileSync(`${file}.lock.break`, JSON.stringify(gone()));
+  fs.writeFileSync(`${file}.lock.dead-x`, JSON.stringify({ host: os.hostname(), pid: process.pid, ticks: null, token: 'live' }));
+  assert.equal((await withLocalExecutionLock(file, () => assert.fail('live moved lock'), { attempts: 3, waitMs: 1 })).ok, false);
+  assert.ok(fs.existsSync(`${file}.lock.break`) && fs.existsSync(`${file}.lock.dead-x`));
+  fs.unlinkSync(`${file}.lock.dead-x`); fs.unlinkSync(`${file}.lock.break`);
+  // A LIVE breaker is never cleared.
+  fs.writeFileSync(`${file}.lock.break`, JSON.stringify({ host: os.hostname(), pid: process.pid, ticks: null, token: 'live-breaker' }));
+  assert.equal((await withLocalExecutionLock(file, () => assert.fail('live breaker'), { attempts: 3, waitMs: 1 })).ok, false);
+  assert.equal(JSON.parse(fs.readFileSync(`${file}.lock.break`, 'utf8')).token, 'live-breaker');
+});
