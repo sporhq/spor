@@ -25,6 +25,7 @@ const graphLib = require(path.join(ROOT, "lib", "graph.js"));
 const queueLib = require(path.join(ROOT, "lib", "queue.js"));
 const programKernel = require(path.join(ROOT, "lib", "kernel", "program.js"));
 const analyticsLib = require(path.join(ROOT, "lib", "analytics.js"));
+const documentShell = require(path.join(ROOT, "lib", "shell", "document.js"));
 
 // server/rest.js
 const QUEUE_MAX_LIMIT = 100;
@@ -145,6 +146,43 @@ function startStubServer({ nodesDir }) {
       });
       if (env.found === false) return send(res, 404, { error: { code: "not_found", message: "unknown root" } });
       return send(res, 200, env);
+    }
+
+    const dm = url.pathname.match(/^\/v1\/documents\/([^/]+)$/);
+    if (dm && req.method === "GET") {
+      // server/rest-fastify.ts `getDocument` over documents.ts getDocument: the
+      // answer is the bare document; a refusal is {error:{code,message,details}}
+      // (bad_request 400, not_found 404).
+      const r = documentShell.getDocument(nodesDir, { id: decodeURIComponent(dm[1]), revision: sp.get("revision") });
+      if (!r.ok) return send(res, r.code === "not_found" ? 404 : 400, { error: { code: r.code, message: r.message, details: r.details } });
+      return send(res, 200, r.document);
+    }
+    if (dm && req.method === "PUT") {
+      // server/rest-fastify.ts `putDocument`: {node, snapshot?}, the source's id
+      // must be :id; the body is the result minus `ok`; a conflict's error
+      // carries the current root revision.
+      let raw = "";
+      req.on("data", (d) => (raw += d));
+      req.on("end", () => {
+        let payload = {};
+        try { payload = JSON.parse(raw); } catch { return send(res, 400, { error: { code: "bad_request", message: "bad json" } }); }
+        const id = decodeURIComponent(dm[1]);
+        let srcId = null;
+        try { srcId = graphLib.parseFrontmatter(String(payload.node || ""), "incoming.md").id; } catch { /* putDocument reports it */ }
+        if (srcId && srcId !== id) return send(res, 400, { error: { code: "bad_request", message: `the source's id '${srcId}' does not match '${id}'` } });
+        const r = documentShell.putDocument(nodesDir, {
+          node: payload.node, snapshot: payload.snapshot ?? null,
+          journalDir: path.join(path.dirname(nodesDir), "stub-journal"),
+          prefixesFor: (t) => graphLib.loadGraph(nodesDir).registry.prefixesFor(t) || [],
+        });
+        if (!r.ok) {
+          const status = { conflict: 409, not_found: 404, invalid_node: 422 }[r.code] || 400;
+          return send(res, status, { error: { code: r.code, message: r.message, details: r.details, ...(r.revision ? { revision: r.revision } : {}) } });
+        }
+        const { ok: _ok, recovered: _rec, ...body } = r;
+        return send(res, 200, body);
+      });
+      return;
     }
 
     send(res, 404, { error: { code: "not_found", message: `stub has no route ${url.pathname}` } });

@@ -99,6 +99,13 @@ spor status [--quiet]          # resolved mode, graph, project, identity, health
                                #   `project:`)
 spor next [--project <slug>]   # the ranked decision queue — "what's next"
 spor get <id>                  # one node by id
+spor get <id> --document [--revision <sha>] [--json]
+                               # a LONG document whole: root frontmatter over every continuation
+                               #   part rejoined into one exact source; --json adds digest,
+                               #   completeness and the `snapshot` an edit is based on
+spor put-document [<file>|-] [--snapshot <file|json>]
+                               # publish a whole source of ANY length (parts first, root last);
+                               #   update by passing the snapshot you read; stale -> conflict
 spor put-node [<file>|-] --if-exists <error|skip|update> [--revision <sha>] [--spill]
                                # write a full node markdown file through validated put_node semantics;
                                # use `spor get <id> --json` first and pass its revision for updates
@@ -228,6 +235,11 @@ A few of these have enough surface to be worth a sentence:
   prints the part ids — don't truncate the body or abandon the write. Without
   it an over-cap create is refused naming the byte overage. `--spill` is
   remote-only and not valid with `--if-exists update`.
+  To EDIT a long document (a spilled one, or any over-cap source), don't touch
+  its parts: `spor get <id> --document --json > read.json`, edit its `source`,
+  then `spor put-document <file> --snapshot read.json` — the whole body is
+  republished as one immutable generation, root last, in either mode (MCP
+  `get_document`/`put_document`, REST `GET|PUT /v1/documents/<id>`).
   For many nodes at once (a backfill), `--dir <dir>` or several concatenated
   nodes on stdin submit them as one batch (`--if-exists error|skip`): every
   entry is parsed before anything is written, resolvers are moved ahead of the

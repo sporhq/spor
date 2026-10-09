@@ -210,6 +210,45 @@ written from the source node's perspective) plus the accepted inverse forms.
 Generated from the live registry, so an org schema that adds an edge type
 changes the description without a deploy.
 
+### `get_document` / `put_document`
+
+Long documents (task-spor-chatgpt-document-publication; the server-side
+contract is spor-server `docs/DOCUMENT-GENERATIONS.md`). A node body is capped
+at 8192 B; a document longer than that is a ROOT (the node itself, stamped
+`doc_sha256`/`doc_bytes` over the whole body) plus immutable, content-addressed
+generation PARTS `<family>-g<digest8>-<n>` (`continuation_of: <root>`,
+`doc_generation: <digest>`). These two tools read and publish the WHOLE source
+in one call, so no caller ever reassembles or splits pieces itself.
+
+`get_document {id, revision?}` returns `{id, revision, source, body, complete,
+managed, doc_sha256?, doc_bytes?, generation?, parts: [{id, revision}],
+snapshot, missing?, integrity_failed?}`: `source` is the root's frontmatter over
+the reassembled body (ONE exact text), `doc_sha256`/`doc_bytes` the full-body
+digest of the text returned (complete reads only), and `snapshot` `{root,
+revision, doc_sha256?, doc_bytes?, parts: [{id, revision}]}` (the client content
+contract, `lib/kernel/content.js` `validateDocumentSnapshot`) what an edit is
+based on. `revision` pins the ROOT revision: since parts are immutable that
+reproduces the document exactly as that revision published it (a pinned read of
+a multi-part LEGACY spill, whose parts are mutable, refuses `not_found`). A
+broken chain reads `complete: false` with `missing`, an edited piece
+`integrity_failed: true`; no reader ever substitutes text.
+
+`put_document {node, snapshot?}` publishes `node` (frontmatter + a body of any
+length) as one generation: new parts first, the root LAST by revision CAS.
+Without `snapshot` it creates (an existing root is `conflict`); with one it
+updates, and a moved root revision — or, for a legacy spill, a moved part
+revision — is `conflict` carrying the current `revision`. Re-sending a source
+that already landed answers `unchanged` and mints nothing. Output `{status:
+created|updated|unchanged, id, revision, generation, parts: [ids], warnings,
+snapshot}`. Both tools also return the source / a status line as plain text.
+The REST twins are `GET|PUT /v1/documents/{id}` (§3); the CLI is `spor get <id>
+--document [--revision <sha>] [--json]` and `spor put-document [<file>|-]
+[--snapshot <file|json>] [--json]`, and in LOCAL mode the CLI runs the same
+contract over the nodes dir (`lib/shell/document.js`: identical part ids,
+digests and verdicts, a per-document lock, and an intent journal under
+`journal/documents/` that the next `put-document` finishes or rolls back after a
+crash).
+
 ### `add_edge`
 
 Micro-mutation. Input `{ "id": "<node>", "type": "<edge type>",
@@ -765,6 +804,8 @@ agent subject sees no graph content; a coarse read-only/CI flag is not a bypass.
 | `GET /v1/nodes/{id}/history?limit=N` | `spor history <id>`, the `node_history` MCP tool | per-node commit lineage — a `git log` projection over `nodes/{id}.md` → `{id, head, count, history: [{sha, short, actor, actor_name, actor_email, date, message, internal, person}]}`, newest first. Each revision is labeled `internal:true` for a server-internal write (boot reconcile / migration, `server@spor.invalid`) vs. a real actor, and mapped to its `person` node by author email. Deliberately NOT `git log --follow` (node files share heavy frontmatter boilerplate, so similarity-based rename detection crosses node boundaries — dec-spor-node-history-git-log-projection). `limit` defaults to 50, max 200. The frontmatter `author` re-stamps to the LAST editor on every write, so this is the only durable record of the full chain of editors. A node with no commit history (unknown id) is `404`; a bad id is `422`. The `spor history <id>` CLI verb is the shell front-door (remote reads this; local mode runs the same projection over the graph home) |
 | `GET /v1/nodes/{id}/history/{sha}` | `spor history <id> <sha>`, `node_history` (sha mode) | one revision's detail, the expensive half gated behind an explicit per-sha fetch → the history record for that commit plus `{change, patch, content}`: the change type (`A`/`M`/`D`/`R`), the patch this commit introduced to the node file, and the full node content at that revision (`null` when the commit deleted it). The `sha` must be one from the node's own history — a sha that didn't touch the node, or an unresolvable sha, is `404`; a malformed sha is `422` |
 | `POST /v1/nodes` | `spor put-node` (one node, or a `--dir`/multi-document batch), drain-outbox, mechanical writers | `put_node` semantics, batch: `{nodes: [...], if_exists: "skip"}` (entries may be raw strings or `{node, if_exists, revision}`) → `{results: [...]}`, 207 when any entry failed. Entries are applied **sequentially** and each is fully validated before the next — including the completion-resolver gate that runs on create (GRAPH.md "the resolver gate") — so a born-terminal node (`done` task / `resolved` issue) must have its resolving `decision`/`artifact` EARLIER in the same batch (**resolver-first ordering**; the batch does not defer the gate to end-of-batch, dec-spor-batch-create-gate-resolver-first-ordering). The 207 is partial-success: entries already applied before a later entry's failure are not rolled back. (`spor put-node`'s LOCAL-mode batch differs: it validates the whole batch against one temp graph and writes nothing if any entry is invalid; its remote mode is this per-entry route) **Spill (opt-in, creates only):** node bodies are capped at 8192 bytes, and an over-cap create is refused naming the byte overage. An entry (`{node, if_exists, revision, spill: true}`) or the whole request (batch-wide `spill: true`) opts in to **spill**: the server splits the overflow into server-minted `art-<stem>-<n>` continuation parts linked to the base node and returns their ids as `parts` on that entry's result (an array of id strings, absent when nothing spilled). Parts are numbered from 2 (`art-<stem>-2`, `-3`, …), so `parts` lists only the continuations — the base node is the entry's own `id`. Each piece carries italic link lines that count toward the 8192-byte cap: a part's first line is `_(continued from <prevId>)_` and every piece but the last ends with a final line `_(continues in <nextId>)_`. Spill never applies to updates: with `if_exists: update` (or any existing id) `spill` is ignored with a warning, and the write is refused only if the body is still over the cap (`spor put-node --spill` sends it per entry and is remote-only). **Reassembling:** read the base node and each part in `parts` order, drop the first line of every part after the base (`continued from`) and the last line of every piece but the last (`continues in`), then concatenate the bodies with no separator. The write is all-or-nothing: if a piece fails to write after validation (e.g. disk full), every piece already written and every flip is rolled back (nothing is committed), and the refusal's `details` lists the rolled-back ids (`rolled back the piece(s) already written: …`, plus a `rollback failed: …` line for any undo that itself failed) — so a retry, even with `if_exists: error`, starts clean. A refused over-cap body (unspilled create, or an update still over the cap) carries the overage as a structured `body_over_bytes` integer on the refusal beside the message. A spilled base is stamped `spill_sha256`/`spill_bytes` (see `follow_continuations` on `GET /v1/nodes/{id}`). MCP `put_node` takes the same `spill: true` argument. |
+| `GET /v1/documents/{id}[?revision=<root revision>]` | `spor get <id> --document [--revision <sha>]` | `get_document` semantics (§2): the whole document as one exact `source` + `body`, its full-body digest, completeness and the `snapshot` that pins it. `400 bad_request` for a malformed revision; `404 not_found` for an unknown id, a revision that does not name one of this root's, or a pinned read of a multi-part legacy spill |
+| `PUT /v1/documents/{id}` `{node, snapshot?}` | `spor put-document` | `put_document` semantics (§2): the source's id must be `{id}`. Answer `{status, id, revision, generation, parts, warnings, snapshot}`; a stale snapshot is `409 conflict` whose `error.revision` names the current root revision |
 | `POST /v1/nodes/{id}/edges` `{type, to, attrs?}` | scripts, mechanical writers | `add_edge` semantics (§1): normalize/flip, dedupe, append — no revision echo. Optional `attrs` adds trailing flat edge attributes (e.g. a per-assignment `profile:` override); re-adding the same edge with different attrs upserts the set. Adding a review-outcome edge (`reviewed-by`/`changes-requested-by`/`review-requested`) flips a sibling review edge to the same person in place — the one-call submit-review primitive |
 | `DELETE /v1/nodes/{id}/edges` `{type, to}` | scripts, mechanical writers | `remove_edge` semantics (§1): the withdrawal twin of the POST above — drop one typed edge by `{type, to}`, normalize/flip exactly as `add_edge` (an inverse form removes the canonical edge on the *other* node and echoes its id), no revision echo. A missing edge is an idempotent `skipped`. For *withdrawing* a relationship the review flip can't express — a pulled review request, a dismissed review |
 | `PATCH /v1/nodes/{id}` `{patch, revision?}` | `patch_node` MCP tool, `spor patch` CLI | the JSON-merge-patch door (§1 `patch_node`): `patch` is `{key: scalar\|null}` over the node's flat frontmatter — a scalar sets the field, `null` removes it, everything unnamed (body, edges) is untouched. A key with a dedicated door (`status`, `edges`, `commits`, the priority/readiness registers, structural and server-stamped fields) is `422 invalid_node` naming the door; an optional `revision` that no longer matches is `409 conflict`. → 200 `{status: "updated"\|"skipped", id, revision, warnings}` (`skipped` = no field changed, nothing committed) |

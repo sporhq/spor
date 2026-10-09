@@ -1,0 +1,263 @@
+// document.test.js — complete document IO (task-spor-chatgpt-document-cli):
+// the kernel's generation builder and chain read (lib/kernel/content.js), the
+// local root-last publication with its recovery journal (lib/shell/document.js),
+// and the CLI doors (`spor get --document`, `spor put-document`). Mode parity
+// against the server's shapes is test/mode-parity.test.js. Scratch homes only.
+
+require("./helpers/tmp-cleanup");
+const test = require("node:test");
+const assert = require("node:assert");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { hermeticEnv } = require("./helpers/env.js");
+const { gitEnv } = require("./helpers/git.js");
+
+const content = require("../lib/kernel/content.js");
+const documentShell = require("../lib/shell/document.js");
+
+const CLI = path.join(__dirname, "..", "bin", "spor.js");
+const SHELL = path.join(__dirname, "..", "lib", "shell", "document.js");
+
+function source(id, { edit = "", paras = 400, type = "artifact", extra = "" } = {}) {
+  const ps = [];
+  for (let i = 1; i <= paras; i++) ps.push(`Paragraph ${i}${i === 3 ? edit : ""} — text ünïcode 😀.`);
+  return `---\nid: ${id}\ntype: ${type}\ntitle: Doc ${id}\nsummary: A long document.\nstatus: active\ndate: 2026-10-09\n${extra}---\n\n${ps.join("\n\n")}\n`;
+}
+function home({ git = false } = {}) {
+  const h = fs.mkdtempSync(path.join(os.tmpdir(), "spor-document-"));
+  fs.mkdirSync(path.join(h, "nodes"));
+  if (git) spawnSync("git", ["init", "-q"], { cwd: h, env: gitEnv() });
+  return h;
+}
+const nodes = (h) => path.join(h, "nodes");
+const journal = (h) => path.join(h, "journal", "documents");
+const put = (h, node, snapshot = null, opts = {}) =>
+  documentShell.putDocument(nodes(h), { node, snapshot, journalDir: journal(h), ...opts });
+const get = (h, id, revision = null) => documentShell.getDocument(nodes(h), { id, revision });
+const cli = (h, args, input) =>
+  spawnSync(process.execPath, [CLI, ...args], {
+    cwd: h, input, encoding: "utf8",
+    env: hermeticEnv({ SPOR_HOME: h, XDG_CONFIG_HOME: h, SPOR_MODE: "local" }),
+  });
+const core = (s) => content.documentCore(s.split("\n---\n").slice(1).join("\n---\n"));
+
+// ---------- kernel ----------
+
+test("kernel: a generation is content-addressed, under the cap, and reassembles exactly", () => {
+  const src = source("dec-big", { type: "decision", paras: 900 });
+  const a = content.documentGeneration(src, { prefixes: ["dec-"] });
+  const b = content.documentGeneration(src, { prefixes: ["dec-"] });
+  assert.ok(a.ok);
+  assert.deepStrictEqual(a, b, "same body, same pieces");
+  assert.ok(a.parts.length >= 3);
+  a.parts.forEach((p, i) => assert.strictEqual(p.id, `art-decision-big-g${a.digest.slice(0, 8)}-${i + 2}`));
+  for (const raw of [a.root, ...a.parts.map((p) => p.raw)]) {
+    const body = raw.split("\n---\n")[1];
+    assert.ok(Buffer.byteLength(body, "utf8") <= content.DOC_BODY_CAP, "every piece fits the body cap");
+  }
+  const bodies = [a.root, ...a.parts.map((p) => p.raw)].map((r) => r.slice(r.indexOf("\n---\n") + 5));
+  assert.strictEqual(content.documentCore(content.spillReassemble(bodies)), core(src));
+  assert.strictEqual(a.digest, content.documentDigest(core(src)));
+  const edited = content.documentGeneration(source("dec-big", { type: "decision", paras: 900, edit: "!" }), { prefixes: ["dec-"] });
+  assert.ok(edited.parts.every((p) => !a.parts.some((q) => q.id === p.id)), "an edit is a disjoint generation");
+});
+
+test("kernel: a root may not carry a part's stamps; old spill stamps are replaced", () => {
+  const r = content.documentGeneration(source("art-x", { extra: "continuation_of: art-y\n" }));
+  assert.strictEqual(r.ok, false);
+  assert.match(r.message, /continuation_of/);
+  const g = content.documentGeneration(source("art-x", { paras: 2, extra: "spill_sha256: ab\nspill_bytes: 2\n" }));
+  assert.doesNotMatch(g.root, /spill_/);
+  assert.match(g.root, /\ndoc_sha256: [0-9a-f]{64}\ndoc_bytes: \d+\n---\n/);
+  assert.deepStrictEqual(g.parts, [], "a fitting body is a one-piece generation");
+});
+
+test("kernel: the chain read never substitutes — missing, foreign, edited, pinned legacy", () => {
+  const g = content.documentGeneration(source("art-d", { paras: 700 }));
+  const fm = (raw) => require("../lib/kernel/frontmatter.js").parseFrontmatter(raw, "x.md");
+  const store = new Map(g.parts.map((p) => [p.id, { raw: p.raw, frontmatter: fm(p.raw) }]));
+  const root = { raw: g.root, frontmatter: fm(g.root) };
+  const read = () => content.readDocumentChain(root, (id) => store.get(id) || null);
+  assert.deepStrictEqual({ ...read(), body: undefined }, { body: undefined, parts: g.parts.map((p) => p.id), complete: true, generation: g.digest });
+  // an edited part: the chain still walks, the digest catches it
+  const p2 = g.parts[0];
+  store.set(p2.id, { raw: p2.raw.replace("Paragraph", "PARAGRAPH"), frontmatter: fm(p2.raw) });
+  assert.deepStrictEqual([read().complete, read().integrity_failed], [false, true]);
+  // a re-stamped (foreign) part reads as missing, never spliced in
+  store.set(p2.id, { raw: p2.raw.replace(/doc_generation: \w+/, `doc_generation: ${"0".repeat(64)}`), frontmatter: fm(p2.raw.replace(/doc_generation: \w+/, `doc_generation: ${"0".repeat(64)}`)) });
+  assert.deepStrictEqual([read().complete, read().missing, read().parts.length], [false, p2.id, 0]);
+  store.delete(p2.id);
+  assert.strictEqual(read().missing, p2.id);
+  // a legacy root pinned to a revision cannot be reproduced
+  const legacy = "---\nid: art-l\ntype: artifact\n---\n\nhead\n_(continues in art-l-2)_\n";
+  const pinned = content.readDocumentChain({ raw: legacy, frontmatter: fm(legacy) }, () => null, { pinned: true });
+  assert.strictEqual(pinned.history_unavailable, true);
+});
+
+// ---------- local publication ----------
+
+test("local: create, read exactly, edit from the snapshot, pin the old revision", () => {
+  const h = home({ git: true });
+  const v1 = put(h, source("art-doc"));
+  assert.strictEqual(v1.status, "created");
+  const r1 = get(h, "art-doc");
+  assert.ok(r1.ok && r1.document.complete);
+  assert.strictEqual(content.documentCore(r1.document.body), core(source("art-doc")));
+  assert.strictEqual(r1.document.doc_sha256, v1.generation);
+  // edit FROM the returned source, as a client would
+  const v2src = r1.document.source.replace("Paragraph 3 ", "Paragraph 3 (edited) ");
+  const v2 = put(h, v2src, r1.document.snapshot);
+  assert.strictEqual(v2.status, "updated");
+  const r2 = get(h, "art-doc").document;
+  assert.strictEqual(r2.body, r1.document.body.replace("Paragraph 3 ", "Paragraph 3 (edited) "), "the read returns the edited body exactly");
+  assert.strictEqual(r2.source, fs.readFileSync(path.join(nodes(h), "art-doc.md"), "utf8").split("\n---\n")[0] + "\n---\n" + r2.body,
+    "the source is the root's (restamped) frontmatter over the whole body");
+  const old = get(h, "art-doc", v1.revision);
+  assert.ok(old.ok, old.message);
+  assert.strictEqual(old.document.source, r1.document.source, "the old root revision reproduces v1");
+  // a lost-answer retry mints nothing
+  const files = fs.readdirSync(nodes(h)).length;
+  assert.strictEqual(put(h, v2src, r1.document.snapshot).status, "unchanged");
+  assert.strictEqual(fs.readdirSync(nodes(h)).length, files);
+});
+
+test("local: long edits conflict safely — stale root, moved legacy part, squatted part, part id", () => {
+  const h = home();
+  const v1 = put(h, source("art-doc"));
+  const a = put(h, source("art-doc", { edit: " A" }), v1.snapshot);
+  assert.strictEqual(a.status, "updated");
+  const b = put(h, source("art-doc", { edit: " B" }), v1.snapshot);
+  assert.deepStrictEqual([b.ok, b.code, b.revision], [false, "conflict", a.revision], "the second edit from one snapshot is refused");
+  assert.match(get(h, "art-doc").document.body, /Paragraph 3 A/, "and the first edit stands whole");
+  assert.strictEqual(put(h, source("art-doc", { edit: " C" })).code, "conflict", "a create over an existing root");
+  assert.strictEqual(put(h, source("art-new"), a.snapshot).code, "bad_request", "a snapshot of another document");
+  assert.strictEqual(put(h, source("art-new"), { ...a.snapshot, root: "art-new" }).code, "not_found");
+
+  // a legacy spill whose part moved under an unchanged root
+  fs.writeFileSync(path.join(nodes(h), "art-legacy.md"), "---\nid: art-legacy\ntype: artifact\ntitle: L\nsummary: s\nstatus: active\ndate: 2026-10-01\n---\n\nhead\n_(continues in art-legacy-2)_\n");
+  const partFile = path.join(nodes(h), "art-legacy-2.md");
+  fs.writeFileSync(partFile, "---\nid: art-legacy-2\ntype: artifact\ntitle: L2\nsummary: s\nstatus: active\ndate: 2026-10-01\ncontinuation_of: art-legacy\nedges:\n  - {type: derived-from, to: art-legacy}\n---\n\n_(continued from art-legacy)_\ntail\n");
+  const leg = get(h, "art-legacy").document;
+  assert.deepStrictEqual([leg.complete, leg.managed, leg.parts.length], [true, false, 1]);
+  fs.appendFileSync(partFile, "more\n");
+  const moved = put(h, leg.source, leg.snapshot);
+  assert.strictEqual(moved.code, "conflict");
+  assert.match(moved.message, /legacy spill part vector differs/);
+  const fresh = get(h, "art-legacy").document;
+  assert.strictEqual(put(h, fresh.source, fresh.snapshot).status, "updated", "migrates to a generation from a fresh read");
+  assert.strictEqual(get(h, "art-legacy").document.managed, true);
+
+  // a squatted generation id is never adopted
+  const src = source("art-sq");
+  const gen = content.documentGeneration(src);
+  fs.writeFileSync(path.join(nodes(h), `${gen.parts[0].id}.md`), gen.parts[0].raw.replace("Paragraph", "Squat"));
+  const sq = put(h, src);
+  assert.strictEqual(sq.code, "conflict");
+  assert.ok(!fs.existsSync(path.join(nodes(h), "art-sq.md")), "nothing published");
+  // a part is never published as a document of its own
+  const part = put(h, fs.readFileSync(path.join(nodes(h), `${a.parts[0]}.md`), "utf8").replace(/continuation_of: .*\n|doc_generation: .*\n/g, ""));
+  assert.strictEqual(part.code, "conflict");
+  assert.match(part.message, /continuation part of 'art-doc'/);
+});
+
+test("local: a refused piece writes nothing", () => {
+  const h = home();
+  const r = put(h, source("art-v"), null, { validate: () => ({ errors: ["art-v.md: bogus"], warnings: [] }) });
+  assert.deepStrictEqual([r.ok, r.code], [false, "invalid_node"]);
+  assert.deepStrictEqual(fs.readdirSync(nodes(h)), []);
+  assert.deepStrictEqual(fs.readdirSync(journal(h)).filter((f) => !f.endsWith(".lock")), []);
+});
+
+// ---------- restart recovery: the publisher really dies ----------
+
+// Publish in a child process that exits at `stage` (the at() seam), as a kill
+// would: no finally, no rollback.
+function dieAt(h, node, snapshot, stage) {
+  const script = `
+    const d = require(${JSON.stringify(SHELL)});
+    d.putDocument(${JSON.stringify(nodes(h))}, {
+      node: ${JSON.stringify(node)}, snapshot: ${JSON.stringify(snapshot)}, journalDir: ${JSON.stringify(journal(h))},
+      at: (s) => { if (s === ${JSON.stringify(stage)}) process.exit(137); },
+    });
+    process.exit(0);`;
+  const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
+  assert.strictEqual(r.status, 137, r.stderr);
+}
+
+for (const stage of ["journaled", "parts", "root"]) {
+  test(`local restart recovery: death after ${stage} leaves the old or the whole new document, and the next publication recovers`, () => {
+    const h = home({ git: true });
+    const v1 = put(h, source("art-doc"));
+    const before = new Set(fs.readdirSync(nodes(h)));
+    const v2src = source("art-doc", { edit: " (v2)" });
+    dieAt(h, v2src, v1.snapshot, stage);
+    // A dead publisher's lock and intent are left behind.
+    assert.ok(fs.existsSync(path.join(journal(h), "art-doc.lock")));
+    assert.ok(fs.existsSync(path.join(journal(h), "art-doc.publish.json")));
+    const mid = get(h, "art-doc").document;
+    assert.strictEqual(mid.complete, true, "never a mix");
+    const landed = stage === "root";
+    assert.strictEqual(content.documentCore(mid.body), core(landed ? v2src : source("art-doc")));
+
+    // The CLI's next publication (of anything) recovers it and says so.
+    const r = cli(h, ["put-document", "-"], source("art-other", { paras: 2 }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stderr, new RegExp(`recovered an interrupted publication of 'art-doc' \\(${landed ? "landed" : "rolled-back"}`));
+    assert.ok(!fs.existsSync(path.join(journal(h), "art-doc.publish.json")), "the intent is settled");
+    const after = new Set(fs.readdirSync(nodes(h)).filter((f) => f !== "art-other.md"));
+    if (!landed) assert.deepStrictEqual([...after].sort(), [...before].sort(), "orphaned parts removed");
+    // and the edit (re)publishes cleanly against a fresh read
+    const cur = get(h, "art-doc").document;
+    const again = put(h, v2src, cur.snapshot);
+    assert.strictEqual(again.status, landed ? "unchanged" : "updated");
+    assert.strictEqual(content.documentCore(get(h, "art-doc").document.body), core(v2src));
+    assert.strictEqual(content.documentCore(get(h, "art-doc", v1.revision).document.body), core(source("art-doc")), "v1 still pinned");
+  });
+}
+
+test("local: a live publication's lock is a conflict, never waited on", () => {
+  const h = home();
+  fs.mkdirSync(journal(h), { recursive: true });
+  fs.writeFileSync(path.join(journal(h), "art-doc.lock"), JSON.stringify({ pid: process.ppid, ticks: null, at: Date.now(), token: "x" }));
+  const r = put(h, source("art-doc"));
+  assert.strictEqual(r.code, "conflict");
+  assert.match(r.message, /another publication of 'art-doc' is in progress/);
+});
+
+// ---------- the CLI doors ----------
+
+test("cli: get without --document is unchanged; --revision needs --document", () => {
+  const h = home();
+  put(h, source("art-doc"));
+  const raw = fs.readFileSync(path.join(nodes(h), "art-doc.md"), "utf8");
+  const plain = cli(h, ["get", "art-doc"]);
+  assert.strictEqual(plain.status, 0);
+  assert.strictEqual(plain.stdout, `${raw}\n`, "the raw root file, as before");
+  const json = JSON.parse(cli(h, ["get", "art-doc", "--json"]).stdout);
+  assert.deepStrictEqual(Object.keys(json), ["id", "frontmatter", "body", "edges", "revision"]);
+  assert.strictEqual(json.revision, documentShell.readNodeFile(nodes(h), "art-doc").revision);
+  const bad = cli(h, ["get", "art-doc", "--revision", json.revision]);
+  assert.strictEqual(bad.status, 1);
+  assert.match(bad.stderr, /--revision is only valid with --document/);
+});
+
+test("cli: put-document validates pieces against the graph and takes a whole get --json answer as --snapshot", () => {
+  const h = home();
+  const created = cli(h, ["put-document", "-"], source("art-doc"));
+  assert.strictEqual(created.status, 0, created.stderr);
+  assert.match(created.stdout, /^put-document created: art-doc @ [0-9a-f]{40}, generation [0-9a-f]{8} \(\+ generation parts /);
+  const read = cli(h, ["get", "art-doc", "--document", "--json"]);
+  fs.writeFileSync(path.join(h, "read.json"), read.stdout);
+  const upd = cli(h, ["put-document", "-", "--snapshot", path.join(h, "read.json"), "--json"], source("art-doc", { edit: " x" }));
+  assert.strictEqual(upd.status, 0, upd.stderr);
+  assert.strictEqual(JSON.parse(upd.stdout).status, "updated");
+  const invalid = cli(h, ["put-document", "-"], source("art-bad").replace("summary: A long document.\n", ""));
+  assert.strictEqual(invalid.status, 1);
+  assert.match(invalid.stderr, /^put-document: document 'art-bad' refused \(invalid_node\)/);
+  assert.ok(!fs.existsSync(path.join(nodes(h), "art-bad.md")));
+  const badSnap = cli(h, ["put-document", "-", "--snapshot", "{\"root\":\"art-doc\"}"], source("art-doc"));
+  assert.strictEqual(badSnap.status, 1);
+  assert.match(badSnap.stderr, /invalid document snapshot/);
+});

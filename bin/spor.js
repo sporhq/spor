@@ -854,7 +854,12 @@ async function fetchQueuePaged(cfg, baseQs, target) {
 async function cmdGet(cfg, { positionals, values }) {
   const id = positionals[0];
   if (!id) {
-    err("usage: spor get <id> [--json]");
+    err("usage: spor get <id> [--json] [--document [--revision <sha>]]");
+    return 1;
+  }
+  if (values.document) return cmdGetDocument(cfg, id, values);
+  if (values.revision) {
+    err("--revision is only valid with --document (a pinned whole-document read)");
     return 1;
   }
   if (cfg.mode() === "remote") {
@@ -941,6 +946,173 @@ async function cmdGet(cfg, { positionals, values }) {
   const node = graphLib.parseFrontmatter(raw.toString("utf8"), `${id}.md`);
   const inbound = inboundEdges(graphLib.loadGraph(nodesDir), node.id);
   out(JSON.stringify(getNodeJson(node, inbound, gitBlobSha(raw)), null, 2));
+  return 0;
+}
+
+// --- complete documents: spor get --document / spor put-document ----------
+// (task-spor-chatgpt-document-cli) A node body is capped at 8192 bytes; a
+// longer document is a root plus immutable generation parts
+// (spor-server docs/DOCUMENT-GENERATIONS.md). These read and publish the WHOLE
+// source in one call: remote mode is GET|PUT /v1/documents/{id}, local mode is
+// lib/shell/document.js over the nodes dir, and both answer the server's own
+// shapes through ONE renderer each (norm-spor-cli-mode-parity, pinned by
+// test/mode-parity.test.js).
+const documentShell = () => require(path.join(ROOT, "lib", "shell", "document.js"));
+const contentKernel = () => require(path.join(ROOT, "lib", "kernel", "content.js"));
+
+// A refusal, from either arm: {code, message, details, revision?}.
+function renderDocumentRefusal(prefix, r) {
+  err(`${prefix}: ${(r && r.message) || "refused"}${r && r.code ? ` (${r.code})` : ""}`);
+  for (const d of (r && r.details) || []) err(`  ${d}`);
+  if (r && r.revision) err(`  current revision: ${r.revision}`);
+}
+
+// A remote /v1/documents answer folded into the local arm's {ok, ...} shape.
+function remoteDocumentResult(r) {
+  if (r.transport) return { ok: false, offline: true, message: `offline — could not reach server (${r.error})` };
+  if (r.ok && r.json && !r.jsonError) return { ok: true, body: r.json };
+  const e = (r.json && r.json.error) || {};
+  return {
+    ok: false, code: e.code || `http_${r.status}`, message: e.message || `error ${r.status}`,
+    details: Array.isArray(e.details) ? e.details : [], ...(typeof e.revision === "string" ? { revision: e.revision } : {}),
+  };
+}
+
+async function cmdGetDocument(cfg, id, values) {
+  const revision = values.revision || null;
+  let r;
+  if (cfg.mode() === "remote") {
+    const q = revision ? `?revision=${encodeURIComponent(revision)}` : "";
+    const rr = remoteDocumentResult(await remote.get(cfg, `/v1/documents/${encodeURIComponent(id)}${q}`, { timeoutMs: 15000 }));
+    r = rr.ok ? { ok: true, document: rr.body } : rr;
+  } else {
+    const bad = badNodeIdReason(id);
+    if (bad) {
+      err(bad);
+      return 1;
+    }
+    r = documentShell().getDocument(cfg.nodesDir(), { id, revision });
+  }
+  if (!r.ok) {
+    if (r.offline) err(r.message);
+    else renderDocumentRefusal("get --document", r);
+    return 1;
+  }
+  const d = r.document;
+  if (values.json) out(JSON.stringify(d, null, 2));
+  else process.stdout.write(d.source.endsWith("\n") ? d.source : `${d.source}\n`);
+  // An incomplete read is printed (the cut stays visible) but is not the
+  // document: say so on stderr and exit 1, so `> file` never looks like a
+  // faithful copy.
+  if (!d.complete) {
+    err(`warning: ${contentKernel().documentStateLine(d)}`);
+    return 1;
+  }
+  return 0;
+}
+
+// --snapshot takes inline JSON, a file holding a snapshot, or a file holding a
+// whole `spor get --document --json` answer (its .snapshot is used).
+function readDocumentSnapshotArg(v) {
+  if (v == null) return { snapshot: null };
+  let text = String(v);
+  if (!text.trim().startsWith("{")) {
+    try {
+      text = fs.readFileSync(text, "utf8");
+    } catch (e) {
+      return { error: `could not read --snapshot ${v}: ${e.message}` };
+    }
+  }
+  let o;
+  try {
+    o = JSON.parse(text);
+  } catch (e) {
+    return { error: `--snapshot is not JSON: ${e.message}` };
+  }
+  if (o && typeof o === "object" && o.snapshot && typeof o.snapshot === "object") o = o.snapshot;
+  return { snapshot: o };
+}
+
+async function cmdPutDocument(cfg, { values, positionals }) {
+  const input = readPutNodeInput(positionals[0] || "-");
+  if (input.error) {
+    err(input.error);
+    return 1;
+  }
+  const parsed = parsePutNode(input.raw, input.label);
+  if (parsed.error) {
+    err(parsed.error);
+    return 1;
+  }
+  const id = parsed.node.id;
+  const snap = readDocumentSnapshotArg(values.snapshot);
+  if (snap.error) {
+    err(snap.error);
+    return 1;
+  }
+  let res;
+  if (cfg.mode() === "remote") {
+    const rr = remoteDocumentResult(await remote.request(cfg, "PUT", `/v1/documents/${encodeURIComponent(id)}`, {
+      body: { node: input.raw, ...(snap.snapshot ? { snapshot: snap.snapshot } : {}) }, timeoutMs: 60000,
+    }));
+    if (!rr.ok && rr.offline) {
+      err(rr.message);
+      return 1;
+    }
+    res = rr.ok ? { ok: true, ...rr.body } : rr;
+  } else {
+    const nodesDir = cfg.nodesDir();
+    if (!fs.existsSync(nodesDir)) {
+      err(`no graph at ${nodesDir} — run 'spor init' first`);
+      return 1;
+    }
+    const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+    const docs = documentShell();
+    const journalDir = path.join(path.dirname(nodesDir), "journal", "documents");
+    for (const rec of docs.recoverAll(nodesDir, journalDir)) {
+      err(`note: recovered an interrupted publication of '${rec.id}' (${rec.outcome}${rec.removed.length ? `; removed unreferenced ${rec.removed.join(", ")}` : ""})`);
+    }
+    let registry = null;
+    res = docs.putDocument(nodesDir, {
+      node: input.raw,
+      snapshot: snap.snapshot,
+      journalDir,
+      prefixesFor: (t) => {
+        registry ??= graphLib.loadGraph(nodesDir).registry;
+        return registry.prefixesFor(t) || [];
+      },
+      validate: (pieces) => {
+        const prepared = [];
+        for (const p of pieces) {
+          const pp = parsePutNode(p.raw, `${p.id}.md`);
+          if (pp.error) return { errors: [`${p.id}: ${pp.error}`], warnings: [] };
+          prepared.push({ node: pp.node, raw: p.raw });
+        }
+        const v = validatePutNodeBatchLocal(nodesDir, prepared);
+        const errors = [...v.graphErrors];
+        for (const [pid, es] of v.errors) for (const e of es) errors.push(`${pid}: ${e}`);
+        const warnings = [...v.batchWarnings];
+        for (const ws of v.warnings.values()) warnings.push(...ws);
+        return { errors, warnings };
+      },
+    });
+    if (res.recovered) {
+      err(`note: recovered an interrupted publication of '${res.recovered.id}' (${res.recovered.outcome})`);
+      delete res.recovered;
+    }
+  }
+  if (!res.ok) {
+    renderDocumentRefusal("put-document", res);
+    return 1;
+  }
+  const { ok: _ok, ...body } = res;
+  if (values.json) {
+    out(JSON.stringify(body, null, 2));
+    return 0;
+  }
+  out(contentKernel().publicationLine(body));
+  out(writeTargetLine(cfg));
+  for (const w of body.warnings || []) err(`  warning: ${w}`);
   return 0;
 }
 
@@ -1675,7 +1847,7 @@ async function cmdPutNode(cfg, { values, positionals }) {
       return 1;
     }
     if (cfg.mode() !== "remote") {
-      err("--spill is remote-only: the server mints the continuation parts. Local mode keeps the 8192-byte body cap — split the node yourself (a derived-from chain of art-<stem>-<n> parts)");
+      err("--spill is remote-only: the server mints the continuation parts. Local mode keeps the 8192-byte body cap for put-node — publish a long document with 'spor put-document' (either mode)");
       return 1;
     }
   }
@@ -19933,9 +20105,11 @@ const COMMANDS = {
     run: (cfg, args) => cmdNext(cfg, args),
   },
   get: {
-    group: "Graph", parse: "strict", args: "<id> [--json]",
+    group: "Graph", parse: "strict", args: "<id> [--json] [--document [--revision <sha>]]",
     options: {
       json: { type: "boolean", desc: "structured JSON: frontmatter, edges (inbound+outbound), body, revision" },
+      document: { type: "boolean", desc: "the WHOLE document: the root's frontmatter over every continuation part, rejoined" },
+      revision: { type: "string", value: "sha", desc: "with --document: the document as that root revision published it" },
     },
     summary: "a node by id (local: file; remote: /v1/nodes/<id>)",
     help:
@@ -19945,9 +20119,50 @@ const COMMANDS = {
       "inbound}, revision} — so scripts and tooling stop scraping markdown\n" +
       "frontmatter. `revision` is the git blob SHA an update sends; inbound edges are\n" +
       "gathered by scanning the whole graph (remote fetches GET /v1/export), so --json\n" +
-      "is heavier than the plain read. Mode-symmetric (norm-spor-cli-mode-parity).",
-    examples: ["spor get dec-cc-zero-dep-client", "spor get dec-cc-zero-dep-client --json"],
+      "is heavier than the plain read. Mode-symmetric (norm-spor-cli-mode-parity).\n\n" +
+      "--document reads a long document whole: the root's frontmatter over its body\n" +
+      "and every continuation part, rejoined into ONE exact source (remote: GET\n" +
+      "/v1/documents/<id>; local: the same chain walk over the nodes dir). Plain\n" +
+      "output is that source; --json is the server's get_document answer —\n" +
+      "{id, revision, source, body, complete, managed, doc_sha256, doc_bytes,\n" +
+      "generation, parts, snapshot}. Pass its `snapshot` to 'spor put-document' to\n" +
+      "edit. --revision <sha> reads the document as that ROOT revision published it.\n" +
+      "An incomplete read (a missing part, a digest mismatch) still prints what was\n" +
+      "read, warns on stderr, and exits 1. Without --document, get is unchanged.",
+    examples: ["spor get dec-cc-zero-dep-client", "spor get dec-cc-zero-dep-client --json", "spor get art-design --document", "spor get art-design --document --json > art-design.json"],
     run: (cfg, p) => cmdGet(cfg, p),
+  },
+  "put-document": {
+    group: "Graph", parse: "strict", args: "[<file>|-] [--snapshot <file|json>]",
+    summary: "publish a whole document source of any length (local root-last publication; remote: PUT /v1/documents/<id>)",
+    help:
+      "Publish one complete document — frontmatter + a body of ANY length — as one\n" +
+      "immutable generation: the body is cut into content-addressed continuation\n" +
+      "parts (<family>-g<digest8>-<n>), the parts land first and the root LAST by\n" +
+      "revision CAS, so every reader sees the old document or the whole new one and\n" +
+      "an older root revision still reads back exactly (spor get <id> --document\n" +
+      "--revision <sha>). The same contract as MCP put_document / REST PUT\n" +
+      "/v1/documents/<id>; with no file, or '-', reads the source from stdin.\n\n" +
+      "Create: no --snapshot; an existing document refuses (conflict). Update: pass\n" +
+      "the snapshot you read — inline JSON, a file holding it, or the whole\n" +
+      "'spor get <id> --document --json' answer. A stale root revision, or a legacy\n" +
+      "spill whose parts moved, refuses with the current revision: re-read, re-apply\n" +
+      "your edit, retry. Re-sending a source that already landed answers\n" +
+      "`unchanged` and mints nothing.\n\n" +
+      "Local mode validates every new piece against the graph it would leave,\n" +
+      "takes a per-document lock, and journals its intent under\n" +
+      "journal/documents/ first, so a publication killed midway is finished or\n" +
+      "rolled back by the next put-document (a note on stderr says which).",
+    options: {
+      snapshot: { type: "string", value: "file|json", desc: "the snapshot you read (required to update an existing document)" },
+      json: { type: "boolean", desc: "machine-readable result: {status, id, revision, generation, parts, warnings, snapshot}" },
+    },
+    examples: [
+      "spor put-document ./art-design.md",
+      "spor get art-design --document --json > read.json",
+      "spor put-document ./art-design.md --snapshot read.json",
+    ],
+    run: (cfg, p) => cmdPutDocument(cfg, p),
   },
   "put-node": {
     group: "Graph", parse: "strict", args: "[<file>|-] | --dir <dir>",

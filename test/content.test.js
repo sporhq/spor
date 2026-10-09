@@ -348,8 +348,10 @@ test("uses-asset ships as a candidate: inert until adopted ACTIVE, weight from t
   assert.equal(overridden.registry.edgeWeight("uses-asset"), 0.6);
 });
 
-test("content.js stays dependency-free: node builtins only", () => {
+test("content.js stays dependency-free: node builtins and the pure kernel grammar only", () => {
   const src = fs.readFileSync(path.join(__dirname, "..", "lib", "kernel", "content.js"), "utf8");
   const reqs = [...src.matchAll(/require\(\s*["']([^"']+)["']\s*\)/g)].map((m) => m[1]);
-  assert.deepEqual(reqs, ["crypto"]);
+  // ./frontmatter.js is the ONE node-file grammar (pure, itself require-free),
+  // which the document generation builder edits stamps through.
+  assert.deepEqual(reqs, ["crypto", "./frontmatter.js"]);
 });
