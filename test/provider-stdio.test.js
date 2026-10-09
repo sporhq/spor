@@ -312,3 +312,30 @@ test("a planned close does not mark held handles lost; a closed binding refuses"
   assert.deepEqual(p.lost(), []);
   assert.equal((await p.request(req("observe", { handle }))).error.code, "provider_exited");
 });
+
+test("a provider that writes its last reply and exits is still heard (stdout drains before the generation ends)", async () => {
+  // The write completes (its callback) before the exit, so every byte is in
+  // the pipe; whether the binding reads it all is the question.
+  const { declaration } = fakeProvider(`process.stdout.write(JSON.stringify({ id: msg.id, ok: true, result: { provider_id: "fake", contract_version: 1, capabilities: { isolation: ["vm"], lifecycle: [] }, pad: "x".repeat(400000) } }) + "\\n", () => process.exit(0));`);
+  for (let i = 0; i < 5; i++) {
+    const p = bind(declaration);
+    const res = await p.request(req("describe"));
+    assert.equal(res.ok, true, JSON.stringify(res.error));
+    assert.equal(res.result.pad.length, 400000);
+  }
+});
+
+test("a command that cannot start: provider_exited, nothing held, a submit is refused (not a LostReply), close resolves", async () => {
+  for (const command of [path.join(scratch(), "missing-provider"), "bad\u0000command"]) {
+    const p = bind({ id: "fake", command, args: [], env: {}, timeoutMs: 1000 });
+    const res = await p.request(req("observe", { handle }));
+    assert.equal(res.error.code, "provider_exited", command);
+    assert.deepEqual(p.held(), []);
+    const sub = await p.request(req("submit", { idempotency_key: "key-12345678", attempt: attempt() }));
+    assert.equal(sub.error.code, "provider_exited");
+    const q = bind({ id: "fake", command, args: [], env: {}, timeoutMs: 1000 });
+    const pending = q.request(req("describe"));
+    await q.close();
+    assert.equal((await pending).error.code, "provider_exited");
+  }
+});
