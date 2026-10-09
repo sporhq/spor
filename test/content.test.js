@@ -166,6 +166,26 @@ test("embeds: only inline images outside code count — fenced, spanned, comment
   assert.equal(astral.slice(e.start, e.end), "![e](spor-asset:art-e)");
 });
 
+test("embeds: block structure — fences in containers, HTML blocks and paragraph breaks", () => {
+  const ids = (t) => content.extractAssetEmbeds(t).map((e) => e.id ?? e.error);
+  // a fence behind blockquote markers, a list marker, or at a nested list item's content column
+  assert.deepEqual(ids("> ~~~\n> ![x](spor-asset:art-a)\n> ~~~\n![ok](spor-asset:art-ok)"), ["art-ok"]);
+  assert.deepEqual(ids("1. x\n\n   - y\n\n     ~~~\n     ![x](spor-asset:art-a)\n     ~~~\n"), []);
+  assert.deepEqual(ids("- ```\n  ![x](spor-asset:art-a)\n  ```\n![ok](spor-asset:art-ok)"), ["art-ok"]);
+  // a fence marker inside an HTML comment opens nothing; the comment's own lines are not markdown
+  assert.deepEqual(ids("<!--\n```\n-->\n![x](spor-asset:art-a)\n"), ["art-a"]);
+  assert.deepEqual(ids("<!-- ![c](spor-asset:art-c)\n-->\n![x](spor-asset:art-a)"), ["art-a"]);
+  assert.deepEqual(ids("<!-- one line --> ![x](spor-asset:art-c)\n![y](spor-asset:art-b)"), ["art-b"]);
+  assert.deepEqual(ids("<pre>\n![x](spor-asset:art-p)\n</pre>\n![y](spor-asset:art-b)"), ["art-b"]);
+  // an inline comment mid-paragraph hides only itself
+  assert.deepEqual(ids("x <!-- ![c](spor-asset:art-c) --> ![x](spor-asset:art-a)"), ["art-a"]);
+  // a blank line ends a paragraph: no code span or alt text crosses it
+  assert.deepEqual(ids("a `b\n\n![x](spor-asset:art-a)\n\nc` d"), ["art-a"]);
+  assert.deepEqual(ids("![a\n\nb](spor-asset:art-x)"), []);
+  // a code span in the alt text owns its brackets
+  assert.deepEqual(ids("![a `]` b](spor-asset:art-a)"), ["art-a"]);
+});
+
 test("nodeAssetEmbeds: only a content_format: markdown body embeds anything", () => {
   const body = "\n![a](spor-asset:art-a)\n";
   assert.deepEqual(content.nodeAssetEmbeds({ body }), []);

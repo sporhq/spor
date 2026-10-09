@@ -245,11 +245,17 @@ verification, and only that path writes a descriptor. That a root's
 exact bytes. The descriptor id is the stable handle: it is what a `uses-asset`
 edge points at, and it survives a re-upload of the bytes. The pin is evidence
 of exactly which image the author saw. Only inline images OUTSIDE code count as
-embeds. A URI inside a fenced code block (```` ``` ```` or `~~~`), an inline
-code span or an HTML comment, behind a backslash escape, or in a plain link
-`[x](spor-asset:…)` is an example or a reference, never an embedding. Indented
-(4-space) code blocks and reference-style images are not recognized, so put
-examples in a fence.
+embeds. These are examples or references, never embeddings:
+
+- a URI inside a fenced code block (```` ``` ```` or `~~~`), including one
+  behind blockquote `>` markers or nested in a list item;
+- a URI in an inline code span, or behind a backslash escape;
+- a URI in an HTML comment, or in a `<pre>`/`<script>`/`<style>`/`<textarea>`
+  block;
+- a plain link `[x](spor-asset:…)`.
+
+No image or code span crosses a blank line. Indented (4-space) code blocks and
+reference-style images are not recognized, so put examples in a fence.
 
 **`uses-asset` (candidate edge).** A document carries one `uses-asset` edge to
 each descriptor it embeds. Its schema ships in the candidate pack
@@ -299,7 +305,9 @@ split a surrogate pair (`😀` is 2 units, 4 UTF-8 bytes; `content.utf8Range`
 converts for a byte-oriented reader). The optional `doc` digest makes a
 legacy-spill selection detectably stale. Image regions are integer pixels of
 the exact asset digest, in Media Fragments `xywh` form, and must fit within the
-descriptor's dimensions. `content.parseSelection` accepts only the canonical
+descriptor's dimensions. A reader holding the descriptor checks that with
+`content.validateSelection(sel, {descriptor})`; the write door checks only
+shape, because it sees no descriptor. `content.parseSelection` accepts only the canonical
 spelling (no leading zeros, no empty `doc=`), so one selection has one string.
 
 ## Completing work needs a durable why (the resolver gate)
