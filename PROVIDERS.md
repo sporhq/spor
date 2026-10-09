@@ -84,11 +84,14 @@ human-readable message. It never guesses.
 
 **Unknown fields are ignored**, at every level and in both directions. A v1
 reader that meets a field a later revision added must not refuse the message.
-That is why only two schemas in the module declare `additionalProperties`:
+That is why only a few schemas in the module declare `additionalProperties`:
 a secret entry is CLOSED to exactly `{name, ref}`, since an unknown key there
 is a value riding where a reference belongs, and `deliver_credential`'s
 `credential` is CLOSED to `{kind, ref, value, fence, expires_at}`, since it is
-the one object that carries a value and nothing else may ride beside it. The `spor` block stays open but
+the one object that carries a value and nothing else may ride beside it. Its
+`params` is CLOSED too, to `{handle, credential}`: the binding exempts
+`credential.value` from its secret scan (§12.6), so an open `params` would let
+an opaque sibling field ride beside the one value the scan does not read. The `spor` block stays open but
 must not carry a value-bearing key (`value`, `secret`, `plaintext`, `token`,
 `password`, `data`). See §4.2.
 The one operation that does carry a value, `deliver_credential`, carries exactly
@@ -352,7 +355,12 @@ handle, the worker mints the token for the execution and fence it holds
 operation is the **one value exception** to §4.2: it carries the token itself,
 at exactly `params.credential.value`, and nothing else ever does. The
 provider writes it into the environment as a file, readable only by the
-attempt, and points the runner's `SPOR_TOKEN_FILE` at it (§13.1).
+attempt, and points the runner's `SPOR_TOKEN_FILE` at it (§13.1). It
+creates that file `0600` ATOMICALLY: write the token to a temp file in the same
+directory, created with mode `0600` from the start (never chmod-ed down after
+the bytes land), then `rename` it onto the path. The runner may be polling the
+path already, so it must never see a partial token or a moment where the file
+is readable by group or others.
 
 ```json provider-contract=request
 {
@@ -886,6 +894,7 @@ same way.
 | `provider_timeout` | The request went unanswered for `timeout_ms`. The process is killed. | yes |
 | `secret_by_value` | The request carries a secret value (§12.6). Refused before anything is spawned or written. | no |
 | `invalid_request` | The request fails the contract's validation. Refused before anything is spawned or written. | no |
+| `unsatisfiable` | A submit whose secrets the provider's own `describe()` does not declare it resolves (`secret_schemes`) or delivers (`secret_delivery`) (§12.6). Refused before the submit is written. | no |
 
 A submit (or restore) is the exception. If the process dies or hangs with one
 in flight, whether the provider acted on it is unknown, so the binding does not
@@ -969,7 +978,22 @@ attempt token being delivered. It is held to the attempt-token shape instead,
 and it is still refused when it is a credential the worker itself holds — the
 exception admits the token minted for the attempt, never the worker's own. A
 delivered value that the provider later writes to stderr is masked in the
-worker's log.
+worker's log. The request around it is closed (§2): `params` carries exactly
+`{handle, credential}`, so no unscanned sibling can ride beside the exempt
+field.
+
+**A submit is re-matched inside the binding.** The worker matches an attempt
+against `describe()` before it submits (§3.1), but a direct caller or a
+replayed submit never passes through that door. So, before the first submit
+a provider process receives, the binding asks that process to describe itself
+(once per process), and on every submit it re-runs the matcher and refuses as
+`unsatisfiable` an attempt whose secret references use a scheme outside
+`secret_schemes`, or whose secrets the provider has no `secret_delivery` mode
+for. Only the secret axes refuse here, because they decide which references
+cross stdio. Every other axis is the provider's own `unsatisfiable` to answer,
+and a reconcile re-send under a persisted key (§6) must still reach it. A
+describe that fails is answered as that failure, and the submit is never sent,
+so it is never a lost reply.
 
 The child's environment is an **allowlist**, not the worker's environment with
 credentials scrubbed out. A worker's environment routinely holds
@@ -1026,8 +1050,9 @@ worker mints the token only after the submit returned a handle, so the runner
 may start first: an attempt bound to a server waits (up to 120 seconds) for
 the file to appear, and refuses before launch if it never does, if it holds
 anything but an attempt token (`spor_att_…`), or if it is not a regular file
-private to its owner (any group or other permission bit set — write it `0600`;
-Windows, which has no POSIX mode bits, is not checked). A bundle
+private to its owner (any group or other permission bit set — create it `0600`
+atomically, temp file plus `rename`, as §4.3 says; Windows, which has no POSIX
+mode bits, is not checked). A bundle
 is refused, by `build` before it is written and by `run` before anything is
 checked out, when it carries any of these:
 

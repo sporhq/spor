@@ -329,7 +329,7 @@ test("the local provider's collect publishes the candidate the harness committed
     contract_version: 1, attempt_id: "w:1", execution_id: `exec-${"a".repeat(16)}`, fence: 1, tenant: "t", node_id: "task-x",
     harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: [],
     repos: [{ slug: "conformance", commit: "b".repeat(40), branch: "x" }], egress: { allow: [] }, secrets: [],
-    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://x/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
+    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://exec-0123456789abcdef/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
     isolation: "worktree", prompt_bundle_ref: "https://x.invalid/p.tar",
   };
   const attempt = driver.attempt(base, "complete");
@@ -368,7 +368,7 @@ test("the local provider strips a credential from the origin URL before it reach
     contract_version: 1, attempt_id: "w:1", execution_id: `exec-${"c".repeat(16)}`, fence: 1, tenant: "t", node_id: "task-x",
     harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: [],
     repos: [{ slug: "conformance", commit: "b".repeat(40), branch: "x" }], egress: { allow: [] }, secrets: [],
-    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://x/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
+    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://exec-0123456789abcdef/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
     isolation: "worktree", prompt_bundle_ref: "https://x.invalid/p.tar",
   };
   const attempt = driver.attempt(base, "complete");
@@ -409,7 +409,7 @@ async function runToCollect(provider, driver, key) {
     contract_version: 1, attempt_id: "w:1", execution_id: `exec-${"d".repeat(16)}`, fence: 1, tenant: "t", node_id: "task-x",
     harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: [],
     repos: [{ slug: "conformance", commit: "b".repeat(40), branch: "x" }], egress: { allow: [] }, secrets: [],
-    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://x/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
+    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://exec-0123456789abcdef/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
     isolation: "worktree", prompt_bundle_ref: "https://x.invalid/p.tar",
   };
   const res = await provider.request({ contract_version: 1, id: "s", op: "submit", params: { attempt: driver.attempt(base, "complete"), idempotency_key: key } });
@@ -560,7 +560,7 @@ test("a record the local provider closes carries the outcome dimension: cancelle
     contract_version: 1, attempt_id: `w:${n}`, execution_id: `exec-${String(n).repeat(16)}`, fence: 1, tenant: "t", node_id: "task-x",
     harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: [],
     repos: [{ slug: "conformance", commit: "b".repeat(40), branch: "x" }], egress: { allow: [] }, secrets: [],
-    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://x/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
+    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://exec-0123456789abcdef/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
     isolation: "worktree", prompt_bundle_ref: "https://x.invalid/p.tar",
   });
   const req = async (op, params, id = op) => {
@@ -657,7 +657,7 @@ test("a restarted local provider adopts what an earlier process submitted: looku
     contract_version: 1, attempt_id: "w:adopt", execution_id: `exec-${"c".repeat(16)}`, fence: 1, tenant: "t", node_id: "task-x",
     harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: [],
     repos: [{ slug: "conformance", commit: "b".repeat(40), branch: "x" }], egress: { allow: [] }, secrets: [],
-    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://x/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
+    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://exec-0123456789abcdef/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
     isolation: "worktree", prompt_bundle_ref: "https://x.invalid/p.tar",
   };
   const attempt = driver.attempt(base, "hold");

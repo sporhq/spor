@@ -15,6 +15,7 @@ const { spawnSync } = require("node:child_process");
 const stdio = require("../lib/shell/providers/stdio");
 const conf = require("../lib/shell/provider-conformance");
 const sat = require("../lib/kernel/satisfiability");
+const pc = require("../lib/kernel/provider-contract");
 const { hermeticEnv } = require("./helpers/env");
 const { REPO_FORBIDDEN_PATHS } = require("../lib/config");
 
@@ -75,6 +76,10 @@ function handle(msg) { ${body} }
 }
 
 const req = (op, params = {}, id = `t-${op}`) => ({ contract_version: 1, id, op, params });
+// A fake's describe answer: the binding asks for it before every first submit
+// of a process, to re-match the attempt's secret axes.
+const describeBody = (caps = {}) =>
+  `if (msg.op === "describe") return out({ id: msg.id, ok: true, result: { contract_version: 1, provider_id: "fake", capabilities: ${JSON.stringify({ isolation: ["worktree"], lifecycle: [], secret_delivery: ["file"], secret_schemes: ["vault"], ...caps })} } });`;
 const handle = { provider: "fake", id: "env-1" };
 
 function attempt(over = {}) {
@@ -231,8 +236,13 @@ test("a response for a request it was never sent, or a malformed envelope, is a 
 });
 
 test("provider exit mid-call: a plain op answers provider_exited, an in-flight submit is a LostReply to hold on, a held handle is lost", async () => {
+  // The first process dies on describe; the respawned one answers the
+  // describe a submit asks for first, then dies on the submit itself.
+  const died = path.join(scratch("spor-fake-died-"), "died");
   const { declaration } = fakeProvider(`
     if (msg.op === "observe") return out({ id: msg.id, ok: true, result: { state: "running", since: "2026-10-09T00:00:00Z" } });
+    if (msg.op === "describe" && require("fs").existsSync(${JSON.stringify(died)})) { ${describeBody()} }
+    require("fs").writeFileSync(${JSON.stringify(died)}, "1");
     process.exit(3);`);
   const p = bind(declaration);
   assert.equal((await p.request(req("observe", { handle }))).ok, true);
@@ -276,7 +286,7 @@ test("a secret value in a request line is secret_by_value, refused before the pr
   const cases = [
     attempt({ secrets: [{ name: "GITHUB_TOKEN", ref: "ghp_live0123456789abcdef" }] }),
     attempt({ secrets: [{ name: "GITHUB_TOKEN", ref: "vault://a/b", value: "hunter22" }] }),
-    attempt({ spor: { server: "https://s.invalid", token_ref: "spor-attempt-token://x/1", token: "abcdefgh" } }),
+    attempt({ spor: { server: "https://s.invalid", token_ref: "spor-attempt-token://exec-0123456789abcdef/1", token: "abcdefgh" } }),
     attempt({ model: "ghp_abcdefghijklmnopqrstuvwxyz0123" }),
     attempt({ node_id: "task-x", tenant: "s3cret-value-held-by-worker" }),
   ];
@@ -510,6 +520,51 @@ test("deliver_credential refuses before spawn: the worker's own credential, any 
   // The same value on any OTHER op is still a secret by value.
   assert.equal(stdio.secretRefusal(req("observe", { handle: { provider: "fake", id: TOKEN } }), [TOKEN]) !== null, true);
   assert.equal(stdio.secretRefusal(req("deliver_credential", { handle, credential: credential() })), null);
+});
+
+test("deliver_credential params are closed: an opaque sibling of credential is refused before spawn, unscanned or not", async () => {
+  const { declaration, marker } = fakeProvider(`out({ id: msg.id, ok: true, result: { delivered: true } });`);
+  const p = bind(declaration);
+  // An opaque value no credential pattern names, beside the one exempt field.
+  const res = await p.request(req("deliver_credential", { handle, credential: credential(), secret2: "opaque-value-0123456789" }));
+  assert.equal(res.ok, false);
+  assert.equal(res.error.code, "invalid_request", res.error.message);
+  assert.doesNotMatch(res.error.message, /opaque-value|secret2/);
+  assert.equal(fs.existsSync(marker), false, "nothing was spawned");
+  assert.equal(pc.validateRequest(req("deliver_credential", { handle, credential: credential(), secret2: "x" })).ok, false);
+  assert.equal(pc.validateRequest(req("deliver_credential", { handle, credential: credential() })).ok, true);
+});
+
+test("a submit is re-matched inside the binding: a secret scheme (or delivery) the provider does not declare is refused before the line is written", async () => {
+  const seen = path.join(scratch("spor-fake-seen-"), "seen");
+  const { declaration } = fakeProvider(`
+    ${describeBody()}
+    if (msg.op === "submit") { require("fs").appendFileSync(${JSON.stringify(seen)}, msg.params.idempotency_key + "\\n"); return out({ id: msg.id, ok: true, result: { handle: { provider: "fake", id: "env-" + msg.params.idempotency_key }, accepted_at: "2026-10-09T00:00:00Z" } }); }`);
+  const p = bind(declaration);
+  // A direct (or replayed) submit that never passed the worker's matcher.
+  const undeclared = attempt({ secrets: [{ name: "GITHUB_TOKEN", ref: "op://acme/github" }] });
+  const r1 = await p.request(req("submit", { idempotency_key: "key-undeclared", attempt: undeclared }));
+  assert.equal(r1.ok, false);
+  assert.equal(r1.error.code, "unsatisfiable");
+  assert.match(r1.error.message, /secret_schemes: .*GITHUB_TOKEN \(op:\/\/\)/);
+  // Replaying the same submit is refused the same way.
+  assert.equal((await p.request(req("submit", { idempotency_key: "key-undeclared", attempt: undeclared }))).error.code, "unsatisfiable");
+  // A declared scheme crosses; only it reached the provider.
+  const ok = await p.request(req("submit", { idempotency_key: "key-declared", attempt: attempt() }));
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  assert.equal(fs.readFileSync(seen, "utf8"), "key-declared\n");
+
+  // A provider declaring no delivery mode is handed no secret at all.
+  const { declaration: noDelivery } = fakeProvider(`
+    ${describeBody({ secret_delivery: [] })}
+    if (msg.op === "submit") return out({ id: msg.id, ok: true, result: { handle: { provider: "fake", id: "env-x" }, accepted_at: "2026-10-09T00:00:00Z" } });`);
+  const q = bind(noDelivery);
+  const r2 = await q.request(req("submit", { idempotency_key: "key-12345678", attempt: attempt() }));
+  assert.equal(r2.error.code, "unsatisfiable");
+  assert.match(r2.error.message, /secret_delivery: /);
+  // Other axes are the provider's own to answer: an isolation it does not
+  // offer still reaches it (no secrets, so nothing to refuse here).
+  assert.equal((await q.request(req("submit", { idempotency_key: "key-87654321", attempt: attempt({ secrets: [], isolation: "vm" }) }))).ok, true);
 });
 
 test("stdio-echo writes the delivered token to the runner's SPOR_TOKEN_FILE and refuses an older fence", async () => {

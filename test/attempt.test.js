@@ -204,7 +204,7 @@ function goodBundle(over = {}) {
     contract_version: 1, attempt_id: "inst-a", execution_id: `exec-${"a".repeat(16)}`, fence: 1, tenant: "local", node_id: "task-x",
     harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: ["git"],
     repos: [{ slug: "demo", commit: "b".repeat(40), branch: "spor/task-x", url: REMOTE_URL }],
-    egress: { allow: [] }, secrets: [], spor: { server: "https://api.spor.invalid", token_ref: "spor-attempt-token://x/1" },
+    egress: { allow: [] }, secrets: [], spor: { server: "https://api.spor.invalid", token_ref: "spor-attempt-token://exec-0123456789abcdef/1" },
     deadline: "2030-01-01T00:00:00Z", isolation: "container", prompt_bundle_ref: bundleLib.IN_BUNDLE_PROMPT_REF,
     ...over,
   };
@@ -217,7 +217,7 @@ test("verifyBundle refuses a bundle carrying a plaintext secret value, naming wh
   const cases = [
     goodBundle({ secrets: [{ name: "GITHUB_TOKEN", ref: "vault://x/gh", value: token }] }),
     goodBundle({ secrets: [{ name: "GITHUB_TOKEN", ref: token }] }),
-    goodBundle({ spor: { server: "https://api.spor.invalid", token_ref: "spor-attempt-token://x/1", token: "opaque-but-a-value" } }),
+    goodBundle({ spor: { server: "https://api.spor.invalid", token_ref: "spor-attempt-token://exec-0123456789abcdef/1", token: "opaque-but-a-value" } }),
     { ...goodBundle(), env: { env: { GITHUB_TOKEN: "anything" } } },
     { ...goodBundle(), env: { env: { HARMLESS: token } } },
     bundleLib.createBundle({ attempt: goodBundle().attempt, prompt: `use ${token} to push` }),
@@ -238,7 +238,7 @@ test("verifyBundle refuses an unknown key in a secret entry or the spor block, n
   const value = "opaque-credential-value-123";
   for (const b of [
     goodBundle({ secrets: [{ name: "GITHUB_TOKEN", ref: "vault://x/gh", credentials: value }] }),
-    goodBundle({ spor: { server: "https://api.spor.invalid", token_ref: "spor-attempt-token://x/1", bearer: value } }),
+    goodBundle({ spor: { server: "https://api.spor.invalid", token_ref: "spor-attempt-token://exec-0123456789abcdef/1", bearer: value } }),
   ]) {
     const v = bundleLib.verifyBundle(b, { env: {} });
     assert.strictEqual(v.ok, false, JSON.stringify(b));
