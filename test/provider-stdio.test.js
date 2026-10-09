@@ -364,6 +364,10 @@ test("the child environment is an allowlist: base names, LC_*, opted-in names, t
   assert.equal(win.Path, "C:\\bin");
   assert.equal(win.AWS_PROFILE, "dev");
   assert.equal(win.GITHUB_TOKEN, undefined);
+  // ...and a declared spelling replaces the inherited one, so the declaration wins.
+  const winOver = stdio.providerChildEnv(decl({ env: { Path: "C:\\custom" } }), { ...worker, PATH: "C:\\w" }, "win32");
+  assert.equal(winOver.Path, "C:\\custom");
+  assert.equal("PATH" in winOver, false);
 });
 
 test("a spawned provider sees no ambient credential unless its declaration opts the name in", async () => {
