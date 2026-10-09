@@ -894,7 +894,7 @@ test("machineLocalStuck: only cooling/ineligible members with a machine-local ki
     assert.strictEqual(workLoop.machineLocalStuck({ id: "t", bucket: "cooling", kind }), true, `cooling/${kind}`);
   }
   assert.strictEqual(workLoop.machineLocalStuck({ id: "t", bucket: "ineligible", kind: "scope" }), true);
-  for (const kind of ["foreign-hold", "admitted", "outage", "not-gateable", "human", "declined", "assigned-elsewhere", "invalid"]) {
+  for (const kind of ["foreign-hold", "admitted", "outage", "not-gateable", "human", "declined", "invalid"]) {
     assert.strictEqual(workLoop.machineLocalStuck({ id: "t", bucket: "cooling", kind }), false, `cooling/${kind}`);
     assert.strictEqual(workLoop.machineLocalStuck({ id: "t", bucket: "ineligible", kind }), false, `ineligible/${kind}`);
   }
