@@ -313,6 +313,89 @@ test("local: a forged or missing object fails verification and writes nothing", 
   assert.strictEqual((await run(["asset", "verify", id], { env })).status, 0);
 });
 
+test("local: re-import re-verifies an existing object and replaces a corrupt one", async () => {
+  const home = await localHome();
+  const work = scratch("spor-asset-work-");
+  const src = path.join(work, "a.png");
+  fs.writeFileSync(src, SAMPLE);
+  const env = { SPOR_HOME: home };
+  const id = JSON.parse((await run(["asset", "import", src, "--json"], { env })).stdout).asset.id;
+  const obj = assetLib.objectPath(home, sha(SAMPLE));
+  for (const corrupt of [() => fs.writeFileSync(obj, png(64, 48, 3)), () => fs.writeFileSync(obj, SAMPLE.subarray(0, 100))]) {
+    fs.chmodSync(obj, 0o644);
+    corrupt();
+    fs.chmodSync(obj, 0o444); // as published: the replace must not need a writable object
+    assert.strictEqual((await run(["asset", "verify", id], { env })).status, 1);
+    const again = await run(["asset", "import", src], { env });
+    assert.strictEqual(again.status, 0, again.stderr);
+    assert.ok(fs.readFileSync(obj).equals(SAMPLE), "the corrupt object is replaced by the verified bytes");
+    assert.strictEqual(fs.statSync(obj).mode & 0o777, 0o444);
+    assert.strictEqual((await run(["asset", "verify", id], { env })).status, 0);
+  }
+  // A non-file squatting the object path is replaced too.
+  fs.rmSync(obj);
+  fs.mkdirSync(obj);
+  assert.strictEqual((await run(["asset", "import", src], { env })).status, 0);
+  assert.ok(fs.readFileSync(obj).equals(SAMPLE));
+  // An intact object is kept as is (no rewrite).
+  const ino = fs.statSync(obj).ino;
+  assert.strictEqual((await run(["asset", "import", src], { env })).status, 0);
+  assert.strictEqual(fs.statSync(obj).ino, ino);
+  assert.deepStrictEqual(fs.readdirSync(path.join(home, "assets", "staging")), [], "no staging residue");
+});
+
+function assetOf(buf, id = "art-x") {
+  const info = content.sniffImage(buf);
+  return { id, digest: sha(buf), bytes: buf.length, media_type: info.media_type, width: info.width, height: info.height };
+}
+
+test("shell: a read is bounded by the descriptor's byte count — the overflow never reaches the sink", async () => {
+  const asset = assetOf(SAMPLE);
+  let pulled = 0;
+  async function* endless() {
+    yield SAMPLE;
+    for (;;) {
+      pulled++;
+      yield Buffer.alloc(64 * 1024, 1);
+    }
+  }
+  let sunk = 0;
+  await assert.rejects(assetLib.verifyAgainst(endless(), asset, (c) => { sunk += c.length; }), (e) => e.code === "verification_failed" && /more than the descriptor's/.test(e.message));
+  assert.strictEqual(sunk, SAMPLE.length, "nothing past the descriptor's bytes is written");
+  assert.strictEqual(pulled, 1, "the stream is abandoned at the first over-long chunk");
+
+  // writeVerified leaves no output and no .part behind.
+  const out = scratch("spor-asset-out-");
+  await assert.rejects(assetLib.writeVerified(endless(), asset, path.join(out, "x.png")), /more than the descriptor's/);
+  assert.deepStrictEqual(fs.readdirSync(out), []);
+});
+
+test("shell: a fetch without --force never clobbers a file that appears mid-stream", async () => {
+  const asset = assetOf(SAMPLE);
+  const out = scratch("spor-asset-out-");
+  const dest = path.join(out, "x.png");
+  async function* racing() {
+    yield SAMPLE.subarray(0, 10);
+    fs.writeFileSync(dest, "someone else's file");
+    yield SAMPLE.subarray(10);
+  }
+  await assert.rejects(assetLib.writeVerified(racing(), asset, dest), (e) => e.code === "exists");
+  assert.strictEqual(fs.readFileSync(dest, "utf8"), "someone else's file");
+  assert.deepStrictEqual(fs.readdirSync(out), ["x.png"], "no .part residue");
+
+  // --force replaces it; a fresh path is created with the verified bytes.
+  async function* plain() {
+    yield SAMPLE;
+  }
+  assert.strictEqual(await assetLib.writeVerified(plain(), asset, dest, { force: true }), dest);
+  assert.ok(fs.readFileSync(dest).equals(SAMPLE));
+  const fresh = path.join(out, "y.png");
+  assert.strictEqual(await assetLib.writeVerified(plain(), asset, fresh), fresh);
+  assert.ok(fs.readFileSync(fresh).equals(SAMPLE));
+  assert.strictEqual(fs.statSync(fresh).mode & 0o777, 0o644);
+  assert.deepStrictEqual(fs.readdirSync(out).sort(), ["x.png", "y.png"]);
+});
+
 test("local: refusals — not an image, wrong digest, conflicting descriptor, not an asset", async () => {
   const home = await localHome();
   const work = scratch("spor-asset-work-");
@@ -369,7 +452,8 @@ test("cli: help, usage and misplaced options", async () => {
 // assetDescribeRoute / assetContentRoute). `forge` serves other bytes than the
 // descriptor names; `resetFirst` drops the first upload's connection (the
 // refusal-as-socket-reset the upload door documents).
-function startAssetStub({ forge = false, resetFirst = false, keyOwners = null } = {}) {
+function startAssetStub({ forge = false, oversize = false, resetFirst = false, keyOwners = null } = {}) {
+  const sent = { bytes: 0 };
   const nodes = new Map(); // id -> {raw, fm}
   const bytes = new Map(); // digest -> Buffer
   const journal = new Map(); // key -> id
@@ -430,6 +514,24 @@ function startAssetStub({ forge = false, resetFirst = false, keyOwners = null } 
           links: { preview: { path: "/v1/assets/preview/x" } },
         });
       }
+      if (oversize) {
+        // The descriptor's bytes, then junk without end (chunked, no length),
+        // until the client hangs up — or a 256MB backstop.
+        res.writeHead(200, { "content-type": d.media_type });
+        let first = true;
+        const junk = Buffer.alloc(64 * 1024, 1);
+        const pump = () => {
+          while (!res.destroyed && sent.bytes < 256 * 1024 * 1024) {
+            const c = first ? bytes.get(d.digest) : junk;
+            first = false;
+            sent.bytes += c.length;
+            if (!res.write(c)) return res.once("drain", pump);
+          }
+          res.end();
+        };
+        res.on("close", () => { sent.closed = true; });
+        return pump();
+      }
       const b = forge ? png(64, 48, 3) : bytes.get(d.digest);
       res.writeHead(200, { "content-type": d.media_type, "content-length": String(b.length) });
       return res.end(b);
@@ -437,7 +539,7 @@ function startAssetStub({ forge = false, resetFirst = false, keyOwners = null } 
     send(res, 404, { error: { code: "not_found", message: "no route" } });
   });
   return new Promise((resolve) => {
-    srv.listen(0, "127.0.0.1", () => resolve({ base: `http://127.0.0.1:${srv.address().port}`, uploads, close: () => new Promise((r) => srv.close(r)) }));
+    srv.listen(0, "127.0.0.1", () => resolve({ base: `http://127.0.0.1:${srv.address().port}`, uploads, sent, close: () => new Promise((r) => srv.close(r)) }));
   });
 }
 
@@ -504,6 +606,48 @@ test("remote: forged bytes from the server fail verification and write nothing",
     assert.strictEqual((await run(["asset", "verify", id], { env })).status, 1);
   } finally {
     await stub.close();
+  }
+});
+
+test("remote: a response running past the descriptor's bytes is cut off and writes nothing", async () => {
+  const stub = await startAssetStub({ oversize: true });
+  try {
+    const work = scratch("spor-asset-work-");
+    const src = path.join(work, "a.png");
+    fs.writeFileSync(src, SAMPLE);
+    const env = { SPOR_HOME: scratch("spor-asset-rhome-"), SPOR_SERVER: stub.base, SPOR_TOKEN: "tok" };
+    const id = JSON.parse((await run(["asset", "import", src, "--json"], { env })).stdout).asset.id;
+    const out = scratch("spor-asset-out-");
+    for (const args of [["asset", "fetch", id, "--out", out], ["asset", "verify", id]]) {
+      stub.sent.bytes = 0;
+      const f = await run(args, { env });
+      assert.strictEqual(f.status, 1, args.join(" "));
+      assert.match(f.stderr, /more than the descriptor's/);
+      assert.ok(stub.sent.bytes < 64 * 1024 * 1024, `the client hung up early (server sent ${stub.sent.bytes})`);
+    }
+    assert.deepStrictEqual(fs.readdirSync(out), []);
+  } finally {
+    await stub.close();
+  }
+});
+
+test("remote: exchange() reports an unparseable error body as jsonError, like request()", async () => {
+  const srv = http.createServer((req, res) => {
+    res.writeHead(502, { "content-type": "text/html" });
+    res.end("<html>bad gateway</html>");
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const remote = require("../lib/remote.js");
+    const cfg = { server: () => `http://127.0.0.1:${srv.address().port}`, token: () => "tok", get: () => undefined };
+    const r = await remote.exchange(cfg, "GET", "/v1/assets/x/content", { token: "tok", timeoutMs: 5000 });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.status, 502);
+    assert.strictEqual(r.json, null);
+    assert.ok(r.jsonError, "a body that failed to parse is distinguishable from an empty one");
+    assert.strictEqual(r.text, "<html>bad gateway</html>");
+  } finally {
+    await new Promise((r) => srv.close(r));
   }
 });
 
