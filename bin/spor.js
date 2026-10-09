@@ -83,6 +83,7 @@ const preflight = lazyModule(path.join(ROOT, "lib", "shell", "preflight.js"));
 const dispatchLib = lazyModule(path.join(ROOT, "lib", "shell", "dispatch.js"));
 const workLib = lazyModule(path.join(ROOT, "lib", "shell", "work.js"));
 const sat = lazyModule(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
+const providerContract = lazyModule(path.join(ROOT, "lib", "kernel", "provider-contract.js"));
 const workLoop = lazyModule(path.join(ROOT, "lib", "shell", "work-loop.js"));
 const gatesKernel = lazyModule(path.join(ROOT, "lib", "kernel", "gates.js"));
 const candidateKernel = lazyModule(path.join(ROOT, "lib", "kernel", "candidate.js"));
@@ -18250,6 +18251,20 @@ function cmdCapabilities(cfg, args) {
     return cmdCapabilitiesHosts(cfg, { profileId, owner: flagVal("--owner"), maxAge: flagVal("--max-age"), json });
   }
 
+  // providers [--attempt <file|->] — each execution provider's describe()
+  // (PROVIDERS.md §3), and, given an attempt spec, the matcher's verdict per
+  // provider so an operator can see WHY an attempt would be refused
+  // (task-spor-execution-provider-capability-vocabulary).
+  if (sub === "providers") {
+    const i = rest.indexOf("--attempt");
+    const attemptPath = i >= 0 ? rest[i + 1] : null;
+    if (i >= 0 && !attemptPath) {
+      err("usage: spor capabilities providers [--attempt <file|->] [--json]");
+      return 1;
+    }
+    return cmdCapabilitiesProviders(cfg, { attemptPath, json });
+  }
+
   if (sub === "probe") {
     // Seed reachable_mcp:[spor] from CONFIGURED-ness when a Spor server/connector
     // is bound (remote mode) — the spor MCP is reachable by construction, no
@@ -18333,10 +18348,126 @@ function cmdCapabilities(cfg, args) {
   err(
     "usage: spor capabilities [list [--json]] | show <agent-id> [--json] | probe | publish | set <axis> <v...> | add <axis> <v...> | rm <axis> <v...>\n" +
       "       spor capabilities hosts <profile-id> [--owner X] [--max-age D] [--json]\n" +
+      "       spor capabilities providers [--attempt <file|->] [--json]\n" +
       "       spor capabilities allow-mcp <name...> | deny <profile-id...> | undeny <profile-id...> | clear\n" +
       `       axes: ${AXES.join(", ")}`
   );
   return 1;
+}
+
+// The tools the `local` provider's describe() reports when they are on PATH.
+// A provider's `tools` axis is "binaries on PATH" (PROVIDERS.md §4.1); PATH
+// cannot be enumerated, so local reports this fixed set plus whatever an
+// attempt being checked asks for.
+const LOCAL_PROVIDER_TOOLS = ["git", "node", "npm", "gh", "docker"];
+
+// localProviderDescribe — the `local` provider's describe-result, built from
+// this machine's effective capability map. Until the local provider is
+// extracted (task-spor-work-local-provider-refactor) this is the one place
+// its describe() is spelled: a git worktree on this box (isolation worktree),
+// the repos `dispatch.repos` maps to a checkout, the operator's own network
+// (egress unrestricted) and environment (it delivers no secrets by any
+// contract mode), the supervisor's graceful + forced stop, and this box's
+// resource ceilings.
+function localProviderDescribe(cfg, { tools = [] } = {}) {
+  const eff = sat.effectiveCapabilities(cfg.get("dispatch.capabilities", {}) || {});
+  const repos = cfg.get("dispatch.repos", {}) || {};
+  const wanted = [...new Set([...LOCAL_PROVIDER_TOOLS, ...tools.filter((t) => typeof t === "string" && t)])];
+  return {
+    provider_id: "local",
+    contract_version: providerContract.CONTRACT_VERSION,
+    capabilities: {
+      harnesses: eff.harnesses,
+      reachable_mcp: eff.reachable_mcp,
+      skills: eff.skills,
+      plugins: eff.plugins,
+      deny: eff.deny,
+      tools: wanted.filter((t) => u.whichSync(t) != null),
+      repos: Object.keys(repos && typeof repos === "object" ? repos : {}),
+      egress: ["*"],
+      isolation: ["worktree"],
+      secret_delivery: [],
+      lifecycle: ["cancel", "force-cancel"],
+      resources: localProviderResources(cfg),
+    },
+  };
+}
+
+// This box's ceilings: its cores, its memory, and the free space on the
+// filesystem holding the graph home (where dispatch worktrees' state lands).
+function localProviderResources(cfg) {
+  const res = { cpu: Math.max(1, os.cpus().length), memory_mb: Math.floor(os.totalmem() / (1024 * 1024)) };
+  try {
+    const st = fs.statfsSync(cfg.userConfigHome());
+    res.disk_mb = Math.floor((st.bavail * st.bsize) / (1024 * 1024));
+  } catch {
+    /* no statfs here (or the home is not yet created) — declare no disk ceiling */
+  }
+  return res;
+}
+
+// cmdCapabilitiesProviders — `spor capabilities providers`. Today the one
+// configured provider is `local`; a machine-declared provider joins this list
+// with its binding (task-spor-execution-provider-stdio-binding). With
+// --attempt, the spec is validated against the contract and matched against
+// each provider (satisfiesAttempt); exit 1 when no provider can run it.
+function cmdCapabilitiesProviders(cfg, { attemptPath, json }) {
+  let attempt = null;
+  if (attemptPath) {
+    let text;
+    try {
+      text = attemptPath === "-" ? fs.readFileSync(0, "utf8") : fs.readFileSync(attemptPath, "utf8");
+    } catch (e) {
+      err(`cannot read attempt spec ${attemptPath}: ${e.message}`);
+      return 1;
+    }
+    try {
+      attempt = JSON.parse(text);
+    } catch (e) {
+      err(`attempt spec ${attemptPath} is not JSON: ${e.message}`);
+      return 1;
+    }
+    const v = providerContract.validate("attempt-spec", attempt);
+    if (!v.ok) {
+      err(`attempt spec ${attemptPath} does not validate against the provider contract:`);
+      for (const e of v.errors) err(`  ${e}`);
+      return 1;
+    }
+  }
+  const providers = [localProviderDescribe(cfg, { tools: attempt && Array.isArray(attempt.tools) ? attempt.tools : [] })];
+  const rows = providers.map((d) => (attempt ? { ...d, match: sat.satisfiesAttempt(d.capabilities, attempt) } : d));
+  const anyOk = !attempt || rows.some((r) => r.match.ok);
+  if (json) {
+    out(JSON.stringify({ providers: rows }, null, 2));
+    return anyOk ? 0 : 1;
+  }
+  const list = (v) => (v && v.length ? v.join(", ") : "(none)");
+  for (const r of rows) {
+    const c = r.capabilities;
+    out(`provider ${r.provider_id} (contract v${r.contract_version})`);
+    out(`  isolation:       ${list(c.isolation)}`);
+    out(`  lifecycle:       ${list(c.lifecycle)}`);
+    out(`  harnesses:       ${list(c.harnesses)}`);
+    out(`  reachable_mcp:   ${list(c.reachable_mcp)}`);
+    out(`  skills:          ${c.skills.length} skill(s)`);
+    out(`  plugins:         ${list(c.plugins)}`);
+    out(`  tools:           ${list(c.tools)}`);
+    out(`  repos:           ${list(c.repos)}`);
+    out(`  egress:          ${c.egress.includes("*") ? "unrestricted" : list(c.egress)}`);
+    out(`  secret_delivery: ${list(c.secret_delivery)}`);
+    const res = c.resources || {};
+    out(`  resources:       ${["cpu", "memory_mb", "disk_mb"].filter((k) => res[k] != null).map((k) => `${k} ${res[k]}`).join(", ") || "(none declared)"}`);
+    out(`  deny:            ${list(c.deny)}`);
+    if (r.match) {
+      if (r.match.ok) out(`  attempt:         satisfiable`);
+      else {
+        out(`  attempt:         REFUSED (${r.match.axes.join(", ")})`);
+        for (const why of r.match.reasons) out(`    - ${why}`);
+      }
+    }
+  }
+  if (!anyOk) err("no configured provider can run this attempt — refusing (an attempt is never substituted onto a provider that does not match)");
+  return anyOk ? 0 : 1;
 }
 
 // cmdCapabilitiesPublish — push this box's EFFECTIVE capabilities to the team

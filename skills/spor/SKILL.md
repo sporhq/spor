@@ -131,6 +131,8 @@ spor dispatch <id>|"<task>"    # run work as a background agent; in team mode it
 spor capabilities              # this machine's dispatch capability map (harnesses/MCP/skills/plugins/
                                #   deny) matched against a profile at dispatch; self-probes each session.
                                #   probe | set <axis> <v…> | allow-mcp <m…> | deny <profile-id…> | clear
+                               #   providers [--attempt <spec.json>] — each execution provider's describe()
+                               #   and, given an attempt spec, why it would be refused (PROVIDERS.md)
 spor claim <node-id>           # manually take the heartbeat-renewed lease on a task (POST .../claim) —
                                #   yours-in-progress, out of teammates' queues (dec-cc-task-claim-lease)
 spor renew <node-id>           # heartbeat your live claim, bumping its expiry (POST .../renew)

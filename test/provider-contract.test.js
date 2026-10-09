@@ -261,6 +261,29 @@ test("references carry no credentials in their userinfo", () => {
   assert.deepEqual(pc.validate("attempt-spec", spec).errors, []);
 });
 
+test("an ssh login is an account name, never a credential", () => {
+  const ok = ["ssh://git@github.com/a.git", "ssh://deploy_bot@host/a.git", "ssh://first.last@host/a.git", "ssh://APKAEIBAERJR2EXAMPLE@git-codecommit.us-east-1.amazonaws.com/v1/repos/x", "ssh://host/a.git"];
+  for (const url of ok) {
+    const spec = attemptSpec();
+    spec.repos[0].url = url;
+    assert.deepEqual(pc.validate("attempt-spec", spec).errors, [], url);
+  }
+  const leaky = [
+    "ssh://ghp_0123456789abcdefghijklmnopqrstuvwxyz@github.com/a.git",
+    "ssh://ghp_abc@github.com/a.git",
+    "ssh://github_pat_11ABC@github.com/a.git",
+    "ssh://glpat-abcdefghij@gitlab.com/a.git",
+    "ssh://xoxb-123@host/a.git",
+    "ssh://ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123@github.com/a.git",
+    "ssh://a234567890123456789012345678901234@host/a.git",
+  ];
+  for (const url of leaky) {
+    const spec = attemptSpec();
+    spec.repos[0].url = url;
+    assert.equal(pc.validate("attempt-spec", spec).ok, false, url);
+  }
+});
+
 test("date-times are real calendar dates", () => {
   assert.equal(pc.validate("observe-result", { state: "running", since: "2026-02-30T10:00:00Z" }).ok, false);
   assert.equal(pc.validate("observe-result", { state: "running", since: "2026-02-28T10:00:00.5+02:00" }).ok, true);

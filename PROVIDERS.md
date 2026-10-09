@@ -17,8 +17,7 @@ specs: [WORKERS.md](WORKERS.md) (the worker protocol, the prompt contract
 §4, the execution store §10.15), [API.md](API.md) (REST/MCP).
 
 **Status.** This is the contract only. The `local` provider extraction
-(task-spor-work-local-provider-refactor), the capability matcher
-(task-spor-execution-provider-capability-vocabulary), the subprocess stdio
+(task-spor-work-local-provider-refactor), the subprocess stdio
 binding (task-spor-execution-provider-stdio-binding), the in-environment runner
 (task-spor-attempt-bundle-run) and the server's attempt handle and
 attempt-scoped token are separate items. None of them is shipped yet, so
@@ -26,7 +25,10 @@ attempt-scoped token are separate items. None of them is shipped yet, so
 suite every binding must pass is shipped:
 `lib/shell/provider-conformance.js` (`runConformance(provider, {home,
 driver})`), proven against the synthetic providers in
-`test/fixtures/providers/` by `test/provider-conformance.test.js`.
+`test/fixtures/providers/` by `test/provider-conformance.test.js`. The
+capability matcher (§3.1, `satisfiesAttempt` in `lib/kernel/satisfiability.js`)
+is shipped, and `spor capabilities providers [--attempt <spec.json>]` prints
+each provider's describe() and, given a spec, why it would be refused.
 
 ## 1. Two seams, three layers
 
@@ -137,6 +139,7 @@ again.
     "skills": [],
     "plugins": ["spor@spor"],
     "tools": ["git", "node", "npm", "gh"],
+    "repos": ["*"],
     "egress": ["api.anthropic.com", "api.sporhq.io", "github.com", "registry.npmjs.org"],
     "isolation": ["container"],
     "secret_delivery": ["file"],
@@ -152,7 +155,28 @@ The worker matches the attempt spec against these capabilities using the same
 pure shape as the profile matcher `satisfies()`
 (dec-spor-machine-profile-satisfiability). If an attempt does not match, the
 worker **refuses loudly, leaves the assignment intact, and never substitutes**.
-How each axis matches is task-spor-execution-provider-capability-vocabulary.
+
+### 3.1 How each axis matches
+
+`satisfiesAttempt(capabilities, attempt)` in `lib/kernel/satisfiability.js`
+returns every failing atom, each reason prefixed with the axis that failed
+(`isolation: 'vm' is not offered (this provider offers: worktree)`). A
+capability the provider leaves out is empty; an attempt field left out asks
+for nothing. An attempt field that is present but malformed refuses on its
+axis, and so does a missing `isolation`.
+
+| axis | the attempt is satisfied when |
+|---|---|
+| `deny` | `attempt.profile` is not on the provider's `deny` list. Checked first: a policy opt-out refuses regardless of capability. |
+| `harnesses` | `attempt.harness.id` is in `harnesses`. |
+| `reachable_mcp`, `skills`, `plugins`, `tools` | `attempt.mcp`, `.skills`, `.plugins`, `.tools` are each a subset of the matching capability. |
+| `repos` | Every `attempt.repos[]` slug is in `repos`, or `repos` holds `"*"` (the provider clones any repo) and the entry carries a `url`. |
+| `egress` | `attempt.egress.allow` is a subset of `egress`, or `egress` holds `"*"` (unrestricted). An empty allow list (none) always matches; an allow list naming `"*"` (unrestricted) matches only a `"*"` provider. |
+| `secret_delivery` | One of `attempt.secret_delivery` (the modes that can serve this attempt) is offered. With no `secret_delivery` stated, an attempt carrying `secrets[]` needs some mode, and one with none needs nothing. |
+| `isolation` | `attempt.isolation` is in `isolation`, **exactly**. A stronger kind is not offered in its place, because handing back a different environment than the spec names is a substitution. |
+| `resources` | Each requested floor is at most the provider's ceiling. A floor against a ceiling the provider does not declare is refused. |
+| `lifecycle` | `attempt.lifecycle` (the operations the attempt needs) is a subset of `lifecycle`. |
+| `deadline` | `deadline - now` is within `max_deadline_ms`, when the provider declares one (§8). |
 
 ## 4. The attempt spec
 
@@ -215,6 +239,9 @@ environment must hold and nothing the provider could leak:
 | `resources` | Optional. `{cpu?, memory_mb?, disk_mb?}`. |
 | `deadline` | The attempt's wall clock (§8). |
 | `isolation` | `worktree`, `container` or `vm`. |
+| `profile` | Optional. The resolved profile id; a provider's `deny` list is keyed on it. |
+| `secret_delivery` | Optional. The delivery modes, any one of which can serve this attempt's secrets (§3.1). |
+| `lifecycle` | Optional. The lifecycle operations this attempt needs, such as `suspend` (§10). |
 | `prompt_bundle_ref` | Where the prompt bundle lives: the session note, `# Spor briefing`, `# Task` and the worker contract (WORKERS.md §4). |
 
 ### 4.2 Secrets travel by reference only
@@ -228,7 +255,9 @@ There is no class for plaintext env values passed through Spor. The validator
 refuses an entry whose `ref` is not a URI, and an entry that carries a value
 under any key. Every reference in the contract is a URI with no userinfo
 (`https://user:token@host` and `https://token@host` are refused; a bare ssh
-login such as `ssh://git@host/…` names an account and is allowed). So this
+login such as `ssh://git@host/…` names an account and is allowed, provided it
+is at most 32 characters and does not open with a known token prefix, so
+`ssh://ghp_…@host` is refused). So this
 entry is refused:
 
 ```json provider-contract-refused=secret-entry

@@ -293,3 +293,175 @@ test("spor capabilities clear: resets declarations + probe cache", () => {
   const cap = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8")).dispatch.capabilities;
   assert.deepStrictEqual(cap, {}, "capabilities object emptied");
 });
+
+// ---- attempt satisfiability: a provider's describe() vs an attempt spec ---
+// (task-spor-execution-provider-capability-vocabulary, PROVIDERS.md §3-§4)
+
+const pc = require(path.join(__dirname, "..", "lib", "kernel", "provider-contract.js"));
+const NOW = Date.parse("2026-10-09T10:00:00Z");
+
+function providerCaps(over) {
+  return {
+    harnesses: ["claude-code", "codex"],
+    reachable_mcp: ["spor"],
+    skills: ["brief"],
+    plugins: ["spor@spor"],
+    tools: ["git", "node", "npm"],
+    repos: ["acme-api"],
+    egress: ["api.anthropic.com", "github.com"],
+    isolation: ["container"],
+    secret_delivery: ["file", "egress-inject"],
+    lifecycle: ["cancel", "force-cancel", "suspend"],
+    resources: { cpu: 4, memory_mb: 8192, disk_mb: 20480 },
+    max_deadline_ms: 6 * 3600 * 1000,
+    ...over,
+  };
+}
+function attempt(over) {
+  return {
+    contract_version: 1,
+    attempt_id: "wrk-a1b2:4211:1696850000",
+    execution_id: "exec-3f9c0a1b2c3d4e5f",
+    fence: 3,
+    tenant: "acme",
+    node_id: "task-acme-rate-limit",
+    profile: "profile-acme-impl",
+    harness: { id: "claude-code" },
+    mcp: ["spor"],
+    skills: ["brief"],
+    plugins: ["spor@spor"],
+    tools: ["git", "node"],
+    repos: [{ slug: "acme-api", commit: "4b825dc642cb6eb9a060e54bf8d69288fbee4904", branch: "spor/task-acme-rate-limit" }],
+    egress: { allow: ["github.com"] },
+    secrets: [{ name: "GITHUB_TOKEN", ref: "vault://acme/ci/github-token" }],
+    spor: { server: "https://api.sporhq.io", token_ref: "spor-attempt-token://exec-3f9c0a1b2c3d4e5f/3" },
+    resources: { cpu: 2, memory_mb: 4096 },
+    deadline: "2026-10-09T14:00:00Z",
+    isolation: "container",
+    prompt_bundle_ref: "https://bundles.acme.internal/p.tar",
+    ...over,
+  };
+}
+
+test("satisfiesAttempt: the test fixtures are contract-valid", () => {
+  assert.deepStrictEqual(pc.validate("attempt-spec", attempt({ secret_delivery: ["egress-inject"], lifecycle: ["suspend"] })).errors, []);
+  assert.deepStrictEqual(pc.validate("describe-result", { provider_id: "container", contract_version: 1, capabilities: providerCaps({ deny: ["profile-x"] }) }).errors, []);
+});
+
+test("satisfiesAttempt: a fully satisfiable attempt passes", () => {
+  const r = sat.satisfiesAttempt(providerCaps(), attempt({ secret_delivery: ["egress-inject"], lifecycle: ["suspend"] }), { now: NOW });
+  assert.deepStrictEqual(r, { ok: true, reasons: [], axes: [] });
+  // A full describe-result is accepted as well as its bare capabilities.
+  assert.ok(sat.satisfiesAttempt({ provider_id: "c", contract_version: 1, capabilities: providerCaps() }, attempt(), { now: NOW }).ok);
+});
+
+test("satisfiesAttempt: secret_delivery egress-inject against a provider declaring only env is refused, naming the axis", () => {
+  const r = sat.satisfiesAttempt(providerCaps({ secret_delivery: ["env"] }), attempt({ secret_delivery: ["egress-inject"] }), { now: NOW });
+  assert.strictEqual(r.ok, false);
+  assert.deepStrictEqual(r.axes, ["secret_delivery"]);
+  assert.match(r.reasons[0], /^secret_delivery: needs egress-inject; this provider delivers by: env$/);
+  // ANY acceptable mode satisfies.
+  assert.ok(sat.satisfiesAttempt(providerCaps({ secret_delivery: ["file"] }), attempt({ secret_delivery: ["egress-inject", "file"] }), { now: NOW }).ok);
+  // Unstated: secrets need SOME mode; no secrets need none.
+  assert.deepStrictEqual(sat.satisfiesAttempt(providerCaps({ secret_delivery: [] }), attempt(), { now: NOW }).axes, ["secret_delivery"]);
+  assert.ok(sat.satisfiesAttempt(providerCaps({ secret_delivery: [] }), attempt({ secrets: [] }), { now: NOW }).ok);
+});
+
+test("satisfiesAttempt: isolation vm against the local provider is refused, and a stronger kind is never substituted", () => {
+  const local = { harnesses: ["claude-code"], reachable_mcp: ["spor"], skills: ["brief"], plugins: ["spor@spor"], tools: ["git", "node"], repos: ["acme-api"], egress: ["*"], isolation: ["worktree"], secret_delivery: ["file"], lifecycle: ["cancel", "force-cancel"], resources: { cpu: 8, memory_mb: 16384 } };
+  const r = sat.satisfiesAttempt(local, attempt({ isolation: "vm" }), { now: NOW });
+  assert.strictEqual(r.ok, false);
+  assert.deepStrictEqual(r.axes, ["isolation"]);
+  assert.match(r.reasons[0], /^isolation: 'vm' is not offered \(this provider offers: worktree\)$/);
+  // EXACT match: a vm provider does not take a container attempt.
+  assert.deepStrictEqual(sat.satisfiesAttempt(providerCaps({ isolation: ["vm"] }), attempt(), { now: NOW }).axes, ["isolation"]);
+});
+
+test("satisfiesAttempt: deny still applies — first, regardless of capability", () => {
+  const r = sat.satisfiesAttempt(providerCaps({ deny: ["profile-acme-impl"] }), attempt(), { now: NOW });
+  assert.strictEqual(r.ok, false);
+  assert.deepStrictEqual(r.axes, ["deny"]);
+  assert.match(r.reasons[0], /^deny: profile profile-acme-impl is on this provider's deny list/);
+});
+
+test("satisfiesAttempt: every profile + environment axis names its own failure", () => {
+  const r = sat.satisfiesAttempt(
+    { isolation: ["container"], lifecycle: ["cancel"], resources: { cpu: 1 }, max_deadline_ms: 3600 * 1000 },
+    attempt({ secret_delivery: ["file"], lifecycle: ["checkpoint"], resources: { cpu: 2, memory_mb: 1024 }, egress: { allow: ["github.com"] } }),
+    { now: NOW }
+  );
+  assert.strictEqual(r.ok, false);
+  assert.deepStrictEqual(r.axes, ["harnesses", "reachable_mcp", "skills", "plugins", "tools", "repos", "egress", "secret_delivery", "resources", "lifecycle", "deadline"]);
+  const text = r.reasons.join("\n");
+  assert.match(text, /harnesses: harness 'claude-code' not offered/);
+  assert.match(text, /tools: tool\(s\) on PATH not offered: git, node/);
+  assert.match(text, /repos: cannot check out acme-api/);
+  assert.match(text, /egress: host\(s\) not reachable: github.com/);
+  assert.match(text, /resources: cpu >= 2 requested; this provider offers 1/);
+  assert.match(text, /resources: memory_mb >= 1024 requested; this provider declares no memory_mb/);
+  assert.match(text, /lifecycle: lifecycle operation\(s\) not offered: checkpoint/);
+  assert.match(text, /deadline: 2026-10-09T14:00:00Z is past this provider's environment lifetime/);
+});
+
+test("satisfiesAttempt: repos and egress wildcards", () => {
+  const withUrl = [{ slug: "other", commit: "4b825dc642cb6eb9a060e54bf8d69288fbee4904", branch: "b", url: "https://github.com/acme/other.git" }];
+  const noUrl = [{ slug: "other", commit: "4b825dc642cb6eb9a060e54bf8d69288fbee4904", branch: "b" }];
+  assert.ok(sat.satisfiesAttempt(providerCaps({ repos: ["*"] }), attempt({ repos: withUrl }), { now: NOW }).ok, "* clones any repo with a url");
+  const r = sat.satisfiesAttempt(providerCaps({ repos: ["*"] }), attempt({ repos: noUrl }), { now: NOW });
+  assert.deepStrictEqual(r.axes, ["repos"]);
+  assert.match(r.reasons[0], /no url to clone from/);
+  // egress: none is always satisfiable; unrestricted needs a "*" provider.
+  assert.ok(sat.satisfiesAttempt(providerCaps({ egress: [] }), attempt({ egress: { allow: [] } }), { now: NOW }).ok);
+  assert.match(sat.satisfiesAttempt(providerCaps(), attempt({ egress: { allow: ["*"] } }), { now: NOW }).reasons[0], /^egress: unrestricted egress not offered/);
+  assert.ok(sat.satisfiesAttempt(providerCaps({ egress: ["*"] }), attempt({ egress: { allow: ["*", "x.example"] } }), { now: NOW }).ok);
+});
+
+test("satisfiesAttempt: a present-but-malformed attempt field refuses on its axis, never admits", () => {
+  const caps2 = providerCaps({ isolation: ["worktree"] });
+  const axesOf = (over) => sat.satisfiesAttempt(caps2, attempt({ isolation: "worktree", ...over }), { now: NOW }).axes;
+  assert.deepStrictEqual(axesOf({ resources: { cpu: "64" } }), ["resources"]);
+  assert.deepStrictEqual(axesOf({ isolation: ["vm"] }), ["isolation"]);
+  assert.deepStrictEqual(axesOf({ isolation: undefined }), ["isolation"]);
+  assert.deepStrictEqual(axesOf({ harness: { id: 5 } }), ["harnesses"]);
+  assert.deepStrictEqual(axesOf({ deadline: "garbage" }), ["deadline"]);
+  assert.deepStrictEqual(axesOf({ deadline: "2026" }), ["deadline"]);
+  assert.deepStrictEqual(axesOf({ deadline: "2026-10-09T11:00:00" }), ["deadline"], "a zone-less time is not read in the host zone");
+  assert.deepStrictEqual(axesOf({ deadline: "2026-10-09T13:00:00+02:00" }), []);
+  assert.deepStrictEqual(axesOf({ tools: [5] }), ["tools"]);
+  assert.deepStrictEqual(axesOf({ repos: "acme-api" }), ["repos"]);
+  assert.deepStrictEqual(axesOf({ egress: ["github.com"] }), ["egress"]);
+  assert.deepStrictEqual(axesOf({ secrets: "x" }), ["secret_delivery"]);
+  assert.deepStrictEqual(axesOf({ profile: 7 }), ["deny"]);
+  assert.deepStrictEqual(axesOf({}), [], "the well-formed baseline passes");
+  assert.deepStrictEqual(sat.ATTEMPT_AXES, ["deny", "harnesses", "reachable_mcp", "skills", "plugins", "tools", "repos", "egress", "secret_delivery", "isolation", "resources", "lifecycle", "deadline"]);
+});
+
+test("satisfiesAttempt: satisfies() is untouched for the profile path", () => {
+  assert.deepStrictEqual(sat.CAP_AXES, ["harnesses", "reachable_mcp", "skills", "plugins"]);
+  assert.deepStrictEqual(sat.satisfies({ harnesses: ["claude-code"] }, { id: "p", harness: "claude-code" }), { ok: true, reasons: [], profile: "p" });
+});
+
+test("spor capabilities providers: the local describe() validates, and --attempt names the refusing axis", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cap-home-"));
+  caps(["set", "harnesses", "claude-code"], home);
+  const list = caps(["providers", "--json"], home);
+  assert.strictEqual(list.status, 0, list.stderr);
+  const [local] = JSON.parse(list.stdout).providers;
+  assert.strictEqual(local.provider_id, "local");
+  assert.deepStrictEqual(pc.validate("describe-result", local).errors, []);
+  assert.deepStrictEqual(local.capabilities.isolation, ["worktree"]);
+  assert.ok(local.capabilities.resources.cpu >= 1 && local.capabilities.resources.memory_mb > 0);
+
+  const spec = path.join(home, "attempt.json");
+  fs.writeFileSync(spec, JSON.stringify(attempt({ isolation: "vm", secrets: [], mcp: [], skills: [], plugins: [], tools: [], egress: { allow: [] }, resources: undefined })));
+  const r = caps(["providers", "--attempt", spec], home);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stdout, /attempt: +REFUSED \(repos, isolation\)/);
+  assert.match(r.stdout, /- isolation: 'vm' is not offered \(this provider offers: worktree\)/);
+  assert.match(r.stderr, /no configured provider can run this attempt/);
+
+  fs.writeFileSync(spec, JSON.stringify({ not: "an attempt" }));
+  const bad = caps(["providers", "--attempt", spec], home);
+  assert.strictEqual(bad.status, 1);
+  assert.match(bad.stderr, /does not validate against the provider contract/);
+});
