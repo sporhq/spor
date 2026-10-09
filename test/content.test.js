@@ -378,6 +378,10 @@ test("embeds: indented code, HTML blocks and quote-continued destinations", () =
   assert.deepEqual(ids(`para\n\n    ${img}\n\n${img}`), ["art-a"]);
   assert.deepEqual(ids(`> para\n>\n>     ${img}`), []);
   assert.deepEqual(ids(`- item\n\n      ${img}\n\n  ${img}`), ["art-a"]);
+  assert.deepEqual(ids(`# H\n    ${img}`), []);
+  assert.deepEqual(ids(`---\n    ${img}`), []);
+  assert.deepEqual(ids(`- a\nlazy\n\n    ${img}`), ["art-a"]);
+  assert.deepEqual(ids(`- <div>\n  ${img}`), []);
   // HTML blocks run to the blank line; a lone inline tag cannot interrupt a paragraph
   assert.deepEqual(ids(`<div>\n${img}\n\n${img}`), ["art-a"]);
   assert.deepEqual(ids(`text\n<span>\n${img}`), ["art-a"]);
