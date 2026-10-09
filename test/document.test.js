@@ -384,11 +384,8 @@ test("local restart recovery: a pre-stage intent (v1) still decides by the objec
   assert.deepStrictEqual([rec.outcome, rec.removed.length], ["rolled-back", gen.parts.length]);
 });
 
-test("local restart recovery: a death between the stage-root intent and the root write keeps the parts (not proof either way)", () => {
-  const h = home({ git: true });
-  const v1 = put(h, source("art-doc"));
-  const v2src = source("art-doc", { edit: " (v2)" });
-  // Die right after the stage-`root` intent lands: the root write is next.
+// Die right after the stage-`root` intent lands: the root write is next.
+function dieAtStageRoot(h, node, snapshot) {
   const script = `
     const fs = require("node:fs");
     const d = require(${JSON.stringify(SHELL)});
@@ -398,18 +395,100 @@ test("local restart recovery: a death between the stage-root intent and the root
       if (to.endsWith("art-doc.publish.json") && JSON.parse(fs.readFileSync(to, "utf8")).stage === "root") process.exit(137);
     };
     d.putDocument(${JSON.stringify(nodes(h))}, {
-      node: ${JSON.stringify(v2src)}, snapshot: ${JSON.stringify(v1.snapshot)}, journalDir: ${JSON.stringify(journal(h))},
+      node: ${JSON.stringify(node)}, snapshot: ${JSON.stringify(snapshot)}, journalDir: ${JSON.stringify(journal(h))},
     });
     process.exit(0);`;
   const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
   assert.strictEqual(r.status, 137, r.stderr);
-  const intent = JSON.parse(fs.readFileSync(path.join(journal(h), "art-doc.publish.json"), "utf8"));
+  return JSON.parse(fs.readFileSync(path.join(journal(h), "art-doc.publish.json"), "utf8"));
+}
+
+test("local restart recovery: a death between the stage-root intent and the root write collects the parts", () => {
+  const h = home({ git: true });
+  const v1 = put(h, source("art-doc"));
+  const before = new Set(fs.readdirSync(nodes(h)));
+  const intent = dieAtStageRoot(h, source("art-doc", { edit: " (v2)" }), v1.snapshot);
   assert.strictEqual(intent.hashed.length, 1 + intent.fresh.length + 1, "the prior root, every fresh part and the new root were hashed");
   assert.strictEqual(intent.hashed.at(-1), intent.root);
   assert.strictEqual(documentShell.readNodeFile(nodes(h), "art-doc").revision, v1.revision);
   const rec = documentShell.recoverPublication(nodes(h), journal(h), "art-doc");
-  assert.deepStrictEqual([rec.outcome, rec.removed], ["kept", []]);
+  assert.deepStrictEqual([rec.outcome, rec.removed.length], ["rolled-back", intent.fresh.length]);
+  assert.deepStrictEqual([...fs.readdirSync(nodes(h))].sort(), [...before].sort(), "no unreferenced part is left behind");
   assert.strictEqual(content.documentCore(get(h, "art-doc").document.body), core(source("art-doc")));
+});
+
+test("local restart recovery: a stage-root intent keeps the parts when the new root is in a commit", () => {
+  const h = home({ git: true });
+  const v1 = put(h, source("art-doc"));
+  const v2src = source("art-doc", { edit: " (v2)" });
+  const intent = dieAtStageRoot(h, v2src, v1.snapshot);
+  // The new root landed, was committed, and its file was put back since.
+  const rootFile = path.join(nodes(h), "art-doc.md");
+  const v1bytes = fs.readFileSync(rootFile);
+  fs.writeFileSync(rootFile, content.documentGeneration(v2src).root);
+  const git = (...a) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...a], { cwd: h, env: gitEnv(), encoding: "utf8" });
+  assert.strictEqual(git("add", "-A").status, 0);
+  assert.strictEqual(git("commit", "-qm", "v2").status, 0);
+  fs.writeFileSync(rootFile, v1bytes);
+  const rec = documentShell.recoverPublication(nodes(h), journal(h), "art-doc");
+  assert.deepStrictEqual([rec.outcome, rec.removed], ["kept", []]);
+  const pinned = get(h, "art-doc", intent.root);
+  assert.ok(pinned.ok && pinned.document.complete, "the committed revision still reads whole");
+});
+
+test("local: a pinned read refuses when git cannot answer, never reports the revision missing", { skip: process.platform === "win32" && "a /bin/sh git shim" }, () => {
+  const h = home({ git: true });
+  const v1 = put(h, source("art-doc"));
+  put(h, source("art-doc", { edit: " (v2)" }), v1.snapshot);
+  const fakeGit = fs.mkdtempSync(path.join(os.tmpdir(), "spor-document-git-"));
+  fs.writeFileSync(path.join(fakeGit, "git"), "#!/bin/sh\necho \'fatal: Resource temporarily unavailable\' >&2\nexit 128\n", { mode: 0o755 });
+  const PATH = process.env.PATH;
+  process.env.PATH = `${fakeGit}${path.delimiter}${PATH}`;
+  let r;
+  try {
+    r = get(h, "art-doc", v1.revision);
+  } finally {
+    process.env.PATH = PATH;
+  }
+  assert.deepStrictEqual([r.ok, r.code], [false, "internal"], JSON.stringify(r));
+  assert.match(r.details.join("\n"), /Resource temporarily unavailable/);
+  assert.ok(get(h, "art-doc", v1.revision).ok, "the same read succeeds once git answers");
+  assert.strictEqual(get(h, "art-doc", "1".repeat(40)).code, "not_found", "an absent blob is still not_found");
+  // No git binary at all is no object store, not a failure to answer.
+  process.env.PATH = fs.mkdtempSync(path.join(os.tmpdir(), "spor-document-nogit-"));
+  try {
+    assert.strictEqual(get(h, "art-doc", v1.revision).code, "not_found");
+  } finally {
+    process.env.PATH = PATH;
+  }
+});
+
+test("local: a spool lock naming a recycled pid (start ticks differ) is not a live publisher", { skip: process.platform !== "linux" && "start ticks are read from /proc" }, () => {
+  const h = home();
+  fs.mkdirSync(journal(h), { recursive: true });
+  const { processStartTicks } = require("../lib/shell/process-identity.js");
+  const ticks = processStartTicks(process.ppid);
+  const hex = (t) => t.toString(16).padStart(16, "0");
+  const recycled = path.join(journal(h), `art-doc.lock-${process.ppid}-${Date.now()}-${hex(ticks + 1)}ab12cd34`);
+  fs.writeFileSync(recycled, "");
+  assert.strictEqual(put(h, source("art-doc")).status, "created");
+  assert.ok(!fs.existsSync(recycled), "a verified-dead holder is reaped at once");
+  const live = path.join(journal(h), `art-doc.lock-${process.ppid}-${Date.now()}-${hex(ticks)}ab12cd34`);
+  fs.writeFileSync(live, "");
+  assert.strictEqual(put(h, source("art-doc", { edit: "!" }), get(h, "art-doc").document.snapshot).code, "conflict");
+  assert.ok(fs.existsSync(live));
+  fs.unlinkSync(live);
+  // The lock a publication writes carries this process's ticks, in a name a
+  // client from before them still reads as a contender.
+  let ours = [];
+  const r = put(h, source("art-doc", { edit: "!" }), get(h, "art-doc").document.snapshot, {
+    at: () => { ours = fs.readdirSync(journal(h)).filter((f) => f.startsWith("art-doc.lock-")); },
+  });
+  assert.strictEqual(r.status, "updated");
+  assert.strictEqual(ours.length, 1);
+  const stamp = ours[0].slice("art-doc.lock-".length);
+  assert.match(stamp, /^(\d+)-(\d+)-[0-9a-f]+$/, "the pre-ticks parser matches");
+  assert.strictEqual(parseInt(stamp.split("-")[2].slice(0, 16), 16), processStartTicks(process.pid));
 });
 
 // ---------- the CLI doors ----------

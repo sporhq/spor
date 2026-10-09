@@ -362,7 +362,7 @@ unlink-it, re-create-it is not a claim, and two sweepers could both break one
 stale lock, both `wx` it, and then delete each OTHER's (the loser's break takes
 the winner's lock, the winner's release takes its successor's). Instead each
 contender creates ONLY its own uniquely-named
-`<hash>.redrive.lock-<pid>-<ts>-<rand>` and deletes ONLY its own; everything a
+`<hash>.redrive.lock-<pid>-<ts>-<ticks><rand>` and deletes ONLY its own; everything a
 racer must judge is in the NAME, so there is no create-then-write window to
 misread; and ownership is decided by a listing taken AFTER the create — you hold
 the job only if no other LIVE contender is present, which two contenders can

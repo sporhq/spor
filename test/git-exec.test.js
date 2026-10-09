@@ -11,6 +11,8 @@ const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 
 const {
+  gitEnv,
+  gitSpawn,
   gitOracle,
   gitToplevelAndCommonDir,
   envWithoutRepoLocalVars,
@@ -51,6 +53,30 @@ test("envWithoutRepoLocalVars strips the whole class and keeps everything else",
   for (const v of GIT_LOCAL_ENV_VARS) assert.ok(!(v in out), `${v} survived the scrub`);
   assert.deepEqual(out, { PATH: "/bin", HOME: "/h", GIT_AUTHOR_NAME: "keep" });
   assert.equal(env.GIT_DIR, "/leak", "the input env is not mutated");
+});
+
+test("gitSpawn: an ambient object directory never redirects a hash-object write", () => {
+  const dir = scratchRepo();
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-git-exec-objects-"));
+  for (const v of ["GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"]) {
+    assert.ok(!(v in gitEnv({ PATH: "/bin", [v]: elsewhere })), `${v} survived the narrow scrub`);
+  }
+  const env = { ...process.env, GIT_OBJECT_DIRECTORY: elsewhere, GIT_ALTERNATE_OBJECT_DIRECTORIES: elsewhere };
+  const r = gitSpawn(dir, ["hash-object", "-w", "--stdin"], { input: "graph blob\n", env });
+  assert.equal(r.status, 0, r.stderr);
+  const sha = r.stdout.trim();
+  assert.ok(fs.existsSync(path.join(dir, ".git", "objects", sha.slice(0, 2), sha.slice(2))), "the blob lands in the repo's own store");
+  assert.deepEqual(fs.readdirSync(elsewhere), [], "nothing is written to the ambient directory");
+});
+
+test("gitSpawn runs git in the C locale, so matched stderr is never translated", { skip: process.platform === "win32" && "a shell alias that prints the env" }, () => {
+  const dir = scratchRepo();
+  // A shell alias prints the environment git itself was started with.
+  const r = gitSpawn(dir, ["-c", "alias.envdump=!env", "envdump"], { env: { ...process.env, LC_ALL: "de_DE.UTF-8", LANGUAGE: "de" } });
+  assert.equal(r.status, 0, r.stderr);
+  const env = new Map(r.stdout.split("\n").filter((l) => l.includes("=")).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
+  assert.equal(env.get("LC_ALL"), "C");
+  assert.equal(env.get("LANGUAGE"), "");
 });
 
 test("gitOracle types its answer: hit / miss / error, never a folded boolean", () => {

@@ -1347,6 +1347,21 @@ function preparePutNodeLocal(nodesDir, raw, node, policy, revision, stampIdentit
     if (current !== revision) return { ok: false, error: `put-node conflict: stale revision for ${id}; current revision: ${current}` };
   }
 
+  // The managed-document guards (issue-spor-local-mode-document-mutation-
+  // guards): the server's put_node refusals for a managed root's body, a
+  // generation part, and the doc_* stamps, so a local graph protects a long
+  // document exactly as the hosted one does. An omitted stamp is restored.
+  const guard = contentKernel().managedDocumentWriteGuard({ id, priorRaw: exists ? fs.readFileSync(file, "utf8") : null, raw });
+  if (!guard.ok) return { ok: false, error: documentGuardError(guard) };
+  if (guard.raw !== raw) {
+    raw = guard.raw;
+    try {
+      node = require(path.join(ROOT, "lib", "graph.js")).parseFrontmatter(raw, `${id}.md`);
+    } catch (e) {
+      return { ok: false, error: `invalid node after restoring document stamps: ${e.message}` };
+    }
+  }
+
   // priority at create: the same stamp `spor priority` writes locally, so a
   // backfilled priority is attributed rather than "source unrecorded".
   if (!exists) {
@@ -1369,6 +1384,12 @@ function preparePutNodeLocal(nodesDir, raw, node, policy, revision, stampIdentit
     }
   }
   return { ok: true, file, exists, raw, node, priority };
+}
+
+// A managed-document guard refusal as one error string: the message, then each
+// detail indented on its own line (the shape every local refusal prints).
+function documentGuardError(guard) {
+  return [guard.message, ...(guard.details || []).map((d) => `  ${d}`)].join("\n");
 }
 
 function writePreparedPutNode(p, warnings) {
@@ -5353,6 +5374,11 @@ const PATCH_LOCAL_PROTECTED = new Map([
   ["status", "spor set-status"], ["edges", "spor edge"], ["commits", "spor put-node"],
   ["priority", "spor priority"], ["priority_by", "spor priority"], ["priority_at", "spor priority"], ["priority_via", "spor priority"],
   ["readiness", "spor ready"], ["readiness_by", "spor ready"], ["readiness_at", "spor ready"], ["readiness_via", "spor ready"],
+  // managed-document stamps: only the document owner computes them, and the
+  // chain-membership stamp is never a flat scalar to patch (it would re-parent
+  // a part) — issue-spor-local-mode-document-mutation-guards
+  ["doc_sha256", "spor put-document"], ["doc_bytes", "spor put-document"], ["doc_generation", "spor put-document"],
+  ["continuation_of", ""],
 ]);
 
 function parsePatchArgs(positionals, unset) {
@@ -5698,6 +5724,13 @@ async function cmdEdge(cfg, { values, positionals }) {
     if (newRaw == null) {
       err(`could not remove ${srcId} -[${edgeType}]-> ${target}: no matching edge entry found in the frontmatter`);
       err(`  (the edge is present per the parsed graph but its line(s) could not be located — rewrite the node with 'spor put-node' instead)`);
+      return 1;
+    }
+    // A generation part's derived-from links are what its published revisions
+    // name it by (issue-spor-local-mode-document-mutation-guards).
+    const guard = contentKernel().managedDocumentWriteGuard({ id: site.holder, priorRaw: holderRaw, raw: newRaw });
+    if (!guard.ok) {
+      err(documentGuardError(guard));
       return 1;
     }
     let node;
@@ -14739,6 +14772,9 @@ async function graphEdgeMutation(cfg, from, type, to, { remove = false } = {}) {
   }
   const newRaw = remove ? removeEdgeLine(raw, site.pred) : appendEdgeLine(raw, edgeType, target, null);
   if (newRaw == null) return { ok: false, reason: `could not ${remove ? "remove" : "add"} ${srcId} -[${edgeType}]-> ${target}: the frontmatter${remove ? " line" : ""} could not be located` };
+  // `spor edge --remove`'s managed-document guard, on its automated twin.
+  const guard = contentKernel().managedDocumentWriteGuard({ id: srcId, priorRaw: raw, raw: newRaw });
+  if (!guard.ok) return { ok: false, reason: documentGuardError(guard) };
   let node;
   try {
     node = graphLib.parseFrontmatter(newRaw, `${srcId}.md`);
