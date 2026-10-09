@@ -109,6 +109,18 @@ Output: `{ "found": bool, "text": "<digest or full neighborhood>",
 optional server-computed digest-intent verdict — see the `/v1/digest` row in §3). `found: false` (gate not met) is a
 **successful empty result**, not an error.
 
+**Digest rerank parity** (per-org opt-in, the same stage as `/v1/digest`, §3):
+in `digest` mode with a free-text `query`, an org that allows the `rerank`
+judgment scores the candidate pool and, by default, FILTERS it — the output then
+carries `rerank: {applied: true, candidates, kept, dropped, unscored, min_score}`,
+`node_ids` becomes the ids the filtered digest served (rendered nodes, pins
+included, then any in-scope standing corrections it carries); `top_sim` stays
+the relevance gate's signal, unchanged by rerank. A pool scored entirely below the threshold is `found: false`
+with the `rerank` summary and the gate's nonzero `top_sim` (a gate miss is
+`found: false` with `top_sim: 0`). A rerank that ran but fell open (timeout, no verdict,
+…) serves the unfiltered digest with `rerank: {applied: false, reason}`. `full`
+mode and `root_id` walks never rerank; an org that has not opted in is unchanged.
+
 ### `get_node`
 
 Input `{ "id": "dec-..." }` → full raw markdown, parsed frontmatter, and
