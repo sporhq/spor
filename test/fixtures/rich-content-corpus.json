@@ -1,0 +1,23 @@
+[
+  {"name":"inline", "source":"![caption](spor-asset:art-shot)", "rendered":["art-shot"], "scanned":["art-shot"]},
+  {"name":"pin", "source":"![caption](spor-asset:art-shot@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)", "rendered":["art-shot"], "scanned":["art-shot"]},
+  {"name":"angle destination", "source":"![caption](<spor-asset:art-shot>)", "rendered":["art-shot"], "scanned":["art-shot"]},
+  {"name":"image title", "source":"![caption](spor-asset:art-shot \"title\")", "rendered":["art-shot"], "scanned":["art-shot"]},
+  {"name":"Unicode and CRLF", "source":"👁 café\r\n\r\n![caption](spor-asset:art-shot)", "rendered":["art-shot"], "scanned":["art-shot"]},
+  {"name":"plain asset link", "source":"[caption](spor-asset:art-shot)", "rendered":[], "scanned":[]},
+  {"name":"escaped image", "source":"\\![caption](spor-asset:art-shot)", "rendered":[], "scanned":[]},
+  {"name":"code span", "source":"`![caption](spor-asset:art-shot)`", "rendered":[], "scanned":[]},
+  {"name":"fenced example", "source":"```markdown\n![caption](spor-asset:art-shot)\n```", "rendered":[], "scanned":[]},
+  {"name":"tilde example", "source":"~~~\n![caption](spor-asset:art-shot)\n~~~", "rendered":[], "scanned":[]},
+  {"name":"quote fence", "source":"> ```\n> ![caption](spor-asset:art-shot)\n> ```", "rendered":[], "scanned":[]},
+  {"name":"list fence then image", "source":"- ```\n  ![caption](spor-asset:art-example)\n  ```\n\n![actual](spor-asset:art-shot)", "rendered":["art-shot"], "scanned":["art-shot"]},
+  {"name":"quote image", "source":"> ![caption](spor-asset:art-shot)", "rendered":["art-shot"], "scanned":["art-shot"]},
+  {"name":"list image", "source":"- ![caption](spor-asset:art-shot)", "rendered":["art-shot"], "scanned":["art-shot"]},
+  {"name":"HTML comment", "source":"<!-- ![caption](spor-asset:art-shot) -->", "rendered":[], "scanned":[]},
+  {"name":"script block", "source":"<script>\n![caption](spor-asset:art-shot)\n</script>", "rendered":[], "scanned":[]},
+  {"name":"unclosed fence", "source":"```\n![caption](spor-asset:art-shot)", "rendered":[], "scanned":[]},
+  {"name":"reference image outside inline profile", "source":"![caption][shot]\n\n[shot]: spor-asset:art-shot", "rendered":[], "scanned":[]},
+  {"name":"indented code scanner gap", "source":"    ![caption](spor-asset:art-shot)", "rendered":[], "scanned":["art-shot"], "gap":"The portable scanner treats indented code as an embed."},
+  {"name":"continued quote destination scanner gap", "source":"> ![caption](\n> spor-asset:art-shot)", "rendered":["art-shot"], "scanned":[], "gap":"The portable scanner does not continue destinations through blockquote prefixes."},
+  {"name":"generic HTML block scanner gap", "source":"<div>\n![caption](spor-asset:art-shot)\n</div>", "rendered":[], "scanned":["art-shot"], "gap":"The portable scanner does not recognize CommonMark generic HTML blocks."}
+]

@@ -263,11 +263,15 @@ embeds. These are examples or references, never embeddings:
   at the container depth and column it opened at, or when its container ends;
 - a URI in an inline code span, or behind a backslash escape;
 - a URI in an HTML comment, or in a `<pre>`/`<script>`/`<style>`/`<textarea>`
-  block;
+  block, or in any other CommonMark HTML block (`<div>…`, a lone tag on its
+  line, `<?…`), which runs to the next blank line;
+- a URI in an indented (4-column) code block;
 - a plain link `[x](spor-asset:…)`.
 
-No image or code span crosses a blank line. Indented (4-space) code blocks and
-reference-style images are not recognized, so put examples in a fence.
+No image or code span crosses a blank line; an image destination may continue
+onto the next line, through `>` blockquote prefixes. Reference-style images are
+outside the inline-asset profile. The scanner is pinned to the renderer's
+shared corpus (`test/fixtures/rich-content-corpus.json`).
 
 **`uses-asset` (candidate edge).** A document carries one `uses-asset` edge to
 each descriptor it embeds. Its schema ships in the candidate pack

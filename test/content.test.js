@@ -355,3 +355,38 @@ test("content.js stays dependency-free: node builtins and the pure kernel gramma
   // which the document generation builder edits stamps through.
   assert.deepEqual(reqs, ["crypto", "./frontmatter.js"]);
 });
+
+// The renderer's shared corpus (spor-server server/test/fixtures/
+// rich-content-corpus.json, copied verbatim): the portable scanner must agree
+// with the Markdown renderer on what is an asset embed. `scanned` records the
+// scanner's pre-parity answer on the three gap rows and is not asserted.
+test("embeds: the scanner agrees with the renderer's shared corpus", () => {
+  const rows = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "rich-content-corpus.json"), "utf8"));
+  assert.ok(rows.length >= 20);
+  for (const row of rows) {
+    const got = content.extractAssetEmbeds(row.source);
+    assert.deepEqual(got.map((e) => e.id), row.rendered, row.name);
+    for (const e of got) assert.match(row.source.slice(e.start, e.end), /^!\[[^\]]*\]\(/, `${row.name}: range`);
+  }
+});
+
+test("embeds: indented code, HTML blocks and quote-continued destinations", () => {
+  const ids = (t) => content.extractAssetEmbeds(t).map((e) => e.id ?? e.error);
+  const img = "![x](spor-asset:art-a)";
+  // indented code is not an embed, but an indented line continuing a paragraph is
+  assert.deepEqual(ids(`para\n    ${img}`), ["art-a"]);
+  assert.deepEqual(ids(`para\n\n    ${img}\n\n${img}`), ["art-a"]);
+  assert.deepEqual(ids(`> para\n>\n>     ${img}`), []);
+  assert.deepEqual(ids(`- item\n\n      ${img}\n\n  ${img}`), ["art-a"]);
+  // HTML blocks run to the blank line; a lone inline tag cannot interrupt a paragraph
+  assert.deepEqual(ids(`<div>\n${img}\n\n${img}`), ["art-a"]);
+  assert.deepEqual(ids(`text\n<span>\n${img}`), ["art-a"]);
+  assert.deepEqual(ids(`<span>\n${img}`), []);
+  assert.deepEqual(ids(`<?php\n${img}\n\n${img}`), ["art-a"]);
+  // destinations continue through quote prefixes, ranges are UTF-16 offsets into the source
+  const src = "😀\n> ![c](\n> spor-asset:art-q\n> \"t\"\n> )\n";
+  const [e] = content.extractAssetEmbeds(src);
+  assert.equal(e.id, "art-q");
+  assert.equal(src.slice(e.start, e.end), "![c](\n> spor-asset:art-q\n> \"t\"\n> )");
+  assert.deepEqual(ids("> ![c](\n>\n> spor-asset:art-q)"), []);
+});
