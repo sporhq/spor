@@ -1031,6 +1031,23 @@ every other non-routing outcome re-asks broadly and prints exactly what an
 auto-route-free refusal would, at the cost of one bounded GET. Off, not one
 syscall of it runs and the refusal is byte-identical. See test/dispatch.test.js
 "AUTONOMOUS tier".
+**The execution provider (task-spor-work-local-provider-refactor, PROVIDERS.md):**
+WHERE an attempt runs is a provider behind the loop's one launch door —
+`executeDispatch` resolves `--provider <id>` > `dispatch.provider.default` >
+`local` (`lib/shell/providers/index.js`; an unknown id is REFUSED naming it,
+by `spor dispatch` before any side effect and by `spor work` at startup, never
+silently run under local) and calls its `submit`. `local`
+(`lib/shell/providers/local.js`) is the pre-provider worktree+supervisor
+launch, byte-identical: `test/dispatch-local-provider.test.js` pins the run
+record, job file, prompt bytes, journal layout and stdout against a golden
+recorded from the inline launch (re-record with `SPOR_GOLDEN_RECORD=1` only
+for a deliberate change, and say so), and drives the provider through the
+conformance suite over real supervisor launches. The harness adapter's argv
+stays the dispatcher's; the provider gets the finished launch on the
+provider-private `attempt.local` block. `dispatch.provider` is one
+machine-local map (`default` + `<id>` bindings, `noRepo` like
+`dispatch.harness`); its key→handle table is in memory until the attempt-handle
+work persists it.
 **The work loop (task-spor-work-loop):** `spor work` is the pull-based
 continuous worker over the queue — poll, dispatch, await the TERMINAL state,
 repeat — and is a GENERALIZATION of `spor dispatch --from-queue`, never a second

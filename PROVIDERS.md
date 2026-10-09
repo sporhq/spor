@@ -16,15 +16,25 @@ Governing decision: dec-spor-work-execution-provider-contract. Companion
 specs: [WORKERS.md](WORKERS.md) (the worker protocol, the prompt contract
 §4, the execution store §10.15), [API.md](API.md) (REST/MCP).
 
-**Status.** The `local` provider extraction
-(task-spor-work-local-provider-refactor), the in-environment runner
-(task-spor-attempt-bundle-run) and the server's attempt handle and
-attempt-scoped token are separate items. None of them is shipped yet, so
-`spor work` behaves today exactly as WORKERS.md describes. The subprocess
-stdio binding (§12, `lib/shell/providers/stdio.js`) is shipped, with the
-`examples/providers/stdio-echo/` reference provider and `spor provider check
-<id>`; no worker drives a binding yet. The conformance
-suite every binding must pass is shipped:
+**Status.** The contract, the `local` provider and the resolution rule are
+shipped; the subprocess stdio binding
+(§12, `lib/shell/providers/stdio.js`, with `examples/providers/stdio-echo/` and `spor provider check <id>`; no worker drives a binding yet) is shipped too; the in-environment runner
+(task-spor-attempt-bundle-run), the worker's persisted attempt handle
+(task-spor-work-attempt-handle-adoption) and the server's attempt-scoped token
+are separate items. `spor work` therefore behaves today exactly as WORKERS.md
+describes: every launch goes through the one door (`executeDispatch` in
+`lib/shell/dispatch.js`), which now resolves a provider — `--provider <id>` >
+`dispatch.provider.default` > `local` (`lib/shell/providers/index.js`; an id
+this machine cannot run under is refused naming it, by `spor dispatch` before
+any side effect and by `spor work` at startup, never silently run under
+`local`) — and calls its `submit`. `local` (`lib/shell/providers/local.js`) is
+the pre-provider launch byte-identical: `test/dispatch-local-provider.test.js`
+pins the run record, job file, prompt bytes, journal layout and stdout against
+a golden recorded from the inline launch, and drives the provider through the
+conformance suite over real supervisor launches. The loop still reads run
+records itself; `observe`/`collect`/`cancel`/`release` are exercised by the
+suite and become the loop's own reads with the attempt-handle work. The
+conformance suite every binding must pass is
 `lib/shell/provider-conformance.js` (`runConformance(provider, {home,
 driver})`), proven against the synthetic providers in
 `test/fixtures/providers/` by `test/provider-conformance.test.js`. The
@@ -500,15 +510,30 @@ tokens in a restored environment: re-mint, never reuse.
 
 ## 11. Worked examples (prose; no vendor code ships in Spor)
 
-**`local`** is the default, and it is today's behaviour. `describe` reports
-`isolation: [worktree]` and the machine's probed capability map. `submit`
-creates the dispatch worktree and starts the detached supervisor
-(`launchSupervisedHarness`). The handle's `id` is the run id. `observe` reads
-the run record; `collect` reads the report and the pinned candidate; `release`
-removes the worktree. Secrets are not materialized, since the harness runs
-with the operator's own environment. The extraction must be byte-identical:
-same run records, same journal paths, same prompt bytes
-(task-spor-work-local-provider-refactor).
+**`local`** (`lib/shell/providers/local.js`) is the default, and it is
+today's behaviour. `describe` reports `isolation: [worktree]` and the
+machine's probed capability map (`tools` is a fixed `git node npm gh docker`
+plus whatever the attempt asks for, filtered to what is on PATH, since PATH
+cannot be enumerated; `secret_delivery` is empty, so an attempt carrying
+`secrets[]` does not match it). `submit` takes the finished launch on a
+provider-private `attempt.local` block (the harness adapter's argv is the
+dispatcher's, not the provider's), creates the dispatch worktree and starts the
+detached supervisor (`launchSupervisedHarness`); the handle's `id` is the run
+id, and the key→handle table lives in memory until the worker persists handles
+(task-spor-work-attempt-handle-adoption). `observe` reads the run record
+(launching → `provisioning`, running → `running`, a closed record → `finished`
+with the harness exit, a vanished one → `lost`, and a non-terminal record whose
+supervisor is demonstrably gone → `lost`); `collect` answers the branch's HEAD
+once it moved past the launch's base commit, referenced through the repo's
+`origin` URL (a manifest must be fetchable off the environment, so a repo with
+no `origin` has no manifest and says why), plus the report and log as `file://`
+references; `cancel` is SIGTERM to the supervisor's process group (identity-
+gated), `force` the TERM-then-KILL stop with the record closed as cancelled;
+`release` stops anything still running and removes the worktree this submit
+created. Secrets are not materialized, since the harness runs with the
+operator's own environment. The extraction is byte-identical — same run
+records, same journal paths, same prompt bytes — and
+`test/dispatch-local-provider.test.js` holds the golden that says so.
 
 **A container provider** (the first remote reference, decided before exe.dev).
 `submit` runs a labelled container (`spor.execution=<id>`, `spor.fence=<n>`)

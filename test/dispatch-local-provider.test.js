@@ -189,3 +189,213 @@ test("golden: the local provider's dispatch is byte-identical to the pre-refacto
     assert.deepStrictEqual(capture[key], golden[key], `${key} differs from the recorded golden`);
   }
 });
+
+// ------------------------------------------------------------- conformance
+
+const conf = require("../lib/shell/provider-conformance");
+const sat = require("../lib/kernel/satisfiability");
+const dispatchRuns = require("../lib/shell/agent-dispatch-runner");
+const dispatchHarnesses = require("../lib/shell/dispatch-harnesses");
+const { loadConfig } = require("../lib/config.js");
+const { createLocalProvider } = require("../lib/shell/providers/local.js");
+const providers = require("../lib/shell/providers/index.js");
+const cli = require(CLI);
+
+// The real local provider over a scratch home: the CLI's own worktree and
+// supervisor helpers as its host, a scratch repo mapped as `conformance` with
+// an https origin (a manifest's candidate must be fetchable off the
+// environment), and two stub harnesses — one that commits and exits, one that
+// holds until it is signalled.
+function conformanceSetup() {
+  const home = scratchHome("spor-lprov-conf-");
+  const repo = gitRepo("spor-lprov-conf-repo-");
+  git(repo, ["remote", "add", "origin", "https://conformance.spor.invalid/conformance.git"]);
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({
+    dispatch: { repos: { conformance: repo }, capabilities: { declared: { harnesses: ["claude-code"] } } },
+  }));
+  const cfg = loadConfig({ cwd: home, env: hermeticEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, HOME: home }) });
+  const stubs = {
+    complete: writeSpawnableNodeStub(home, "claude-complete", `
+      const { spawnSync } = require("child_process");
+      const r = spawnSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "conformance candidate"], { cwd: process.cwd(), stdio: "ignore" });
+      process.exit(r.status === 0 ? 0 : 3);
+    `),
+    hold: writeSpawnableNodeStub(home, "claude-hold", "setInterval(() => {}, 1000);"),
+  };
+  const lines = { out: [], err: [] };
+  const provider = createLocalProvider({
+    cfg,
+    host: {
+      out: (m) => lines.out.push(m),
+      err: (m) => lines.err.push(m),
+      createDispatchWorktree: cli.createDispatchWorktree,
+      removeDispatchWorktree: cli.removeDispatchWorktree,
+      launchSupervisedHarness: cli.launchSupervisedHarness,
+    },
+  });
+  const adapter = dispatchHarnesses.getHarness("claude-code");
+  let n = 0;
+  const driver = {
+    attempt(base, behavior) {
+      const name = `conf-${base.execution_id.slice(5, 13)}-${++n}`;
+      const args = adapter.buildArgs({
+        name, model: null, permissionMode: null, agent: null, mcpConfig: null, sandbox: null, approvalPolicy: null,
+        reportPath: dispatchHarnesses.REPORT_PLACEHOLDER, sporMcp: null, readOnly: null,
+      });
+      return {
+        ...base,
+        local: {
+          repoDir: repo, name, slug: "conformance", nodeId: null, useWorktree: true,
+          launch: {
+            adapter, command: stubs[behavior], args, readOnly: false, name, nodeId: null,
+            prompt: `conformance ${behavior} ${base.execution_id}`, server: null, localNodesDir: cfg.nodesDir(),
+            childToken: null, mcpToken: null, bindToken: null, renewToken: null, renewNode: null, releaseNode: null,
+            project: "conformance", itemRepo: null, itemCommits: null, resolvedProfile: null, recordFields: null,
+          },
+        },
+      };
+    },
+    candidate: () => null,
+    crash(handle) {
+      const rec = dispatchRuns.readRecord(home, provider.runIdOf(handle));
+      if (rec && rec.runner_pid) process.kill(rec.runner_pid, "SIGKILL");
+    },
+    environments: () => provider.environments(),
+    pollIntervalMs: 100,
+    maxPolls: 600,
+  };
+  return { home, repo, cfg, provider, driver, lines };
+}
+
+test("the local provider passes the conformance suite over real supervisor launches", async () => {
+  const { home, provider, driver } = conformanceSetup();
+  const report = await conf.runConformance(provider, { home, driver, matcher: sat.satisfiesAttempt });
+  assert.deepStrictEqual(report.results.filter((r) => !r.ok || r.skipped), [], JSON.stringify(report.results, null, 2));
+  assert.strictEqual(report.ok, true);
+  assert.deepStrictEqual(report.results.map((r) => r.name), [...conf.SCENARIO_NAMES]);
+  assert.strictEqual(provider.environments(), 0, "every scenario released what it submitted");
+});
+
+test("the local provider's collect names the candidate the harness committed, through the repo's origin", async () => {
+  const { home, repo, provider, driver } = conformanceSetup();
+  const r = await conf.runScenario(provider, "observe-collect", { home, driver, matcher: sat.satisfiesAttempt });
+  assert.strictEqual(r.skipped, undefined);
+  // Drive one more attempt by hand to look at the manifest itself.
+  const base = {
+    contract_version: 1, attempt_id: "w:1", execution_id: `exec-${"a".repeat(16)}`, fence: 1, tenant: "t", node_id: "task-x",
+    harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: [],
+    repos: [{ slug: "conformance", commit: "b".repeat(40), branch: "x" }], egress: { allow: [] }, secrets: [],
+    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://x/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
+    isolation: "worktree", prompt_bundle_ref: "https://x.invalid/p.tar",
+  };
+  const attempt = driver.attempt(base, "complete");
+  const res = await provider.request({ contract_version: 1, id: "r1", op: "submit", params: { attempt, idempotency_key: "manual-key-1" } });
+  assert.strictEqual(res.ok, true, JSON.stringify(res));
+  const handle = res.result.handle;
+  assert.strictEqual(handle.provider, "local");
+  assert.ok(fs.existsSync(path.join(home, "journal", "dispatch", `${handle.id}.run.json`)), "the handle id IS the run id");
+  let obs;
+  for (let i = 0; i < 600; i++) {
+    obs = (await provider.request({ contract_version: 1, id: "o", op: "observe", params: { handle } })).result;
+    if (obs.state === "finished") break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.strictEqual(obs.state, "finished", JSON.stringify(obs));
+  assert.deepStrictEqual(obs.exit, { code: 0 });
+  const col = (await provider.request({ contract_version: 1, id: "c", op: "collect", params: { handle } })).result;
+  assert.ok(col.manifest, JSON.stringify(col));
+  const head = git(repo, ["rev-parse", attempt.local.name]).trim();
+  assert.strictEqual(col.manifest.candidate.commit, head);
+  assert.strictEqual(col.manifest.candidate.branch, attempt.local.name);
+  assert.deepStrictEqual(col.manifest.candidate.reference, {
+    kind: "branch", locator: "https://conformance.spor.invalid/conformance.git", ref: `refs/heads/${attempt.local.name}`, commit: head,
+  });
+  assert.ok(col.manifest.log_refs[0].startsWith("file://"), "the log is referenced");
+  const rel = (await provider.request({ contract_version: 1, id: "x", op: "release", params: { handle } })).result;
+  assert.deepStrictEqual(rel, { released: true, worktree: { removed: true } });
+  assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", attempt.local.name)), "release removed the worktree");
+});
+
+test("createLocalProvider refuses a host missing a helper, naming it", () => {
+  const { cfg } = conformanceSetup();
+  assert.throws(() => createLocalProvider({ cfg, host: { out() {}, err() {}, createDispatchWorktree() {}, removeDispatchWorktree() {} } }), /host is missing launchSupervisedHarness/);
+});
+
+test("the local provider's describe() is the one spor capabilities providers prints", () => {
+  const { home, cfg } = conformanceSetup();
+  const r = runCli(["capabilities", "providers", "--json"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const [printed] = JSON.parse(r.stdout).providers;
+  const described = require("../lib/shell/providers/local.js").localProviderDescribe(cfg);
+  assert.deepStrictEqual(printed.capabilities.isolation, ["worktree"]);
+  assert.deepStrictEqual(printed.capabilities.repos, ["conformance"]);
+  assert.deepStrictEqual(printed.capabilities.harnesses, described.capabilities.harnesses);
+  assert.deepStrictEqual(printed.capabilities.secret_delivery, []);
+});
+
+// ---------------------------------------------------------------- resolution
+
+test("resolveProviderId: --provider > dispatch.provider.default > local; an unknown id is a refusal naming it", () => {
+  const home = scratchHome();
+  const cfgOf = (file) => {
+    if (file) fs.writeFileSync(path.join(home, "config.json"), JSON.stringify(file));
+    return loadConfig({ cwd: home, env: hermeticEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, HOME: home }) });
+  };
+  assert.deepStrictEqual(providers.resolveProviderId(cfgOf(null)), { id: "local", source: "default" });
+  assert.deepStrictEqual(providers.resolveProviderId(cfgOf(null), "local"), { id: "local", source: "--provider" });
+  const configured = cfgOf({ dispatch: { provider: { default: "sandbox" } } });
+  assert.deepStrictEqual(providers.resolveProviderId(configured), { id: "sandbox", source: "dispatch.provider.default" });
+  assert.match(providers.providerRefusal(configured, providers.resolveProviderId(configured)), /^unknown execution provider 'sandbox' \(from dispatch\.provider\.default\) — the providers this machine can run under: local$/);
+  assert.deepStrictEqual(providers.resolveProviderId(configured, "local"), { id: "local", source: "--provider" });
+  assert.strictEqual(providers.providerRefusal(configured, { id: "local", source: "--provider" }), null);
+  const declared = cfgOf({ dispatch: { provider: { stdio: { command: "x" } } } });
+  assert.match(providers.providerRefusal(declared, providers.resolveProviderId(declared, "stdio")), /dispatch\.provider\.stdio is declared, but provider bindings are not shipped yet/);
+  assert.throws(() => providers.createProvider("stdio", { cfg: declared, host: {} }), /no binding for execution provider 'stdio'/);
+});
+
+test("spor dispatch --provider missing refuses loudly naming the id, before any side effect", () => {
+  const home = scratchHome();
+  const repo = gitRepo();
+  const r = runCli(["dispatch", "some task text", "--no-brief", "--print", "--provider", "missing"], { SPOR_HOME: home }, repo);
+  assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /cannot dispatch: unknown execution provider 'missing' \(from --provider\)/);
+  assert.ok(!fs.existsSync(path.join(home, "journal")), "nothing was written");
+});
+
+test("spor dispatch --print: the default provider adds no line; an explicit one is named", () => {
+  const home = scratchHome();
+  const repo = gitRepo();
+  const plain = runCli(["dispatch", "some task text", "--no-brief", "--print"], { SPOR_HOME: home }, repo);
+  assert.strictEqual(plain.status, 0, plain.stderr);
+  assert.doesNotMatch(plain.stdout, /^provider:/m);
+  const explicit = runCli(["dispatch", "some task text", "--no-brief", "--print", "--provider", "local"], { SPOR_HOME: home }, repo);
+  assert.strictEqual(explicit.status, 0, explicit.stderr);
+  assert.match(explicit.stdout, /^provider: local  \(via --provider\)$/m);
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { provider: { default: "local" } } }));
+  const configured = runCli(["dispatch", "some task text", "--no-brief", "--print"], { SPOR_HOME: home }, repo);
+  assert.strictEqual(configured.status, 0, configured.stderr);
+  assert.match(configured.stdout, /^provider: local  \(via dispatch\.provider\.default\)$/m);
+});
+
+test("spor work --provider missing refuses to start, naming the id; dispatch.provider.default is honored the same way", () => {
+  const home = scratchHome();
+  const repo = gitRepo();
+  const r = runCli(["work", "--print", "--provider", "missing"], { SPOR_HOME: home }, repo);
+  assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /spor work: unknown execution provider 'missing' \(from --provider\)/);
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { provider: { default: "elsewhere" } } }));
+  const c = runCli(["work", "--print"], { SPOR_HOME: home }, repo);
+  assert.strictEqual(c.status, 1, c.stdout + c.stderr);
+  assert.match(c.stderr, /spor work: unknown execution provider 'elsewhere' \(from dispatch\.provider\.default\)/);
+  const ok = runCli(["work", "--print", "--provider", "local"], { SPOR_HOME: home }, repo);
+  assert.strictEqual(ok.status, 0, ok.stdout + ok.stderr);
+});
+
+test("a committable .spor.json cannot bind an execution provider (machine-local like dispatch.harness)", () => {
+  const home = scratchHome();
+  const repo = gitRepo();
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { provider: { default: "missing" } } }));
+  const r = runCli(["dispatch", "some task text", "--no-brief", "--print"], { SPOR_HOME: home }, repo);
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout, /^provider:/m);
+});

@@ -86,6 +86,9 @@ const sat = lazyModule(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 const providerContract = lazyModule(path.join(ROOT, "lib", "kernel", "provider-contract.js"));
 const stdioProviders = lazyModule(path.join(ROOT, "lib", "shell", "providers", "stdio.js"));
 const providerConformance = lazyModule(path.join(ROOT, "lib", "shell", "provider-conformance.js"));
+// The `local` execution provider: its describe() lives with the provider
+// (lib/shell/providers/local.js, task-spor-work-local-provider-refactor).
+const localProvider = lazyModule(path.join(ROOT, "lib", "shell", "providers", "local.js"));
 const workLoop = lazyModule(path.join(ROOT, "lib", "shell", "work-loop.js"));
 const gatesKernel = lazyModule(path.join(ROOT, "lib", "kernel", "gates.js"));
 const candidateKernel = lazyModule(path.join(ROOT, "lib", "kernel", "candidate.js"));
@@ -18357,57 +18360,6 @@ function cmdCapabilities(cfg, args) {
   return 1;
 }
 
-// The tools the `local` provider's describe() reports when they are on PATH.
-// A provider's `tools` axis is "binaries on PATH" (PROVIDERS.md §4.1); PATH
-// cannot be enumerated, so local reports this fixed set plus whatever an
-// attempt being checked asks for.
-const LOCAL_PROVIDER_TOOLS = ["git", "node", "npm", "gh", "docker"];
-
-// localProviderDescribe — the `local` provider's describe-result, built from
-// this machine's effective capability map. Until the local provider is
-// extracted (task-spor-work-local-provider-refactor) this is the one place
-// its describe() is spelled: a git worktree on this box (isolation worktree),
-// the repos `dispatch.repos` maps to a checkout, the operator's own network
-// (egress unrestricted) and environment (it delivers no secrets by any
-// contract mode), the supervisor's graceful + forced stop, and this box's
-// resource ceilings.
-function localProviderDescribe(cfg, { tools = [] } = {}) {
-  const eff = sat.effectiveCapabilities(cfg.get("dispatch.capabilities", {}) || {});
-  const repos = cfg.get("dispatch.repos", {}) || {};
-  const wanted = [...new Set([...LOCAL_PROVIDER_TOOLS, ...tools.filter((t) => typeof t === "string" && t)])];
-  return {
-    provider_id: "local",
-    contract_version: providerContract.CONTRACT_VERSION,
-    capabilities: {
-      harnesses: eff.harnesses,
-      reachable_mcp: eff.reachable_mcp,
-      skills: eff.skills,
-      plugins: eff.plugins,
-      deny: eff.deny,
-      tools: wanted.filter((t) => u.whichSync(t) != null),
-      repos: Object.keys(repos && typeof repos === "object" ? repos : {}),
-      egress: ["*"],
-      isolation: ["worktree"],
-      secret_delivery: [],
-      lifecycle: ["cancel", "force-cancel"],
-      resources: localProviderResources(cfg),
-    },
-  };
-}
-
-// This box's ceilings: its cores, its memory, and the free space on the
-// filesystem holding the graph home (where dispatch worktrees' state lands).
-function localProviderResources(cfg) {
-  const res = { cpu: Math.max(1, os.cpus().length), memory_mb: Math.floor(os.totalmem() / (1024 * 1024)) };
-  try {
-    const st = fs.statfsSync(cfg.userConfigHome());
-    res.disk_mb = Math.floor((st.bavail * st.bsize) / (1024 * 1024));
-  } catch {
-    /* no statfs here (or the home is not yet created) — declare no disk ceiling */
-  }
-  return res;
-}
-
 // The values a provider request line must never carry beyond what the binding
 // already reads from the environment: the token the cascade resolved (a
 // store tenant's, which no env var holds).
@@ -18491,7 +18443,7 @@ async function cmdCapabilitiesProviders(cfg, { attemptPath, json }) {
       return 1;
     }
   }
-  const providers = [localProviderDescribe(cfg, { tools: attempt && Array.isArray(attempt.tools) ? attempt.tools : [] }), ...(await describeDeclaredProviders(cfg))];
+  const providers = [localProvider.localProviderDescribe(cfg, { tools: attempt && Array.isArray(attempt.tools) ? attempt.tools : [] }), ...(await describeDeclaredProviders(cfg))];
   const rows = providers.map((d) => (attempt && !d.error ? { ...d, match: sat.satisfiesAttempt(d.capabilities, attempt) } : d));
   const anyOk = !attempt || rows.some((r) => r.match && r.match.ok);
   if (json) {
@@ -20437,6 +20389,7 @@ const COMMANDS = {
       "read-only": { type: "boolean", desc: "run under the harness's read-only posture (codex --sandbox read-only, claude --permission-mode plan); overrides --sandbox/--permission-mode" },
       agent: { type: "string", value: "A", desc: "claude --agent (harness agent DEFINITION — NOT the Spor identity; see --as)" },
       profile: { type: "string", value: "profile-id", desc: "profile to run under; checked against this machine's capabilities (overrides the assigned/default profile)" },
+      provider: { type: "string", value: "provider-id", desc: "execution provider to run under (WHERE the attempt runs; default dispatch.provider.default, else local; an unknown id is refused)" },
       name: { type: "string", value: "N", desc: "dispatch run name (passed to Claude; tracked locally for Codex)" },
       template: { type: "string", value: "F", desc: "prompt template file (placeholders above)" },
       full: { type: "boolean", desc: "full briefing instead of the digest" },
@@ -20567,6 +20520,7 @@ const COMMANDS = {
       status: { type: "boolean", desc: "read back this machine's workers instead of running one" },
       json: { type: "boolean", desc: "machine-readable status (with --status)" },
       profile: { type: "string", value: "profile-id", desc: "pin the profile every dispatch runs under" },
+      provider: { type: "string", value: "provider-id", desc: "pin the execution provider every dispatch runs under (default dispatch.provider.default, else local; an unknown id refuses to start the worker)" },
       model: { type: "string", value: "M", desc: "harness model override (otherwise profile.model)" },
       as: { type: "string", value: "agent-id", desc: "Spor agent IDENTITY to run as (overrides dispatch.agent; remote-only)" },
       agent: { type: "string", value: "A", desc: "claude --agent (harness agent DEFINITION — NOT the Spor identity; see --as)" },
@@ -21183,7 +21137,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { gcExecutionsDue, gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess };
+module.exports = { gcExecutionsDue, gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess, createDispatchWorktree, removeDispatchWorktree };
 
 if (require.main === module) {
   main()
