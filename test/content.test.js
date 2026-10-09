@@ -197,6 +197,10 @@ test("embeds: block structure — fences in containers, HTML blocks and paragrap
   assert.deepEqual(ids("- ```\n  code\n![ok](spor-asset:art-ok)"), ["art-ok"]);
   // a top-level fence's content may sit left of its (indented) marker
   assert.deepEqual(ids("  ```\ncode\n![x](spor-asset:art-a)\n   ```\n![ok](spor-asset:art-ok)"), ["art-ok"]);
+  // a tab advances to a 4-column stop, so tab-indented code stays inside a list fence
+  assert.deepEqual(ids("- Makefile:\n\n- ```make\n\tcp ![a](spor-asset:art-a) out\n  ```\n\nSee ![b](spor-asset:art-b)\n"), ["art-b"]);
+  assert.deepEqual(ids("1. ```\n\t![a](spor-asset:art-a)\n   ```\n![b](spor-asset:art-b)"), ["art-b"]);
+  assert.deepEqual(ids("-\t```\n\t![a](spor-asset:art-a)\n\t```\n![b](spor-asset:art-b)"), ["art-b"]);
   // the empty comments <!--> and <!---> close at once
   assert.deepEqual(ids("<!-->\n![x](spor-asset:art-a)\n"), ["art-a"]);
   assert.deepEqual(ids("x <!--> ![a](spor-asset:art-a)"), ["art-a"]);
