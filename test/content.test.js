@@ -184,6 +184,25 @@ test("embeds: block structure — fences in containers, HTML blocks and paragrap
   assert.deepEqual(ids("![a\n\nb](spor-asset:art-x)"), []);
   // a code span in the alt text owns its brackets
   assert.deepEqual(ids("![a `]` b](spor-asset:art-a)"), ["art-a"]);
+  // a fence closes only at the depth and column it opened at: quoted or over-indented
+  // fence lines inside a fence are content (a markdown example of a quoted fence)
+  assert.deepEqual(ids("```markdown\n> ```\n> ![x](spor-asset:art-a)\n> ```\n```\n"), []);
+  assert.deepEqual(ids("```markdown\n- item\n\n    ```\n    ![x](spor-asset:art-a)\n    ```\n```\n"), []);
+  assert.deepEqual(ids("~~~\n    ~~~\n![x](spor-asset:art-a)\n~~~\n"), []);
+  // stacked containers, in either order
+  assert.deepEqual(ids("- > ~~~\n  > ![x](spor-asset:art-a)\n  > ~~~\n"), []);
+  assert.deepEqual(ids("- - ~~~\n    ![x](spor-asset:art-a)\n    ~~~\n"), []);
+  // a fence ends with its container
+  assert.deepEqual(ids("> ```\n> code\n\n![x](spor-asset:art-a)\n"), ["art-a"]);
+  assert.deepEqual(ids("- ```\n  code\n![ok](spor-asset:art-ok)"), ["art-ok"]);
+  // a top-level fence's content may sit left of its (indented) marker
+  assert.deepEqual(ids("  ```\ncode\n![x](spor-asset:art-a)\n   ```\n![ok](spor-asset:art-ok)"), ["art-ok"]);
+  // the empty comments <!--> and <!---> close at once
+  assert.deepEqual(ids("<!-->\n![x](spor-asset:art-a)\n"), ["art-a"]);
+  assert.deepEqual(ids("x <!--> ![a](spor-asset:art-a)"), ["art-a"]);
+  // ordinary markdown: headings, tables, list items, blockquotes
+  assert.deepEqual(ids("# h\n\n| a | b |\n|---|---|\n| ![x](spor-asset:art-t) | y |\n\n- item ![l](spor-asset:art-l)\n> q ![q](spor-asset:art-q)"),
+    ["art-t", "art-l", "art-q"]);
 });
 
 test("nodeAssetEmbeds: only a content_format: markdown body embeds anything", () => {

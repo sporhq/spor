@@ -248,7 +248,8 @@ of exactly which image the author saw. Only inline images OUTSIDE code count as
 embeds. These are examples or references, never embeddings:
 
 - a URI inside a fenced code block (```` ``` ```` or `~~~`), including one
-  behind blockquote `>` markers or nested in a list item;
+  behind blockquote `>` markers or nested in a list item. A fence closes only
+  at the container depth and column it opened at, or when its container ends;
 - a URI in an inline code span, or behind a backslash escape;
 - a URI in an HTML comment, or in a `<pre>`/`<script>`/`<style>`/`<textarea>`
   block;
