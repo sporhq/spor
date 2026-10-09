@@ -1746,6 +1746,113 @@ async function cmdPutNode(cfg, { values, positionals }) {
   return 0;
 }
 
+// --- spor asset: image import / describe / fetch / verify ------------------
+// (task-spor-chatgpt-asset-cli) The shell door over graph assets. The pure
+// contracts (sniffing, canonical descriptor text, safe filename) live in
+// lib/kernel/content.js; the IO (streaming verification, the local
+// content-addressed store, the /v1/assets byte routes) in lib/shell/asset.js.
+// This is argument parsing and rendering only.
+// The options each subcommand takes; anything else is refused, never ignored.
+const ASSET_SUBCOMMAND_OPTIONS = {
+  import: ["id", "title", "summary", "alt", "project", "idempotency-key", "digest", "json"],
+  describe: ["digest", "json"],
+  fetch: ["digest", "out", "force", "json"],
+  verify: ["digest", "json"],
+};
+
+function renderAssetText(a, available) {
+  const lines = [
+    `Asset ${a.id}${a.title ? ` — ${a.title}` : ""}`,
+    `${a.media_type}, ${a.width}×${a.height} px, ${a.bytes} bytes; ${a.uri}`,
+  ];
+  if (a.alt) lines.push(`Caption: ${a.alt}`);
+  else if (a.summary) lines.push(`Summary: ${a.summary}`);
+  if (available === false) lines.push("bytes: NOT AVAILABLE in this graph's asset store");
+  return lines.join("\n");
+}
+
+async function cmdAsset(cfg, { positionals, values }) {
+  const assetLib = require(path.join(ROOT, "lib", "shell", "asset.js"));
+  const [sub, target, ...extra] = positionals;
+  if (!Object.hasOwn(ASSET_SUBCOMMAND_OPTIONS, sub || "") || !target || extra.length) {
+    err("usage: spor asset <import <file> | describe <id|uri> | fetch <id|uri> | verify <id|uri>> [options]");
+    return 1;
+  }
+  const misplaced = Object.keys(values).filter((k) => values[k] !== undefined && !ASSET_SUBCOMMAND_OPTIONS[sub].includes(k));
+  if (misplaced.length) {
+    err(`spor asset ${sub} does not take ${misplaced.map((k) => `--${k}`).join(", ")}`);
+    return 1;
+  }
+  const remoteMode = cfg.mode() === "remote";
+  const home = cfg.graphHome();
+  const nodesDir = cfg.nodesDir();
+  if (!remoteMode && !fs.existsSync(nodesDir)) {
+    err(`no graph at ${nodesDir} — run 'spor init' first`);
+    return 1;
+  }
+  const fail = (e) => {
+    if (!(e instanceof assetLib.AssetError)) throw e;
+    if (values.json) out(JSON.stringify({ ok: false, error: { code: e.code, message: e.message } }, null, 2));
+    else err(`spor asset ${sub}: ${e.message}`);
+    return 1;
+  };
+  try {
+    if (sub === "import") {
+      const opts = {
+        id: values.id, title: values.title, summary: values.summary, alt: values.alt,
+        project: values.project, key: values["idempotency-key"], digest: values.digest,
+      };
+      const file = path.resolve(process.cwd(), target);
+      const r = remoteMode
+        ? await assetLib.importRemote({ cfg, remote, file, opts })
+        : await assetLib.importLocal({
+          home, nodesDir, file, opts,
+          putNode: (raw, id) => putNodeLocal(nodesDir, raw, require(path.join(ROOT, "lib", "graph.js")).parseFrontmatter(raw, `${id}.md`), "error", null, () => gitIdentity(path.dirname(nodesDir))),
+        });
+      if (values.json) {
+        out(JSON.stringify(r, null, 2));
+      } else {
+        const a = r.asset;
+        out(`${r.status} ${a.id}${r.descriptor && r.descriptor.revision ? ` @${String(r.descriptor.revision).slice(0, 12)}` : ""}`);
+        out(`  ${a.media_type}, ${a.width}×${a.height} px, ${a.bytes} bytes`);
+        out(`  ${a.uri}`);
+        out(`  embed: ![${values.alt ? "caption" : "image"}](${a.uri})`);
+        for (const w of r.warnings || []) err(`warning: ${w}`);
+      }
+      return 0;
+    }
+    const ref = assetLib.parseRef(target, values.digest || null);
+    const described = remoteMode
+      ? await assetLib.describeRemote({ cfg, remote, ref })
+      : assetLib.describeLocal({ home, nodesDir, ref });
+    if (sub === "describe") {
+      out(values.json ? JSON.stringify(described, null, 2) : renderAssetText(described.asset, described.available));
+      return 0;
+    }
+    const mode = remoteMode ? "remote" : "local";
+    if (sub === "verify") {
+      await assetLib.readBytes({ mode, cfg, remote, home, described, dest: null });
+      if (values.json) out(JSON.stringify({ ok: true, verified: true, asset: described.asset }, null, 2));
+      else out(`verified ${described.asset.id}: ${described.asset.digest}, ${described.asset.bytes} bytes, ${described.asset.media_type} ${described.asset.width}×${described.asset.height}`);
+      return 0;
+    }
+    // fetch
+    const dest = assetLib.outputPath(values.out, described.asset, process.cwd());
+    if (dest === "-" && values.json) {
+      err("spor asset fetch: --json cannot be combined with --out - (stdout carries the bytes)");
+      return 1;
+    }
+    const wrote = await assetLib.readBytes({ mode, cfg, remote, home, described, dest, force: !!values.force });
+    if (wrote !== "-") {
+      if (values.json) out(JSON.stringify({ ok: true, path: wrote, asset: described.asset }, null, 2));
+      else out(`fetched ${described.asset.id} -> ${wrote} (${described.asset.bytes} bytes, verified ${described.asset.digest})`);
+    }
+    return 0;
+  } catch (e) {
+    return fail(e);
+  }
+}
+
 // --- spor blame / commits: commit-sha -> nodes reverse lookup ---------------
 // (task-spor-blame-commit-lookup-cli-verb) The shell verb over the commit->node
 // reverse index: which decisions/tasks/issues reference a git commit in their
@@ -20251,6 +20358,63 @@ const COMMANDS = {
       "spor export --auth --gzip --out graph-restore.tar.gz",
     ],
     run: (cfg, p) => cmdExport(cfg, p),
+  },
+  asset: {
+    group: "Graph", parse: "strict",
+    args: "<import <file> | describe <id|uri> | fetch <id|uri> | verify <id|uri>>",
+    summary: "import, describe, fetch and verify image assets (local store / /v1/assets)",
+    help:
+      "Graph assets: image bytes held OUTSIDE graph Git, named by an ordinary\n" +
+      "artifact DESCRIPTOR node (asset_digest/asset_media_type/asset_bytes/\n" +
+      "asset_width/asset_height, optional asset_alt — GRAPH.md \"Rich content and\n" +
+      "assets\"). Dual-mode (norm-spor-cli-mode-parity): the same image imports to\n" +
+      "the same descriptor fields locally and remotely, and fetches back byte-\n" +
+      "identical.\n\n" +
+      "  spor asset import <file>     verify a PNG/JPEG/GIF/WebP and write its\n" +
+      "                               descriptor. Remote: streams the file to POST\n" +
+      "                               /v1/assets (metadata in the query string) under\n" +
+      "                               an Idempotency-Key; local: publishes the bytes\n" +
+      "                               to $SPOR_HOME/assets/ (kept out of graph Git)\n" +
+      "                               and writes the descriptor through the validated\n" +
+      "                               put-node door.\n" +
+      "  spor asset describe <ref>    the descriptor as text (GET /v1/assets/:id)\n" +
+      "  spor asset fetch <ref>       the verified bytes to --out (a file or a\n" +
+      "                               directory; '-' = stdout), else <id>.<ext> in\n" +
+      "                               the current directory (GET .../content)\n" +
+      "  spor asset verify <ref>      re-hash the bytes against the descriptor\n\n" +
+      "<ref> is a descriptor id or a spor-asset:<id>[@sha256:<hex>] URI; --digest\n" +
+      "pins the exact bytes. Every read is VERIFIED before an output file exists:\n" +
+      "the bytes must hash to the descriptor's digest and match its size, media type\n" +
+      "and pixel dimensions, so a forged or missing object fails (exit 1) and\n" +
+      "leaves nothing behind. A fetched file is named only from the descriptor id\n" +
+      "and a fixed extension table; an existing file is never replaced without\n" +
+      "--force. The import is limited like the server (25 MiB, 40M pixels; SVG is\n" +
+      "refused), and its descriptor carries the title/summary/alt you give — never\n" +
+      "the source path or filename.\n\n" +
+      "Idempotency: with no --idempotency-key the key is derived from the bytes and\n" +
+      "the metadata, so re-importing the same image with the same metadata returns\n" +
+      "the same descriptor (`replayed`) instead of a second one; with no --id the\n" +
+      "descriptor id is derived from the key (art-asset-<16 hex>). A transport\n" +
+      "failure mid-upload is retried once under the same key.",
+    options: {
+      id: { type: "string", value: "id", desc: "import: the descriptor id (default art-asset-<16 hex>, derived)" },
+      title: { type: "string", value: "text", desc: "import: the descriptor title (one line, <=200 chars)" },
+      summary: { type: "string", value: "text", desc: "import: the descriptor summary (one line, <=500 chars)" },
+      alt: { type: "string", value: "text", desc: "import: alt text / caption (one line, <=1000 chars)" },
+      project: { type: "string", value: "slug", desc: "import: stamp project: <slug> on the descriptor" },
+      "idempotency-key": { type: "string", value: "key", desc: "import: the upload's idempotency key (default derived)" },
+      digest: { type: "string", value: "sha256:<hex>", desc: "import: the bytes must hash to this; reads: pin the exact bytes" },
+      out: { type: "string", value: "path", desc: "fetch: output file or directory ('-' = stdout)" },
+      force: { type: "boolean", desc: "fetch: replace an existing output file" },
+      json: { type: "boolean", desc: "machine-readable result" },
+    },
+    examples: [
+      'spor asset import screenshot.png --title "Queue view" --alt "The queue with two blocked items"',
+      "spor asset describe art-asset-3f2a9c1d0b7e4a51",
+      "spor asset fetch spor-asset:art-asset-3f2a9c1d0b7e4a51 --out ./shots/",
+      "spor asset verify art-asset-3f2a9c1d0b7e4a51",
+    ],
+    run: (cfg, p) => cmdAsset(cfg, p),
   },
   merge: {
     group: "Team admin (remote, admin token)", parse: "strict",

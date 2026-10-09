@@ -240,6 +240,17 @@ verification, and only that path writes a descriptor. That a root's
 `doc_sha256` matches the reassembled body is the reader's exact-body check
 (`get_node follow_continuations`).
 
+**Importing and fetching** (`spor asset`, task-spor-chatgpt-asset-cli). `spor
+asset import <file>` is the shell upload path in both modes: remotely it
+streams the file to `POST /v1/assets` (API.md §3); locally it runs the same
+verifier, publishes the bytes under `$SPOR_HOME/assets/sha256/<hex[0..2]>/<hex>`
+(read-only, excluded from graph Git) and writes the same canonical descriptor
+text through the validated put-node door — so one image yields the same
+descriptor fields either way, and never carries its source path or filename.
+`spor asset describe|fetch|verify <id|spor-asset:uri>` read it back; every read
+re-hashes the bytes against the descriptor (digest, size, media type,
+dimensions) before an output file exists, so a forged or missing object fails.
+
 **Asset URIs.** A markdown body embeds an asset with inline image syntax:
 `![alt](spor-asset:<descriptor-id>)`. Add `@sha256:<hex>` to the URI to pin the
 exact bytes. The descriptor id is the stable handle: it is what a `uses-asset`

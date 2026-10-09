@@ -162,6 +162,10 @@ spor check [--staged|--range <a..b>|--files <f...>] [--strict]   # coupling-drif
                                #   disagreement. Advisory; --strict exits 1 (CI/pre-commit). The diff is
                                #   always local git; norms are mode-aware (local nodes dir / GET /v1/export)
 spor export [--gzip] [--history|--auth] [--out <file>]   # nodes/ ustar tarball (--history: git-bundle data-exit; --auth: admin-gated restore w/ auth files — both remote-only); local build / GET /v1/export
+spor asset import <file> [--title t] [--alt a] [--id id]   # verify an image + write its descriptor
+                               #   (local: $SPOR_HOME/assets/ + put-node; remote: POST /v1/assets, metadata
+                               #   in the query string). describe|fetch [--out p]|verify <id|spor-asset:uri>
+                               #   read it back, re-hashed against the descriptor (a forged/missing object fails)
 spor reconcile-landed [--since <ref>|--last N]   # open tasks/issues a commit REACHABLE FROM main names
                                #   (Spor: trailer or commits: stamp) get an unlinked draft resolver +
                                #   a confirm-close finding; never flips status. --confirm <find-…> closes
