@@ -604,7 +604,7 @@ test("a restarted local provider adopts what an earlier process submitted: looku
   const found = again.impl.lookup({ idempotency_key: key });
   assert.deepStrictEqual(found && found.handle, first.handle);
   assert.strictEqual(again.impl.lookup({ idempotency_key: "never-submitted-key" }), null);
-  const resent = await again.impl.submit({ attempt: driver.attempt(base, "hold"), idempotency_key: key });
+  const resent = await again.impl.submit({ attempt, idempotency_key: key });
   assert.strictEqual(resent.existing, true);
   assert.deepStrictEqual(resent.handle, first.handle);
   assert.strictEqual(dispatchRuns.readRunRecords(home).length, 1, "no second run was launched");
