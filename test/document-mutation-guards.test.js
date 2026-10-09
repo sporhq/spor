@@ -62,6 +62,19 @@ test("guard: ordinary nodes pass through unchanged", () => {
   assert.deepStrictEqual(content.managedDocumentWriteGuard({ id: "art-x", priorRaw: raw, raw: next }), { ok: true, raw: next });
 });
 
+test("guard: a body differing only by trailing newlines (get's extra newline) is no body change; the stored tail is kept", () => {
+  const h = home();
+  published(h);
+  const prior = read(h, "art-doc");
+  const edited = prior.replace("title: Doc art-doc", "title: Retitled");
+  assert.notStrictEqual(edited, prior);
+  const r = content.managedDocumentWriteGuard({ id: "art-doc", priorRaw: prior, raw: edited + "\n" });
+  assert.strictEqual(r.ok, true, JSON.stringify(r));
+  assert.strictEqual(r.raw, edited);
+  const changed = content.managedDocumentWriteGuard({ id: "art-doc", priorRaw: prior, raw: prior.replace("Paragraph 3", "Paragraph X") });
+  assert.strictEqual(changed.ok, false);
+});
+
 // ---------- put-node ----------
 
 test("put-node: a managed root's body is refused, pointing at put-document; metadata edits pass", () => {
