@@ -107,7 +107,8 @@ test("round trip: attempt build, then attempt run with a stub harness, yields a 
   assert.strictEqual(attempt.fence, f.execution.owner.fence);
   assert.strictEqual(attempt.node_id, "task-attempt-demo");
   assert.strictEqual(attempt.harness.id, "claude-code");
-  assert.deepStrictEqual(attempt.repos, [{ slug: "demo", commit: git(f.repo, ["rev-parse", "HEAD"]), branch: "spor/task-attempt-demo", url: REMOTE_URL }]);
+  const branch = `spor/task-attempt-demo-${f.execution.execution_id.slice(5, 13)}-f${f.execution.owner.fence}`;
+  assert.deepStrictEqual(attempt.repos, [{ slug: "demo", commit: git(f.repo, ["rev-parse", "HEAD"]), branch, url: REMOTE_URL }]);
   assert.deepStrictEqual(attempt.secrets, []);
   assert.match(attempt.spor.server, /^file:\/\//);
   const prompt = fs.readFileSync(path.join(out, "prompt", "prompt.md"), "utf8");
@@ -133,10 +134,10 @@ test("round trip: attempt build, then attempt run with a stub harness, yields a 
   assert.strictEqual(result.kind, "result");
   const { kind, ...collect } = result;
   assert.ok(pc.validate("collect-result", collect).ok, JSON.stringify(pc.validate("collect-result", collect).errors));
-  const stubCommit = git(f.bare, ["rev-parse", "refs/heads/spor/task-attempt-demo"]);
+  const stubCommit = git(f.bare, ["rev-parse", `refs/heads/${branch}`]);
   assert.strictEqual(git(f.bare, ["log", "-1", "--format=%s", stubCommit]), "stub work");
   assert.strictEqual(collect.manifest.candidate.commit, stubCommit, "the manifest names the stub's commit, published to the url");
-  assert.deepStrictEqual(collect.manifest.candidate.reference, { kind: "branch", locator: REMOTE_URL, ref: "refs/heads/spor/task-attempt-demo", commit: stubCommit });
+  assert.deepStrictEqual(collect.manifest.candidate.reference, { kind: "branch", locator: REMOTE_URL, ref: `refs/heads/${branch}`, commit: stubCommit });
   assert.strictEqual(collect.manifest.attempt_id, "inst-a");
   // On disk: the manifest, the report, the log, the status stream, and the run record.
   const res = path.join(f.home, "result");
@@ -152,7 +153,7 @@ test("round trip: attempt build, then attempt run with a stub harness, yields a 
 test("a tarball bundle round-trips byte-for-byte through readBundle", async () => {
   const f = await fixture();
   const tarPath = path.join(f.home, "attempt.tar");
-  const b = cli(["attempt", "build", f.execution.execution_id, "--out", tarPath, "--no-brief"], { SPOR_HOME: f.home }, f.repo);
+  const b = cli(["attempt", "build", f.execution.execution_id, "--out", tarPath, "--no-brief", "--permission-mode", "bypassPermissions"], { SPOR_HOME: f.home }, f.repo);
   assert.strictEqual(b.status, 0, b.stdout + b.stderr);
   const read = bundleLib.readBundle(tarPath);
   assert.ok(read.ok, JSON.stringify(read.errors));
@@ -214,7 +215,7 @@ test("attempt run refuses a bundle carrying a secret before anything is checked 
 test("attempt run fails before launch, with the reason, when a repo cannot be checked out at its pinned commit", async () => {
   const f = await fixture();
   const out = path.join(f.home, "bundle");
-  assert.strictEqual(cli(["attempt", "build", f.execution.execution_id, "--out", out, "--no-brief"], { SPOR_HOME: f.home }, f.repo).status, 0);
+  assert.strictEqual(cli(["attempt", "build", f.execution.execution_id, "--out", out, "--no-brief", "--permission-mode", "bypassPermissions"], { SPOR_HOME: f.home }, f.repo).status, 0);
   // Pin a commit the origin never received.
   fs.writeFileSync(path.join(f.repo, "g.txt"), "unpushed\n");
   git(f.repo, ["add", "g.txt"]);
@@ -247,7 +248,7 @@ test("verifyBundle refuses pins that disagree with the attempt and unknown setti
 test("attempt run: a SIGTERM winds the run down through stopping, and the exit mirrors the absent manifest", async () => {
   const f = await fixture();
   const out = path.join(f.home, "bundle");
-  assert.strictEqual(cli(["attempt", "build", f.execution.execution_id, "--out", out, "--no-brief"], { SPOR_HOME: f.home }, f.repo).status, 0);
+  assert.strictEqual(cli(["attempt", "build", f.execution.execution_id, "--out", out, "--no-brief", "--permission-mode", "bypassPermissions"], { SPOR_HOME: f.home }, f.repo).status, 0);
   const hold = writeSpawnableNodeStub(f.home, "claude-hold", "setInterval(() => {}, 1000);");
   const child = spawn(process.execPath, [CLI, "attempt", "run", out], { env: hermeticEnv({ SPOR_HOME: f.home, XDG_CONFIG_HOME: f.home, SPOR_CLAUDE_CMD: hold, GIT_CONFIG_GLOBAL: f.gitconfig }), cwd: f.home });
   let stdout = "";
@@ -270,4 +271,42 @@ test("attempt run: a SIGTERM winds the run down through stopping, and the exit m
   assert.strictEqual(states[states.length - 1], "finished");
   assert.strictEqual(lines[lines.length - 1].manifest, null);
   assert.match(lines[lines.length - 1].no_candidate.reason, /still the attempt's base commit/);
+});
+
+test("attempt build refuses an unattended attempt whose harness would stop at its first write; run refuses such a bundle too", async () => {
+  const f = await fixture();
+  const out = path.join(f.home, "bundle");
+  const b = cli(["attempt", "build", f.execution.execution_id, "--out", out, "--no-brief"], { SPOR_HOME: f.home }, f.repo);
+  assert.strictEqual(b.status, 1, b.stdout + b.stderr);
+  assert.match(b.stderr, /spor attempt build: .*ATTENDED|no write posture/);
+  assert.ok(!fs.existsSync(out), "nothing was written");
+  // A hand-built bundle with no posture is held to the same rule at run time.
+  const home = tmp("spor-attempt-posture-");
+  const pinned = git(f.repo, ["rev-parse", "HEAD"]);
+  bundleLib.writeBundle(goodBundle({ repos: [{ slug: "demo", commit: pinned, branch: "spor/x", url: REMOTE_URL }] }), path.join(home, "b"));
+  const r = cli(["attempt", "run", path.join(home, "b")], { SPOR_HOME: home, SPOR_CLAUDE_CMD: f.stub, GIT_CONFIG_GLOBAL: f.gitconfig }, home);
+  assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+  assert.match(statusLines(r.stdout).find((l) => l.state === "failed").detail, /ATTENDED|no write posture/);
+  assert.ok(!fs.existsSync(path.join(home, "journal", "dispatch")), "nothing was launched");
+});
+
+test("a credential in a repo url is refused by shape and never echoed by the refusal", () => {
+  const leak = "hunter2pass";
+  const b = goodBundle({ repos: [{ slug: "demo", commit: "b".repeat(40), branch: "x", url: `https://bob:${leak}@github.com/x/y.git` }] });
+  const v = bundleLib.verifyBundle(b, { env: {} });
+  assert.strictEqual(v.ok, false);
+  assert.ok(!v.errors.join(" ").includes(leak), v.errors.join("; "));
+  assert.match(v.errors.join(" "), /https:\/\/\*\*\*@github\.com/);
+});
+
+test("attempt run refuses a result directory that already holds a run, overwriting nothing", () => {
+  const home = tmp("spor-attempt-out-");
+  bundleLib.writeBundle(goodBundle(), path.join(home, "b"));
+  fs.mkdirSync(path.join(home, "result"));
+  fs.writeFileSync(path.join(home, "result", "manifest.json"), "previous\n");
+  const r = cli(["attempt", "run", path.join(home, "b")], { SPOR_HOME: home }, home);
+  assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+  assert.match(statusLines(r.stdout)[0].detail, /result directory .* is not empty/);
+  assert.strictEqual(fs.readFileSync(path.join(home, "result", "manifest.json"), "utf8"), "previous\n");
+  assert.deepStrictEqual(fs.readdirSync(path.join(home, "result")), ["manifest.json"]);
 });

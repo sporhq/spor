@@ -18732,6 +18732,21 @@ async function cmdAttemptBuild(cfg, args) {
   // lines go to stderr so stdout carries only this verb's own answer.
   const plan = await attemptDispatcher().planDispatch(cfg, { values: passthrough, positionals: [workerContract({ nodeId: x.item.node_id, factory: loaded.factory })] }, { carryTask: true, supervisedOnly: true, unattended: true });
   if (typeof plan === "number") return plan;
+  // The plan ran as a preview, so the guards a real dispatch enforces after it
+  // are enforced here. Not this box's satisfiability or harness binary — the
+  // PROVIDER's environment runs the attempt, and its matcher decides that —
+  // but a harness spor cannot launch at all, and the unattended write posture:
+  // nobody in a sandbox answers a permission prompt.
+  if (!plan.supportedHarness) {
+    err(`spor attempt build: harness '${plan.harness}' is not one spor can launch`);
+    return 1;
+  }
+  if (plan.postureCheck && plan.postureCheck.warning) err(plan.postureCheck.warning);
+  if (plan.postureCheck && !plan.postureCheck.ok) {
+    err(`spor attempt build: ${plan.postureCheck.reason}.`);
+    err(`  ${plan.postureCheck.hint}`);
+    return 1;
+  }
   const repoDir = plan.res.dir;
   const slug = plan.res.slug;
   const rev = values.ref || "HEAD";
@@ -18742,13 +18757,23 @@ async function cmdAttemptBuild(cfg, args) {
     return 1;
   }
   const remoteUrl = candidatePublish.resolveRemoteUrl("origin", repoDir);
-  const url = remoteUrl.ok && !candidatePublish.portableRemoteRefusal(remoteUrl.url) ? remoteUrl.url : null;
+  let url = remoteUrl.ok && !candidatePublish.portableRemoteRefusal(remoteUrl.url) ? remoteUrl.url : null;
+  // A credential in the origin url (`https://x-access-token:<tok>@host/…`, a CI
+  // checkout's shape) never rides the bundle: the url is pinned without it,
+  // and the provider supplies the repo credential itself.
+  if (url && /^https?:\/\/[^/@]+@/i.test(url)) {
+    url = url.replace(/^(https?:\/\/)[^/@]+@/i, "$1");
+    err(`warning: ${repoDir}'s origin url carries credentials — the bundle pins it without them`);
+  }
   if (!url) err(`warning: ${repoDir} has no portable 'origin' url — the bundle pins ${slug} without one, so 'spor attempt run' needs --repo ${slug}=<path|url> and cannot publish a candidate`);
   const server = cfg.mode() === "remote" ? remote.base(cfg) : require("url").pathToFileURL(cfg.nodesDir()).href;
   const built = attemptBundle.bundleFromPlan({
     execution: x,
     plan,
-    repo: { slug, commit, branch: values.branch || `spor/${x.item.node_id}`, url },
+    // Per ATTEMPT by default: every attempt of one item pushing one branch
+    // would make a re-attempt (built from a base without the last one's
+    // commits) or a superseded fence's late push refuse the other's candidate.
+    repo: { slug, commit, branch: values.branch || `spor/${x.item.node_id}-${x.execution_id.slice(5, 13)}-f${x.owner && x.owner.fence}`, url },
     server,
     deadline: new Date(Date.now() + deadlineMs).toISOString().replace(/\.\d{3}Z$/, "Z"),
     isolation,
@@ -21072,7 +21097,8 @@ const COMMANDS = {
       "      Secrets never ride a bundle: they are named by reference and the provider\n" +
       "      delivers them (the attempt token as SPOR_TOKEN / SPOR_DISPATCH_CHILD_TOKEN).\n" +
       "      --ref pins the commit (default HEAD of the mapped checkout), --branch the\n" +
-      "      branch the attempt commits to (default spor/<node-id>), --deadline its wall\n" +
+      "      branch the attempt commits to (default spor/<node-id>-<exec>-f<fence>, one\n" +
+      "      per attempt), --deadline its wall\n" +
       "      clock (default work.runMaxMs), --isolation the environment kind (container).\n\n" +
       "  spor attempt run <bundle>\n" +
       "      SANDBOX side. Verifies the bundle (a bundle carrying a secret value is\n" +
@@ -21082,8 +21108,8 @@ const COMMANDS = {
       "      line per state on stdout ({kind: status, state, since, at, run_id, detail} —\n" +
       "      an observe-result) and, at exit, {kind: result, ...collect-result}. The\n" +
       "      candidate branch is pushed to the repo's url and read back before the\n" +
-      "      manifest names it. --out (default <bundle>/../result) receives\n" +
-      "      manifest.json, status.jsonl, report.md and harness.jsonl.\n" +
+      "      manifest names it. --out (default <bundle>/../result; must be absent or\n" +
+      "      empty) receives manifest.json, status.jsonl, report.md and harness.jsonl.\n" +
       "      Exit 0: a manifest. 1: no candidate. 2: refused before launch.",
     examples: [
       "spor attempt build exec-3f9c0a1b2c3d4e5f --out /tmp/attempt.tar",

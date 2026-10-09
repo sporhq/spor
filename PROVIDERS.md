@@ -799,10 +799,15 @@ write it by hand:
 - **What runs.** From the dispatch plan for the item, which is the same
   read-only plan `spor dispatch --print` resolves: the harness, the model, the
   profile and its runtime needs, the compiled briefing, and the factory's
-  worker contract as the task.
+  worker contract as the task. The attempt is unattended, so a harness posture
+  that would stop at its first write is refused, as it is for a worker's
+  dispatch. Pass the posture, for example `--permission-mode
+  bypassPermissions` for Claude Code. `run` checks the same rule again.
 - **The pin.** The mapped checkout's commit (`--ref`, default `HEAD`) and its
-  portable `origin` URL. The attempt commits to `--branch` (default
-  `spor/<node-id>`).
+  portable `origin` URL, stripped of any credentials it carries. The attempt
+  commits to `--branch`. The default is `spor/<node-id>-<exec>-f<fence>`, one
+  branch per attempt, so a re-attempt never collides with an earlier attempt's
+  published candidate.
 - **The graph.** `spor.server` is the server, or, for a local-mode attempt, the
   graph's `nodes/` directory as a `file://` reference.
 
@@ -849,7 +854,11 @@ name it (§7). It writes the collect-result to `--out/manifest.json` beside
 stdout line, `{"kind": "result", …collect-result}`. The exit code mirrors the
 manifest: `0` means a manifest; `1` means no candidate (the attempt produced
 nothing, or it could not be published); `2` means the attempt was refused
-before launch.
+before launch. `--out` must be absent or empty, because a result directory
+belongs to one run. The token-bearing MCP config a Claude Code harness reads
+is written to a private temporary directory, never into `--out`, and is
+removed when the run settles. Refusals and status details mask URL userinfo
+and credential-shaped strings.
 
 The `local` provider (§11) uses the same path in-process. It wraps the launch
 a dispatch built as an in-memory bundle, launches it through the same door, and
