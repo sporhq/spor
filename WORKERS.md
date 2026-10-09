@@ -14,7 +14,10 @@ dec-spor-dispatch-harness-adapter-contract exists precisely so new harnesses
 are additive registry entries, never a new fork in the orchestration layer.
 Companion specs: [GRAPH.md](GRAPH.md) (node/edge format), [API.md](API.md)
 (the full REST/MCP contract this document is built from), [QUEUE.md](QUEUE.md)
-(the decision queue).
+(the decision queue), [PROVIDERS.md](PROVIDERS.md) (the execution-provider
+contract: WHERE an attempt runs — a worktree, a container, a VM — as a
+versioned describe/submit/observe/collect/cancel/release seam beside the
+harness adapter).
 
 ## 1. What a worker is
 
