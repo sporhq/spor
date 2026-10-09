@@ -116,7 +116,10 @@ function awaitTerminalRecord(home) {
     if (!file) return null;
     let rec;
     try { rec = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8")); } catch { return null; }
-    return ["done", "failed", "failed_launch", "vanished"].includes(rec.state) ? rec : null;
+    // Terminal AND settled: a supervised record goes terminal carrying a
+    // provisional outcome and the contract's verdict merges in a beat later
+    // (`contract_pending`), so the golden is read only once that landed.
+    return ["done", "failed", "failed_launch", "vanished"].includes(rec.state) && rec.contract_pending === false ? rec : null;
   }, { timeoutMs: 30000, intervalMs: 50 });
 }
 
@@ -134,9 +137,10 @@ function normalize(text, { runId, home, repo, stub }) {
   t = t.split(path.basename(repo).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")).join("<SLUG>");
   t = t.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z/g, "<TS>");
   t = t.replace(/\d{4}-\d{2}-\d{2}/g, "<DATE>");
-  // `rev` (the count of record puts) is deliberately NOT normalized: an extra
-  // record write in the launch is exactly the kind of drift this pins.
-  t = t.replace(new RegExp(`"(runner_pid|child_pid|runner_started_ticks|child_started_ticks)": \\d+`, "g"), '"$1": <N>');
+  // `rev` (the count of record puts) IS normalized: the launcher's pid stamp
+  // and the supervisor's own writes race under load (4 or 5 puts for the
+  // same launch), so pinning it literally flakes the full suite.
+  t = t.replace(new RegExp(`"(runner_pid|child_pid|runner_started_ticks|child_started_ticks|rev)": \\d+`, "g"), '"$1": <N>');
   t = t.replace(new RegExp(esc(process.execPath), "g"), "<NODE>");
   return t;
 }
@@ -495,5 +499,40 @@ test("a record the local provider closes carries the outcome dimension: cancelle
   assert.strictEqual(vanished.terminal_state, "failed");
   assert.strictEqual(vanished.terminal_enforced, false);
   assert.strictEqual(vanished.child_reaped, true, "the orphaned harness child was reaped on release");
+
+  // A FORCED cancel of a crashed run takes the same reading through the
+  // other door: lost, closed as a vanish, never a cancel.
+  const d = await req("submit", { attempt: driver.attempt(base(3), "hold"), idempotency_key: "shape-crash-cancel" });
+  await untilRunning(d.handle);
+  driver.crash(d.handle);
+  for (let i = 0; i < 600; i++) {
+    if ((await req("observe", { handle: d.handle })).state === "lost") break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const forced = await req("cancel", { handle: d.handle, force: true });
+  assert.strictEqual(forced.state, "lost");
+  const crashedForced = record(d.handle);
+  assert.strictEqual(crashedForced.state, "vanished");
+  assert.strictEqual(crashedForced.termination_class, "vanished");
+  assert.strictEqual(crashedForced.child_reaped, true);
+  await req("release", { handle: d.handle });
+
+  // A GRACEFUL cancel whose supervisor dies on the signal: the record is
+  // closed as the cancel it was, with the outcome dimension.
+  const e = await req("submit", { attempt: driver.attempt(base(4), "hold"), idempotency_key: "shape-graceful" });
+  await untilRunning(e.handle);
+  assert.strictEqual((await req("cancel", { handle: e.handle, force: false })).state, "stopping");
+  let settled;
+  for (let i = 0; i < 600; i++) {
+    settled = await req("observe", { handle: e.handle });
+    if (settled.state !== "stopping") break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.strictEqual(settled.state, "finished", JSON.stringify(settled));
+  const graceful = record(e.handle);
+  assert.strictEqual(graceful.termination_class, "cancelled");
+  assert.strictEqual(graceful.terminal_state, "failed");
+  assert.strictEqual(graceful.terminal_enforced, false);
+  await req("release", { handle: e.handle });
   assert.strictEqual(provider.environments(), 0);
 });
