@@ -11878,7 +11878,7 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
   if (programRun && !controller) return { ok: false, reason: `a program run admits members only under a controller-completion factory; '${factory && factory.id}' completes by the agent` };
   if (!controller) return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { ...(gateFactory ? { recordFields: gateFactory } : {}), ...(factory ? { factory } : {}), ...dispatchOpts });
   const held = await claimExecutionHold(cfg, item, factory, { home, log, ...(programRun ? { programRun } : {}) });
-  if (!held.ok) return { ok: false, reason: held.reason, ...(held.admission_code ? { admission_code: held.admission_code, message: held.message || null } : {}) };
+  if (!held.ok) return { ok: false, reason: held.reason, ...(held.kind ? { kind: held.kind } : {}), ...(held.code ? { code: held.code } : {}), ...(held.transient ? { transient: true } : {}), ...(held.admission_code ? { admission_code: held.admission_code, message: held.message || null } : {}) };
   // The provider attempt handle (task-spor-work-attempt-handle-adoption,
   // PROVIDERS.md §6): an execution this claim RE-took (a restarted worker, a
   // takeover) may already record where its attempt runs. A recorded handle is
@@ -15010,7 +15010,11 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
   // ...except under a program run: admission IS the server's open, and a
   // machine-local execution would be a child the run never admitted.
   if (!opened.ok && opened.unserved && store.mode === "remote" && programRun) {
-    return { ok: false, kind: "store", code: "not_served", reason: `the server does not serve /v1/executions (${opened.message}); a program run cannot admit ${item.id}` };
+    // Not this item's refusal and not this machine's: every worker reaching
+    // this server reads the same unserved surface, so it is `transient` — the
+    // loop retries it without cooling the member or releasing the run
+    // (issue-spor-work-settle-run-standing-cooling-is-global).
+    return { ok: false, kind: "store", code: "not_served", transient: true, reason: `the server does not serve /v1/executions (${opened.message}); a program run cannot admit ${item.id}` };
   }
   if (!opened.ok && opened.unserved && store.mode === "remote") {
     log(`work: ${item.id} — the server does not serve /v1/executions (${opened.message}); this execution's coordination state is machine-local`);
@@ -15027,7 +15031,10 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
     // locally handed-off execution (`handed_off`, this process lost THAT
     // item's execution earlier) refuses with an execution code that says
     // nothing about the run and must never read as losing the run lease.
-    return { ok: false, kind: foreign ? "foreign-hold" : "store", ...(programRun && !opened.handed_off && opened.code ? { admission_code: opened.code, message: opened.message || null } : {}), ...(opened.handed_off ? { handed_off: true } : {}), reason: `execution store refused ${item.id}: ${opened.code}: ${opened.message}${foreign && opened.execution ? ` (execution ${opened.execution.execution_id})` : ""}` };
+    // `code`/`transient` ride along so the loop can tell an outage (a dead
+    // socket, a 5xx) from a refusal about the item, and a run-scoped refusal
+    // every machine would hit from one only this box sees.
+    return { ok: false, kind: foreign ? "foreign-hold" : "store", ...(opened.code ? { code: opened.code } : {}), ...(opened.transport || opened.transient ? { transient: true } : {}), ...(programRun && !opened.handed_off && opened.code ? { admission_code: opened.code, message: opened.message || null } : {}), ...(opened.handed_off ? { handed_off: true } : {}), reason: `execution store refused ${item.id}: ${opened.code}: ${opened.message}${foreign && opened.execution ? ` (execution ${opened.execution.execution_id})` : ""}` };
   }
   let fence = opened.fence;
   let execution = opened.execution;
@@ -15041,7 +15048,7 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
     if (!claimed.ok) {
       const h = claimed.holder || (execution.owner || null);
       const who = h ? `${h.worker}${h.machine ? ` on ${h.machine}` : ""} until ${h.lease_expires_at}` : "another worker";
-      return { ok: false, kind: claimed.code === "already_owned" || claimed.code === "lease_live" || claimed.handed_off ? "foreign-hold" : "store", ...(claimed.handed_off ? { handed_off: true } : {}), reason: `execution ${execution.execution_id} on ${item.id} is held by ${who} (${claimed.code}: ${claimed.message})` };
+      return { ok: false, kind: claimed.code === "already_owned" || claimed.code === "lease_live" || claimed.handed_off ? "foreign-hold" : "store", ...(claimed.code ? { code: claimed.code } : {}), ...(claimed.transport || claimed.transient ? { transient: true } : {}), ...(claimed.handed_off ? { handed_off: true } : {}), reason: `execution ${execution.execution_id} on ${item.id} is held by ${who} (${claimed.code}: ${claimed.message})` };
     }
     fence = claimed.fence;
     execution = claimed.execution;

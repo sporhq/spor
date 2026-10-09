@@ -394,7 +394,7 @@ test("admitThrough: carries the binding, and turns the run's own refusal into st
 
 // The loop over the real source and admission wrapper, with a fake queue: a
 // dispatched member finishes (and is done by graph truth) on the next wait.
-function loopHarness({ server, clock, members = ["task-a", "task-b"], human = [], unsatisfiable = [], extraQueue = [], opts = {}, maxPasses = 12, onTick = () => {}, pendingGates = null } = {}) {
+function loopHarness({ server, clock, members = ["task-a", "task-b"], human = [], unsatisfiable = [], extraQueue = [], refuse = () => null, opts = {}, maxPasses = 12, onTick = () => {}, pendingGates = null } = {}) {
   const { source, log } = sourceFor(server, { clock });
   const state = { dispatched: [], runs: new Map(), sleeps: [], candidateCalls: 0, pendingGateCalls: 0, published: [] };
   const control = { stopping: false, reason: null, wake: () => {} };
@@ -427,6 +427,8 @@ function loopHarness({ server, clock, members = ["task-a", "task-b"], human = []
     },
     dispatch: programRuns.admitThrough(source, async (item, binding) => {
       if (unsatisfiable.includes(item.id)) return { ok: false, reason: `profile for ${item.id} not satisfiable here` };
+      const refused = refuse(item, state);
+      if (refused) return refused;
       const r = server.admit(item, binding, "tok-a");
       if (!r.ok) return { ok: false, reason: `execution store refused ${item.id}: ${r.code}: ${r.message}`, admission_code: r.code, message: r.message };
       const runId = `run-${item.id}`;
@@ -761,3 +763,295 @@ test("a REPLAYED drift report (first reply lost) reads the server's verdict off 
   assert.strictEqual(await source.checkPin(misread), false, "the replay's run is still running: the server saw no drift");
   assert.strictEqual(source.admitting(), true);
 });
+
+// --------------------- cooling is split by WHY (issue-spor-work-settle-run-
+// standing-cooling-is-global): a member cooled after a refusal every machine
+// would hit is a GLOBAL halt — the run stays held and visible — while a
+// machine-local refusal releases it as local.no_capable_member.
+
+const observed = (server) => server.events.filter((e) => e.type === "worker.observed").map((e) => e.local_reason);
+
+// The refusal shapes the dispatcher hands the loop (bin/spor.js
+// claimExecutionHold / dispatchWorkItem / makeFactoryAvailabilityCheck).
+const GLOBAL_REFUSALS = {
+  "a foreign execution hold (execution_open)": (id) => ({ ok: false, kind: "foreign-hold", code: "execution_open", reason: `execution store refused ${id}: execution_open: a live execution holds it (execution exec-0123)` }),
+  "a live lease held by another worker": (id) => ({ ok: false, kind: "foreign-hold", code: "lease_live", reason: `execution exec-1 on ${id} is held by agent-b on box-2 until 2026-10-09T13:00:00Z (lease_live: live)` }),
+  "the item hold another execution stamped": (id) => ({ ok: false, kind: "foreign-hold", reason: `execution hold refused on ${id}: ${id} is held by execution exec-9` }),
+  "admitted_to_run through the admission door": (id) => ({ ok: false, kind: "store", code: "admitted_to_run", admission_code: "admitted_to_run", message: "bound to another run", reason: `execution store refused ${id}: admitted_to_run: '${id}' is admitted to program run prun-other (running)` }),
+  "admitted_to_run from a claim guard's free text": (id) => ({ ok: false, reason: `cannot dispatch ${id}: admitted_to_run: '${id}' is admitted to program run prun-other (running); claim it through that run` }),
+  "not_admitted (an item the run did not admit)": (id) => ({ ok: false, kind: "store", code: "not_admitted", admission_code: "not_admitted", message: "not admitted", reason: `execution store refused ${id}: not_admitted: not admitted` }),
+  "an item already resolved (not gateable)": (id) => ({ ok: false, kind: "not-gateable", reason: `execution hold refused on ${id}: ${id} already carries a live resolving edge` }),
+};
+
+for (const [label, refusal] of Object.entries(GLOBAL_REFUSALS)) {
+  test(`loop: a member cooled after ${label} is a GLOBAL halt — the run is held, never released as local.no_capable_member`, async () => {
+    const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+    const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001", admitted: ["task-g"] }] });
+    const h = loopHarness({ server, clock, members: ["task-g"], refuse: (item) => refusal(item.id), opts: { concurrency: 1 }, maxPasses: 4 });
+    const status = await h.run();
+    assert.deepStrictEqual(observed(server), ["local.signal"], `held until the local stop:\n${h.log.join("\n")}`);
+    assert.ok(h.log.some((l) => /nothing admissible: task-g .*The run stays held and visible; this is not a local stop/.test(l)), h.log.join("\n"));
+    assert.ok(status.skipped.some((s) => s.id === "task-g"), "the member is still cooled here — retrying it every poll would only re-refuse");
+  });
+}
+
+test("loop: a member cooled after a MACHINE-LOCAL refusal (capability availability) releases the run", async () => {
+  const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+  const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001", admitted: ["task-l"] }] });
+  const h = loopHarness({ server, clock, members: ["task-l"], refuse: (item) => ({ ok: false, kind: "availability", reason: `cannot dispatch ${item.id} here: gh is not installed on this machine` }), opts: { concurrency: 1 }, maxPasses: 4 });
+  await h.run();
+  assert.deepStrictEqual(observed(server), ["local.no_capable_member"], h.log.join("\n"));
+  assert.strictEqual(server.runs.get("prun-0000000000000001").state, "running", "a local release never changes run state");
+});
+
+test("loop: one machine-local member releases even beside a globally-refused one", async () => {
+  const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+  const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001", admitted: ["task-g", "task-x"] }] });
+  const h = loopHarness({ server, clock, members: ["task-g"], unsatisfiable: ["task-x"], refuse: (item) => (item.id === "task-g" ? GLOBAL_REFUSALS["a foreign execution hold (execution_open)"](item.id) : null), maxPasses: 4 });
+  await h.run();
+  assert.deepStrictEqual(observed(server), ["local.no_capable_member"], h.log.join("\n"));
+  const release = h.log.find((l) => /released \(local\.no_capable_member/.test(l));
+  assert.ok(release && /task-x/.test(release) && !/task-g/.test(release), `only the machine-local member is named:\n${h.log.join("\n")}`);
+});
+
+for (const [label, refusal] of Object.entries({
+  "an unserved execution store (not_served)": (id) => ({ ok: false, kind: "store", code: "not_served", transient: true, reason: `the server does not serve /v1/executions (HTTP 404); a program run cannot admit ${id}` }),
+  "an execution-store outage (5xx / dead socket)": (id) => ({ ok: false, kind: "store", code: "transport", transient: true, reason: `execution store refused ${id}: transport: offline — ECONNREFUSED` }),
+})) {
+  test(`loop: ${label} under a program run is transient and global — retried, never cooled, never a release`, async () => {
+    const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+    const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001", admitted: ["task-s"] }] });
+    let outage = 2; // the first two attempts hit the outage (under the cool-after bound), then the store answers
+    const attempts = [];
+    const h = loopHarness({
+      server,
+      clock,
+      members: ["task-s"],
+      refuse: (item) => {
+        attempts.push(item.id);
+        return outage-- > 0 ? refusal(item.id) : null;
+      },
+      opts: { concurrency: 1 },
+      maxPasses: 6,
+    });
+    const status = await h.run();
+    assert.strictEqual(attempts.length, 3, `retried on every poll, not held off for a cooldown window:\n${h.log.join("\n")}`);
+    assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-s"], "admitted once the store answers");
+    assert.deepStrictEqual(observed(server), ["local.signal"], "never released as local.no_capable_member");
+    assert.ok(h.log.some((l) => /task-s — .* \(transient: not cooling the member; retrying next poll\)/.test(l)), h.log.join("\n"));
+    assert.ok(!status.skipped.some((s) => s.id === "task-s"));
+  });
+}
+
+test("loop: a member whose store open keeps failing transiently is cooled as an OUTAGE after a bounded streak — the run is held, never released", async () => {
+  const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+  const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001", admitted: ["task-s"] }] });
+  const attempts = [];
+  const h = loopHarness({
+    server,
+    clock,
+    members: ["task-s"],
+    refuse: (item) => (attempts.push(item.id), { ok: false, kind: "store", code: "not_served", transient: true, reason: `the server does not serve /v1/executions (HTTP 503); a program run cannot admit ${item.id}` }),
+    opts: { concurrency: 1, retryAfterMs: 120_000 },
+    maxPasses: 6,
+  });
+  const status = await h.run();
+  assert.strictEqual(attempts.length, 3, `retried up to the bound, then cooled:\n${h.log.join("\n")}`);
+  assert.ok(h.log.some((l) => /task-s — .*transient 3 times running: cooled as an outage; the run stays held/.test(l)), h.log.join("\n"));
+  assert.strictEqual(status.skipped.find((s) => s.id === "task-s").kind, "outage");
+  assert.deepStrictEqual(observed(server), ["local.signal"], "an outage is global: never local.no_capable_member");
+  assert.ok(h.log.some((l) => /nothing admissible: task-s .*The run stays held and visible/.test(l)), h.log.join("\n"));
+});
+
+test("loop: a 5xx about ONE member's open moves on to the next member instead of stalling the pass", async () => {
+  const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+  const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001", admitted: ["task-bad", "task-ok"] }] });
+  const h = loopHarness({
+    server,
+    clock,
+    members: ["task-bad", "task-ok"],
+    refuse: (item) => (item.id === "task-bad" ? { ok: false, kind: "store", code: "server_error", transient: true, reason: `execution store refused ${item.id}: server_error: HTTP 500` } : null),
+    opts: { concurrency: 2 },
+    maxPasses: 2,
+  });
+  await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-ok"], h.log.join("\n"));
+});
+
+test("refusalKind: run-admission refusals about the item are `admitted` whichever door they came through", () => {
+  assert.strictEqual(workLoop.refusalKind({ admission_code: "admitted_to_run", kind: "store" }), "admitted");
+  assert.strictEqual(workLoop.refusalKind({ code: "not_admitted", kind: "store" }), "admitted");
+  assert.strictEqual(workLoop.refusalKind({ kind: "store", code: "factory_mismatch" }), "store", "a mismatch is about the WORKER's factory: machine-local");
+  assert.strictEqual(workLoop.refusalKind({ reason: "cannot dispatch task-a: admitted_to_run: bound elsewhere" }), "admitted");
+  assert.strictEqual(workLoop.refusalKind({ kind: "foreign-hold", code: "execution_open" }), "foreign-hold");
+  assert.strictEqual(workLoop.refusalKind({ kind: "availability" }), "availability");
+  assert.strictEqual(workLoop.refusalKind({ reason: "profile not satisfiable here" }), "refusal");
+  assert.strictEqual(workLoop.refusalKind(null), "refusal");
+});
+
+test("machineLocalStuck: only cooling/ineligible members with a machine-local kind count", () => {
+  for (const kind of ["refusal", "availability", "policy", "scope", "workspace", "gate", "outcome", "store", null, undefined]) {
+    assert.strictEqual(workLoop.machineLocalStuck({ id: "t", bucket: "cooling", kind }), true, `cooling/${kind}`);
+  }
+  assert.strictEqual(workLoop.machineLocalStuck({ id: "t", bucket: "ineligible", kind: "scope" }), true);
+  for (const kind of ["foreign-hold", "admitted", "outage", "not-gateable", "human", "declined", "assigned-elsewhere", "invalid"]) {
+    assert.strictEqual(workLoop.machineLocalStuck({ id: "t", bucket: "cooling", kind }), false, `cooling/${kind}`);
+    assert.strictEqual(workLoop.machineLocalStuck({ id: "t", bucket: "ineligible", kind }), false, `ineligible/${kind}`);
+  }
+  for (const bucket of ["human", "blocked", "undispatchable", "claim-stale", "off-queue"]) {
+    assert.strictEqual(workLoop.machineLocalStuck({ id: "t", bucket, kind: "refusal" }), false, bucket);
+  }
+});
+
+test("programStanding carries the cooldown kind on a cooling member", () => {
+  const now = Date.parse("2026-10-09T12:00:00Z");
+  const standing = workLoop.programStanding(
+    { members: [{ id: "task-a", bucket: "open", status: "open", human: null, blockers: [] }], queue: { complete: true, located: new Map() } },
+    { page: new Map(), policy: { accept: "open" }, skipped: new Map([["task-a", { reason: "held", kind: "foreign-hold", until: now + 1000 }]]), busy: new Set(), now, selfAgent: null, foreignSince: new Map(), foreignHoldMs: 1000 }
+  );
+  assert.deepStrictEqual(standing.members.find((m) => m.id === "task-a"), { id: "task-a", bucket: "cooling", why: "held", kind: "foreign-hold" });
+});
+
+// ------------- end to end through work.js's wiring (createWorker + bindWork +
+// executeWork over the REAL remote client, the real program read and the real
+// per-pass factory reload): the run source re-binds the gates to the run's
+// PINNED definition on every pass, and a HEAD edit is caught by the reload and
+// reported as drift (issue-spor-work-settle-run-standing-cooling-is-global).
+
+const { createWorker, HOST_FUNCTIONS } = require("../lib/shell/work.js");
+
+const E2E_HEAD = "h".repeat(40);
+// A parsed factory whose pin tuple is `rev` (+ the stub's two gates).
+const factoryAt = (rev, label) => ({
+  id: "factory-x",
+  revision: rev,
+  label,
+  repos: [],
+  gates: [{ id: "tests", kind: "command", command: `npm test # ${label}`, source: "inline" }, { id: "review", kind: "agent-review", source: "gate-review" }],
+  definition: { factory: { revision: rev }, gates: [{ id: "review", revision: PIN.gates[1].revision }] },
+  integration: null,
+  completion: { by: "controller", after: "gates" },
+  implementation: null,
+});
+
+function e2eServer(server, { members }) {
+  const program = {
+    found: true,
+    root_id: "task-prog",
+    root: { id: "task-prog", title: "Program" },
+    tree: members.map((id) => ({ id, parent: "task-prog", edge: "member-of-program", bucket: "open", type: "task", title: id })),
+  };
+  return new Promise((resolve) => {
+    const srv = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        const json = body ? JSON.parse(body) : null;
+        const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+        const send = (status, payload) => {
+          res.writeHead(status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(payload));
+        };
+        if (req.url.startsWith("/v1/program/")) return send(200, program);
+        if (req.url.startsWith("/v1/nodes/batch")) return send(200, { nodes: json.ids.map((id) => ({ id, type: "task", status: server.runs.values().next().value.done.has(id) ? "done" : "open" })) });
+        if (req.url.startsWith("/v1/program-runs")) {
+          const r = server.handle(req.method, req.url, json, bearer);
+          if (r.transport) return req.socket.destroy();
+          return send(r.status, r.json);
+        }
+        send(404, { error: { code: "not_found", message: "no such route" } });
+      });
+    });
+    srv.listen(0, "127.0.0.1", () => resolve({ base: `http://127.0.0.1:${srv.address().port}`, close: () => new Promise((r) => srv.close(r)) }));
+  });
+}
+
+async function serveEndToEnd({ serverSeesDrift, values }) {
+  // The real loop sleeps on the real clock, so the stub's leases read it too.
+  const server = stubServer({ clock: { get now() { return Date.now(); } }, runs: [{ run_id: "prun-0000000000000001", admitted: ["task-a", "task-b"] }] });
+  const srv = await e2eServer(server, { members: ["task-a", "task-b"] });
+  const home = fsx.mkdtempSync(pathx.join(osx.tmpdir(), "spor-prw-e2e-"));
+  const lines = { out: [], err: [] };
+  const dispatches = [];
+  const runs = new Map();
+  let head = factoryAt(PIN.factory_revision, "head"); // HEAD agrees with the pin at Start
+  const headEdit = factoryAt(E2E_HEAD, "head-edited");
+  if (serverSeesDrift) server.actualPin = programRuns.pinTupleOf(headEdit);
+  const host = {};
+  for (const k of HOST_FUNCTIONS) host[k] = () => null;
+  Object.assign(host, {
+    out: (s) => (process.env.E2E_DEBUG && process.stderr.write(`OUT ${s}\n`), lines.out.push(s)),
+    err: (s) => (process.env.E2E_DEBUG && process.stderr.write(`ERR ${s}\n`), lines.err.push(s)),
+    dispatchAgentId: () => null,
+    isAgentId: (s) => /^agent-[a-z0-9-]+$/.test(String(s)),
+    factoryScopeSlug: () => null,
+    integrationSatisfiability: () => ({ ok: true, reasons: [] }),
+    // HEAD from the graph, or — given served `nodes` — the PINNED bytes.
+    loadFactoryDefinition: async (_cfg, id, { nodes } = {}) => {
+      if (nodes) {
+        const n = nodes.get(id);
+        return n ? { factory: factoryAt(n.revision, "pinned"), revision: n.revision } : { factory: null, errors: ["missing"] };
+      }
+      return { factory: head, revision: head.revision };
+    },
+    makeFactoryAvailabilityCheck: () => async () => ({ ok: true }),
+    makeCodeMovedNotice: () => () => null,
+    workerCodeIdentity: () => ({ stamp: null, commit: null, branch: null, repo: null }),
+    dispatchedAgents: () => new Map(),
+    workerAlive: () => false,
+    annotateInFlight: (items) => ({ items }),
+    programQueueEntries: async (_cfg, _slug, ids) => {
+      const items = ids.map((id) => ({ id, readiness: "agent" }));
+      return { complete: true, located: new Map(items.map((it) => [it.id, it])), items };
+    },
+    dispatchSatisfiableWorkItem: async (_cfg, item, _passthrough, ctx) => {
+      dispatches.push({ id: item.id, factory: ctx.factory && ctx.factory.label, revision: ctx.factory && ctx.factory.revision, programRun: ctx.programRun });
+      const admitted = server.admit(item, { ...ctx.programRun, machine: osx.hostname() }, "tok-a");
+      if (!admitted.ok) return { ok: false, reason: `execution store refused ${item.id}: ${admitted.code}`, admission_code: admitted.code };
+      head = headEdit; // a person edits the factory on HEAD while this child runs
+      const runId = `run-${item.id}`;
+      runs.set(runId, item.id);
+      return { ok: true, run: { run_id: runId, harness: "fake" } };
+    },
+    pollWorkRuns: async (_cfg, ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: runs.get(id), state: "done", terminal_state: "failed", terminal_enforced: true } })),
+    reconcileCompletions: async () => {},
+    reconcileWithdrawnExecutions: async () => {},
+    replayAttestationDebts: async () => {},
+    renewLiveExecutions: async () => {},
+  });
+  try {
+    const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: srv.base, SPOR_TOKEN: "tok-a", SPOR_MODE: "remote" } });
+    const worker = createWorker(host);
+    const plan = await worker.planWork(cfg, { values: { "program-runs": true, factory: "factory-x", interval: "1", "max-interval": "1", accept: "open", concurrency: "1", ...values } });
+    assert.strictEqual(typeof plan, "object", lines.err.join("\n"));
+    const code = await worker.bindWork(cfg, plan).executeWork();
+    return { code, server, lines, dispatches };
+  } finally {
+    await srv.close();
+    fsx.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+test("e2e (work.js): a HEAD edit is caught by the REAL per-pass reload and reported as drift, and the server pauses the run", async () => {
+  const { server, lines, dispatches } = await serveEndToEnd({ serverSeesDrift: true, values: { once: true } });
+  const log = lines.out.join("\n");
+  assert.deepStrictEqual(dispatches.map((d) => [d.id, d.revision]), [["task-a", PIN.factory_revision]], log);
+  assert.strictEqual(dispatches[0].programRun.run_id, "prun-0000000000000001", "the admission carried the run binding");
+  const drift = server.events.filter((e) => e.type === "drift.observed");
+  assert.strictEqual(drift.length, 1, log);
+  assert.strictEqual(server.runs.get("prun-0000000000000001").state, "paused", "the server re-read the factory itself and paused the run");
+  assert.match(log, /the factory changed since it was pinned \(factory_changed: fffffffffff\w -> hhhhhhhhhhh\w\)/);
+}, { timeout: 60_000 });
+
+test("e2e (work.js): every pass re-binds the gates to the run's PINNED definition — never to the edited HEAD", async () => {
+  const { server, lines, dispatches } = await serveEndToEnd({ serverSeesDrift: false, values: { max: "2" } });
+  const log = lines.out.join("\n");
+  assert.deepStrictEqual(dispatches.map((d) => d.id), ["task-a", "task-b"], log);
+  assert.strictEqual(dispatches[0].factory, "head", "HEAD agreed with the pin at Start");
+  assert.strictEqual(dispatches[1].factory, "pinned", `HEAD moved: the second child is judged by the pinned bytes the server served:\n${log}`);
+  assert.strictEqual(dispatches[1].revision, PIN.factory_revision);
+  assert.strictEqual(server.events.filter((e) => e.type === "drift.observed").length, 1, "the reload reported it once");
+  assert.match(log, /sees NO drift from its pin; trusting it/);
+  assert.match(log, /is pinned behind HEAD — judging its children by the pinned definition @ fffffffffff/);
+  assert.strictEqual(server.runs.get("prun-0000000000000001").state, "running");
+}, { timeout: 60_000 });
