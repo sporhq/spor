@@ -416,6 +416,38 @@ test("satisfiesAttempt: repos and egress wildcards", () => {
   assert.ok(sat.satisfiesAttempt(providerCaps({ egress: ["*"] }), attempt({ egress: { allow: ["*", "x.example"] } }), { now: NOW }).ok);
 });
 
+test("satisfiesAttempt: secrets[] with an EXPLICITLY empty secret_delivery has no delivery path and is refused", () => {
+  // Every mode the provider offers is beside the point: the attempt says none of them can serve it.
+  const r = sat.satisfiesAttempt(providerCaps({ secret_delivery: ["file", "egress-inject"] }), attempt({ secret_delivery: [] }), { now: NOW });
+  assert.deepStrictEqual(r.axes, ["secret_delivery"]);
+  assert.match(r.reasons[0], /^secret_delivery: 1 secret\(s\) to deliver and the attempt names no delivery mode/);
+  // With nothing to deliver, an empty list asks for nothing.
+  assert.ok(sat.satisfiesAttempt(providerCaps({ secret_delivery: [] }), attempt({ secrets: [], secret_delivery: [] }), { now: NOW }).ok);
+});
+
+test("satisfiesAttempt: repo commit/branch pins are honoured, not matched by slug alone", () => {
+  const caps = providerCaps({ repos: ["acme-api"] });
+  const repo = (over) => [{ slug: "acme-api", commit: "4b825dc642cb6eb9a060e54bf8d69288fbee4904", branch: "spor/x", ...over }];
+  assert.ok(sat.satisfiesAttempt(caps, attempt({ repos: repo({}) }), { now: NOW }).ok);
+  assert.ok(sat.satisfiesAttempt(caps, attempt({ repos: repo({ commit: "a".repeat(64) }) }), { now: NOW }).ok, "a sha-256 object name pins too");
+  for (const commit of ["4b825dc", "HEAD", "main", "4B825DC642CB6EB9A060E54BF8D69288FBEE4904", 42]) {
+    const r = sat.satisfiesAttempt(caps, attempt({ repos: repo({ commit }) }), { now: NOW });
+    assert.deepStrictEqual(r.axes, ["repos"], `commit ${JSON.stringify(commit)} is not a pin`);
+    assert.match(r.reasons[0], /^repos: acme-api pins commit .* not a full object name/);
+  }
+  for (const branch of ["", 7]) {
+    const r = sat.satisfiesAttempt(caps, attempt({ repos: repo({ branch }) }), { now: NOW });
+    assert.deepStrictEqual(r.axes, ["repos"]);
+    assert.match(r.reasons[0], /^repos: acme-api pins a malformed branch/);
+  }
+  const twice = [...repo({}), ...repo({ commit: "b".repeat(40) })];
+  const r = sat.satisfiesAttempt(caps, attempt({ repos: twice }), { now: NOW });
+  assert.deepStrictEqual(r.axes, ["repos"]);
+  assert.match(r.reasons[0], /^repos: acme-api is pinned twice to different commits\/branches/);
+  // An unpinned entry (the matcher is also called on specs outside the contract validator) still matches on slug.
+  assert.ok(sat.satisfiesAttempt(caps, attempt({ repos: [{ slug: "acme-api" }] }), { now: NOW }).ok);
+});
+
 test("satisfiesAttempt: a present-but-malformed attempt field refuses on its axis, never admits", () => {
   const caps2 = providerCaps({ isolation: ["worktree"] });
   const axesOf = (over) => sat.satisfiesAttempt(caps2, attempt({ isolation: "worktree", ...over }), { now: NOW }).axes;
@@ -464,4 +496,24 @@ test("spor capabilities providers: the local describe() validates, and --attempt
   const bad = caps(["providers", "--attempt", spec], home);
   assert.strictEqual(bad.status, 1);
   assert.match(bad.stderr, /does not validate against the provider contract/);
+});
+
+test("spor capabilities providers --attempt never echoes a credential from a refused reference", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cap-home-"));
+  const spec = path.join(home, "attempt.json");
+  const repos = [{ slug: "acme-api", commit: "4b825dc642cb6eb9a060e54bf8d69288fbee4904", branch: "b", url: "https://ci-bot:hunter2-s3cr3t@github.com/acme/api.git" }];
+  fs.writeFileSync(spec, JSON.stringify(attempt({ repos, prompt_bundle_ref: "ghp_bareTokenNotAReference0000000000" })));
+  const r = caps(["providers", "--attempt", spec], home);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /repos\[0\]\.url: "https:\/\/<redacted>@github\.com\/acme\/api\.git" is not a reference/);
+  assert.match(r.stderr, /prompt_bundle_ref: \(value withheld\) is not a reference/);
+  assert.doesNotMatch(r.stdout + r.stderr, /hunter2|ci-bot|ghp_bareToken/);
+});
+
+test("the contract validator redacts refused references; stripReferenceUserinfo leaves a valid one alone", () => {
+  const errs = pc.validate("attempt-spec", attempt({ prompt_bundle_ref: "https:///tok3n@bundles.example/p.tar" })).errors;
+  assert.deepStrictEqual(errs, ['prompt_bundle_ref: "https:///<redacted>@bundles.example/p.tar" is not a reference — an absolute <scheme>://… URI with no credential (userinfo) in its authority']);
+  assert.strictEqual(pc.stripReferenceUserinfo("https://user:tok@github.com/a.git"), "https://github.com/a.git");
+  assert.strictEqual(pc.stripReferenceUserinfo("ssh://git@github.com/a.git"), "ssh://git@github.com/a.git", "a bare ssh login is an account, not a credential");
+  assert.strictEqual(pc.stripReferenceUserinfo("ssh://ghp_abcdefghijklmnopqrstuvwxyz@github.com/a.git"), "ssh://github.com/a.git");
 });

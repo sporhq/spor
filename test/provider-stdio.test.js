@@ -173,6 +173,13 @@ test("a declaration is refused loudly: relative command, unknown key, reserved i
   assert.ok(REPO_FORBIDDEN_PATHS.includes("dispatch.provider"), "a committable .spor.json can never declare what a machine executes");
 });
 
+test("dispatch.provider.default is the provider SELECTOR, never a declaration row", () => {
+  const cfg = { get: (k) => (k === "dispatch.provider" ? { default: "p", p: { command: "/usr/bin/p" } } : undefined) };
+  const decls = stdio.providerDeclarations(cfg);
+  assert.deepEqual([...decls.keys()], ["p"]);
+  assert.equal(decls.get("p").ok, true);
+});
+
 // ------------------------------------------------------------- refusals
 
 test("version mismatch: a hello answering another contract_version is contract_version_unsupported, and no op is sent", async () => {

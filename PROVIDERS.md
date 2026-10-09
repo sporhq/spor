@@ -183,9 +183,9 @@ axis, and so does a missing `isolation`.
 | `deny` | `attempt.profile` is not on the provider's `deny` list. Checked first: a policy opt-out refuses regardless of capability. |
 | `harnesses` | `attempt.harness.id` is in `harnesses`. |
 | `reachable_mcp`, `skills`, `plugins`, `tools` | `attempt.mcp`, `.skills`, `.plugins`, `.tools` are each a subset of the matching capability. |
-| `repos` | Every `attempt.repos[]` slug is in `repos`, or `repos` holds `"*"` (the provider clones any repo) and the entry carries a `url`. |
+| `repos` | Every `attempt.repos[]` slug is in `repos`, or `repos` holds `"*"` (the provider clones any repo) and the entry carries a `url`. A pin the entry carries is honoured: a `commit` that is not a full object name, an empty `branch`, or one slug pinned twice to different commits/branches refuses. |
 | `egress` | `attempt.egress.allow` is a subset of `egress`, or `egress` holds `"*"` (unrestricted). An empty allow list (none) always matches; an allow list naming `"*"` (unrestricted) matches only a `"*"` provider. |
-| `secret_delivery` | One of `attempt.secret_delivery` (the modes that can serve this attempt) is offered. With no `secret_delivery` stated, an attempt carrying `secrets[]` needs some mode, and one with none needs nothing. |
+| `secret_delivery` | One of `attempt.secret_delivery` (the modes that can serve this attempt) is offered. With no `secret_delivery` stated, an attempt carrying `secrets[]` needs some mode, and one with none needs nothing. Stated empty, an attempt carrying `secrets[]` has no delivery path and is refused. |
 | `isolation` | `attempt.isolation` is in `isolation`, **exactly**. A stronger kind is not offered in its place, because handing back a different environment than the spec names is a substitution. |
 | `resources` | Each requested floor is at most the provider's ceiling. A floor against a ceiling the provider does not declare is refused. |
 | `lifecycle` | `attempt.lifecycle` (the operations the attempt needs) is a subset of `lifecycle`. |
@@ -684,7 +684,12 @@ handles.
 `spor provider check <id> [--json]` opens the binding, runs every conformance
 scenario (`lib/shell/provider-conformance.js`) against a scratch home that it
 then removes, and exits 0 only when every scenario passes. The capability
-matcher is the real one (§3.1). The driver it uses, `stdioDriver`, makes three
+matcher is the real one (§3.1) — the suite's default, so the attempt it
+derives carries a `profile`, `secret_delivery`, `lifecycle` and a repo pinned
+to a full commit and branch. Graceful `cancel` is exercised whatever
+`lifecycle` advertises, since `cancel` is a required operation (§3); only the
+forced cancel is gated on `force-cancel`. A collected manifest must name the
+attempt's identity and a `candidate.repo` the attempt asked for. The driver it uses, `stdioDriver`, makes three
 conventions a provider under check should honour:
 
 - An attempt whose `prompt_bundle_ref` has a `/hold/` path segment keeps

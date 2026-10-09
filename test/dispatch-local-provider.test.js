@@ -226,6 +226,7 @@ for (const [name, shape] of Object.entries(GOLDENS)) {
 
 const conf = require("../lib/shell/provider-conformance");
 const sat = require("../lib/kernel/satisfiability");
+const pc = require("../lib/kernel/provider-contract");
 const dispatchRuns = require("../lib/shell/agent-dispatch-runner");
 const dispatchHarnesses = require("../lib/shell/dispatch-harnesses");
 const { loadConfig } = require("../lib/config.js");
@@ -348,6 +349,48 @@ test("the local provider's collect names the candidate the harness committed, th
   assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", attempt.local.name)), "release removed the worktree");
 });
 
+test("the local provider strips a credential from the origin URL before it reaches a manifest; the launch block is part of the idempotency identity", async () => {
+  const { repo, provider, driver } = conformanceSetup();
+  git(repo, ["remote", "set-url", "origin", "https://ci-bot:s3cr3t-tok@conformance.spor.invalid/conformance.git"]);
+  const base = {
+    contract_version: 1, attempt_id: "w:1", execution_id: `exec-${"c".repeat(16)}`, fence: 1, tenant: "t", node_id: "task-x",
+    harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: [],
+    repos: [{ slug: "conformance", commit: "b".repeat(40), branch: "x" }], egress: { allow: [] }, secrets: [],
+    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://x/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
+    isolation: "worktree", prompt_bundle_ref: "https://x.invalid/p.tar",
+  };
+  const attempt = driver.attempt(base, "complete");
+  const submit = (a, id) => provider.request({ contract_version: 1, id, op: "submit", params: { attempt: a, idempotency_key: "cred-key-1" } });
+  const res = await submit(attempt, "s1");
+  assert.strictEqual(res.ok, true, JSON.stringify(res));
+  const handle = res.result.handle;
+  try {
+    // The same attempt read back from a persisted request (the adapter is now plain JSON) is a replay.
+    const replay = await submit(JSON.parse(JSON.stringify(attempt)), "s2");
+    assert.strictEqual(replay.ok, true, JSON.stringify(replay));
+    assert.strictEqual(replay.result.existing, true);
+    // A different LAUNCH under the accepted key is a conflict, not a replay.
+    const other = { ...attempt, local: { ...attempt.local, launch: { ...attempt.local.launch, prompt: "a different prompt" } } };
+    const conflict = await submit(other, "s3");
+    assert.strictEqual(conflict.ok, false);
+    assert.strictEqual(conflict.error.code, "idempotency_conflict");
+    let obs;
+    for (let i = 0; i < 600; i++) {
+      obs = (await provider.request({ contract_version: 1, id: "o", op: "observe", params: { handle } })).result;
+      if (obs.state === "finished") break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.strictEqual(obs.state, "finished", JSON.stringify(obs));
+    const col = (await provider.request({ contract_version: 1, id: "c", op: "collect", params: { handle } })).result;
+    assert.ok(col.manifest, JSON.stringify(col));
+    assert.strictEqual(col.manifest.candidate.reference.locator, "https://conformance.spor.invalid/conformance.git");
+    assert.doesNotMatch(JSON.stringify(col), /s3cr3t|ci-bot/);
+    assert.deepStrictEqual(pc.validate("collect-result", col).errors, []);
+  } finally {
+    await provider.request({ contract_version: 1, id: "x", op: "release", params: { handle } });
+  }
+});
+
 test("createLocalProvider refuses a host missing a helper, naming it", () => {
   const { cfg } = conformanceSetup();
   assert.throws(() => createLocalProvider({ cfg, host: { out() {}, err() {}, createDispatchWorktree() {}, removeDispatchWorktree() {} } }), /host is missing launchSupervisedHarness/);
@@ -381,7 +424,8 @@ test("resolveProviderId: --provider > dispatch.provider.default > local; an unkn
   assert.deepStrictEqual(providers.resolveProviderId(configured, "local"), { id: "local", source: "--provider" });
   assert.strictEqual(providers.providerRefusal(configured, { id: "local", source: "--provider" }), null);
   const declared = cfgOf({ dispatch: { provider: { stdio: { command: "x" } } } });
-  assert.match(providers.providerRefusal(declared, providers.resolveProviderId(declared, "stdio")), /dispatch\.provider\.stdio is declared, but provider bindings are not shipped yet/);
+  assert.match(providers.providerRefusal(declared, providers.resolveProviderId(declared, "stdio")), /dispatch\.provider\.stdio is declared — `spor provider check stdio` runs the conformance suite against it — but a dispatch cannot launch under a declared provider yet/);
+  assert.doesNotMatch(providers.providerRefusal(declared, providers.resolveProviderId(declared, "stdio")), /not shipped/);
   assert.throws(() => providers.createProvider("stdio", { cfg: declared, host: {} }), /no binding for execution provider 'stdio'/);
 });
 

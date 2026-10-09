@@ -12,6 +12,7 @@ const path = require("node:path");
 
 const conf = require("../lib/shell/provider-conformance");
 const candidate = require("../lib/kernel/candidate");
+const sat = require("../lib/kernel/satisfiability");
 const { createSyntheticProvider } = require("./fixtures/providers/synthetic");
 const { startSyntheticStdio } = require("./fixtures/providers/synthetic-stdio");
 
@@ -153,6 +154,56 @@ test("refuse-unsatisfiable: the matcher refuses before submit, and a permissive 
   await conf.runScenario(all.provider, "refuse-unsatisfiable", { home: scratch(), driver: all.driver });
 });
 
+test("the suite's default matcher is the real satisfiesAttempt, and the derived attempt carries what it reads", async () => {
+  const { provider, driver } = createSyntheticProvider();
+  const seen = [];
+  const spy = (caps, attempt) => (seen.push(attempt), sat.satisfiesAttempt(caps, attempt));
+  await conf.runScenario(provider, "refuse-unsatisfiable", { home: scratch(), driver, matcher: spy });
+  const [base] = seen;
+  assert.equal(base.profile, "profile-conformance");
+  assert.deepEqual(base.secret_delivery, ["file"]);
+  assert.deepEqual(base.lifecycle, []);
+  assert.equal(base.repos.length, 1);
+  assert.match(base.repos[0].commit, /^[0-9a-f]{40}$/);
+  assert.ok(base.repos[0].branch && base.repos[0].url, "a `*` provider is handed a pinned repo with a url");
+  // Under no explicit matcher, a provider that cannot check out the repo fails the base check — the real matcher is in force.
+  const noRepos = createSyntheticProvider({ capabilities: { repos: [] } });
+  await assert.rejects(
+    conf.runScenario(noRepos.provider, "refuse-unsatisfiable", { home: scratch(), driver: noRepos.driver }),
+    /\[refuse-unsatisfiable\]: the matcher refuses even the attempt derived from describe\(\): repos: cannot check out conformance/,
+  );
+  // A provider naming a concrete repo is handed THAT repo, with no url.
+  const named = createSyntheticProvider({ capabilities: { repos: ["acme-api"] } });
+  await conf.runScenario(named.provider, "refuse-unsatisfiable", { home: scratch(), driver: named.driver });
+});
+
+test("cancel-graceful runs even when lifecycle does not list cancel — cancel is a required operation", async () => {
+  const { provider, driver } = createSyntheticProvider({ capabilities: { lifecycle: [] } });
+  const r = await conf.runScenario(provider, "cancel-graceful", { home: scratch(), driver });
+  assert.equal(r.skipped, undefined);
+  // force-cancel IS a lifecycle capability, and stays gated on it.
+  assert.match((await conf.runScenario(provider, "cancel-force", { home: scratch(), driver })).skipped, /force-cancel/);
+});
+
+test("a manifest naming a repo the attempt did not ask for fails the suite", async () => {
+  const { provider, driver } = createSyntheticProvider({ manifestRepo: "someone-elses-repo" });
+  const report = await conf.runConformance(provider, { home: scratch(), driver });
+  for (const name of ["observe-collect", "manifest-before-release", "adopt-new-instance"]) {
+    const row = report.results.find((r) => r.name === name);
+    assert.equal(row.ok, false, name);
+    assert.match(row.error, /manifest candidate repo "someone-elses-repo" is not a repo the attempt named \(conformance\)/);
+  }
+});
+
+test("AttemptJournal writes are durable and whole: a reader sees the previous or the next state, never a torn file", () => {
+  const file = path.join(scratch(), "deep", "j.json");
+  const j = new conf.AttemptJournal(file);
+  j.write("submitting", { idempotency_key: "k" });
+  j.write("submitted", { handle: { provider: "x", id: "1" } });
+  assert.deepEqual(j.read(), { submitting: { idempotency_key: "k" }, submitted: { handle: { provider: "x", id: "1" } } });
+  assert.deepEqual(fs.readdirSync(path.dirname(file)), ["j.json"], "no temp file is left behind");
+});
+
 test("adoption under a new instance: the re-derived attempt is a conflict and the manifest keeps the submitter's attempt_id", async () => {
   const { provider, driver } = createSyntheticProvider();
   const home = scratch();
@@ -168,9 +219,9 @@ test("submitMatched never sends an attempt the matcher refuses", async () => {
   const sent = [];
   const client = { call: async (op, params) => (sent.push(op), { handle: { provider: "x", id: "1" }, accepted_at: "2026-10-09T00:00:00Z" }) };
   const journal = new conf.AttemptJournal(path.join(scratch(), "j.json"));
-  const r = await conf.submitMatched(client, conf.minimalAttemptMatcher, { isolation: ["vm"], harnesses: ["codex"] }, journal, { isolation: "container", harness: { id: "codex" } }, "key-12345678");
+  const r = await conf.submitMatched(client, sat.satisfiesAttempt, { isolation: ["vm"], harnesses: ["codex"], lifecycle: [] }, journal, { isolation: "container", harness: { id: "codex" } }, "key-12345678");
   assert.equal(r.submitted, false);
-  assert.deepEqual(r.verdict.missing, ["isolation:container"]);
+  assert.deepEqual(r.verdict.missing, ["isolation: 'container' is not offered (this provider offers: vm)"]);
   assert.deepEqual(sent, []);
   assert.deepEqual(journal.read(), {});
 });

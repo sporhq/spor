@@ -116,6 +116,11 @@ spor priority <id> <p1|p2|p3|clear>  # set/clear queue human-triage priority (lo
 spor set-status <id> <status>  # flip a node's status — an active status (active/open) also CLAIMS it (local: rewrite frontmatter; remote: /v1/nodes/{id}/status)
 spor edge <id> <type> <to> [--remove]  # add (or --remove) a typed edge, e.g. close a loop with resolves (local: append/remove edge line; remote: POST/DELETE /v1/nodes/{id}/edges)
 spor patch <id> key=value… [--unset <key>] [--revision <sha>]  # change frontmatter scalars in place without a whole-node rewrite; body + edges untouched, dedicated-door fields (status/edges/priority/…) refused (local: rewrite frontmatter; remote: PATCH /v1/nodes/{id})
+spor capabilities providers [--attempt <spec.json>]   # each execution provider's describe() (the built-in
+                               #   `local` + every machine-declared dispatch.provider.<id>) and, given an
+                               #   attempt spec, why each would refuse it (PROVIDERS.md)
+spor provider check <id>       # run the execution-provider conformance suite against a machine-declared
+                               #   dispatch.provider.<id> over its stdio binding (PROVIDERS.md §12)
 
 # remote (team server) only
 spor lens [<id>]               # list saved views, or render one
@@ -131,10 +136,6 @@ spor dispatch <id>|"<task>"    # run work as a background agent; in team mode it
 spor capabilities              # this machine's dispatch capability map (harnesses/MCP/skills/plugins/
                                #   deny) matched against a profile at dispatch; self-probes each session.
                                #   probe | set <axis> <v…> | allow-mcp <m…> | deny <profile-id…> | clear
-                               #   providers [--attempt <spec.json>] — each execution provider's describe()
-                               #   and, given an attempt spec, why it would be refused (PROVIDERS.md)
-spor provider check <id>       # (either mode) run the execution-provider conformance suite against a
-                               #   machine-declared dispatch.provider.<id> over its stdio binding (PROVIDERS.md §12)
 spor claim <node-id>           # manually take the heartbeat-renewed lease on a task (POST .../claim) —
                                #   yours-in-progress, out of teammates' queues (dec-cc-task-claim-lease)
 spor renew <node-id>           # heartbeat your live claim, bumping its expiry (POST .../renew)

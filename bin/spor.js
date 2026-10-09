@@ -20689,7 +20689,7 @@ const COMMANDS = {
   },
   capabilities: {
     group: "Dispatch (background agents)", parse: "raw", aliases: ["caps", "profiles"],
-    args: "[list [--json] | show <agent-id> | probe | publish | hosts <profile-id> | set <axis> <v...> | allow-mcp <m...> | deny <profile-id...> | clear]",
+    args: "[list [--json] | show <agent-id> | probe | publish | hosts <profile-id> | providers [--attempt <file|->] [--json] | set <axis> <v...> | allow-mcp <m...> | deny <profile-id...> | clear]",
     summary: "this machine's dispatch capability map (profile satisfiability)",
     // A function, not a plain string: the last line reads sat.CAP_AXES, and
     // sat is lazy-loaded (task-spor-cli-lazy-load-modules) — COMMANDS is built
@@ -20707,6 +20707,8 @@ const COMMANDS = {
       "  spor capabilities probe            re-probe harnesses/plugins/skills now\n" +
       "  spor capabilities publish          push them to the team fleet scheduler (remote)\n" +
       "  spor capabilities hosts <profile>  which fleet boxes satisfy a profile (remote)\n" +
+      "  spor capabilities providers [--attempt <spec>]  each execution provider's describe(),\n" +
+      "                                     and why each would refuse an attempt spec\n" +
       "  spor capabilities set <axis> <v…>  declare an axis (replaces)\n" +
       "  spor capabilities add|rm <axis> <v…>  adjust a declared axis\n" +
       "  spor capabilities allow-mcp <name…>   declare a reachable MCP server\n" +

@@ -12,7 +12,9 @@
 // does not hand the handle back verbatim is caught.
 //
 // `brokenIdempotency: true` is the deliberately broken fixture: every submit
-// creates a new environment, key or no key.
+// creates a new environment, key or no key. `manifestRepo` overrides the
+// repo a collected manifest names (a provider naming a repo the attempt never
+// asked for, which the suite must refuse).
 
 const crypto = require("node:crypto");
 const { bindInProcess, ProviderError } = require("../../../lib/shell/provider-conformance");
@@ -27,7 +29,7 @@ function candidateFor(attempt) {
   return { commit: sha1(`commit\u0000${id}`), tree: sha1(`tree\u0000${id}`) };
 }
 
-function createSyntheticImpl({ providerId = "synthetic", brokenIdempotency = false, capabilities = {}, now = () => new Date().toISOString() } = {}) {
+function createSyntheticImpl({ providerId = "synthetic", brokenIdempotency = false, manifestRepo = null, capabilities = {}, now = () => new Date().toISOString() } = {}) {
   const envs = new Map(); // id -> env
   const byKey = new Map(); // idempotency key -> id
   let next = 0;
@@ -38,6 +40,9 @@ function createSyntheticImpl({ providerId = "synthetic", brokenIdempotency = fal
     skills: [],
     plugins: [],
     tools: ["git", "node"],
+    // Any repo the attempt gives a url for (the conformance base attempt then
+    // carries one, so the real matcher admits it).
+    repos: ["*"],
     egress: [],
     isolation: ["container"],
     secret_delivery: ["file"],
@@ -119,7 +124,7 @@ function createSyntheticImpl({ providerId = "synthetic", brokenIdempotency = fal
             execution_id: env.attempt.execution_id,
             fence: env.attempt.fence,
             candidate: {
-              repo: repo.slug,
+              repo: manifestRepo || repo.slug,
               commit: c.commit,
               tree: c.tree,
               branch: repo.branch,
