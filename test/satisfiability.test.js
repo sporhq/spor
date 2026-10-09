@@ -512,7 +512,7 @@ test("spor capabilities providers --attempt never echoes a credential from a ref
 
 test("the contract validator redacts refused references; stripReferenceUserinfo leaves a valid one alone", () => {
   const errs = pc.validate("attempt-spec", attempt({ prompt_bundle_ref: "https:///tok3n@bundles.example/p.tar" })).errors;
-  assert.deepStrictEqual(errs, ['prompt_bundle_ref: "https:///<redacted>@bundles.example/p.tar" is not a reference — an absolute <scheme>://… URI with no credential (userinfo) in its authority']);
+  assert.deepStrictEqual(errs, ['prompt_bundle_ref: "https:///<redacted>@bundles.example/p.tar" is not a reference — an absolute <scheme>://… URI with no credential (userinfo), query or fragment']);
   assert.strictEqual(pc.stripReferenceUserinfo("https://user:tok@github.com/a.git"), "https://github.com/a.git");
   assert.strictEqual(pc.stripReferenceUserinfo("ssh://git@github.com/a.git"), "ssh://git@github.com/a.git", "a bare ssh login is an account, not a credential");
   assert.strictEqual(pc.stripReferenceUserinfo("ssh://ghp_abcdefghijklmnopqrstuvwxyz@github.com/a.git"), "ssh://github.com/a.git");
@@ -542,7 +542,7 @@ test("satisfiesAttempt: `*` repo admission refuses a credential-bearing url with
     const r = sat.satisfiesAttempt(providerCaps({ repos: ["*"] }), { ...attempt(), repos }, { now: NOW });
     assert.strictEqual(r.ok, false, url);
     assert.deepStrictEqual(r.axes, ["repos"], url);
-    assert.match(r.reasons[0], /cannot check out other: its url is not a credential-free reference \(value withheld\)/);
+    assert.match(r.reasons[0], /cannot check out other: its url is not an allowed repo url \(value withheld\)/);
     assert.ok(!r.reasons.join(" ").includes(leak), r.reasons.join("; "));
   }
   // A provider naming the slug outright checks it out by name: the url is not what admits it.

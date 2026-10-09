@@ -69,7 +69,7 @@ test("the doc's refused secret example is refused inside an attempt spec", () =>
 });
 
 test("a hand-written secret value in secrets[] is refused, under any value key", () => {
-  for (const key of pc.$defs.secretRef.not.anyOf.map((s) => s.required[0])) {
+  for (const key of ["value", "secret", "plaintext", "token", "password", "data", "apiKey", "credentials"]) {
     const spec = attemptSpec();
     spec.secrets = [{ name: "GITHUB_TOKEN", ref: "vault://acme/gh", [key]: "ghp_abc" }];
     const r = pc.validate("attempt-spec", spec);
@@ -162,7 +162,6 @@ test("unknown fields are ignored at every level (forward compatibility)", () => 
   spec.future_top_level = { anything: [1, 2] };
   spec.harness.sandbox_profile = "strict";
   spec.repos[0].sparse = ["lib/"];
-  spec.secrets[0].rotation = "daily";
   assert.deepEqual(pc.validate("attempt-spec", spec).errors, []);
 
   const req = submitRequest();

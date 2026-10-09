@@ -77,10 +77,11 @@ human-readable message. It never guesses.
 
 **Unknown fields are ignored**, at every level and in both directions. A v1
 reader that meets a field a later revision added must not refuse the message.
-That is why no schema in the module declares `additionalProperties`. The one
-exception is closed by name rather than by shape: a secret entry (and the
-`spor` block) must not carry a value-bearing key (`value`, `secret`,
-`plaintext`, `token`, `password`, `data`). See §4.2.
+That is why only one schema in the module declares `additionalProperties`:
+a secret entry is CLOSED to exactly `{name, ref}`, since an unknown key there
+is a value riding where a reference belongs. The `spor` block stays open but
+must not carry a value-bearing key (`value`, `secret`, `plaintext`, `token`,
+`password`, `data`). See §4.2.
 
 The contract is transport-neutral. A binding (subprocess JSON-over-stdio
 first, then HTTP) carries one **request** and one **response** per operation:
@@ -270,12 +271,27 @@ provider's own vault** (`vault://…`, `azure-keyvault://…`, a token-mint
 integration URL). The provider resolves the reference at the edge, through one
 of the delivery modes it advertises (`file`, `egress-inject`, `token-mint`).
 There is no class for plaintext env values passed through Spor. The validator
-refuses an entry whose `ref` is not a URI, and an entry that carries a value
-under any key. Every reference in the contract is a URI with no userinfo
+refuses an entry whose `ref` is not a URI, and an entry with any key besides
+`name` and `ref`. Every reference in the contract is a URI with no userinfo
 (`https://user:token@host` and `https://token@host` are refused; a bare ssh
 login such as `ssh://git@host/…` names an account and is allowed, provided it
 is at most 32 characters and does not open with a known token prefix, so
-`ssh://ghp_…@host` is refused). So this
+`ssh://ghp_…@host` is refused), no query and no fragment
+(`?access_token=…`, a presigned `?X-Amz-Signature=…`, `#tok=…`), and no
+credential-shaped string anywhere (`https://host/ghp_…/x.git`,
+`vault://sk-live-…`). On top of that rule each field admits an allow-listed
+SHAPE (`REFERENCE_FORMATS` in lib/kernel/provider-contract.js):
+
+| Field | Shapes admitted |
+|---|---|
+| `repos[].url` | `https://host/path`, `ssh://[login@]host/path`, scp-style `login@host:path` |
+| candidate `reference.locator` | `file://`, `https://`, `ssh://` |
+| `spor.server` | an origin only — `http(s)://host[:port]` (a local graph: its `file:///` nodes dir) |
+| `spor.token_ref` | `spor-attempt-token://<execution>/<fence>` |
+| `secrets[].ref`, `prompt_bundle_ref`, `report_ref`, `log_refs[]`, evidence `ref` | any `<scheme>://…` reference |
+
+A refusal never quotes the value: userinfo, query and fragment are cut and a
+value still carrying a credential shape is withheld. So this
 entry is refused:
 
 ```json provider-contract-refused=secret-entry
@@ -751,7 +767,10 @@ ok, error: {code, message, retryable}}`). A response may leave
 every level. The binding mints its own request ids, so several requests may be
 in flight and answered in any order. The provider's stderr is not part of the
 protocol: each line is mirrored into the worker's log as `[provider <id>]
-<line>`.
+<line>`, REDACTED first — provider code is third-party and its diagnostics may
+echo a credential — by the contract's fail-closed `redact` plus an exact mask
+of every value the worker holds. An error response's `message` is redacted the
+same way.
 
 ### 12.3 What the binding answers when the provider cannot
 
@@ -822,7 +841,8 @@ written, and before a process is spawned for it. It answers
 - a secret entry or `spor` block carrying a value, or a `ref` that is not a
   reference (the §4.2 validator);
 - a credential-shaped string anywhere in the line (a GitHub, GitLab, Slack,
-  Anthropic or AWS key shape);
+  `sk-` API key or AWS key shape, or a Spor `spor_att_`/`spor_pat_`/`spor_oat_`/
+  `sub_pat_` token);
 - a value the worker itself holds: its Spor credentials from the environment
   and the token the config cascade resolved.
 
@@ -973,8 +993,11 @@ nothing, or it could not be published); `2` means the attempt was refused
 before launch. `--out` must be absent or empty, because a result directory
 belongs to one run. The token-bearing MCP config a Claude Code harness reads
 is written to a private temporary directory, never into `--out`, and is
-removed when the run settles. Refusals and status details mask URL userinfo
-and credential-shaped strings.
+removed when the run settles. Refusals and status details pass the contract's
+`redact`, which FAILS CLOSED: any `<scheme>:…@` span is masked up to its last
+`@`, whitespace and quotes included (`https://u:p w@host`), as are a URL's query
+and fragment and every credential-shaped string (Spor's token prefixes
+included).
 
 The `local` provider (§11) uses the same path in-process. It wraps the launch
 a dispatch built as an in-memory bundle, launches it through the same door, and
