@@ -186,7 +186,7 @@ function dieAt(h, node, snapshot, stage) {
   assert.strictEqual(r.status, 137, r.stderr);
 }
 
-for (const stage of ["journaled", "parts", "root"]) {
+for (const stage of ["journaled", "parts", "hashed", "root"]) {
   test(`local restart recovery: death after ${stage} leaves the old or the whole new document, and the next publication recovers`, () => {
     const h = home({ git: true });
     const v1 = put(h, source("art-doc"));
@@ -275,6 +275,141 @@ test("local restart recovery: a root that landed and then moved keeps its parts 
   const pinned = get(h, "art-doc", landed);
   assert.ok(pinned.ok && pinned.document.complete, "the revision that landed still reads whole");
   assert.strictEqual(content.documentCore(pinned.document.body), core(v2src));
+});
+
+test("local: a git hash failure refuses the publication before the root is replaced (issue-spor-document-cli-root-written-before-hashed)", { skip: process.platform === "win32" && "a /bin/sh git shim and POSIX directory modes" }, () => {
+  const h = home({ git: true });
+  const v1 = put(h, source("art-doc"));
+  const before = new Set(fs.readdirSync(nodes(h)));
+  const rootBytes = fs.readFileSync(path.join(nodes(h), "art-doc.md"));
+  const objects = path.join(h, ".git", "objects");
+  const chmodAll = (dir, mode) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) if (e.isDirectory()) chmodAll(path.join(dir, e.name), mode);
+    fs.chmodSync(dir, mode);
+  };
+  const refused = (r, why) => {
+    assert.deepStrictEqual([r.ok, r.code], [false, "internal"], JSON.stringify(r));
+    assert.match(r.details.join("\n"), why);
+    assert.ok(fs.readFileSync(path.join(nodes(h), "art-doc.md")).equals(rootBytes), "the old root is untouched");
+    assert.deepStrictEqual([...fs.readdirSync(nodes(h))].sort(), [...before].sort(), "the parts already written are rolled back");
+    assert.ok(!fs.existsSync(path.join(journal(h), "art-doc.publish.json")), "the intent is settled");
+    assert.strictEqual(content.documentCore(get(h, "art-doc", v1.revision).document.body), core(source("art-doc")), "v1 still reads");
+  };
+  let r;
+  if (process.getuid?.() !== 0) { // root ignores directory permissions
+    chmodAll(objects, 0o555);
+    try {
+      r = put(h, source("art-doc", { edit: " (v2)" }), v1.snapshot);
+    } finally {
+      chmodAll(objects, 0o755);
+    }
+    refused(r, /git hash-object failed/);
+  }
+  // a git that fails hash-object, and one answering another id than the
+  // bytes' revision, through a PATH shim
+  const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+  const shimmed = (hashObject, node) => {
+    const fakeGit = fs.mkdtempSync(path.join(os.tmpdir(), "spor-document-git-"));
+    fs.writeFileSync(path.join(fakeGit, "git"), `#!/bin/sh\nif [ "$1" = hash-object ]; then cat >/dev/null; ${hashObject}; fi\nexec ${realGit} "$@"\n`, { mode: 0o755 });
+    const PATH = process.env.PATH;
+    process.env.PATH = `${fakeGit}${path.delimiter}${PATH}`;
+    try {
+      return put(h, node, v1.snapshot);
+    } finally {
+      process.env.PATH = PATH;
+    }
+  };
+  refused(shimmed("echo 'fatal: cannot write' >&2; exit 128", source("art-doc", { edit: " (v2)" })), /git hash-object failed: fatal: cannot write/);
+  refused(shimmed(`echo ${"0".repeat(40)}; exit 0`, source("art-doc", { edit: " (v3)" })), /git hash-object answered/);
+  // and the same edit publishes once git works
+  assert.strictEqual(put(h, source("art-doc", { edit: " (v2)" }), v1.snapshot).status, "updated");
+  assert.strictEqual(content.documentCore(get(h, "art-doc", v1.revision).document.body), core(source("art-doc")), "v1 pinned after the overwrite");
+});
+
+test("local: git failing to say whether the home is a repository refuses with nothing written", { skip: process.platform === "win32" && "a /bin/sh git shim and POSIX directory modes" }, () => {
+  const h = home({ git: true });
+  const v1 = put(h, source("art-doc"));
+  const before = new Set(fs.readdirSync(nodes(h)));
+  const fakeGit = fs.mkdtempSync(path.join(os.tmpdir(), "spor-document-git-"));
+  fs.writeFileSync(path.join(fakeGit, "git"), "#!/bin/sh\necho 'fatal: something broke' >&2\nexit 128\n", { mode: 0o755 });
+  const PATH = process.env.PATH;
+  process.env.PATH = `${fakeGit}${path.delimiter}${PATH}`;
+  let r;
+  try {
+    r = put(h, source("art-doc", { edit: " (v2)" }), v1.snapshot);
+  } finally {
+    process.env.PATH = PATH;
+  }
+  assert.deepStrictEqual([r.ok, r.code], [false, "internal"]);
+  assert.match(r.details.join("\n"), /something broke/);
+  assert.deepStrictEqual([...fs.readdirSync(nodes(h))].sort(), [...before].sort());
+  assert.ok(!fs.existsSync(path.join(journal(h), "art-doc.publish.json")));
+});
+
+test("local: a root write that fails after the stage-root intent still rolls the parts back", () => {
+  const h = home({ git: true });
+  const v1 = put(h, source("art-doc"));
+  const before = new Set(fs.readdirSync(nodes(h)));
+  const rootFile = path.join(nodes(h), "art-doc.md");
+  const rename = fs.renameSync;
+  fs.renameSync = (from, to) => {
+    if (to === rootFile) throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    return rename(from, to);
+  };
+  let r;
+  try {
+    r = put(h, source("art-doc", { edit: " (v2)" }), v1.snapshot);
+  } finally {
+    fs.renameSync = rename;
+  }
+  assert.deepStrictEqual([r.ok, r.code], [false, "internal"]);
+  assert.match(r.details.join("\n"), /ENOSPC/);
+  assert.strictEqual(documentShell.readNodeFile(nodes(h), "art-doc").revision, v1.revision);
+  assert.deepStrictEqual([...fs.readdirSync(nodes(h))].sort(), [...before].sort(), "no part left behind");
+  assert.ok(!fs.existsSync(path.join(journal(h), "art-doc.publish.json")));
+});
+
+test("local restart recovery: a pre-stage intent (v1) still decides by the object store", () => {
+  const h = home({ git: true });
+  const v1 = put(h, source("art-doc"));
+  const v2src = source("art-doc", { edit: " (v2)" });
+  const gen = content.documentGeneration(v2src);
+  for (const p of gen.parts) fs.writeFileSync(path.join(nodes(h), `${p.id}.md`), p.raw);
+  fs.mkdirSync(journal(h), { recursive: true });
+  fs.writeFileSync(path.join(journal(h), "art-doc.publish.json"), JSON.stringify({
+    id: "art-doc", digest: gen.digest, prior: v1.revision, root: documentShell.gitBlobSha(Buffer.from(gen.root)),
+    fresh: gen.parts.map((p) => ({ id: p.id, revision: documentShell.gitBlobSha(Buffer.from(p.raw)) })),
+  }));
+  const rec = documentShell.recoverPublication(nodes(h), journal(h), "art-doc");
+  assert.deepStrictEqual([rec.outcome, rec.removed.length], ["rolled-back", gen.parts.length]);
+});
+
+test("local restart recovery: a death between the stage-root intent and the root write keeps the parts (not proof either way)", () => {
+  const h = home({ git: true });
+  const v1 = put(h, source("art-doc"));
+  const v2src = source("art-doc", { edit: " (v2)" });
+  // Die right after the stage-`root` intent lands: the root write is next.
+  const script = `
+    const fs = require("node:fs");
+    const d = require(${JSON.stringify(SHELL)});
+    const write = fs.renameSync;
+    fs.renameSync = (from, to) => {
+      write(from, to);
+      if (to.endsWith("art-doc.publish.json") && JSON.parse(fs.readFileSync(to, "utf8")).stage === "root") process.exit(137);
+    };
+    d.putDocument(${JSON.stringify(nodes(h))}, {
+      node: ${JSON.stringify(v2src)}, snapshot: ${JSON.stringify(v1.snapshot)}, journalDir: ${JSON.stringify(journal(h))},
+    });
+    process.exit(0);`;
+  const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
+  assert.strictEqual(r.status, 137, r.stderr);
+  const intent = JSON.parse(fs.readFileSync(path.join(journal(h), "art-doc.publish.json"), "utf8"));
+  assert.strictEqual(intent.hashed.length, 1 + intent.fresh.length + 1, "the prior root, every fresh part and the new root were hashed");
+  assert.strictEqual(intent.hashed.at(-1), intent.root);
+  assert.strictEqual(documentShell.readNodeFile(nodes(h), "art-doc").revision, v1.revision);
+  const rec = documentShell.recoverPublication(nodes(h), journal(h), "art-doc");
+  assert.deepStrictEqual([rec.outcome, rec.removed], ["kept", []]);
+  assert.strictEqual(content.documentCore(get(h, "art-doc").document.body), core(source("art-doc")));
 });
 
 // ---------- the CLI doors ----------
