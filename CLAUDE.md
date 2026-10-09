@@ -1046,8 +1046,19 @@ conformance suite over real supervisor launches. The harness adapter's argv
 stays the dispatcher's; the provider gets the finished launch on the
 provider-private `attempt.local` block. `dispatch.provider` is one
 machine-local map (`default` + `<id>` bindings, `noRepo` like
-`dispatch.harness`); its key→handle table is in memory until the attempt-handle
-work persists it.
+`dispatch.harness`). The provider ATTEMPT HANDLE is persisted on the
+execution record (task-spor-work-attempt-handle-adoption,
+`lib/shell/provider-attempts.js`): under a controller-completion factory the
+launch door writes `attempt.submitting` (the key + request, BEFORE the send)
+and `attempt.submitted` (the handle, before the loop proceeds), with the
+provider key spelled `submit_idempotency_key`. A re-dispatch of a held item
+ADOPTS the recorded attempt instead of launching, a lost submit reply HOLDS
+the execution and reconciles under the persisted key, and an attempt under a
+provider this box does not run is `blocked.orphaned` and never dispatched.
+`local` stamps the key on the run record's creation write
+(`provider_attempt`, only for an attempt carrying an execution identity) so a
+restarted worker's `lookup` finds the run, and every loop pass relays
+observe() as `attempt.observed` (`deps.providerAttempts`).
 **The work loop (task-spor-work-loop):** `spor work` is the pull-based
 continuous worker over the queue — poll, dispatch, await the TERMINAL state,
 repeat — and is a GENERALIZATION of `spor dispatch --from-queue`, never a second

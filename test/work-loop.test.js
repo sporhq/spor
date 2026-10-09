@@ -4394,3 +4394,172 @@ test("--program (residual 3): a membership that grows past one program walk afte
   assert.strictEqual(status.program.outcome, null, `a truncated membership never halts: ${status.stop_reason}`);
   assert.strictEqual(h.log.filter((l) => /grown past one program walk/.test(l)).length, 1, h.log.join("\n"));
 });
+
+// ------------------------------------------- the provider attempt handle --
+// (task-spor-work-attempt-handle-adoption, PROVIDERS.md §6) The loop driven
+// with the SYNTHETIC provider over a real local execution store: a worker
+// that dies between the submit and the handle's persist, a restarted worker
+// (a new process instance, so a new fence) that adopts instead of
+// resubmitting, a dropped submit reply held and reconciled under the
+// persisted key, and an attempt under a provider this box does not run kept
+// out of dispatch and reported.
+{
+  const executionStore = require("../lib/shell/execution-store.js");
+  const providerAttempts = require("../lib/shell/provider-attempts.js");
+  const { bindInProcess } = require("../lib/shell/provider-conformance.js");
+  const { createSyntheticImpl } = require("./fixtures/providers/synthetic.js");
+
+  const ATTEMPT = {
+    contract_version: 1, tenant: "local", node_id: "task-a", harness: { id: "codex" }, mcp: [], skills: [], plugins: [], tools: ["git"],
+    repos: [{ slug: "spor", commit: "4b825dc642cb6eb9a060e54bf8d69288fbee4904", branch: "spor/task-a" }],
+    egress: { allow: [] }, secrets: [], deadline: "2099-01-01T00:00:00Z", isolation: "container",
+  };
+
+  // One "worker process": its own execution-store instance (so a restart is a
+  // re-claim under an advanced fence), the owned-attempt table its sweep
+  // relays, and the dispatch door a real worker runs (open the execution,
+  // then submit/reconcile/adopt through the attempt driver). `die` makes the
+  // handle write never land — the process is gone the instant the provider
+  // accepted.
+  function attemptWorker({ home, instance, provider, die = false, configured = ["synthetic"] }) {
+    const eng = executionStore.localExecutionEngine({ home, worker: "w", machine: "m", instance });
+    const owned = new Map();
+    const store = die ? { ...eng, event: async (id, a) => (a.event.type === "attempt.submitted" ? { ok: false, code: "killed", message: "SIGKILL" } : eng.event(id, a)) } : eng;
+    const dispatch = async (item) => {
+      const o = await eng.open({ node_id: item.id, factory: "factory-t", gates: [] });
+      if (!o.ok) return { ok: false, reason: o.message };
+      const id = o.execution.execution_id;
+      const r = await providerAttempts.submitAttempt({
+        store, executionId: id, fence: o.fence, client: provider.client,
+        key: providerAttempts.mintSubmitKey({ executionId: id, attempt: 1, fence: o.fence, instance }),
+        request: { attempt: { ...ATTEMPT, execution_id: id, fence: o.fence, attempt_id: instance, spor: { server: "https://api.sporhq.io", token_ref: `spor-attempt-token://${id}/${o.fence}` }, prompt_bundle_ref: `https://synthetic.spor.invalid/hold/${id}/prompt.tar` } },
+      });
+      if (r.handle != null) owned.set(id, { fence: o.fence, attempt: 1, client: provider.client, node_id: item.id });
+      if (!r.ok) return { ok: false, reason: r.reason };
+      return { ok: true, adopted: !!r.adopted, run: { run_id: r.handle.id, harness: "synthetic", launch_mode: "provider" } };
+    };
+    const providerAttemptsDep = () => providerAttempts.sweepProviderAttempts({ store: eng, owned, configured });
+    return { eng, owned, dispatch, providerAttempts: providerAttemptsDep };
+  }
+
+  function syntheticProvider() {
+    const impl = createSyntheticImpl();
+    const bound = bindInProcess(impl);
+    const p = { impl, sent: [], dropReply: 0 };
+    p.client = providerAttempts.envelopeClient("synthetic", {
+      async request(msg) {
+        if (msg.op === "submit") p.sent.push(msg.params.idempotency_key);
+        const res = await bound.request(msg);
+        if (msg.op === "submit" && p.dropReply > 0) {
+          p.dropReply -= 1;
+          throw new Error("ETIMEDOUT");
+        }
+        return res;
+      },
+    }, { timeoutMs: 2000 });
+    return p;
+  }
+
+  const providerRow = async (eng) => {
+    const listed = await eng.list({});
+    return providerAttempts.providerRow(listed.executions[0], 1);
+  };
+
+  test("provider attempts: a worker SIGKILLed between submit and persist — the restarted worker adopts the one environment, never a second", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-attempt-"));
+    const provider = syntheticProvider();
+    // Worker 1 dispatches and dies before the handle is persisted.
+    const w1 = attemptWorker({ home, instance: "proc-1", provider, die: true });
+    const died = await w1.dispatch({ id: "task-a" });
+    assert.strictEqual(died.ok, false);
+    assert.strictEqual(provider.impl.fixture.environments(), 1);
+    assert.strictEqual((await providerRow(w1.eng)).handle, null, "the record holds the submit key only");
+    // Worker 2: a new process instance, its own loop.
+    const w2 = attemptWorker({ home, instance: "proc-2", provider });
+    const h = harness({
+      queue: (state) => (state.dispatched.length ? [] : [{ id: "task-a" }]),
+      opts: { concurrency: 1, max: 1 },
+      maxPasses: 6,
+      extraDeps: {
+        dispatch: async (item) => {
+          const r = await w2.dispatch(item);
+          if (r.ok) h.dispatched.push({ id: item.id, run_id: r.run.run_id, adopted: r.adopted });
+          return r;
+        },
+        providerAttempts: w2.providerAttempts,
+        // The run is the environment: terminal once the relayed observe says so.
+        pollRuns: async (ids) => {
+          const row = await providerRow(w2.eng);
+          return ids.map((id) => ({ run_id: id, terminal: ["finished", "failed", "lost"].includes(row.last_state), record: { run_id: id, state: "running" } }));
+        },
+      },
+    });
+    await h.run();
+    assert.deepStrictEqual(h.dispatched.map((d) => [d.id, d.adopted]), [["task-a", true]], "the restarted loop adopted the attempt");
+    assert.strictEqual(provider.impl.fixture.environments(), 1, "exactly one environment exists");
+    assert.strictEqual(new Set(provider.sent).size, 1, "every submit carried the one persisted key");
+    const row = await providerRow(w2.eng);
+    assert.ok(row.handle, "the reconciled handle is on the record");
+    assert.ok(row.observed_seq >= 1, "each pass relayed observe() as attempt.observed");
+    assert.ok(["provisioning", "running"].includes(row.last_state));
+    assert.deepStrictEqual(h.published[h.published.length - 1].blocked, { orphaned: [] });
+  });
+
+  test("provider attempts: a dropped submit reply holds the item (acceptance unknown) and the next dispatch reconciles by key — no second environment", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-attempt-"));
+    const provider = syntheticProvider();
+    provider.dropReply = 1;
+    const w = attemptWorker({ home, instance: "proc-1", provider });
+    const results = [];
+    const h = harness({
+      queue: (state) => (state.dispatched.length ? [] : [{ id: "task-a" }]),
+      opts: { concurrency: 1, max: 1, retryAfterMs: 1000 },
+      maxPasses: 8,
+      extraDeps: {
+        dispatch: async (item) => {
+          const r = await w.dispatch(item);
+          results.push(r);
+          if (r.ok) h.dispatched.push({ id: item.id, run_id: r.run.run_id });
+          return r;
+        },
+        providerAttempts: w.providerAttempts,
+        pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: false, record: { run_id: id, state: "running" } })),
+      },
+    });
+    await h.run();
+    assert.strictEqual(results[0].ok, false);
+    assert.match(results[0].reason, /acceptance is unknown/);
+    assert.ok(results.some((r) => r.ok), "a later pass reconciled it");
+    assert.strictEqual(provider.impl.fixture.environments(), 1);
+    assert.strictEqual(new Set(provider.sent).size, 1, "the reconcile re-sent under the persisted key — never a new one");
+    assert.strictEqual(h.dispatched.length, 1);
+  });
+
+  test("provider attempts: a live attempt under a provider this box does not run is reported blocked.orphaned and never dispatched", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-attempt-"));
+    const eng = executionStore.localExecutionEngine({ home, worker: "w", machine: "m", instance: "other" });
+    const o = await eng.open({ node_id: "task-a", factory: "factory-t", gates: [] });
+    const key = "exec-elsewhere/a1/1/other";
+    await eng.event(o.execution.execution_id, { fence: o.fence, event: { type: "attempt.submitting", attempt: 1, provider: "container", submit_idempotency_key: key, request: { attempt: {} } } });
+    await eng.event(o.execution.execution_id, { fence: o.fence, event: { type: "attempt.submitted", attempt: 1, provider: "container", handle: { provider: "container", id: "ctr-1" }, submit_idempotency_key: key } });
+    const w = attemptWorker({ home, instance: "proc-1", provider: syntheticProvider() });
+    const h = harness({
+      queue: [{ id: "task-a" }, { id: "task-b" }],
+      opts: { concurrency: 2 },
+      maxPasses: 3,
+      dispatch: () => ({ ok: true }),
+      extraDeps: { providerAttempts: w.providerAttempts },
+    });
+    await h.run();
+    assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-b"], "the orphaned item is never dispatched here");
+    const last = h.published[h.published.length - 1];
+    assert.deepStrictEqual(last.blocked.orphaned, [{ node_id: "task-a", execution_id: o.execution.execution_id, attempt: 1, provider: "container", handle: { provider: "container", id: "ctr-1" } }]);
+    assert.strictEqual(h.log.filter((l) => /runs under provider 'container'/.test(l)).length, 1, "reported once, not every pass");
+  });
+
+  test("provider attempts: a loop with no provider sweep publishes no `blocked` key (byte-identical status)", async () => {
+    const h = harness({ queue: [{ id: "task-a" }], opts: { concurrency: 1, max: 1 }, maxPasses: 2 });
+    await h.run();
+    assert.ok(h.published.every((s) => !("blocked" in s)));
+  });
+}

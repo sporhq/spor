@@ -391,8 +391,38 @@ the attempt failed. It reconciles by re-sending the persisted request with the
 persisted key. That is safe by the rule above, and the reply settles the
 question. A blind retry under a fresh key is exactly the duplicate environment
 this rule exists to prevent. Once a handle comes back, it is written to the
-execution record as `attempt.submitted {provider, handle, idempotency_key,
-env}` before submit returns to the loop.
+execution record as `attempt.submitted {provider, handle, env}` before submit
+returns to the loop.
+
+**On the execution record** (EXECUTION-STATE.md §3/§5 in spor-server; the
+client mirror is `lib/kernel/execution.js`, the worker side
+`lib/shell/provider-attempts.js`) the persistence is three fenced events,
+materialized as the attempt row's `provider` object:
+
+| event | written | carries |
+|---|---|---|
+| `attempt.submitting` | before the first send | `provider`, `submit_idempotency_key`, `request` (the params minus the key; nothing provider-private) |
+| `attempt.submitted` | once a handle comes back, before the loop proceeds | `provider`, `handle`, `submit_idempotency_key`, `env?` |
+| `attempt.observed` | each pass the loop observes the environment | `state`, `detail?` |
+
+The provider's key travels as **`submit_idempotency_key`** on these events.
+The field `idempotency_key` on an execution event is the event log's own replay
+key, which for these three is always derived (`<execution_id>:attempt.
+submitted:<attempt>`, …). A writer that sends the provider's key as
+`idempotency_key` is accepted and canonicalized, and sending both with
+different values is `invalid_event`. A second submit for the same attempt
+under a different handle or key is `attempt_handle_conflict`: adopt what the
+record names.
+
+The work loop holds a submit whose acceptance is unknown in place. The
+execution and the item's hold stand, nothing is marked failed, and the next
+dispatch of the item re-sends the persisted request under the persisted key.
+A provider that can name what it accepted under a key without being handed
+the request again may offer an in-process `lookup(key)`. The `local` provider
+does this from its run records. The worker consults `lookup` before
+re-sending. An attempt the record places under a provider this box does not
+run is reported as `blocked.orphaned` in `spor work --status`. It is never
+dispatched here.
 
 **Adoption.** A restarted worker re-claims the execution as a new instance
 under an advanced fence. If the record carries `attempt.submitted`, it

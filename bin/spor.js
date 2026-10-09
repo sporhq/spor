@@ -95,6 +95,8 @@ const candidateKernel = lazyModule(path.join(ROOT, "lib", "kernel", "candidate.j
 const completionKernel = lazyModule(path.join(ROOT, "lib", "kernel", "completion.js"));
 const completionShell = lazyModule(path.join(ROOT, "lib", "shell", "completion.js"));
 const executionStore = lazyModule(path.join(ROOT, "lib", "shell", "execution-store.js"));
+const providerAttempts = lazyModule(path.join(ROOT, "lib", "shell", "provider-attempts.js"));
+const executionProviders = lazyModule(path.join(ROOT, "lib", "shell", "providers", "index.js"));
 const workOutcome = lazyModule(path.join(ROOT, "lib", "shell", "work-outcome.js"));
 const executionKernel = lazyModule(path.join(ROOT, "lib", "kernel", "execution.js"));
 const gateRunner = lazyModule(path.join(ROOT, "lib", "shell", "gate-runner.js"));
@@ -11594,7 +11596,44 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
   if (!controller) return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { ...(gateFactory ? { recordFields: gateFactory } : {}), ...dispatchOpts });
   const held = await claimExecutionHold(cfg, item, factory, { home, log });
   if (!held.ok) return { ok: false, reason: held.reason };
-  const launched = await dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { recordFields: { ...(held.recordFields || {}), ...(gateFactory || {}) }, ...dispatchOpts });
+  // The provider attempt handle (task-spor-work-attempt-handle-adoption,
+  // PROVIDERS.md §6): an execution this claim RE-took (a restarted worker, a
+  // takeover) may already record where its attempt runs. A recorded handle is
+  // ADOPTED and nothing is submitted; a recorded submit key whose run exists
+  // is reconciled onto the record and adopted; a provider this box does not
+  // run leaves the item orphaned and HELD — never re-dispatched elsewhere.
+  const attemptStore = held.store ? openExecutionStoreFor(cfg, { home, mode: held.store, log }) : null;
+  const resumed = attemptStore ? await resumeProviderAttempt(cfg, { item, held, store: attemptStore, home, log }) : null;
+  if (resumed) return resumed;
+  let attemptResult = null;
+  const submitAttempt = attemptStore
+    ? async ({ providerId, impl, attempt, augment }) => {
+        const client = providerAttempts.inProcessClient(providerId, impl);
+        const instance = executionInstance();
+        const spec = { ...attempt, execution_id: held.executionId, fence: held.fence, attempt_id: instance };
+        // `machine` binds the persisted submit to THIS box: a `local`
+        // environment (and the run records its key -> handle table lives in)
+        // exists here alone, so a takeover on another box must read the
+        // attempt as orphaned, never re-send its key and launch a second run.
+        attemptResult = await providerAttempts.submitAttempt({
+          store: attemptStore, executionId: held.executionId, fence: held.fence, attempt: 1, client,
+          key: providerAttempts.mintSubmitKey({ executionId: held.executionId, attempt: 1, fence: held.fence, instance }),
+          request: { attempt: spec, machine: os.hostname() }, augment, log,
+        });
+        if (attemptResult.handle != null) {
+          PROVIDER_ATTEMPTS.set(held.executionId, { store: attemptStore, fence: held.fence, attempt: 1, client, node_id: item.id, handle: attemptResult.handle, key: attemptResult.key || null, env: attemptResult.env || null });
+        }
+        return attemptResult;
+      }
+    : null;
+  const launched = await dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { recordFields: { ...(held.recordFields || {}), ...(gateFactory || {}) }, ...(submitAttempt ? { submitAttempt } : {}), ...dispatchOpts });
+  // Unknown acceptance HOLDS: the submit key is on the record and an
+  // environment may exist, so the execution and its hold stand and the next
+  // dispatch of this item reconciles under the persisted key (above) instead
+  // of ending the execution and launching afresh.
+  if (!launched.ok && attemptResult && attemptResult.held) {
+    return { ok: false, held: true, reason: `${item.id} — ${attemptResult.reason}` };
+  }
   // The store's copy of the launch (task-spor-client-execution-store-adapter):
   // the attempt row learns its run id, or — I2 — the execution is ended with
   // the hold, so neither the item pointer nor a server's resolving-edge gate
@@ -11616,6 +11655,82 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
     }
   }
   return launched;
+}
+
+// The attempts this PROCESS submitted or adopted through a provider
+// (task-spor-work-attempt-handle-adoption): execution id -> {store, fence,
+// attempt, client, node_id}. The per-pass sweep relays each one's observe()
+// as `attempt.observed` and keeps its node out of dispatch while its
+// environment is live.
+const PROVIDER_ATTEMPTS = new Map();
+
+// The providers whose attempts this worker can FOLLOW after a restart — today
+// the `local` provider alone, whose run records the loop harvests. An attempt
+// under any other provider is orphaned here (reported, held), never adopted
+// into a loop that has no way to see it end.
+function followableProviderIds(cfg) {
+  return executionProviders.knownProviderIds(cfg).filter((id) => id === "local");
+}
+
+// The `local` provider over this CLI's own launch helpers — the same host
+// lib/shell/dispatch.js hands it.
+function localExecutionProvider(cfg) {
+  return executionProviders.createProvider("local", { cfg, host: { err, out, createDispatchWorktree, removeDispatchWorktree, launchSupervisedHarness } });
+}
+
+// Adopt (or reconcile, or refuse as orphaned) the provider attempt a
+// re-claimed execution already records — dispatchWorkItem's first step after
+// the claim. Returns null when there is nothing recorded (or a recorded submit
+// key the provider never acted on, which the ordinary dispatch below then
+// re-sends under the PERSISTED key), else the dispatch verdict to hand the
+// loop: an adopted run (`ok`, nothing launched), or a hold that is neither a
+// refusal to cool-and-withdraw nor a launch.
+async function resumeProviderAttempt(cfg, { item, held, store, home, log = () => {} }) {
+  const got = await store.get(held.executionId);
+  const row = providerAttempts.providerRow(got && got.ok ? got.execution : null, 1);
+  if (!row) return null;
+  const configured = followableProviderIds(cfg);
+  if (!configured.includes(row.id)) {
+    return { ok: false, held: true, orphaned: true, reason: `${item.id} — attempt 1 of execution ${held.executionId} runs under provider '${row.id}', which this worker cannot follow (it follows: ${configured.join(", ")}); left held for a worker that can, never re-dispatched here` };
+  }
+  if (providerAttempts.foreignMachine(row, os.hostname())) {
+    return { ok: false, held: true, orphaned: true, reason: `${item.id} — attempt 1 of execution ${held.executionId} was submitted to the ${row.id} provider on ${row.request.machine}, not this box; its environment is only visible there, so it is left held, never re-sent from here` };
+  }
+  const client = providerAttempts.inProcessClient("local", localExecutionProvider(cfg).impl);
+  // A submit key with no run behind it was never acted on: the ordinary
+  // dispatch re-sends it (with the live launch) under the persisted key.
+  if (row.handle == null && !(await client.lookup(row.idempotency_key))) return null;
+  const r = await providerAttempts.submitAttempt({ store, executionId: held.executionId, fence: held.fence, attempt: 1, client, log });
+  if (!r.ok) return { ok: false, held: true, reason: `${item.id} — ${r.reason}` };
+  const runId = r.handle && r.handle.id;
+  const rec = runId ? dispatchRuns.readRecord(home, runId) : null;
+  if (!rec || dispatchRuns.TERMINAL_STATES.has(rec.state)) {
+    // The environment already ended: its pipeline is the resume scan's
+    // (openPipelines, by the run's `gate_factory` stamp), never a re-launch.
+    return { ok: false, held: true, reason: `${item.id} — the attempt execution ${held.executionId} records (run ${runId || "?"}) has ${rec ? `ended (${rec.state})` : "no run record"}; left to the pipeline resume` };
+  }
+  // The fence moved with the re-claim: the run's claim pins carry the new one,
+  // so the pipeline that judges this run writes under a fence that holds.
+  const claim = held.recordFields && held.recordFields.impl_claim;
+  if (rec.impl_claim && claim) {
+    try {
+      dispatchRuns.stampImplState(home, runId, { impl_claim: { ...rec.impl_claim, fence: claim.fence, lease_expires_at: claim.lease_expires_at, worker: claim.worker, machine: claim.machine } });
+    } catch {
+      /* best effort — the heartbeat re-reads the store's fence */
+    }
+  }
+  PROVIDER_ATTEMPTS.set(held.executionId, { store, fence: held.fence, attempt: 1, client, node_id: item.id });
+  log(`work: ${item.id} — adopted the live local attempt (run ${String(runId).slice(0, 8)}) execution ${held.executionId} already records${r.reconciled ? ", reconciled under its persisted submit key" : ""}; nothing re-dispatched`);
+  return { ok: true, adopted: true, run: { run_id: runId, harness: rec.harness || null, launch_mode: rec.launch_mode || null, node_id: item.id, record_path: dispatchRuns.runPaths(home, runId).record } };
+}
+
+// The work loop's per-pass provider-attempt sweep (`deps.providerAttempts`):
+// relay every owned attempt's observe() and report the nodes to keep out of
+// dispatch — the owned ones while live, and every live execution's attempt
+// under a provider this box does not run.
+async function providerAttemptSweep(cfg, { home = cfg.userConfigHome(), log = () => {} } = {}) {
+  const store = openExecutionStoreFor(cfg, { home, log });
+  return providerAttempts.sweepProviderAttempts({ store, owned: PROVIDER_ATTEMPTS, configured: followableProviderIds(cfg), machine: os.hostname(), log });
 }
 
 // Whether THIS machine can satisfy a loaded factory's integration
@@ -11725,7 +11840,7 @@ async function dispatchThroughLocked(cfg, values, positionals = [], opts = {}) {
     // opts.cmdDispatch: test-only seam, defaulting to the real cmdDispatch —
     // see dispatchWorkItem's cmdDispatchOverride.
     const runDispatch = opts.cmdDispatch || cmdDispatch;
-    code = await runDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true, unattended: true, allowAttended: !!opts.allowAttended, recordFields: opts.recordFields || null });
+    code = await runDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true, unattended: true, allowAttended: !!opts.allowAttended, recordFields: opts.recordFields || null, ...(opts.submitAttempt ? { submitAttempt: opts.submitAttempt } : {}) });
   } catch (e) {
     // A throw AFTER the launch (the post-launch session capture and bind are
     // network calls) still means an agent is running and holding a lease —
@@ -17803,7 +17918,7 @@ function worker() {
       loadedCodeCommit, makeCodeMovedNotice, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, makeFactoryAvailabilityCheck, pollWorkRuns,
       reconcileCompletions, reconcileWithdrawnExecutions, renewLiveExecutions, replayAttestationDebts,
       resolveDir, retryOneEscalation, runGateAndIntegration, takeProjectWarning,
-      targetRepoDispatchCfg, warnQueueProjectOnce, workerAlive, gcExecutionsDue,
+      targetRepoDispatchCfg, warnQueueProjectOnce, workerAlive, gcExecutionsDue, providerAttemptSweep,
     });
   }
   return _worker;
@@ -21139,7 +21254,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { gcExecutionsDue, gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess, createDispatchWorktree, removeDispatchWorktree };
+module.exports = { resumeProviderAttempt, providerAttemptSweep, gcExecutionsDue, gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess, createDispatchWorktree, removeDispatchWorktree };
 
 if (require.main === module) {
   main()

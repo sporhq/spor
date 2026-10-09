@@ -580,3 +580,42 @@ test("a record the local provider closes carries the outcome dimension: cancelle
   await req("release", { handle: e.handle });
   assert.strictEqual(provider.environments(), 0);
 });
+
+test("a restarted local provider adopts what an earlier process submitted: lookup and submit by the persisted key, observe and release by handle — one run (task-spor-work-attempt-handle-adoption)", async () => {
+  const { home, cfg, provider, driver } = conformanceSetup();
+  const base = {
+    contract_version: 1, attempt_id: "w:adopt", execution_id: `exec-${"c".repeat(16)}`, fence: 1, tenant: "t", node_id: "task-x",
+    harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: [],
+    repos: [{ slug: "conformance", commit: "b".repeat(40), branch: "x" }], egress: { allow: [] }, secrets: [],
+    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://x/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
+    isolation: "worktree", prompt_bundle_ref: "https://x.invalid/p.tar",
+  };
+  const attempt = driver.attempt(base, "hold");
+  const key = `exec-${"c".repeat(16)}/a1/1/w:adopt`;
+  const first = await provider.impl.submit({ attempt, idempotency_key: key });
+  const rec = dispatchRuns.readRecord(home, first.handle.id);
+  assert.strictEqual(rec.provider_attempt.idempotency_key, key, "the key rides the run record's creation write");
+  assert.strictEqual(rec.provider_attempt.attempt.execution_id, base.execution_id);
+  assert.strictEqual("local" in rec.provider_attempt.attempt, false, "the live launch block is never persisted");
+
+  // The "restart": a fresh provider instance with an empty handle table.
+  const host = { out() {}, err() {}, createDispatchWorktree: cli.createDispatchWorktree, removeDispatchWorktree: cli.removeDispatchWorktree, launchSupervisedHarness: cli.launchSupervisedHarness };
+  const again = createLocalProvider({ cfg, host });
+  const found = again.impl.lookup({ idempotency_key: key });
+  assert.deepStrictEqual(found && found.handle, first.handle);
+  assert.strictEqual(again.impl.lookup({ idempotency_key: "never-submitted-key" }), null);
+  const resent = await again.impl.submit({ attempt: driver.attempt(base, "hold"), idempotency_key: key });
+  assert.strictEqual(resent.existing, true);
+  assert.deepStrictEqual(resent.handle, first.handle);
+  assert.strictEqual(dispatchRuns.readRunRecords(home).length, 1, "no second run was launched");
+  let obs;
+  for (let i = 0; i < 600; i++) {
+    obs = await again.impl.observe({ handle: first.handle });
+    if (obs.state === "running") break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.strictEqual(obs.state, "running");
+  const rel = await again.impl.release({ handle: first.handle });
+  assert.deepStrictEqual(rel, { released: true, worktree: { removed: true } });
+  assert.ok(dispatchRuns.TERMINAL_STATES.has(dispatchRuns.readRecord(home, first.handle.id).state));
+});
