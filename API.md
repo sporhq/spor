@@ -420,9 +420,23 @@ out. Input:
 {
   "text":    "2-3 standalone sentences — the fact, what + why",
   "project": "optional project slug",
-  "during":  "optional node id the work was discovered during (provenance)"
+  "during":  "optional node id the work was discovered during (provenance)",
+  "idempotency_key": "optional client-chosen key; REUSE it on every retry"
 }
 ```
+
+`idempotency_key` is the MCP twin of `POST /v1/capture`'s
+`idempotency_key` / `Idempotency-Key` (§3), checked against the SAME
+identity-scoped record, so a retry may even cross doors (MCP then REST, or the
+reverse): a key this caller has already completed replays the original result
+instead of re-running the ingestion model and minting a duplicate. A host
+must mint the key once per logical capture and send the SAME key on every
+retry of it — the server derives no key from the JSON-RPC request id, because
+hosts mint a fresh request id on each retry
+(dec-spor-mcp-capture-explicit-idempotency-key-only). The key grammar is the
+REST one (`^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$`); an absent or invalid key runs
+the capture unguarded, and a `busy` refusal of a capture is `retryable: true`
+only when it carried a valid key (§5).
 
 The server-side ingestion model drafts node(s) against the live registry and
 the similarity-ranked node index; the deterministic half validates (one
@@ -852,7 +866,7 @@ agent subject sees no graph content; a coarse read-only/CI flag is not a bypass.
 | `POST /v1/admin/tokens` `{person, expires?}` | onboarding; `spor invite` | mint a PAT bound to an existing person node (`expires` is `<N>d` or an ISO date) → 201 `{token, hash_prefix, person, name, email, expires}`; the plaintext `token` is returned **once**. Admin-only. Binds someone *else* (onboarding); the self-serve mint is `POST /v1/me/tokens` above |
 | `DELETE /v1/admin/tokens/{hash-prefix}` | offboarding / rotation; `spor admin token revoke` (= `spor token revoke --all`) | revoke the single PAT matching the hash prefix (≥8 hex chars; an ambiguous prefix is a 409) → `{revoked, hash_prefix}`. Admin-only. Revokes ANY token; the self-serve revoke (the caller's own) is `DELETE /v1/me/tokens/{hash-prefix}` above |
 | `GET /v1/agents` | `spor agent list` | list the agents the caller **owns** → `{agents: [{id, label, owner, spiffe, pubkey, status}], count}`; `?all=1` lists every agent (admin-only) |
-| `POST /v1/agents` `{label, id?, pubkey?}` | `spor agent create` | **self-serve** (NOT admin): create an `agent` node owned by the CALLER's bound person + its `owned-by` edge (owner is never payload-asserted; `id` derives from `label`) → 201 `{id, owner, spiffe, pubkey, status, revision}` (the shared `createAgentNode` body the admin door also runs). 409 dup id / 422 invalid / `403` if the caller maps to **no person node** (you need a subject to own one). The default door for `spor agent create`; the admin `POST /v1/admin/agents` is reached only by `--owner <other>` (task-spor-app-agents-self-serve-create) |
+| `POST /v1/agents` `{label, id?, pubkey?}` | `spor agent create` | **self-serve** (NOT admin): create an `agent` node owned by the CALLER's bound person + its `owned-by` edge (owner is never payload-asserted; `id` derives from `label`) → 201 `{id, owner, spiffe, pubkey, status, revision}` (the shared `createAgentNode` body the admin door also runs). 409 dup id / 422 invalid / `403` if the caller maps to **no person node** (you need a subject to own one) / `500 internal` with `error.landed_ids: [<agent id>]` when the agent node was written but not acknowledged durable — the node stands, so re-read it (`GET /v1/nodes/{id}`) rather than re-create (a re-create answers 409). The refusal names what stands ONLY as `landed_ids`; there is no boolean `landed` on it (issue-spor-idempotency-store-to-state-db). The default door for `spor agent create`; the admin `POST /v1/admin/agents` is reached only by `--owner <other>` (task-spor-app-agents-self-serve-create) |
 | `POST /v1/admin/agents` `{label, owner?, id?, pubkey?}` | `spor agent create --owner <other>`, onboarding | create an `agent` node + `owned-by` edge on behalf of ANOTHER person (`owner` defaults to the caller's person; `id` derives from `label`) → 201 `{id, owner, spiffe, pubkey, status, revision}`. 409 dup id / 422 invalid / 403 non-admin. Admin-only, same `stewards→root` gate as `/v1/admin/tokens`. The self-serve `POST /v1/agents` above is the owner=caller path |
 | `POST /v1/agents/{id}/token` `{session?, audience?, expires?, standing?, label?}` | `spor dispatch` (per-session), `spor agent token <id>` (standing) | **self-serve** (NOT admin), ownership-gated (the caller's person **owns** the agent — else `403`; `404` unknown agent). Two modes. **Per-session** (default): mint a short-TTL token scoped to agent `{id}` → 201 `{token, expires_at, agent, session}` (`session: null` when deferred); `session` is OPTIONAL (deferred binding, dec-spor-dispatch-bg-session-late-bind) — `spor dispatch` mints it deferred because `claude --bg` self-allocates the run session only at launch, then binds the real one via `POST /v1/agents/session` below; a caller `expires` may only SHORTEN the default TTL, never extend past the 7d cap; `422` on a malformed SUPPLIED `session`. **Standing** (`{standing:true}`, task-spor-app-standing-agent-pat): mint a long-lived agent-scoped `spor_pat_` — the durable `SPOR_TOKEN` a headless agent (Claude Code on the Web) runs under → 201 `{token, hash_prefix, agent, owner, label, expires, standing:true}`; user-set `expires` defaults to and is **capped at 1 year** (a past/beyond-cap date is `422`, rejected not clamped), `label` is an optional ≤200-char note, a supplied `session` is `422` (a standing credential carries none); listable/revocable via `/v1/agents/{id}/tokens` below. Both modes: a write under the token is stamped agent-on-behalf-of-person (§1) |
 | `GET /v1/agents/{id}/tokens` | `spor agent token <id> list` | list the agent's STANDING PATs → `{tokens: [{hash_prefix, label, standing, created, expires, expired, last_used, …}], count}` (short per-session dispatch tokens are excluded — they age out on their own). Same OWNERSHIP gate as the mint (the agent's owner — else `403`; `404` unknown agent) |
@@ -1084,6 +1098,22 @@ Codes and their HTTP statuses: `unauthorized` 401, `forbidden` 403,
 429, `too_large` 413, `ingestion_unavailable` 503, `unimplemented` 501,
 `busy` 503, `internal` 500. Hooks never parse error bodies — any non-200
 means "behave as if the graph is empty" (§6).
+
+Beyond `code`/`message`/`details`, some refusals carry extra fields on the
+error object; each has ONE type:
+
+| field | type | carried by |
+|---|---|---|
+| `retryable`, `retry_after` | boolean, number (seconds) | `busy` (below); `partial_unsaved` (`retryable: false`) |
+| `landed` | string array | a capture's `503 partial_unsaved` only: the ids of the drafts that landed (§3 `POST /v1/capture`). Never a boolean |
+| `landed_ids` | string array | a node-write refusal whose node file(s) stand anyway — today the not-durable `500 internal` of `POST /v1/agents`: read those ids as written, never as "nothing landed". (A REST `503 partial_rollback` names what stands only in its `message`; its envelope carries no `landed_ids`.) |
+| `ids`, `nodes`, `deferred`, `deferred_drafts` | arrays | a capture's `503 partial_unsaved` (§3) |
+
+An older server answered the agent-create refusal with a boolean `landed:
+true`; a client reading "did it land" checks `landed_ids` (and, for a
+per-entry `POST /v1/nodes` batch result, which is a store result rather than
+this envelope, either `landed: true` or its id among `landed_ids` —
+`lib/shell/busy.js` `entryLanded`).
 
 `503 busy` is the server's **retryable** refusal: its state store lost a
 write lock under the serving loop's budget, or its shared buffered-body
