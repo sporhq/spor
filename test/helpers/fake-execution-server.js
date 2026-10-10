@@ -9,6 +9,10 @@
 // The oracle a test reads is `requests` (method, path, body, bearer) — what
 // the client actually sent — and the state files under `home`. Knobs:
 //   down       refuse connections (a partition): the socket is destroyed
+//              — but only while this process's event loop runs: a CLI
+//              driven through spawnSync blocks the loop, so the server never
+//              destroys anything and the CLI hangs to its own timeout. Drive
+//              any test against this server with an async spawn.
 //   unserved   answer 404 with no error envelope on every /v1/executions route
 //              (a front door with no such route)
 //   unservedEnveloped  answer the server router's own route-miss — 404 with

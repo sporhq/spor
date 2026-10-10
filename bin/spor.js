@@ -1763,6 +1763,54 @@ function chunkPutEntries(wire) {
   return chunks;
 }
 
+// The one chunked remote batch put behind `spor put-node --dir` and
+// reconcile-landed: entries ({id, node, wire}) go out in order, chunked by
+// chunkPutEntries, through POST /v1/nodes. -> one result per entry, in entry
+// order. An entry the server answered gets its per-entry result (a retried
+// `skipped` reconciled against the node it re-reads as); a failed chunk STOPS
+// the batch, since a later chunk can depend on an entry in this one:
+//   - no response (transport): its entries are "not confirmed" — the write
+//     may have landed;
+//   - a whole-request 4xx with no per-entry results (401, 413, …): the server
+//     refused the request before handling any entry, so they definitely did
+//     NOT land — "rejected", with the server's own error message — unless an
+//     earlier attempt of the same request was lost, which may have landed it;
+//   - anything else without per-entry results (a 5xx): "not confirmed".
+// Every later entry is "not sent". `write` is the re-run hint a transport
+// failure carries; `report`, when given, receives the failed chunk's reason
+// (put-node prints it; reconcile-landed's callers log the per-entry messages).
+async function putNodesRemoteChunked(cfg, entries, { write, report = null }) {
+  const results = [];
+  for (const chunk of chunkPutEntries(entries.map((e) => e.wire))) {
+    const batch = entries.slice(results.length, results.length + chunk.length);
+    const r = await remote.post(cfg, "/v1/nodes", { nodes: chunk }, { timeoutMs: Math.min(120000, 15000 + 1000 * chunk.length) });
+    const rs = r.json && Array.isArray(r.json.results) ? r.json.results : null;
+    if (r.transport || !rs) {
+      const msg = r.json && r.json.error && r.json.error.message;
+      const definite = !r.transport && !r.earlierAttemptUnknown && r.status >= 400 && r.status < 500;
+      const why = r.transport ? remote.describeTransport(r, { write }) : `put-node error ${r.status}${msg ? `: ${msg}` : ": no per-entry results returned"}`;
+      if (report) report(why);
+      for (const e of entries.slice(results.length)) {
+        const label = !batch.includes(e) ? "not sent" : definite ? "rejected" : "not confirmed";
+        results.push({ ok: false, id: e.id, status: "error", message: `${label} (${why})` });
+      }
+      break;
+    }
+    for (let n = 0; n < batch.length; n++) {
+      const e = batch[n];
+      const res0 = rs[n];
+      if (res0 && res0.ok) {
+        // a `skipped` re-send may be the lost attempt's own create
+        results.push(res0.status === "skipped" && r.earlierAttemptUnknown ? await reconcileRetriedSkip(cfg, e.node, res0) : res0);
+      } else {
+        const detail = res0 ? putNodeEntryDetail(res0) : "no result returned for this entry";
+        results.push({ ...(res0 || {}), ok: false, id: e.id, status: "error", message: `${r.status}${detail ? `: ${detail}` : ""}` });
+      }
+    }
+  }
+  return results;
+}
+
 function readPutNodeBatch(values, input) {
   if (values.dir) {
     let names;
@@ -1855,41 +1903,16 @@ async function cmdPutNodeBatch(cfg, values, docs, policy) {
   };
 
   if (isRemote) {
-    const byId = new Map(ordered.map((e) => [e.id, e]));
-    const wire = ordered.map((e) => (values.spill ? { node: e.raw, if_exists: policy, spill: true } : { node: e.raw, if_exists: policy }));
-    let sent = 0;
-    for (const chunk of chunkPutEntries(wire)) {
-      const batch = ordered.slice(sent, sent + chunk.length);
-      const r = await remote.post(cfg, "/v1/nodes", { nodes: chunk }, { timeoutMs: Math.min(120000, 15000 + 1000 * chunk.length) });
-      const rs = r.json && Array.isArray(r.json.results) ? r.json.results : null;
-      if (r.transport || !rs) {
-        const why = r.transport
-          ? remote.describeTransport(r, { write: "re-run with --if-exists skip" })
-          : `put-node error ${r.status}${r.json && r.json.error && r.json.error.message ? `: ${r.json.error.message}` : ""}`;
-        err(why);
-        // outcome unknown for this chunk (a transport failure may have landed
-        // it) and nothing after it was sent: re-run with --if-exists skip.
-        for (const e of ordered.slice(sent)) record(e, { ok: false, id: e.id, status: "error", message: `not confirmed (${why})` });
-        sent = ordered.length;
-        break;
+    const wire = (e) => (values.spill ? { node: e.raw, if_exists: policy, spill: true } : { node: e.raw, if_exists: policy });
+    const rs = await putNodesRemoteChunked(cfg, ordered.map((e) => ({ id: e.id, node: e.node, wire: wire(e) })), { write: "re-run with --if-exists skip", report: err });
+    for (let n = 0; n < ordered.length; n++) {
+      const e = ordered[n];
+      const res = rs[n];
+      if (res.ok && res.status === "created" && carriesPriority(e.node)) {
+        const stamp = await stampCreatedPriorityIfNeeded(cfg, e.node, res.id || e.id);
+        if (stamp) res.priority_stamp = stamp;
       }
-      for (let n = 0; n < batch.length; n++) {
-        const e = batch[n];
-        const res0 = rs[n];
-        if (res0 && res0.ok) {
-          const node = byId.get(e.id).node;
-          const res = res0.status === "skipped" && r.earlierAttemptUnknown ? await reconcileRetriedSkip(cfg, node, res0) : res0;
-          if (res.status === "created" && carriesPriority(node)) {
-            const stamp = await stampCreatedPriorityIfNeeded(cfg, node, res.id || e.id);
-            if (stamp) res.priority_stamp = stamp;
-          }
-          record(e, res);
-        } else {
-          const detail = res0 ? putNodeEntryDetail(res0) : "no result returned for this entry";
-          record(e, { ...(res0 || {}), ok: false, id: e.id, status: "error", message: `${r.status}${detail ? `: ${detail}` : ""}` });
-        }
-      }
-      sent += chunk.length;
+      record(e, res);
     }
   } else {
     // Local is all-or-nothing: every entry is prepared (collision policy,
@@ -2267,8 +2290,12 @@ async function loadLandedGraph(cfg, exportOpts = {}) {
 }
 
 // Write complete node markdown with `if_exists: skip`, through the same
-// validated doors `spor put-node` uses. -> [{id, ok, status, message?}]
-async function putNodesSkip(cfg, raws) {
+// validated doors `spor put-node` uses. `dependsOn` maps an id to the id it
+// names that must land first (a finding to its draft): remotely the dependent
+// is sent only once its dependency confirmed landed; locally the batch is
+// all-or-nothing, which already holds the rule. -> [{id, ok, status,
+// message?}] in input order
+async function putNodesSkip(cfg, raws, { dependsOn = new Map() } = {}) {
   const nodes = [];
   for (const raw of raws) {
     const parsed = parsePutNode(raw, "reconcile-landed.md");
@@ -2277,31 +2304,34 @@ async function putNodesSkip(cfg, raws) {
   }
   if (!nodes.length) return [];
   if (cfg.mode() === "remote") {
-    const results = [];
-    for (const chunk of chunkPutEntries(nodes.map((n) => ({ node: n.raw, if_exists: "skip" })))) {
-      const batch = nodes.slice(results.length, results.length + chunk.length);
-      const r = await remote.post(cfg, "/v1/nodes", { nodes: chunk }, { timeoutMs: Math.min(120000, 15000 + 1000 * chunk.length) });
-      const rs = r.json && Array.isArray(r.json.results) ? r.json.results : null;
-      if (r.transport || !rs) {
-        // As cmdPutNodeBatch: this chunk's outcome is unknown (a transport
-        // failure may have landed it) and nothing after it is sent — a later
-        // chunk can carry a finding whose draft sat in this one, and a
-        // finding must never name a draft that did not land. Every write is
-        // `if_exists: skip`, so a re-run settles the lot.
-        const why = r.transport ? remote.describeTransport(r, { write: "re-run (every write is --if-exists skip)" }) : `${r.status}: no per-entry results returned`;
-        for (const n of nodes.slice(results.length)) results.push({ id: n.node.id, ok: false, status: "error", message: batch.includes(n) ? `not confirmed (${why})` : `not sent (${why})` });
-        break;
-      }
-      for (let i = 0; i < batch.length; i++) {
-        const n = batch[i];
-        let res = rs[i];
-        // a `skipped` re-send may be the lost attempt's own create
-        if (res && res.ok && res.status === "skipped" && r.earlierAttemptUnknown) res = await reconcileRetriedSkip(cfg, n.node, res);
-        if (res && res.ok) results.push({ id: n.node.id, ok: true, status: res.status || "ok", ...(res.note ? { note: res.note } : {}) });
-        else results.push({ id: n.node.id, ok: false, status: "error", message: `${r.status}${res ? `: ${putNodeEntryDetail(res)}` : ": no result returned for this entry"}` });
-      }
+    // The server handles each entry independently, so a dependent sent in
+    // the same request as its dependency could land while the dependency is
+    // rejected. Send everything with no dependency first, then only the
+    // dependents whose dependency confirmed landed. A transport failure stops
+    // the batch (putNodesRemoteChunked); every write is `if_exists: skip`, so
+    // a re-run settles the lot.
+    const write = "re-run (every write is --if-exists skip)";
+    const send = async (list) => {
+      const rs = await putNodesRemoteChunked(cfg, list.map((n) => ({ id: n.node.id, node: n.node, wire: { node: n.raw, if_exists: "skip" } })), { write });
+      return list.map((n, i) => {
+        const res = rs[i];
+        if (res.ok) return { id: n.node.id, ok: true, status: res.status || "ok", ...(res.note ? { note: res.note } : {}) };
+        return { id: n.node.id, ok: false, status: "error", message: res.message };
+      });
+    };
+    const byId = new Map();
+    const first = nodes.filter((n) => !dependsOn.has(n.node.id));
+    for (const x of await send(first)) byId.set(x.id, x);
+    const ready = [];
+    for (const n of nodes) {
+      if (!dependsOn.has(n.node.id)) continue;
+      const dep = dependsOn.get(n.node.id);
+      const d = byId.get(dep);
+      if (d && d.ok) ready.push(n);
+      else byId.set(n.node.id, { id: n.node.id, ok: false, status: "error", message: `not sent — ${dep} did not land${d && d.message ? ` (${d.message})` : ""}` });
     }
-    return results;
+    for (const x of await send(ready)) byId.set(x.id, x);
+    return nodes.map((n) => byId.get(n.node.id));
   }
   const nodesDir = cfg.nodesDir();
   let identity;
@@ -2343,7 +2373,8 @@ async function reconcileLanded(cfg, { dir, ref = null, tip = null, since = null,
     }));
     // Draft first, then its finding: a finding never names a draft that did
     // not land.
-    const results = dryRun ? [] : await putNodesSkip(cfg, rendered.flatMap(({ r }) => [r.draft, r.finding]));
+    const dependsOn = new Map(rendered.map(({ r }) => [r.findingId, r.draftId]));
+    const results = dryRun ? [] : await putNodesSkip(cfg, rendered.flatMap(({ r }) => [r.draft, r.finding]), { dependsOn });
     const byId = new Map(results.map((x) => [x.id, x]));
     return {
       ok: !results.some((x) => !x.ok),

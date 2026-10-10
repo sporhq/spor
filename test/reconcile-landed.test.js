@@ -325,9 +325,10 @@ test("remote mode reads the team graph from /v1/export and writes the pair throu
     const r = await runAsync(home, ["reconcile-landed", "--dir", repo], { SPOR_SERVER: `http://127.0.0.1:${srv.address().port}`, SPOR_TOKEN: "t" });
     assert.strictEqual(r.status, 0, r.stderr + r.stdout);
     assert.match(r.stdout, /filed: find-shipped-on-main-task-remote/);
-    assert.strictEqual(posts.length, 1);
-    assert.deepStrictEqual(posts[0].nodes.map((n) => n.if_exists), ["skip", "skip"]);
-    assert.deepStrictEqual(posts[0].nodes.map((n) => /\nid: (\S+)/.exec(n.node)[1]), ["art-shipped-task-remote", "find-shipped-on-main-task-remote"], "draft before its finding");
+    // the draft is sent first, alone; its finding only once it landed
+    assert.strictEqual(posts.length, 2);
+    assert.deepStrictEqual(posts.flatMap((p) => p.nodes.map((n) => n.if_exists)), ["skip", "skip"]);
+    assert.deepStrictEqual(posts.map((p) => p.nodes.map((n) => /\nid: (\S+)/.exec(n.node)[1])), [["art-shipped-task-remote"], ["find-shipped-on-main-task-remote"]], "draft before its finding");
   } finally {
     srv.close();
   }
@@ -337,7 +338,7 @@ test("remote mode reads the team graph from /v1/export and writes the pair throu
 // wire has an unknown outcome, and nothing after it is sent — a later chunk
 // could carry a finding whose draft sat in the failed one (as put-node's
 // batch does). Every write is if_exists: skip, so a re-run settles the lot.
-test("remote mode: a chunk that fails on the wire stops the batch — its entries unconfirmed, the rest not sent", async () => {
+test("remote mode: a chunk that fails on the wire stops the batch — its drafts unconfirmed, their findings never sent", async () => {
   const { home, nodes, repo } = scratch();
   const ids = Array.from({ length: 51 }, (_, i) => `task-chunk-${String(i).padStart(2, "0")}`);
   for (const id of ids) node(nodes, id);
@@ -365,15 +366,90 @@ test("remote mode: a chunk that fails on the wire stops the batch — its entrie
   try {
     const r = await runAsync(home, ["reconcile-landed", "--dir", repo, "--json"], { SPOR_SERVER: `http://127.0.0.1:${srv.address().port}`, SPOR_TOKEN: "t" });
     assert.strictEqual(r.status, 1, r.stderr + r.stdout);
-    // the first chunk (100 entries) is attempted twice (the one stale-socket
-    // re-send skip-only writes get); the second chunk is never sent
+    // the drafts go first (one chunk of 51), attempted twice (the one
+    // stale-socket re-send skip-only writes get); no finding is ever sent
     assert.strictEqual(posts, 2, "nothing after the failed chunk is sent");
     const out = JSON.parse(r.stdout);
-    const entries = out.hits.flatMap((h) => [h.draft, h.finding]);
-    assert.strictEqual(entries.length, 102);
-    assert.ok(entries.slice(0, 100).every((e) => !e.ok && /^not confirmed \(connection to server failed/.test(e.message)), JSON.stringify(entries[0]));
-    assert.ok(entries.slice(100).every((e) => !e.ok && /^not sent \(/.test(e.message)), JSON.stringify(entries[101]));
+    assert.strictEqual(out.hits.length, 51);
+    assert.ok(out.hits.every((h) => !h.draft.ok && /^not confirmed \(connection to server failed/.test(h.draft.message)), JSON.stringify(out.hits[0].draft));
+    assert.ok(out.hits.every((h) => !h.finding.ok && h.finding.message.startsWith(`not sent — ${h.draftId} did not land`)), JSON.stringify(out.hits[0].finding));
     assert.doesNotMatch(r.stdout + r.stderr, /offline/);
+  } finally {
+    srv.close();
+  }
+});
+
+// issue-spor-reconcile-landed-finding-without-draft: the server handles each
+// entry of a POST independently, so a finding sent beside its draft could
+// land while the draft is rejected. Drafts go first; a finding is sent only
+// once its own draft confirmed landed.
+function remoteGraph(ids) {
+  const { home, nodes, repo } = scratch();
+  for (const id of ids) node(nodes, id);
+  commit(repo, "fixes", ids.map((id) => `Spor: ${id}`).join("\n"));
+  const tar = require("../lib/tar.js");
+  const tarball = tar.exportNodesDir(nodes).buffer;
+  fs.rmSync(nodes, { recursive: true, force: true });
+  return { home, repo, tarball };
+}
+async function serveNodes(tarball, onPost) {
+  const posts = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/v1/export")) {
+        res.writeHead(200, { "Content-Type": "application/x-tar" });
+        return res.end(tarball);
+      }
+      if (req.method === "POST" && req.url === "/v1/nodes") {
+        const ids = JSON.parse(body).nodes.map((n) => /\nid: (\S+)/.exec(n.node)[1]);
+        posts.push(ids);
+        const [status, reply] = onPost(ids);
+        res.writeHead(status, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify(reply));
+      }
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "not_found", message: req.url } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  return { srv, posts, env: { SPOR_SERVER: `http://127.0.0.1:${srv.address().port}`, SPOR_TOKEN: "t" } };
+}
+
+test("remote mode: a finding is never sent when its draft was rejected in the same pass", async () => {
+  const { home, repo, tarball } = remoteGraph(["task-good", "task-bad"]);
+  const { srv, posts, env } = await serveNodes(tarball, (ids) => [200, {
+    results: ids.map((id) => (id === "art-shipped-task-bad"
+      ? { ok: false, id, status: "error", code: "invalid_node", message: "rejected for the test" }
+      : { ok: true, id, status: "created" })),
+  }]);
+  try {
+    const r = await runAsync(home, ["reconcile-landed", "--dir", repo, "--json"], env);
+    assert.strictEqual(r.status, 1, r.stderr + r.stdout);
+    assert.strictEqual(posts.length, 2);
+    assert.deepStrictEqual(posts[0].slice().sort(), ["art-shipped-task-bad", "art-shipped-task-good"], "drafts first, alone");
+    assert.deepStrictEqual(posts[1], ["find-shipped-on-main-task-good"], "only the finding whose draft landed");
+    const hits = Object.fromEntries(JSON.parse(r.stdout).hits.map((h) => [h.id, h]));
+    assert.strictEqual(hits["task-good"].finding.status, "created");
+    assert.ok(!hits["task-bad"].draft.ok && /rejected for the test/.test(hits["task-bad"].draft.message));
+    assert.match(hits["task-bad"].finding.message, /^not sent — art-shipped-task-bad did not land \(\d+: rejected for the test/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("remote mode: a whole-request 4xx with no per-entry results reads as rejected (did not land), with the server's message", async () => {
+  const { home, repo, tarball } = remoteGraph(["task-unauth"]);
+  const { srv, posts, env } = await serveNodes(tarball, () => [401, { error: { code: "unauthorized", message: "token expired" } }]);
+  try {
+    const r = await runAsync(home, ["reconcile-landed", "--dir", repo, "--json"], env);
+    assert.strictEqual(r.status, 1, r.stderr + r.stdout);
+    assert.strictEqual(posts.length, 1, "the finding is never sent");
+    const h = JSON.parse(r.stdout).hits[0];
+    assert.strictEqual(h.draft.message, "rejected (put-node error 401: token expired)");
+    assert.doesNotMatch(h.draft.message, /not confirmed/);
+    assert.match(h.finding.message, /^not sent — art-shipped-task-unauth did not land/);
   } finally {
     srv.close();
   }
