@@ -6275,6 +6275,9 @@ async function loginViaDevice(cfg, { server, org, scope, noOpen }) {
     }
     const e = r.json && r.json.error;
     if (e === "authorization_pending") continue;
+    // The server's state store stayed busy past devicePoll's own bounded
+    // re-sends: the device_code is unspent, so keep polling.
+    if (e === "temporarily_unavailable") continue;
     if (e === "slow_down") {
       pollMs += 5000;
       continue;

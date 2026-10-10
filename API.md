@@ -1082,12 +1082,33 @@ Codes and their HTTP statuses: `unauthorized` 401, `forbidden` 403,
 `not_found` 404, `conflict` 409, `transition_denied` 409, `lease_expired` 409,
 `outcome_conflict` 409, `not_ready` 409, `invalid_node` 422, `rate_limited`
 429, `too_large` 413, `ingestion_unavailable` 503, `unimplemented` 501,
-`internal` 500. Hooks never parse error bodies — any non-200 means "behave
-as if the graph is empty" (§6).
+`busy` 503, `internal` 500. Hooks never parse error bodies — any non-200
+means "behave as if the graph is empty" (§6).
+
+`503 busy` is the server's **retryable** refusal: its state store lost a
+write lock under the serving loop's budget, or its shared buffered-body
+budget is exhausted by concurrent uploads (a body over its own route cap
+still gets `413 too_large`). It writes nothing and carries `Retry-After`
+(seconds). The OAuth endpoints answer the same condition `503
+{"error": "temporarily_unavailable"}` + `Retry-After` (an authorization code,
+device_code, or refresh token is spent only after its mint commits, so the
+retry succeeds), and an MCP tool call answers a structured `busy` tool error
+(`structuredContent: {error: "busy", retryable: true, retry_after}`). Any
+other `503` (`ingestion_unavailable`, a proxy mid-deploy) makes no such
+promise. The CLI (`lib/remote.js`, `lib/auth.js`) re-sends a busy refusal up
+to 3 times, each after its `Retry-After` (else 1s·2^n), capped at 5s per wait
+(`lib/shell/busy.js`) — but only a request safe to re-send: a GET/PUT/DELETE,
+a POST carrying an `idempotency_key` or marked idempotent, or a route whose
+re-send is idempotent by construction (`busyRetryable` in `lib/remote.js`:
+id-keyed `POST /v1/nodes` with its `if_exists`/revision CAS, edge adds,
+status/priority/readiness sets, releases, digest/batch reads, capability
+replaces, `PATCH /v1/nodes/{id}`). An appending POST (a capture without an
+idempotency key, a question, a token mint, a claim) reports the busy answer
+rather than re-sending it.
 
 A `429 rate_limited` response SHOULD carry a `Retry-After` header (delay
-seconds or an HTTP-date); clients honor it, otherwise backing off
-exponentially, capped, before retrying. Mechanical writers
+seconds or an HTTP-date); clients honor it (and a `503`'s), otherwise backing
+off exponentially, capped, before retrying. Mechanical writers
 (drain-outbox, distill) classify `401`/`403`, `400`, `413`, and `422` as
 **permanent** (one shared classifier, `classifyHttpFailure` in
 `scripts/engines/util.js`, which session-start also reads its banner from) — a revoked token will not un-revoke, so these are

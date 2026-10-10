@@ -1318,17 +1318,9 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Parse a Retry-After header to milliseconds. HTTP allows two forms: a
-// non-negative integer of seconds, or an HTTP-date. Returns null when the
-// header is absent or unparseable (caller falls back to exponential backoff).
-function parseRetryAfter(value) {
-  if (value == null || value === "") return null;
-  const secs = Number(value);
-  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
-  const when = Date.parse(value);
-  if (!Number.isNaN(when)) return Math.max(0, when - Date.now());
-  return null;
-}
+// Parse a Retry-After header to milliseconds (seconds or an HTTP-date; null
+// when absent/unparseable) — the one parser, shared with the CLI's busy retry.
+const { parseRetryAfter } = require(path.join(ROOT, "lib", "shell", "busy.js"));
 
 // Delay before the next retry: honor a server-supplied Retry-After when
 // present, else exponential backoff (250ms · 2^attempt). Always capped so a
@@ -1435,7 +1427,7 @@ function sleepUnless(ms, signal) {
 // names on iteration) — absent (undefined) on transport failure, since there
 // is no response to read it from. Like bare curl, redirects are not
 // followed. Transient failures (transport, 429, 5xx) are retried up to
-// `retry` times; between retries we honor a 429 Retry-After header and
+// `retry` times; between retries we honor a 429/503 Retry-After header and
 // otherwise back off exponentially (capped at backoffCapMs). With retry=0
 // (the session-start hook budget) no backoff ever runs. An optional `signal`
 // is a caller-owned DEADLINE layered over the per-call timeout: whichever
@@ -1471,7 +1463,10 @@ async function curl(
     const kind = classifyHttpFailure(res.status);
     const transient = kind === "rate-limit" || res.status >= 500;
     if (transient && canRetry) {
-      const retryAfterMs = kind === "rate-limit" ? parseRetryAfter(res.headers.get("retry-after")) : null;
+      // A 503 carries Retry-After when it is the server's retryable `busy` /
+      // `temporarily_unavailable` refusal (task-spor-client-honor-retry-after-
+      // on-503-busy); honor it like a 429's. Other 5xx back off exponentially.
+      const retryAfterMs = kind === "rate-limit" || res.status === 503 ? parseRetryAfter(res.headers.get("retry-after")) : null;
       await sleepUnless(backoffMs(attempt, retryAfterMs, backoffCapMs), signal);
       if (!(signal && signal.aborted)) continue;
     }
@@ -1550,7 +1545,7 @@ async function refreshBearer(sent) {
   const promise = (async () => {
     let fresh = null;
     try {
-      fresh = await require(path.join(ROOT, "lib", "remote.js")).refreshAfterAuthFailure(cfg);
+      fresh = await require(path.join(ROOT, "lib", "remote.js")).refreshAfterAuthFailure(cfg, { busyRetries: 0 });
     } catch {
       fresh = null;
     }
