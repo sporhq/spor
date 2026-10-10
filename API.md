@@ -1147,9 +1147,19 @@ busy marked `retryable: false` is dead-lettered unless it is a keyed capture,
 and a `/v1/nodes` `207` keeps exactly its busy entries spooled and
 dead-letters the refused ones instead of reading the whole file as drained; a
 `/v1/nodes` `2xx` whose per-entry `results` are missing or not one per entry
-keeps the whole batch spooled, never counted landed. A deferred-draft
-re-submit answered with a non-replayable busy is dead-lettered (drafts kept),
-not spooled for the drain. A dead-letter never overwrites an earlier one of
+keeps the whole batch spooled, never counted landed — but only up to 5 such
+results-less replies (counted per spooled file): the fifth dead-letters the
+batch to `outbox/dead/` for inspection instead of rotating it forever (a skip
+batch, so replaying it from there stays safe). The same holds for a reply
+whose `results` array is not one per entry sent. `infer-commits` hands a
+proposal capture it could not land to the outbox the same way: a transient
+failure (transport, `429`, `5xx`, including a non-replayable one) is spooled
+under a name derived from its `idempotency_key` for the drain to re-send, since
+the key makes the replay safe; a permanent one is dead-lettered. A
+deferred-draft re-submit answered with a non-replayable busy — a whole-chunk
+`5xx`, or, in `spor add`, an individual entry inside a 2xx whose own result is
+a busy with `retryable: false` — is dead-lettered to `outbox/dead/` (drafts
+kept), not spooled for the drain; the other unconfirmed drafts are spooled. A dead-letter never overwrites an earlier one of
 the same name (it takes a unique suffix, keeping its `.capture.json`/`.json`
 spool suffix), and one that cannot be written leaves the file spooled. The execution store reports a `busy` refusal as transient with
 `busy: true` (+ `retryable`/`retry_after`), never as the `unavailable`
