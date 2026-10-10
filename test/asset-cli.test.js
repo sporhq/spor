@@ -762,3 +762,39 @@ test("asset import (remote): busy and transport re-sends share one bounded budge
   await assert.rejects(assetLib.importRemote({ cfg: {}, remote: scripted([BUSY]), file: src, opts: { id: "art-shot" } }));
   assert.strictEqual(calls.length, 1 + busyLib.BUSY_MAX_RETRIES);
 });
+// issue-spor-hook-curl-retries-nonretryable-busy: the salted-key send spends
+// what the first send left, counted from exchange()'s own `attempts` — a 401
+// refresh's re-send (which runs the body factory again) is not budget.
+test("asset import (remote): a token refresh on the first send does not shrink the salted send's budget", async () => {
+  const busyLib = require("../lib/shell/busy.js");
+  const work = scratch("spor-asset-work-");
+  const src = path.join(work, "a.png");
+  fs.writeFileSync(src, SAMPLE);
+  const REUSED = { ok: false, status: 409, json: { error: { code: "idempotency_key_reused" } }, headers: {} };
+  const BUSY = { ok: false, status: 503, json: { error: { code: "busy", retryable: true, retry_after: 0 } }, headers: {} };
+  const keys = [];
+  const remote = {
+    token: () => "tok",
+    base: () => "http://x",
+    exchange: async (_cfg, _m, _p, o) => {
+      if (!keys.length) {
+        // the first send: a 401, a refresh, its re-send — two body reads, one attempt
+        o.body();
+        o.body();
+        keys.push(o.headers["idempotency-key"]);
+        return { ...REUSED, attempts: 1 };
+      }
+      let attempts = 0;
+      const r = await busyLib.withBusyRetry(async () => {
+        attempts++;
+        o.body();
+        keys.push(o.headers["idempotency-key"]);
+        return BUSY;
+      }, { retries: o.retries, replaySafe: true, sleep: async () => {} });
+      return { ...r, attempts };
+    },
+  };
+  await assert.rejects(assetLib.importRemote({ cfg: {}, remote, file: src, opts: { id: "art-shot" } }));
+  assert.strictEqual(keys.length - 1, 1 + busyLib.BUSY_MAX_RETRIES, "the salted key keeps the whole remaining budget");
+  assert.notStrictEqual(keys[1], keys[0]);
+});

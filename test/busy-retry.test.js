@@ -249,6 +249,89 @@ test("hook curl() honours a 503's Retry-After between retries", async () => {
   }
 });
 
+// issue-spor-hook-curl-retries-nonretryable-busy: the hook engines' curl()
+// defers to the server's replay verdict — a busy marked `retryable: false`
+// (an undeclared append) or a `partial_unsaved` is returned, never re-sent.
+test("hook curl() never re-sends a busy the server marked retryable: false", async () => {
+  const body = JSON.stringify({ error: { code: "busy", message: "retry shortly", retryable: false, retry_after: 0 } });
+  const s = await busyServer({ body });
+  try {
+    const r = await u.curl(`${s.url}/v1/capture`, { method: "POST", body: "{}", retry: 2, backoffCapMs: 1 });
+    assert.strictEqual(r.http, "503");
+    assert.strictEqual(s.seen.length, 1);
+    assert.strictEqual(JSON.parse(r.body).error.retryable, false);
+  } finally {
+    await s.close();
+  }
+});
+
+test("hook curl() never re-sends a partial_unsaved", async () => {
+  const body = JSON.stringify({ error: { code: "partial_unsaved", message: "draft landed", retryable: false } });
+  const s = await busyServer({ body });
+  try {
+    const r = await u.curl(`${s.url}/v1/capture`, { method: "POST", body: "{}", retry: 2, backoffCapMs: 1 });
+    assert.strictEqual(r.http, "503");
+    assert.strictEqual(s.seen.length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+test("hook curl() re-sends a busy marked retryable: true, paced by its body retry_after", async () => {
+  // retry_after 0.6s in the body beats a 0s header and curl's 250ms step
+  const body = JSON.stringify({ error: { code: "busy", message: "retry shortly", retryable: true, retry_after: 0.6 } });
+  const s = await busyServer({ body, retryAfter: "0" });
+  try {
+    const t0 = Date.now();
+    const r = await u.curl(`${s.url}/v1/nodes`, { method: "POST", body: "{}", retry: 1, backoffCapMs: 8000 });
+    assert.strictEqual(r.http, "200");
+    assert.strictEqual(s.seen.length, 2);
+    assert.ok(Date.now() - t0 >= 550, "waited the body's retry_after");
+  } finally {
+    await s.close();
+  }
+});
+
+test("hook curl() still re-sends a busy with no verdict (an older server) and a bare 5xx", async () => {
+  const s = await busyServer({ busyTimes: 2 });
+  try {
+    const r = await u.curl(`${s.url}/v1/queue`, { retry: 2, backoffCapMs: 1 });
+    assert.strictEqual(r.http, "200");
+    assert.strictEqual(s.seen.length, 3);
+  } finally {
+    await s.close();
+  }
+  const bare = await busyServer({ body: "<html>bad gateway</html>" });
+  try {
+    const r = await u.curl(`${bare.url}/v1/queue`, { retry: 1, backoffCapMs: 1 });
+    assert.strictEqual(r.http, "200");
+    assert.strictEqual(bare.seen.length, 2);
+  } finally {
+    await bare.close();
+  }
+});
+
+test("serverAllowsReplay reads the busy verdict and any stated retryable: false", () => {
+  assert.strictEqual(busy.serverAllowsReplay({ status: 503, json: { error: { code: "busy", retryable: false } } }), false);
+  assert.strictEqual(busy.serverAllowsReplay({ status: 503, json: { jsonrpc: "2.0", error: { code: -32000, data: { error: "busy", retryable: false } } } }), false);
+  assert.strictEqual(busy.serverAllowsReplay({ status: 503, json: { error: { code: "partial_unsaved" } } }), false);
+  assert.strictEqual(busy.serverAllowsReplay({ status: 500, json: { error: { code: "internal", retryable: false } } }), false);
+  assert.strictEqual(busy.serverAllowsReplay({ status: 503, json: { error: { code: "busy", retryable: true } } }), true);
+  assert.strictEqual(busy.serverAllowsReplay({ status: 503, json: { error: { code: "busy" } } }), true);
+  assert.strictEqual(busy.serverAllowsReplay({ status: 502, json: null }), true);
+});
+
+test("remote.exchange reports the attempts it spent", async () => {
+  const s = await busyServer({ busyTimes: 1, body: JSON.stringify({ error: { code: "busy", retryable: true, retry_after: 0 } }) });
+  try {
+    const r = await remoteLib.exchange(cfgFor(s.url), "GET", "/v1/assets/x/content", { timeoutMs: 5000 });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.attempts, 2);
+  } finally {
+    await s.close();
+  }
+});
+
 test("oauthPost busyRetries: 0 (the hook engines' refresh) does not re-send", async () => {
   const s = await busyServer({ body: JSON.stringify({ error: "temporarily_unavailable" }) });
   try {

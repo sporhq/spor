@@ -1133,7 +1133,12 @@ upload's one re-send after a connection reset shares that same bounded budget
 (at most 4 attempts per idempotency key, not a transport retry stacked on the
 busy ones; the per-caller salted key an `idempotency_key_reused` 409 falls
 back to spends only what the first key left, so 5 attempts per import at
-most). The execution store reports a `busy` refusal as transient with
+most). The hook engines' `curl()` (`scripts/engines/util.js`, the outbox
+drain's re-POST) re-sends transient failures within its own small budget but
+defers to the same verdict: a `5xx` whose error states `retryable: false` (a
+busy the server marked unsafe, a `partial_unsaved`) is returned at once and
+never re-sent, and a busy body's `retry_after` paces the wait ahead of
+`Retry-After`. The execution store reports a `busy` refusal as transient with
 `busy: true` (+ `retryable`/`retry_after`), never as the `unavailable`
 unserved surface a caller falls back to the local store for.
 

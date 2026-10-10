@@ -1320,7 +1320,8 @@ function sleep(ms) {
 
 // Parse a Retry-After header to milliseconds (seconds or an HTTP-date; null
 // when absent/unparseable) — the one parser, shared with the CLI's busy retry.
-const { parseRetryAfter } = require(path.join(ROOT, "lib", "shell", "busy.js"));
+const busy = require(path.join(ROOT, "lib", "shell", "busy.js"));
+const { parseRetryAfter } = busy;
 
 // Delay before the next retry: honor a server-supplied Retry-After when
 // present, else exponential backoff (250ms · 2^attempt). Always capped so a
@@ -1421,13 +1422,24 @@ function sleepUnless(ms, signal) {
   });
 }
 
+// JSON.parse that answers null instead of throwing.
+function parseJsonOrNull(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 // curl-shaped HTTP: resolves to {http: "200", body: "...", headers: {...}}
 // with "000" on any transport failure (timeout, refused, DNS). Never throws.
 // `headers` is a plain lowercased-key object (fetch's Headers normalizes
 // names on iteration) — absent (undefined) on transport failure, since there
 // is no response to read it from. Like bare curl, redirects are not
 // followed. Transient failures (transport, 429, 5xx) are retried up to
-// `retry` times; between retries we honor a 429/503 Retry-After header and
+// `retry` times — save a 5xx the server marked unsafe to re-send (a busy with
+// `retryable: false`, a `partial_unsaved`), returned at once; between retries
+// we honor a 429/503 Retry-After (a busy body's retry_after first) and
 // otherwise back off exponentially (capped at backoffCapMs). With retry=0
 // (the session-start hook budget) no backoff ever runs. An optional `signal`
 // is a caller-owned DEADLINE layered over the per-call timeout: whichever
@@ -1462,18 +1474,28 @@ async function curl(
     }
     const kind = classifyHttpFailure(res.status);
     const transient = kind === "rate-limit" || res.status >= 500;
-    if (transient && canRetry) {
-      // A 503 carries Retry-After when it is the server's retryable `busy` /
-      // `temporarily_unavailable` refusal (task-spor-client-honor-retry-after-
-      // on-503-busy); honor it like a 429's. Other 5xx back off exponentially.
-      const retryAfterMs = kind === "rate-limit" || res.status === 503 ? parseRetryAfter(res.headers.get("retry-after")) : null;
-      await sleepUnless(backoffMs(attempt, retryAfterMs, backoffCapMs), signal);
-      if (!(signal && signal.aborted)) continue;
-    }
     const respHeaders = {};
     res.headers.forEach((v, k) => {
       respHeaders[k] = v;
     });
+    if (transient && canRetry) {
+      // The server owns the replay verdict on a 5xx it explains
+      // (dec-spor-rest-busy-retryable-verdict-server-owned-2026-10-10): a
+      // busy marked `retryable: false`, or a `partial_unsaved`, is returned
+      // as-is — a re-send of an append it cannot vouch for is a duplicate
+      // (issue-spor-hook-curl-retries-nonretryable-busy). The body is only
+      // parsed for a 5xx; a non-JSON one states no verdict.
+      const r5 = res.status >= 500 ? { status: res.status, json: parseJsonOrNull(text), headers: respHeaders } : null;
+      if (!r5 || busy.serverAllowsReplay(r5)) {
+        // A 503 busy / temporarily_unavailable carries its wait (the body's
+        // retry_after, else Retry-After; task-spor-client-honor-retry-after-
+        // on-503-busy); honor it like a 429's. Other 5xx back off exponentially.
+        const retryAfterMs =
+          kind === "rate-limit" ? parseRetryAfter(respHeaders["retry-after"]) : res.status === 503 ? busy.busyRetryAfterMs(r5) : null;
+        await sleepUnless(backoffMs(attempt, retryAfterMs, backoffCapMs), signal);
+        if (!(signal && signal.aborted)) continue;
+      }
+    }
     return { http: String(res.status), body: text, headers: respHeaders };
   }
 }
