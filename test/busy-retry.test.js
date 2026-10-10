@@ -259,3 +259,180 @@ test("oauthPost busyRetries: 0 (the hook engines' refresh) does not re-send", as
     await s.close();
   }
 });
+
+// ---- issue-spor-client-busy-retry-gaps ----
+
+// A server scripted per request: `answers[i]` is `[status, bodyObject]` (the
+// last one repeats). Records every request body parsed.
+async function scriptedServer(answers, { retryAfter = "0" } = {}) {
+  const seen = [];
+  const srv = http.createServer((req, res) => {
+    let data = "";
+    req.on("data", (c) => (data += c));
+    req.on("end", () => {
+      seen.push({ url: req.url, body: data ? JSON.parse(data) : null });
+      const [status, obj] = answers[Math.min(seen.length, answers.length) - 1];
+      const h = { "content-type": "application/json" };
+      if (retryAfter != null) h["retry-after"] = retryAfter;
+      res.writeHead(status, h);
+      res.end(JSON.stringify(obj));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  return { url: `http://127.0.0.1:${srv.address().port}`, seen, close: () => new Promise((r) => srv.close(r)) };
+}
+
+const OK = (id) => ({ ok: true, id, status: "created" });
+const ENTRY_BUSY = { ok: false, code: "busy", message: "the state store is busy; retry shortly" };
+
+test("busyEntryIndexes reads only per-entry busy results of a 207", () => {
+  assert.deepStrictEqual(busy.busyEntryIndexes({ status: 207, json: { results: [OK("a"), ENTRY_BUSY, { ok: false, code: "conflict" }, ENTRY_BUSY] } }), [1, 3]);
+  assert.deepStrictEqual(busy.busyEntryIndexes({ status: 200, json: { results: [ENTRY_BUSY] } }), []);
+  assert.deepStrictEqual(busy.busyEntryIndexes({ status: 207, json: {} }), []);
+});
+
+test("POST /v1/nodes: per-entry busy in a 207 re-sends ONLY those entries and merges the answers", async () => {
+  const s = await scriptedServer([
+    [207, { results: [OK("a"), ENTRY_BUSY, OK("c"), ENTRY_BUSY] }],
+    [207, { results: [OK("b"), ENTRY_BUSY] }],
+    [200, { results: [OK("d")] }],
+  ]);
+  try {
+    const body = { nodes: [{ node: "A" }, { node: "B", if_exists: "error" }, "C", { node: "D", revision: "r1" }], if_exists: "skip" };
+    const r = await remoteLib.post(cfgFor(s.url), "/v1/nodes", body);
+    assert.strictEqual(s.seen.length, 3);
+    assert.deepStrictEqual(s.seen[1].body, { nodes: [{ node: "B", if_exists: "error" }, { node: "D", revision: "r1" }], if_exists: "skip" });
+    assert.deepStrictEqual(s.seen[2].body, { nodes: [{ node: "D", revision: "r1" }], if_exists: "skip" });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.ok, true);
+    assert.deepStrictEqual(r.json.results.map((e) => e.id), ["a", "b", "c", "d"]);
+    assert.deepStrictEqual(JSON.parse(r.text), r.json);
+  } finally {
+    await s.close();
+  }
+});
+
+test("POST /v1/nodes: a still-busy entry is bounded and reported in its original position", async () => {
+  const s = await scriptedServer([[207, { results: [OK("a"), ENTRY_BUSY, { ok: false, code: "invalid_node" }] }], [207, { results: [ENTRY_BUSY] }]]);
+  try {
+    const r = await remoteLib.post(cfgFor(s.url), "/v1/nodes", { nodes: ["A", "B", "C"] });
+    assert.strictEqual(s.seen.length, 1 + busy.BUSY_MAX_RETRIES);
+    for (const req of s.seen.slice(1)) assert.deepStrictEqual(req.body.nodes, ["B"]);
+    assert.strictEqual(r.status, 207);
+    assert.strictEqual(r.ok, true, "a 207 reads ok at the HTTP layer, merged or not");
+    assert.deepStrictEqual(r.json.results, [OK("a"), ENTRY_BUSY, { ok: false, code: "invalid_node" }]);
+  } finally {
+    await s.close();
+  }
+});
+
+test("POST /v1/nodes: a 207 with no busy entry is returned as-is, not re-sent", async () => {
+  const s = await scriptedServer([[207, { results: [OK("a"), { ok: false, code: "conflict" }] }]]);
+  try {
+    const r = await remoteLib.post(cfgFor(s.url), "/v1/nodes", { nodes: ["A", "B"] });
+    assert.strictEqual(s.seen.length, 1);
+    assert.strictEqual(r.status, 207);
+  } finally {
+    await s.close();
+  }
+});
+
+test("POST /v1/nodes: a top-level busy re-sends a multi-entry batch only when a landed entry would re-read as success", async () => {
+  const busyTop = [503, { error: { code: "busy", message: "busy", details: [] } }];
+  const done = [200, { results: [OK("a"), OK("b")] }];
+  for (const [body, expectResend] of [
+    [{ nodes: ["A", "B"] }, true], // default skip
+    [{ nodes: [{ node: "A", if_exists: "update" }, "B"], if_exists: "skip" }, true],
+    [{ nodes: ["A", "B"], if_exists: "error" }, false],
+    [{ nodes: [{ node: "A", if_exists: "update", revision: "r" }, "B"] }, false],
+    [{ nodes: ["A", "B"], if_exists: "update", spill: true }, false],
+    [{ nodes: [{ node: "A", if_exists: "error" }] }, true], // one entry is one atomic write
+  ]) {
+    const s = await scriptedServer([busyTop, done]);
+    try {
+      const r = await remoteLib.post(cfgFor(s.url), "/v1/nodes", body);
+      assert.strictEqual(s.seen.length, expectResend ? 2 : 1, JSON.stringify(body));
+      assert.strictEqual(r.status, expectResend ? 200 : 503, JSON.stringify(body));
+    } finally {
+      await s.close();
+    }
+  }
+});
+
+test("POST /v1/nodes: a top-level busy on a re-sent subset re-sends that subset (one entry is atomic)", async () => {
+  const s = await scriptedServer([
+    [207, { results: [OK("a"), ENTRY_BUSY] }],
+    [503, { error: { code: "busy" } }],
+    [200, { results: [OK("b")] }],
+  ]);
+  try {
+    const r = await remoteLib.post(cfgFor(s.url), "/v1/nodes", { nodes: ["A", "B"], if_exists: "error" });
+    assert.strictEqual(s.seen.length, 3);
+    assert.deepStrictEqual(s.seen[2].body.nodes, ["B"]);
+    assert.strictEqual(r.status, 200);
+    assert.deepStrictEqual(r.json.results.map((e) => e.id), ["a", "b"]);
+  } finally {
+    await s.close();
+  }
+});
+
+test("oauthPost stops re-sending a busy refusal once the caller's signal aborts", async () => {
+  const s = await busyServer({ busyTimes: 99, retryAfter: "1", body: JSON.stringify({ error: "temporarily_unavailable" }) });
+  try {
+    const ctl = new AbortController();
+    const t0 = Date.now();
+    setTimeout(() => ctl.abort(), 150);
+    const r = await auth.oauthPost(s.url, "/oauth/token", { grant_type: "refresh_token", refresh_token: "r" }, 8000, { signal: ctl.signal });
+    assert.strictEqual(r.status, 503);
+    assert.strictEqual(s.seen.length, 1);
+    assert.ok(Date.now() - t0 < 900, "returned at the abort, not after the Retry-After");
+  } finally {
+    await s.close();
+  }
+});
+
+test("a 401's nested token refresh stops re-sending once the request's signal aborts", async () => {
+  // /v1/queue answers 401; /oauth/token answers busy (Retry-After 1s) forever.
+  const seen = [];
+  const srv = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      seen.push(req.url);
+      if (req.url === "/oauth/token") {
+        res.writeHead(503, { "content-type": "application/json", "retry-after": "1" });
+        res.end(JSON.stringify({ error: "temporarily_unavailable" }));
+        return;
+      }
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "unauthorized" } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-busy-refresh-"));
+    auth.upsertTenant(home, { server: url, org: "acme", access_token: "tok", refresh_token: "rt", expires_in: 3600 }, { makeDefault: true });
+    const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_ORG: "acme" } });
+    assert.ok(cfg.tenant() && cfg.tenant().refresh_token, "store tenant resolved");
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 300);
+    const r = await remoteLib.get(cfg, "/v1/queue", { signal: ctl.signal });
+    assert.strictEqual(r.status, 401);
+    // Give an un-aborted refresh time to have re-sent after its 1s Retry-After.
+    await new Promise((r2) => setTimeout(r2, 1300));
+    assert.strictEqual(seen.filter((u2) => u2 === "/oauth/token").length, 1, seen.join(","));
+  } finally {
+    await new Promise((r) => srv.close(r));
+  }
+});
+
+test("batchResendSafe: one entry always; several only under skip or an unrevisioned, unspilled update", () => {
+  const safe = (body) => remoteLib.batchResendSafe(body, body.nodes);
+  assert.ok(safe({ nodes: [{ node: "A", if_exists: "error" }] }));
+  assert.ok(safe({ nodes: ["A", "B"] }));
+  assert.ok(safe({ nodes: ["A", { node: "B", if_exists: "update" }] }));
+  assert.ok(!safe({ nodes: ["A", "B"], if_exists: "error" }));
+  assert.ok(!safe({ nodes: ["A", { node: "B", if_exists: "update", revision: "r" }] }));
+  assert.ok(!safe({ nodes: ["A", { node: "B", if_exists: "update", spill: true }] }));
+  assert.ok(safe({ nodes: ["A", { node: "B", spill: true }] }));
+});
