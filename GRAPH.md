@@ -325,6 +325,12 @@ descriptor's dimensions. A reader holding the descriptor checks that with
 `content.validateSelection(sel, {descriptor})`; the write door checks only
 shape, because it sees no descriptor. `content.parseSelection` accepts only the canonical
 spelling (no leading zeros, no empty `doc=`), so one selection has one string.
+The `selection` key is the one content key that is not artifact-scoped: the
+seed `schema-task` and `schema-issue` `validate()` hooks apply the same
+selection rule (and message) as `schema-artifact`, so a follow-up task or issue
+pinned to a passage or screenshot is refused a malformed or non-canonical URI at
+the write door (task-split-spor-e191f3d4e945). A graph-resident override of
+either type replaces its hook, as always.
 
 ## Completing work needs a durable why (the resolver gate)
 

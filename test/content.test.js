@@ -1,7 +1,8 @@
 // content.test.js — the graph-native content contracts
 // (task-spor-chatgpt-content-contracts): lib/kernel/content.js, the seed
-// schema-artifact validate() that mirrors it at the write door, and the
-// uses-asset candidate edge schema.
+// schema-artifact validate() that mirrors it at the write door (and the
+// selection branch schema-task/schema-issue carry), and the uses-asset
+// candidate edge schema.
 //
 // Run: node --test test/content.test.js
 require("./helpers/tmp-cleanup");
@@ -87,6 +88,66 @@ test("seed schema-artifact validate() and kernel validateContentFields agree on 
   assert.ok(verdicts.includes(true) && verdicts.includes(false));
 });
 
+// The task and issue seed schemas carry the SELECTION branch of the same rule
+// (task-split-spor-e191f3d4e945): a follow-up pinned to a passage or
+// screenshot is refused a malformed selection at the write door.
+const _typeSb = new Map();
+function seedValidateFor(type, node) {
+  if (!_typeSb.has(type)) {
+    const s = graph.loadSeedSchemas().find((x) => x.key === type);
+    _typeSb.set(type, createSandbox(s.codeBlocks.join("\n"), { timeoutMs: scale(100) }));
+  }
+  return _typeSb.get(type).call("validate", [node], SLACK);
+}
+const SELECTION_ROWS = CORPUS.filter((r) => "selection" in r);
+const WORK_TYPES = [["task", "task-sel", "open"], ["issue", "issue-sel", "open"]];
+
+test("seed schema-task and schema-issue validate() apply the kernel's selection rule on every selection row", () => {
+  for (const [type, id] of WORK_TYPES) {
+    for (const row of SELECTION_ROWS) {
+      const node = { ...row, id, type, title: "t", summary: "s" };
+      assert.deepEqual(seedValidateFor(type, node), content.validateContentFields(row), `${type} ${row.id}`);
+    }
+    const ok = SELECTION_ROWS.filter((r) => content.validateContentFields(r).length === 0);
+    const bad = SELECTION_ROWS.filter((r) => content.validateContentFields(r).length > 0);
+    assert.ok(ok.some((r) => r.selection.startsWith("spor-source:")) && ok.some((r) => r.selection.startsWith("spor-image:")));
+    assert.ok(bad.length >= 5);
+    for (const r of bad) assert.match(seedValidateFor(type, { ...r, id, type }).join("\n"), /^selection: /);
+  }
+});
+
+test("seed schema-task and schema-issue: only the selection rule, beside the status gate", () => {
+  for (const [type, id, status] of WORK_TYPES) {
+    const base = { id, type, title: "t", summary: "s" };
+    assert.deepEqual(seedValidateFor(type, base), [], `${type}: a node without selection`);
+    assert.deepEqual(seedValidateFor(type, { ...base, status, selection: "" }), [], `${type}: an empty selection is absent`);
+    // the follow-up the server creates: canonical selection + content_format
+    const followup = { ...base, status, content_format: "markdown", selection: `spor-image:art-shot@${DIGEST}#xywh=0,0,10,10` };
+    assert.deepEqual(seedValidateFor(type, followup), [], `${type}: server follow-up shape`);
+    // the other content keys stay artifact-scoped
+    assert.deepEqual(seedValidateFor(type, { ...base, content_format: "html", asset_digest: DIGEST }), [], `${type}: artifact-only keys`);
+    // a bad status and a bad selection both report, status first
+    const errs = seedValidateFor(type, { ...base, status: "bogus", selection: "https://example.com/x" });
+    assert.equal(errs.length, 2, `${type}: ${errs.join(" | ")}`);
+    assert.match(errs[0], new RegExp(`invalid ${type} status 'bogus'`));
+    assert.match(errs[1], /^selection: 'https:\/\/example\.com\/x' is not a spor-source: or spor-image: selection URI$/);
+  }
+});
+
+test("a graph-resident schema-task / schema-issue override replaces the seed selection rule", () => {
+  for (const [type, id] of WORK_TYPES) {
+    const seed = graph.loadSeedSchemas().find((x) => x.key === type);
+    const resident = `---\nid: schema-${type}\ntype: schema\nkind: node-schema\nschema_version: 2099.01.01.1\ntitle: org ${type}\nsummary: An org ${type} schema with no selection rule.\ndate: 2026-10-10\n---\n\n` +
+      "```json\n" + JSON.stringify({ ...seed.payload }, null, 2) + "\n```\n\n```js\nexport function validate(node) { return []; }\n```\n";
+    const g = graph.loadGraph(tmpGraph({ [`schema-${type}.md`]: resident }));
+    const live = g.registry.nodeSchemas.get(type);
+    assert.equal(live.version, "2099.01.01.1", `${type}: the resident schema is the live one`);
+    const bad = { id, type, title: "t", summary: "s", selection: "https://example.com/x" };
+    assert.deepEqual(createSandbox(live.codeBlocks.join("\n"), { timeoutMs: scale(100) }).call("validate", [bad], SLACK), []);
+    assert.notDeepEqual(seedValidateFor(type, bad), []);
+  }
+});
+
 test("legacy nodes: no content keys means no errors, and the conformance corpora validate clean", () => {
   const root = path.join(__dirname, "..", "conformance", "corpora");
   let n = 0;
@@ -100,6 +161,9 @@ test("legacy nodes: no content keys means no errors, and the conformance corpora
         n++;
         assert.deepEqual(content.validateContentFields(r.node), [], p);
         if (r.node.type === "artifact" && !r.node.status) assert.deepEqual(seedValidate(r.node), [], p);
+        if (r.node.type === "task" || r.node.type === "issue") {
+          assert.deepEqual(seedValidateFor(r.node.type, r.node).filter((e) => e.startsWith("selection:")), [], p);
+        }
         assert.deepEqual(content.nodeAssetEmbeds(r.node), [], `${p}: a legacy body embeds nothing`);
       }
     }

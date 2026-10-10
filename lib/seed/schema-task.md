@@ -2,7 +2,7 @@
 id: schema-task
 type: schema
 kind: node-schema
-schema_version: 2026.09.29.1
+schema_version: 2026.10.10.1
 title: Seed schema for task nodes
 summary: Node schema for the task type — active or planned work. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -166,6 +166,20 @@ type and with an undeclared one, so the two cannot drift. The host passes the de
 (absent → the seed pair), so a resident override of it moves the write door with the readers. Declaration only —
 enforcement stays in the hook — backward-readable, no upgrade chain.
 
+`selection` (2026.10.10.1, task-split-spor-e191f3d4e945): a task may carry
+an OPTIONAL `selection:` — one canonical `spor-source:` (a UTF-16 range of an
+exact document revision) or `spor-image:` (a pixel region of an exact asset
+digest) selection URI, the pinned evidence a follow-up created from a reviewed
+passage or screenshot points at (task-spor-chatgpt-screenshot-followups).
+`validate()` now refuses a malformed or non-canonical one with exactly the rule
+and message of the `selection` branch of `lib/kernel/content.js`
+`validateContentFields` (the same inline mirror schema-artifact carries — the
+sandbox cannot require the kernel); `test/content.test.js` pins the three
+together. Only the selection rule: the other content keys (`content_format`,
+asset descriptors, document stamps) stay artifact-scoped. A graph-resident
+schema-task overrides this hook like any other. Write-time only, optional key,
+no stored-shape change: backward-readable, no upgrade chain.
+
 ```json
 {
   "node_type": "task",
@@ -220,8 +234,64 @@ function statusReason(next) {
 // transitions() — a transition concern the host runs on create + update.
 export function validate(node) {
   const s = ((node && node.status) || "").toLowerCase();
-  if (s === "" || VALID.indexOf(s) !== -1) return [];
-  return [statusReason(s)];
+  const errs = s === "" || VALID.indexOf(s) !== -1 ? [] : [statusReason(s)];
+  return errs.concat(selectionErrors(node || {}));
+}
+
+// The selection rule (2026.10.10.1, task-split-spor-e191f3d4e945) — an inline
+// mirror of the `selection` branch of lib/kernel/content.js
+// validateContentFields, same rules and same messages as schema-artifact's copy;
+// test/content.test.js pins all three together. A follow-up created from a
+// pinned passage or screenshot carries ONE canonical `spor-source:` /
+// `spor-image:` URI as a task's `selection:`; a node without the key returns [].
+const ID_RE = /^[a-z0-9][a-z0-9-]*$/;
+const HEX64 = /^[0-9a-f]{64}$/;
+const REV_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+const UINT = /^(?:0|[1-9][0-9]*)$/;
+function str(v) { return v == null ? "" : String(v); }
+function present(v) { return v != null && String(v) !== ""; }
+function validId(id) { return typeof id === "string" && id.length <= 200 && ID_RE.test(id); }
+function uint(v, allowZero) {
+  const t = typeof v === "number" ? (Number.isInteger(v) ? String(v) : "") : str(v);
+  if (!UINT.test(t)) return null;
+  const n = Number(t);
+  if (!Number.isSafeInteger(n) || (!allowZero && n === 0)) return null;
+  return n;
+}
+function selectionError(uri) {
+  const src = /^spor-source:([^@?#]+)@([^?#]+)(?:\?doc=([^#]*))?#utf16=([^,]*),(.*)$/.exec(uri);
+  const img = src ? null : /^spor-image:([^@#]+)@(sha256:[^#]*)(?:#xywh=([^,]*),([^,]*),([^,]*),(.*))?$/.exec(uri);
+  if (!src && !img) return "'" + uri + "' is not a spor-source: or spor-image: selection URI";
+  const errs = [];
+  let canon;
+  if (src) {
+    if (!validId(src[1])) errs.push("selection node '" + src[1] + "' is not a node id");
+    if (!REV_RE.test(src[2])) errs.push("selection revision '" + src[2] + "' must be a git blob sha (40 or 64 hex)");
+    if (present(src[3]) && !HEX64.test(src[3])) errs.push("selection doc_sha256 must be 64 lowercase hex");
+    const a = uint(src[4], true), b = uint(src[5], true);
+    if (a === null || b === null) errs.push("selection start/end must be non-negative integer UTF-16 offsets");
+    else if (a >= b) errs.push("selection range [" + a + ", " + b + ") is empty or reversed");
+    if (errs.length) return errs.join("; ");
+    canon = "spor-source:" + src[1] + "@" + src[2] + (present(src[3]) ? "?doc=" + src[3] : "") + "#utf16=" + a + "," + b;
+  } else {
+    if (!validId(img[1])) errs.push("selection asset '" + img[1] + "' is not a node id");
+    if (!DIGEST_RE.test(img[2])) errs.push("selection digest must be sha256:<64 lowercase hex>");
+    let region = "";
+    if (img[3] !== undefined) {
+      const x = uint(img[3], true), y = uint(img[4], true), w = uint(img[5], false), h = uint(img[6], false);
+      if (x === null || y === null || w === null || h === null) errs.push("selection region needs integer x,y >= 0 and w,h >= 1");
+      else region = "#xywh=" + x + "," + y + "," + w + "," + h;
+    }
+    if (errs.length) return errs.join("; ");
+    canon = "spor-image:" + img[1] + "@" + img[2] + region;
+  }
+  return canon === uri ? null : "'" + uri + "' is not in canonical form";
+}
+function selectionErrors(f) {
+  if (!present(f.selection)) return [];
+  const e = selectionError(str(f.selection));
+  return e ? ["selection: " + e] : [];
 }
 
 // transitions(current, proposed, view) — task status gate. Runs on every write
