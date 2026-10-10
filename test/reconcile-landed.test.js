@@ -333,6 +333,52 @@ test("remote mode reads the team graph from /v1/export and writes the pair throu
   }
 });
 
+// issue-spor-cli-offline-wording-residuals: a chunk whose POST fails on the
+// wire has an unknown outcome, and nothing after it is sent — a later chunk
+// could carry a finding whose draft sat in the failed one (as put-node's
+// batch does). Every write is if_exists: skip, so a re-run settles the lot.
+test("remote mode: a chunk that fails on the wire stops the batch — its entries unconfirmed, the rest not sent", async () => {
+  const { home, nodes, repo } = scratch();
+  const ids = Array.from({ length: 51 }, (_, i) => `task-chunk-${String(i).padStart(2, "0")}`);
+  for (const id of ids) node(nodes, id);
+  commit(repo, "many fixes", ids.map((id) => `Spor: ${id}`).join("\n"));
+  const tar = require("../lib/tar.js");
+  const tarball = tar.exportNodesDir(nodes).buffer;
+  fs.rmSync(nodes, { recursive: true, force: true });
+  let posts = 0;
+  const srv = http.createServer((req, res) => {
+    req.on("data", () => {});
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/v1/export")) {
+        res.writeHead(200, { "Content-Type": "application/x-tar" });
+        return res.end(tarball);
+      }
+      if (req.method === "POST" && req.url === "/v1/nodes") {
+        posts++;
+        return req.socket.destroy();
+      }
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "not_found", message: req.url } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const r = await runAsync(home, ["reconcile-landed", "--dir", repo, "--json"], { SPOR_SERVER: `http://127.0.0.1:${srv.address().port}`, SPOR_TOKEN: "t" });
+    assert.strictEqual(r.status, 1, r.stderr + r.stdout);
+    // the first chunk (100 entries) is attempted twice (the one stale-socket
+    // re-send skip-only writes get); the second chunk is never sent
+    assert.strictEqual(posts, 2, "nothing after the failed chunk is sent");
+    const out = JSON.parse(r.stdout);
+    const entries = out.hits.flatMap((h) => [h.draft, h.finding]);
+    assert.strictEqual(entries.length, 102);
+    assert.ok(entries.slice(0, 100).every((e) => !e.ok && /^not confirmed \(connection to server failed/.test(e.message)), JSON.stringify(entries[0]));
+    assert.ok(entries.slice(100).every((e) => !e.ok && /^not sent \(/.test(e.message)), JSON.stringify(entries[101]));
+    assert.doesNotMatch(r.stdout + r.stderr, /offline/);
+  } finally {
+    srv.close();
+  }
+});
+
 test("--confirm refuses a subject a person has closed since the scan, rather than re-closing over their decision", () => {
   const { home, nodes, repo } = scratch();
   node(nodes, "task-changed-mind");

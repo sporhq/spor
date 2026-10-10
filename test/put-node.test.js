@@ -413,6 +413,23 @@ test("put-node (remote) a retried skip whose node re-reads as what was sent is r
   }
 });
 
+test("put-node (remote) a retried skip sent with no date is still 'created' when the server stamped its create-time date", async () => {
+  // e3179ce: `date` is a create-time default the server fills, so the stored
+  // copy carrying one we never sent is still exactly our create.
+  const sent = nodeMd("dec-remote").replace("date: 2026-06-01\n", "");
+  const file = tmpNodeFile(sent);
+  const { srv, base } = await lostCreateStub({ stored: { "dec-remote": nodeMd("dec-remote").replace("date: 2026-06-01\n", "date: 2026-10-10\n") } });
+  try {
+    const r = await runAsync(["put-node", file, "--if-exists", "skip", "--json"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const res = JSON.parse(r.stdout);
+    assert.strictEqual(res.status, "created");
+    assert.strictEqual(res.recovered, true);
+  } finally {
+    srv.close();
+  }
+});
+
 test("put-node (remote) a retried skip whose node re-reads differently stays skipped, noting the lost attempt may have written it", async () => {
   const file = tmpNodeFile(nodeMd("dec-remote"));
   const { srv, base } = await lostCreateStub({ stored: { "dec-remote": nodeMd("dec-remote", "Someone else's decision") } });

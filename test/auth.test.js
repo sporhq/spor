@@ -1542,3 +1542,30 @@ test('auth login --web falls back to the device grant when the server has no DCR
     srv.close();
   }
 });
+
+// issue-spor-cli-offline-wording-residuals: the login flows read a transport
+// failure the way every remote verb does — "offline" only for a connection
+// never made, a reset is a connection that failed.
+test('auth login (device-code): a refused connect is offline; a reset is not', async () => {
+  const dead = await new Promise((resolve) => {
+    const s = http.createServer();
+    s.listen(0, '127.0.0.1', () => {
+      const b = `http://127.0.0.1:${s.address().port}`;
+      s.close(() => resolve(b));
+    });
+  });
+  const home = tmp();
+  const refused = await runAsync(['auth', 'login', '--server', dead, '--no-open'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(refused.code, 1);
+  assert.match(refused.stderr, new RegExp(`^offline — could not reach ${dead.replace(/[.]/g, '\\.')} \\(fetch failed: .*ECONNREFUSED`, 'm'));
+  const srv = http.createServer((req) => req.socket.destroy());
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const reset = await runAsync(['auth', 'login', '--server', `http://127.0.0.1:${srv.address().port}`, '--no-open'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(reset.code, 1);
+    assert.doesNotMatch(reset.stderr, /offline/);
+    assert.match(reset.stderr, /^connection to server failed \(fetch failed: /m);
+  } finally {
+    srv.close();
+  }
+});

@@ -709,3 +709,23 @@ test("remote: a derived key another principal owns falls back to a per-caller ke
     await stub.close();
   }
 });
+
+// issue-spor-cli-offline-wording-residuals: a reset upload followed by a
+// refused re-send is not "offline" — the reset attempt may have landed it.
+test("asset import (remote): a reset then a refused re-send says the upload may have landed, never 'offline'", async () => {
+  const { transportError } = require("../lib/remote.js");
+  const work = scratch("spor-asset-work-");
+  const src = path.join(work, "a.png");
+  fs.writeFileSync(src, SAMPLE);
+  const fail = (code, message) => transportError(Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(message), { code, syscall: code === "ECONNREFUSED" ? "connect" : "read" }) }));
+  const answers = [fail("ECONNRESET", "read ECONNRESET"), fail("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:1")];
+  const remote = { exchange: async () => answers.shift() };
+  await assert.rejects(assetLib.importRemote({ cfg: {}, remote, file: src, opts: { id: "art-shot" } }), (e) => {
+    assert.doesNotMatch(e.message, /offline/);
+    assert.match(e.message, /^connection to server failed \(.*after an earlier attempt failed with .*ECONNRESET.*\) — the write may have landed; re-running the import is safe/);
+    return true;
+  });
+  // a refused connect on BOTH attempts never reached the server: offline
+  const refused = [fail("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:1"), fail("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:1")];
+  await assert.rejects(assetLib.importRemote({ cfg: {}, remote: { exchange: async () => refused.shift() }, file: src, opts: { id: "art-shot" } }), /offline — could not reach server/);
+});

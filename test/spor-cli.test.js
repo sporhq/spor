@@ -2577,6 +2577,30 @@ test('add (remote) transient 5xx spools the capture for replay', async () => {
   }
 });
 
+// issue-spor-cli-offline-wording-residuals: a 504 is a gateway that gave up on
+// an ingest that may have committed; when the body cannot be spooled, the
+// re-run hint carries THIS attempt's idempotency key, so a re-run replays a
+// landed capture instead of minting a second node.
+test('add (remote) unspoolable 504 says the capture may have landed and hands back its key as --dedupe-key', async () => {
+  const home = freshHome();
+  fs.writeFileSync(path.join(home, 'outbox'), 'not a directory'); // the spool cannot be written
+  const { srv, hits, base } = await captureStubServer((req, res) => {
+    res.writeHead(504, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  try {
+    const r = await runAsyncCli(['add', 'a capture whose gateway timed out mid-ingest'],
+      { SPOR_SERVER: base, SPOR_TOKEN: 'tok', SPOR_HOME: home });
+    assert.strictEqual(r.status, 1, r.stdout);
+    assert.doesNotMatch(r.stderr, /capture lost/);
+    const key = JSON.parse(hits[hits.length - 1].body).idempotency_key;
+    assert.match(r.stderr, /capture not confirmed and could not be spooled; the lost attempt may have landed it/);
+    assert.ok(r.stderr.includes(`re-run with --dedupe-key ${key}`), r.stderr);
+  } finally {
+    srv.close();
+  }
+});
+
 test('add (remote) permanent 4xx does NOT spool — it is a deterministic reject', async () => {
   const home = freshHome();
   const { srv, base } = await captureStubServer((req, res) => {

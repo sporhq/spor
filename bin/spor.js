@@ -969,9 +969,12 @@ function renderDocumentRefusal(prefix, r) {
 
 // A remote /v1/documents answer folded into the local arm's {ok, ...} shape.
 // `write` (a hint) marks the PUT: a failure on a made connection may have
-// published the generation.
+// published the generation. A transport failure is `transport: true` — ANY
+// one, never only a connection never made (that is `unreachable`); the field
+// is internal (printed via `message`, never serialized), so it carries no
+// JSON contract.
 function remoteDocumentResult(r, { write } = {}) {
-  if (r.transport) return { ok: false, offline: true, message: remote.describeTransport(r, { write }) };
+  if (r.transport) return { ok: false, transport: true, unreachable: remote.isUnreachable(r), message: remote.describeTransport(r, { write }) };
   if (r.ok && r.json && !r.jsonError) return { ok: true, body: r.json };
   const e = (r.json && r.json.error) || {};
   return {
@@ -996,7 +999,7 @@ async function cmdGetDocument(cfg, id, values) {
     r = documentShell().getDocument(cfg.nodesDir(), { id, revision });
   }
   if (!r.ok) {
-    if (r.offline) err(r.message);
+    if (r.transport) err(r.message);
     else renderDocumentRefusal("get --document", r);
     return 1;
   }
@@ -1057,7 +1060,7 @@ async function cmdPutDocument(cfg, { values, positionals }) {
     const rr = remoteDocumentResult(await remote.request(cfg, "PUT", `/v1/documents/${encodeURIComponent(id)}`, {
       body: { node: input.raw, ...(snap.snapshot ? { snapshot: snap.snapshot } : {}) }, timeoutMs: 60000,
     }), { write: `check with 'spor get ${id} --document' before re-publishing` });
-    if (!rr.ok && rr.offline) {
+    if (!rr.ok && rr.transport) {
       err(rr.message);
       return 1;
     }
@@ -2279,13 +2282,23 @@ async function putNodesSkip(cfg, raws) {
       const batch = nodes.slice(results.length, results.length + chunk.length);
       const r = await remote.post(cfg, "/v1/nodes", { nodes: chunk }, { timeoutMs: Math.min(120000, 15000 + 1000 * chunk.length) });
       const rs = r.json && Array.isArray(r.json.results) ? r.json.results : null;
+      if (r.transport || !rs) {
+        // As cmdPutNodeBatch: this chunk's outcome is unknown (a transport
+        // failure may have landed it) and nothing after it is sent — a later
+        // chunk can carry a finding whose draft sat in this one, and a
+        // finding must never name a draft that did not land. Every write is
+        // `if_exists: skip`, so a re-run settles the lot.
+        const why = r.transport ? remote.describeTransport(r, { write: "re-run (every write is --if-exists skip)" }) : `${r.status}: no per-entry results returned`;
+        for (const n of nodes.slice(results.length)) results.push({ id: n.node.id, ok: false, status: "error", message: batch.includes(n) ? `not confirmed (${why})` : `not sent (${why})` });
+        break;
+      }
       for (let i = 0; i < batch.length; i++) {
         const n = batch[i];
-        let res = rs && rs[i];
+        let res = rs[i];
         // a `skipped` re-send may be the lost attempt's own create
         if (res && res.ok && res.status === "skipped" && r.earlierAttemptUnknown) res = await reconcileRetriedSkip(cfg, n.node, res);
         if (res && res.ok) results.push({ id: n.node.id, ok: true, status: res.status || "ok", ...(res.note ? { note: res.note } : {}) });
-        else results.push({ id: n.node.id, ok: false, status: "error", message: r.transport ? remote.describeTransport(r, { write: "re-run (every write is --if-exists skip)" }) : `${r.status}${res ? `: ${putNodeEntryDetail(res)}` : ""}` });
+        else results.push({ id: n.node.id, ok: false, status: "error", message: `${r.status}${res ? `: ${putNodeEntryDetail(res)}` : ": no result returned for this entry"}` });
       }
     }
     return results;
@@ -4499,18 +4512,23 @@ async function cmdAdd(cfg, { values, positionals }) {
       // A connection never made (or a 5xx) did not land; a reset or timeout
       // MAY have — the spooled replay carries the same idempotency key, so a
       // capture the lost attempt did land is replayed, not duplicated.
+      // A 502/504 is a gateway that gave up waiting on an ingest the server
+      // behind it may still have committed — a maybe, like a reset.
       const reason = r.transport ? remote.describeTransport(r) : `server error (HTTP ${r.status})`;
-      const maybe = r.transport && !remote.isUnreachable(r);
+      const maybe = r.transport ? !remote.isUnreachable(r) : r.status === 502 || r.status === 504;
       const what = maybe ? "capture not confirmed" : "capture not shipped";
       const spool = spoolCapture(cfg, body);
       if (spool) {
         err(`${reason} — ${what}. Spooled to ${spool}; run 'spor drain' to ship it (or it drains on your next Spor session).`);
       } else {
-        // a hand re-run mints a fresh idempotency key, so one the lost attempt
-        // landed would be captured twice: check first.
+        // A bare re-run mints a fresh idempotency key, so a capture the lost
+        // attempt landed would be captured twice: hand back THIS key as a
+        // --dedupe-key (which takes the idempotency slot) so the re-run
+        // replays it instead (issue-spor-cli-offline-wording-residuals).
+        const rerun = `re-run with --dedupe-key ${body.idempotency_key}${dedupeKey ? "" : " (this attempt's idempotency key)"}`;
         err(maybe
-          ? `${reason} — ${what} and could not be spooled; the lost attempt may have landed it — check 'spor changes' before re-running.`
-          : `${reason} — ${what} and could not be spooled — capture lost. Re-run when the server is reachable.`);
+          ? `${reason} — ${what} and could not be spooled; the lost attempt may have landed it — ${rerun} so a landed capture replays instead of being captured twice.`
+          : `${reason} — ${what} and could not be spooled. To retry, ${rerun} once the server is reachable.`);
       }
       return 1;
     }
@@ -6121,6 +6139,14 @@ async function fetchMe(server, token) {
 // Render a server error message from either shape: an RFC-style oauth error
 // ({error:"code", error_description:"..."}) or the generic REST error object
 // ({error:{code, message}}). Avoids "[object Object]" in CLI output.
+// A login-flow transport failure (lib/auth.js oauthPost), named the way every
+// remote verb names one (remote.describeTransport): "offline" only for a
+// connection never made; `write` marks a call that may have changed state.
+function loginTransport(server, r, write) {
+  if (remote.isUnreachable(r)) return `offline — could not reach ${server} (${r.error})`;
+  return remote.describeTransport(r, write ? { write } : {});
+}
+
 function oauthErrMsg(j) {
   if (!j) return "";
   const e = j.error;
@@ -6345,7 +6371,7 @@ async function loginViaDevice(cfg, { server, org, scope, noOpen }) {
   // un-armed / self-host issuer, so it is always safe to send.
   const da = await auth.deviceAuthorize(server, { scope, resource: server });
   if (da.transport) {
-    err(`offline — could not reach ${server} (${da.error})`);
+    err(loginTransport(server, da));
     return 1;
   }
   if (!da.ok || !da.json || !da.json.device_code) {
@@ -6506,7 +6532,7 @@ async function loginViaLoopback(cfg, { server, org, scope, noOpen }) {
   const reg = await auth.registerClient(server, { redirectUris: [redirectUri], clientName: "spor CLI (loopback)" });
   if (reg.transport) {
     srv.close();
-    err(`offline — could not reach ${server} (${reg.error})`);
+    err(loginTransport(server, reg, "re-running the login is safe (a stray registration is never used)"));
     return 1;
   }
   if (reg.status === 404) {
@@ -6566,7 +6592,7 @@ async function loginViaLoopback(cfg, { server, org, scope, noOpen }) {
   // 6) Exchange the code (+ PKCE verifier) for the org-scoped token pair.
   const tok = await auth.exchangeCode(server, { code: result.code, codeVerifier: verifier, clientId, redirectUri, resource: server });
   if (tok.transport) {
-    err(`offline — token exchange not completed (${tok.error})`);
+    err(`token exchange not completed: ${loginTransport(server, tok, "the sign-in code is single-use, so re-run the login")}`);
     return 1;
   }
   if (!tok.ok || !tok.json || !tok.json.access_token) {
@@ -11290,7 +11316,7 @@ async function cmdExecutions(cfg, { values, positionals: pos }) {
   if (id) {
     const r = values.events ? await store.events(id) : await store.get(id);
     if (!r.ok) {
-      err(r.transport ? `offline — ${r.message}` : `${r.code}: ${r.message}`);
+      err(r.transport ? r.message : `${r.code}: ${r.message}`);
       return 1;
     }
     if (json) {
@@ -11335,7 +11361,7 @@ async function cmdExecutions(cfg, { values, positionals: pos }) {
   }
   const r = await store.list({ node_id: values.node || null, stage: values.stage || null, limit: Math.max(1, parseInt(values.limit, 10) || 50) });
   if (!r.ok) {
-    err(r.transport ? `offline — ${r.message}` : `${r.code}: ${r.message}`);
+    err(r.transport ? r.message : `${r.code}: ${r.message}`);
     return 1;
   }
   if (json) {
@@ -15561,7 +15587,7 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
       owned = false;
       note(`lost:${r.code}`, `work: ${record.node_id} — execution ${id} is no longer held by this worker (${r.code}: ${r.message}${r.holder ? `; held by ${r.holder.worker}` : ""}); the pipeline continues but writes no completion under this fence${r.code === "fence_stale" ? ", and this process never re-claims it" : ""}`);
     } else if (r.deferred) {
-      note("deferred", `work: ${record.node_id} — execution ${id}: the store is unreachable (${r.message}); ${r.pending} event(s) spooled to the outbox and replayed on the next call`);
+      note("deferred", `work: ${record.node_id} — execution ${id}: the store did not record the event (${r.message}); ${r.pending} event(s) spooled to the outbox and replayed on the next call`);
     } else if (r.code === "execution_terminal") {
       note("terminal", `work: ${record.node_id} — execution ${id} is terminal in the store; no further events are recorded`);
     } else {
@@ -15628,7 +15654,7 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
         return { ok: true, fence: r.fence };
       }
       if (r.transport || r.transient) {
-        note("resume-offline", `work: ${record.node_id} — execution ${id}: the store is unreachable (${r.message}); continuing under the recorded fence ${fence}, unconfirmed`);
+        note("resume-offline", `work: ${record.node_id} — execution ${id}: the store did not confirm the claim (${r.message}); continuing under the recorded fence ${fence}, unconfirmed`);
         LIVE_EXECUTIONS.set(id, reporter);
         return { ok: true, unconfirmed: true, fence };
       }
@@ -19218,7 +19244,7 @@ async function cmdAttemptBuild(cfg, args) {
   const store = openExecutionStoreFor(cfg, { mode: values.local ? "local" : null, log: (l) => err(`note: ${l}`) });
   const got = await store.get(id);
   if (!got.ok) {
-    err(`spor attempt build: ${got.transport ? `offline — ${got.message}` : `${got.code}: ${got.message}`}`);
+    err(`spor attempt build: ${got.transport ? got.message : `${got.code}: ${got.message}`}`);
     return 1;
   }
   const x = got.execution;

@@ -547,7 +547,7 @@ test("bin/spor.js, remote mode against a server that does not serve /v1/executio
     const off = await spor.claimExecutionHold(cfg, { id: "task-x" }, factory, { home: tmp("cli-off") });
     assert.equal(off.ok, false);
     assert.equal(off.kind, "store");
-    assert.match(off.reason, /offline/);
+    assert.match(off.reason, /connection to server failed .* the write may have landed/);
   } finally {
     await fake.close();
   }
@@ -1699,4 +1699,45 @@ test('execution boundary stays closed until flake payment and receipt persist, i
   assert.equal(durable.gate_results[0].candidate_id, CAND.candidate_id);
   const settlements = fake.state.requests.filter(q => q.path.endsWith('/events') && q.body?.event?.type === 'gate.settled');
   assert.equal(settlements.length, 1);
+});
+
+// issue-spor-cli-offline-wording-residuals: the store's transport message is
+// the one remote.describeTransport reading, printed as it stands — never
+// "offline — offline —", and a reset (a connection that WAS made) is never
+// "offline" at all.
+test("bin/spor.js `spor executions`: a transport failure prints one describeTransport line — 'offline' once for a refused connect, never for a reset", async () => {
+  const { spawnSync } = require("node:child_process");
+  const http = require("node:http");
+  const run = (base, args) => {
+    const home = tmp("cli-transport");
+    return spawnSync(process.execPath, [path.join(__dirname, "..", "bin", "spor.js"), "executions", ...args], { env: { ...process.env, SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "tok-a" }, cwd: home, encoding: "utf8" });
+  };
+  const dead = await new Promise((resolve) => {
+    const s = http.createServer();
+    s.listen(0, "127.0.0.1", () => {
+      const b = `http://127.0.0.1:${s.address().port}`;
+      s.close(() => resolve(b));
+    });
+  });
+  const refused = run(dead, ["exec-0000000000000000", "--events"]);
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /^offline — could not reach server \(/m);
+  assert.equal((refused.stderr.match(/offline/g) || []).length, 1, refused.stderr);
+  const srv = http.createServer((req) => req.socket.destroy());
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  try {
+    const reset = await new Promise((resolve) => {
+      const { spawn } = require("node:child_process");
+      const home = tmp("cli-transport");
+      const c = spawn(process.execPath, [path.join(__dirname, "..", "bin", "spor.js"), "executions", "exec-0000000000000000", "--events"], { env: { ...process.env, SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${srv.address().port}`, SPOR_TOKEN: "tok-a" }, cwd: home });
+      let stderr = "";
+      c.stderr.on("data", (d) => (stderr += d));
+      c.on("close", (status) => resolve({ status, stderr }));
+    });
+    assert.equal(reset.status, 1);
+    assert.match(reset.stderr, /^connection to server failed \(/m);
+    assert.doesNotMatch(reset.stderr, /offline|may have landed/, "a read carries no write hint");
+  } finally {
+    srv.close();
+  }
 });
