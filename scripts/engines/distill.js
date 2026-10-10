@@ -653,21 +653,20 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
         // revoked/invalid token that does not un-revoke by being spooled —
         // routing it through the outbox only bought one more failed POST
         // before drain-outbox dead-lettered the identical bytes.
-        let dead = false;
+        let dead = null;
         if (u.ensureDir(path.join(graph, "outbox", "dead"))) {
           try {
-            u.writeSpoolFile(path.join(graph, "outbox", "dead", spoolName), body);
-            dead = true;
+            dead = path.basename(u.deadLetterFile(path.join(graph, "outbox", "dead"), spoolName, { data: body }));
           } catch {}
         }
         if (dead) {
           rlog(
             kind === "auth"
               ? `session-final finding from ${r.file} rejected (http=${post.http}, revoked/invalid token); ` +
-                  `dead-lettered to outbox/dead/${spoolName} — re-mint SPOR_TOKEN and replay outbox/dead/, ` +
+                  `dead-lettered to outbox/dead/${dead} — re-mint SPOR_TOKEN and replay outbox/dead/, ` +
                   `auth will not recover on its own`
               : `session-final finding from ${r.file} rejected (http=${post.http}, permanent); ` +
-                  `dead-lettered to outbox/dead/${spoolName} for inspection`
+                  `dead-lettered to outbox/dead/${dead} for inspection`
           );
           consume(fp);
         } else {
@@ -1273,19 +1272,18 @@ async function distill(input) {
         // or spooling a 401/403 for one more doomed POST before drain-outbox
         // dead-letters the identical bytes.
         rejected++;
-        let dead = false;
+        let dead = null;
         if (u.ensureDir(path.join(graph, "outbox", "dead"))) {
           try {
-            u.writeSpoolFile(path.join(graph, "outbox", "dead", spoolName), body);
-            dead = true;
+            dead = path.basename(u.deadLetterFile(path.join(graph, "outbox", "dead"), spoolName, { data: body }));
           } catch {}
         }
         rlog(
           kind === "auth"
             ? `capture rejected (http=${http}, revoked/invalid token) for fact-${factNo}.txt` +
-                `${dead ? `; dead-lettered to outbox/dead/${spoolName}` : ""} — re-mint SPOR_TOKEN and replay outbox/dead/`
+                `${dead ? `; dead-lettered to outbox/dead/${dead}` : ""} — re-mint SPOR_TOKEN and replay outbox/dead/`
             : `capture rejected (http=${http}) for fact-${factNo}.txt` +
-                `${dead ? `; dead-lettered to outbox/dead/${spoolName}` : ""}`
+                `${dead ? `; dead-lettered to outbox/dead/${dead}` : ""}`
         );
       } else {
         u.ensureDir(path.join(graph, "outbox"));

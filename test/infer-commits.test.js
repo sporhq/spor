@@ -39,14 +39,14 @@ function git(cwd, args) {
 
 // Records every request; answers 200 with a body shaped like a real
 // /v1/capture response (see test/hookcli.test.js's stubServer).
-function stubServer(answer = { status: "captured", ids: ["x"], nodes: [], summary: "ok" }) {
+function stubServer(answer = { status: "captured", ids: ["x"], nodes: [], summary: "ok" }, status = 200) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       hits.push({ url: req.url, body });
-      res.writeHead(200, { "content-type": "application/json" });
+      res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify(answer));
     });
   });
@@ -109,7 +109,7 @@ test("infer-commits: /v1/capture body marks project_explicit false (ambient slug
 
 // One untrailered commit on a branch named after the candidate, run through
 // the engine against `answer`; returns the capture hits and the remote log.
-async function runOnce(answer) {
+async function runOnce(answer, status = 200) {
   const { repo, home } = scratch();
   git(repo, ["init", "-q", "-b", "task-test-node"]);
   fs.writeFileSync(path.join(repo, "f.txt"), "x");
@@ -118,7 +118,7 @@ async function runOnce(answer) {
   const sha = git(repo, ["rev-parse", "HEAD"]).trim();
   const journal = path.join(repo, "journal.jsonl");
   fs.writeFileSync(journal, JSON.stringify({ tool: "git-commit", sha, nodes: [] }) + "\n");
-  const { srv, hits, base } = await stubServer(answer);
+  const { srv, hits, base } = await stubServer(answer, status);
   const saved = { SPOR_SERVER: process.env.SPOR_SERVER, SPOR_INFER_COMMITS: process.env.SPOR_INFER_COMMITS, SPOR_HOME: process.env.SPOR_HOME };
   Object.assign(process.env, { SPOR_SERVER: base, SPOR_INFER_COMMITS: "1", SPOR_HOME: home });
   const run = () => inferCommits({ repo, journal, index: "task-test-node — Some candidate title\n", slug: "projx", session: "sess-infer" });
@@ -136,7 +136,7 @@ async function runOnce(answer) {
   try {
     log = fs.readFileSync(path.join(home, "journal", "remote.log"), "utf8");
   } catch {}
-  return { caps: hits.filter((h) => h.url === "/v1/capture").map((h) => JSON.parse(h.body)), log };
+  return { caps: hits.filter((h) => h.url === "/v1/capture").map((h) => JSON.parse(h.body)), log, home };
 }
 
 test("infer-commits: every capture carries a content-addressed idempotency key, stable across re-runs", async () => {
@@ -149,4 +149,29 @@ test("infer-commits: every capture carries a content-addressed idempotency key, 
 test("infer-commits: a 200 marked partial is surfaced in the remote log", async () => {
   const { log } = await runOnce({ status: "captured", ids: ["task-a"], partial: true, landed: ["task-a"], deferred: ["task-b"], pending_id: "cap-1" });
   assert.match(log, /partial capture: task-a landed; task-b not written — the text is preserved as cap-1/);
+});
+
+const listJson = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort() : []);
+
+test("infer-commits: a transient capture failure is spooled under a key-derived name for the drain, never dropped", async () => {
+  // A 5xx the server marks non-replayable is returned at once (no in-call
+  // retry); the capture is keyed, so the drain's replay answers the pinned
+  // reply rather than filing twice.
+  const { caps, log, home } = await runOnce({ error: { code: "internal", message: "boom", retryable: false } }, 500);
+  assert.strictEqual(caps.length, 2);
+  const spooled = listJson(path.join(home, "outbox"));
+  assert.strictEqual(spooled.length, 1, "the re-run rewrites the same key-named spool file");
+  assert.match(spooled[0], /^infer-[0-9a-f]{12}-[0-9a-f]{12}\.capture\.json$/);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(home, "outbox", spooled[0]), "utf8")), caps[0]);
+  assert.match(log, /spooled to outbox\/infer-/);
+});
+
+test("infer-commits: a permanent capture reject is dead-lettered once, not dropped or duplicated by a re-run", async () => {
+  const { caps, log, home } = await runOnce({ error: { code: "invalid", message: "nope" } }, 422);
+  assert.strictEqual(caps.length, 2);
+  assert.deepStrictEqual(listJson(path.join(home, "outbox")), []);
+  const dead = listJson(path.join(home, "outbox", "dead"));
+  assert.strictEqual(dead.length, 1, "an identical dead-letter is adopted, not suffixed");
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(home, "outbox", "dead", dead[0]), "utf8")), caps[0]);
+  assert.match(log, /capture rejected \(http=422\); dead-lettered to outbox\/dead\/infer-/);
 });

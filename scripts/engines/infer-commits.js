@@ -120,9 +120,40 @@ async function inferCommits({ repo, journal, indexFile = "", index = "", slug = 
       // capture-pending node holding the rest.
       const outcome = u.captureOutcome(res);
       if (outcome.partial) rlog(`proposed ${sha.slice(0, 12)}: ${capturePartial.describePartialCapture(outcome.partial)}`);
+      // Anything that did not land is handed to the outbox under a name
+      // derived from the key: a TRANSIENT failure (transport, 429, 5xx) is
+      // spooled for the drain to re-send — the key makes that replay safe, so
+      // even a 5xx the server marked non-replayable answers its pinned reply
+      // rather than filing twice — and a PERMANENT one (API.md §5) is
+      // dead-lettered for inspection, never dropped.
+      const stem = `infer-${sha.slice(0, 12)}-${key.slice(0, 12)}`;
+      const spoolName = `${stem}.capture.json`;
+      const kind = u.classifyHttpFailure(res.http);
+      let handoff = null;
       if (outcome.unsaved) {
-        const stem = `infer-${sha.slice(0, 12)}-${key.slice(0, 12)}`;
-        await u.settlePartialUnsaved(graph, outcome.unsaved, { stem, log: (m) => rlog(`proposed ${sha.slice(0, 12)}: ${m}`) });
+        const { durable } = await u.settlePartialUnsaved(graph, outcome.unsaved, { stem, log: (m) => rlog(`proposed ${sha.slice(0, 12)}: ${m}`) });
+        // Only if its drafts reached neither the server nor disk: a keyed
+        // replay of the capture answers the same drafts again.
+        if (!durable) handoff = "spool";
+      } else if (u.isPermanentHttpFailure(kind)) handoff = "dead";
+      else if (kind !== "ok") handoff = "spool";
+      if (handoff === "spool") {
+        let spooled = false;
+        if (u.ensureDir(path.join(graph, "outbox"))) {
+          try {
+            u.writeSpoolFile(path.join(graph, "outbox", spoolName), body);
+            spooled = true;
+          } catch {}
+        }
+        rlog(`proposed ${sha.slice(0, 12)}: ${spooled ? `spooled to outbox/${spoolName} (http=${res.http})` : `outbox write failed (http=${res.http}); proposal dropped`}`);
+      } else if (handoff === "dead") {
+        let dead = null;
+        if (u.ensureDir(path.join(graph, "outbox", "dead"))) {
+          try {
+            dead = path.basename(u.deadLetterFile(path.join(graph, "outbox", "dead"), spoolName, { data: body }));
+          } catch {}
+        }
+        rlog(`proposed ${sha.slice(0, 12)}: capture rejected (http=${res.http})${dead ? `; dead-lettered to outbox/dead/${dead}` : "; dead-letter write failed"}`);
       }
     }
     posted++;

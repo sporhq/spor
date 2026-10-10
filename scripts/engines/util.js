@@ -1382,28 +1382,64 @@ function captureOutcome(res) {
   return partial ? { partial } : {};
 }
 
-// The outbox/dead/ path a dead-letter named `name` takes: `name` itself, or —
-// when an earlier dead-letter already holds that name (a re-spooled remainder
-// keeps its base name, and two spool cycles can mint the same capture name) —
-// a unique-suffixed sibling that keeps the spool suffix (`.capture.json` /
-// `.json`), so a replay moved back into the outbox still routes to the same
-// endpoint. A dead-letter never replaces an earlier one.
-function deadLetterPath(dir, name) {
-  const file = path.join(dir, name);
-  if (!fs.existsSync(file)) return file;
+// Put a dead-letter into outbox/dead/ (`dir`) under `name`, never replacing an
+// earlier one: the payload is MOVED from the file `from`, or written from
+// `data`. The name is `name` itself when free, else — an earlier dead-letter
+// already holds it (a re-spooled remainder keeps its base name, and two spool
+// cycles can mint the same capture name) — a unique-suffixed sibling that
+// keeps the spool suffix (`.capture.json` / `.json`), so a replay moved back
+// into the outbox still routes to the same endpoint. Every candidate is taken
+// with an EXCLUSIVE create (spool.linkOrReserve: link, or a `wx` reservation
+// renamed over), so two writers racing for one name cannot overwrite each
+// other the way exists-then-rename could. An occupant holding these exact
+// bytes IS this dead-letter (a crash re-drain of a key-named payload), so it
+// is adopted rather than duplicated. Returns the path the dead-letter sits at;
+// throws when it could not be written (the caller keeps its copy).
+function deadLetterFile(dir, name, { from = null, data = null } = {}) {
   const suffix = name.endsWith(".capture.json") ? ".capture.json" : ".json";
   const stem = name.endsWith(suffix) ? name.slice(0, -suffix.length) : name;
-  return path.join(dir, `${stem}.${Date.now()}-${crypto.randomBytes(4).toString("hex")}${suffix}`);
+  const bytes = from ? fs.readFileSync(from) : Buffer.from(data);
+  let tmp = null;
+  try {
+    let src = from;
+    if (!src) {
+      tmp = path.join(dir, `.${name}.${process.pid}-${crypto.randomBytes(4).toString("hex")}.tmp`);
+      fs.writeFileSync(tmp, bytes);
+      src = tmp;
+    }
+    for (let n = 0; n < 8; n++) {
+      const file = n === 0 ? path.join(dir, name) : path.join(dir, `${stem}.${Date.now()}-${crypto.randomBytes(4).toString("hex")}${suffix}`);
+      let landed = spool.linkOrReserve(src, file);
+      if (!landed) {
+        try {
+          landed = fs.readFileSync(file).equals(bytes);
+        } catch {}
+      }
+      if (landed) {
+        // The dead-letter stands; a source we could not remove is re-settled
+        // by a later drain, which adopts this identical occupant.
+        if (from) {
+          try {
+            fs.rmSync(from, { force: true });
+          } catch {}
+        }
+        return file;
+      }
+    }
+    throw new Error(`no free dead-letter name for ${name}`);
+  } finally {
+    if (tmp) fs.rmSync(tmp, { force: true });
+  }
 }
 
 // Write a /v1/nodes batch body into the outbox (`dead` -> outbox/dead/, under
-// deadLetterPath's never-overwrite rule). Returns whether it landed on disk.
+// deadLetterFile's never-overwrite rule). Returns whether it landed on disk.
 function spoolNodesBody(graph, name, body, { dead = false } = {}) {
   const dir = dead ? path.join(graph, "outbox", "dead") : path.join(graph, "outbox");
   if (!ensureDir(dir)) return false;
-  const file = dead ? deadLetterPath(dir, name) : path.join(dir, name);
   try {
-    spool.writeSpoolFile(file, JSON.stringify(body));
+    if (dead) deadLetterFile(dir, name, { data: JSON.stringify(body) });
+    else spool.writeSpoolFile(path.join(dir, name), JSON.stringify(body));
     return true;
   } catch {
     return false;
@@ -2227,7 +2263,7 @@ module.exports = {
   parseJsonOrNull,
   settlePartialUnsaved,
   spoolNodesBody,
-  deadLetterPath,
+  deadLetterFile,
   curlWithRefresh,
   isPermanentHttpFailure,
   isSystemSession,

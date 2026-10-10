@@ -381,6 +381,102 @@ for (const [label, answer] of [
   });
 }
 
+test(`drain: a /v1/nodes batch answered 2xx without per-entry results ${require(DRAIN).RESULTLESS_MAX} times is dead-lettered, not rotated forever`, async () => {
+  const { RESULTLESS_MAX } = require(DRAIN);
+  const { home, outbox } = freshHome();
+  const body = { nodes: ["n1", "n2"], if_exists: "skip" };
+  fs.writeFileSync(path.join(outbox, "batch.json"), JSON.stringify(body));
+  const { srv, base } = await stubServer({ "/v1/nodes": [[200, { ok: true }]] });
+  try {
+    await drain(home, base);
+    assert.strictEqual(fs.readFileSync(path.join(outbox, ".attempts", "batch.json"), "utf8"), "1");
+    // one answer short of the cap: still spooled
+    fs.writeFileSync(path.join(outbox, ".attempts", "batch.json"), String(RESULTLESS_MAX - 2));
+    await drain(home, base);
+    assert.deepStrictEqual(listJson(outbox), ["batch.json"]);
+    await drain(home, base);
+    assert.deepStrictEqual(listJson(outbox), []);
+    assert.deepStrictEqual(listJson(path.join(outbox, "dead")), ["batch.json"]);
+    assert.deepStrictEqual(readJson(path.join(outbox, "dead", "batch.json")), body);
+    assert.match(remoteLog(home), new RegExp(`dead-lettered batch\\.json: ${RESULTLESS_MAX} http=2xx answers carried no per-entry results`));
+  } finally {
+    srv.close();
+  }
+});
+
+test("drain: a 207 with per-entry results resets the results-less count", async () => {
+  const { home, outbox } = freshHome();
+  const body = { nodes: ["n1", "n2"], if_exists: "skip" };
+  fs.writeFileSync(path.join(outbox, "batch.json"), JSON.stringify(body));
+  fs.mkdirSync(path.join(outbox, ".attempts"));
+  fs.writeFileSync(path.join(outbox, ".attempts", "batch.json"), "3");
+  const { srv, base } = await stubServer({ "/v1/nodes": [[207, { results: [{ ok: true, status: "created" }, { ok: false, code: "busy", retryable: true }] }]] });
+  try {
+    await drain(home, base);
+    assert.deepStrictEqual(readJson(path.join(outbox, "batch.json")), { nodes: ["n2"], if_exists: "skip" });
+    assert.strictEqual(fs.readFileSync(path.join(outbox, ".attempts", "batch.json"), "utf8"), "0");
+  } finally {
+    srv.close();
+  }
+});
+
+test("deadLetterFile: never overwrites, adopts an identical occupant, keeps the spool suffix, moves a source file", () => {
+  const u = require("../scripts/engines/util.js");
+  const { outbox } = freshHome();
+  const dir = path.join(outbox, "dead");
+  fs.mkdirSync(dir);
+  const first = u.deadLetterFile(dir, "a.capture.json", { data: "one" });
+  assert.strictEqual(path.basename(first), "a.capture.json");
+  assert.strictEqual(u.deadLetterFile(dir, "a.capture.json", { data: "one" }), first, "identical bytes are this dead-letter");
+  const second = u.deadLetterFile(dir, "a.capture.json", { data: "two" });
+  assert.match(path.basename(second), /^a\.\d+-[0-9a-f]{8}\.capture\.json$/);
+  assert.strictEqual(fs.readFileSync(first, "utf8"), "one");
+  assert.strictEqual(fs.readFileSync(second, "utf8"), "two");
+  const src = path.join(outbox, "b.json");
+  fs.writeFileSync(src, "three");
+  const moved = u.deadLetterFile(dir, "a.capture.json", { from: src });
+  assert.ok(!fs.existsSync(src), "the source is moved, not copied");
+  assert.strictEqual(fs.readFileSync(moved, "utf8"), "three");
+  assert.strictEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")).length, 0, "no temp litter");
+  assert.strictEqual(listJson(dir).length, 3);
+});
+
+test("add (remote): a per-entry busy retryable:false inside a 207 is dead-lettered; a retryable one is spooled for the drain", async () => {
+  const { home, outbox } = freshHome();
+  const answer = { results: [{ ok: false, code: "busy", message: "busy", retryable: false }, { ok: false, code: "busy", message: "busy", retryable: true }] };
+  const { srv, hits, base } = await stubServer({ "/v1/capture": [[503, UNSAVED]], "/v1/nodes": [[207, answer]] });
+  try {
+    const r = await runAsync(CLI, ["add", "a capture whose second half could not be saved"], { SPOR_SERVER: base, SPOR_TOKEN: "tok", SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(r.status, 1, r.stderr);
+    const dead = listJson(path.join(outbox, "dead"));
+    assert.strictEqual(dead.length, 1, r.stderr);
+    assert.deepStrictEqual(readJson(path.join(outbox, "dead", dead[0])), { nodes: [draft("task-b")], if_exists: "skip" });
+    const live = listJson(outbox);
+    assert.strictEqual(live.length, 1, r.stderr);
+    assert.deepStrictEqual(readJson(path.join(outbox, live[0])), { nodes: [draft("task-c")], if_exists: "skip" });
+    assert.ok(hits.filter((h) => h.url === "/v1/nodes").length >= 1);
+  } finally {
+    srv.close();
+  }
+});
+
+test("add (remote): a per-entry results list that is not one per entry sent is unconfirmed — every draft spooled, none read as landed", async () => {
+  const { home, outbox } = freshHome();
+  const { srv, base } = await stubServer({ "/v1/capture": [[503, UNSAVED]], "/v1/nodes": [[200, { results: [{ ok: true, status: "created" }] }]] });
+  try {
+    const r = await runAsync(CLI, ["add", "a capture whose second half could not be saved"], { SPOR_SERVER: base, SPOR_TOKEN: "tok", SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.doesNotMatch(r.stdout, /created: task-b/);
+    const live = listJson(outbox);
+    assert.strictEqual(live.length, 1, r.stderr);
+    assert.deepStrictEqual(readJson(path.join(outbox, live[0])), { nodes: [draft("task-b"), draft("task-c")], if_exists: "skip" });
+    assert.deepStrictEqual(listJson(path.join(outbox, "dead")), []);
+    assert.match(r.stderr, /1 per-entry result\(s\) for 2 entr\(ies\) sent/);
+  } finally {
+    srv.close();
+  }
+});
+
 test("drain: a deferred-draft re-submit answered busy retryable:false dead-letters the drafts and settles the capture", async () => {
   const { home, outbox } = freshHome();
   fs.writeFileSync(path.join(outbox, "s1-abc.capture.json"), JSON.stringify(CAPTURE));

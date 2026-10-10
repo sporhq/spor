@@ -28,6 +28,9 @@ const capturePartial = require(path.join(u.ROOT, "lib", "shell", "capture-partia
 // the whole pass besides the per-file `maxTimeSec` and the `maxFiles` cap.
 // Outbox files this process is draining right now, by unclaimed path.
 const inFlight = new Set();
+// A /v1/nodes batch answered 2xx without per-entry results this many times is
+// dead-lettered rather than rotated forever.
+const RESULTLESS_MAX = 5;
 const suffixOf = (name) => (name.endsWith(".capture.json") ? ".capture.json" : ".json");
 
 async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0, maxWallSec = 0, retryOverride = null } = {}) {
@@ -101,17 +104,27 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
       fs.renameSync(file, path.join(outbox, name));
     } catch {}
   };
-  const stampAttempt = (name) => {
+  // The stamp's CONTENT is the count of 2xx answers that carried no
+  // per-entry results (settleNodes); any other attempt keeps it as it stands.
+  const stampAttempt = (name, resultless = null) => {
     try {
       u.ensureDir(attempts);
-      fs.writeFileSync(stampOf(name), "");
+      if (resultless != null) fs.writeFileSync(stampOf(name), String(resultless));
+      else fs.closeSync(fs.openSync(stampOf(name), "a"));
       const now = new Date();
       fs.utimesSync(stampOf(name), now, now);
     } catch {}
   };
+  const resultlessCount = (name) => {
+    try {
+      return Number(fs.readFileSync(stampOf(name), "utf8").trim()) || 0;
+    } catch {
+      return 0;
+    }
+  };
   // The three settled outcomes every endpoint's settle function ends in, each
   // owning its tally: DRAINED (the file is done with), DEAD-LETTERED (kept in
-  // outbox/dead/ under deadLetterPath's never-overwrite rule), or KEPT
+  // outbox/dead/ under deadLetterFile's never-overwrite rule), or KEPT
   // spooled for a later drain (`stamp` rotates it behind every untried file,
   // so a head that keeps failing never starves the queue).
   const drained = (f, what) => {
@@ -122,9 +135,9 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
     summary.drained++;
     rlog(what);
   };
-  const keep = (f, what, { stamp = true } = {}) => {
+  const keep = (f, what, { stamp = true, resultless = null } = {}) => {
     summary.failed++;
-    if (stamp) stampAttempt(f.name);
+    if (stamp) stampAttempt(f.name, resultless);
     release(f.file, f.name);
     rlog(what);
   };
@@ -135,7 +148,7 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
     try {
       const dir = path.join(outbox, "dead");
       if (!u.ensureDir(dir)) throw new Error("no dead-letter dir");
-      fs.renameSync(f.file, u.deadLetterPath(dir, f.name));
+      u.deadLetterFile(dir, f.name, { from: f.file });
     } catch {
       keep(f, `${what} — but the dead-letter write failed; left spooled`);
       return;
@@ -211,8 +224,17 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
     if (!sent || !Array.isArray(sent.nodes)) return drained(f, `drained ${f.name} (http=${f.http})`);
     const split = capturePartial.splitNodesResults(u.parseJsonOrNull(f.res.body || ""), sent);
     // A 2xx whose per-entry results are missing or not one per entry says
-    // nothing about which entries landed: the batch stays whole and spooled.
-    if (!split) return keep(f, `kept ${f.name} spooled: http=${f.http} carried no per-entry results for its ${sent.nodes.length} entr(ies)`);
+    // nothing about which entries landed: the batch stays whole and spooled —
+    // but a server that NEVER answers it with results would rotate it forever,
+    // so after RESULTLESS_MAX such answers it is dead-lettered for inspection
+    // (a skip batch, so replaying it from outbox/dead/ stays safe).
+    if (!split) {
+      const n = resultlessCount(f.name) + 1;
+      if (n >= RESULTLESS_MAX) {
+        return deadLetter(f, `dead-lettered ${f.name}: ${n} http=2xx answers carried no per-entry results for its ${sent.nodes.length} entr(ies); kept in outbox/dead/ for inspection`);
+      }
+      return keep(f, `kept ${f.name} spooled: http=${f.http} carried no per-entry results for its ${sent.nodes.length} entr(ies) (${n}/${RESULTLESS_MAX})`, { resultless: n });
+    }
     if (!split.retry && !split.dead) return drained(f, `drained ${f.name} (http=${f.http})`);
     // Dead-letter the refused entries first; only once they are safely in
     // outbox/dead/ may the file shrink to the re-sendable ones, otherwise it
@@ -230,7 +252,7 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
     if (!ok) {
       keep(f, `drain of ${f.name} partly landed (http=${f.http}) but its refused entries could not be dead-lettered; leaving the file whole`, { stamp: false });
     } else if (split.retry) {
-      keep(f, `drained ${tally}; ${split.retry.nodes.length} busy entr(ies) left spooled` + (refused ? `, ${refused}` : ""));
+      keep(f, `drained ${tally}; ${split.retry.nodes.length} busy entr(ies) left spooled` + (refused ? `, ${refused}` : ""), { resultless: 0 });
     } else {
       // Everything sent either landed or now sits in outbox/dead/.
       try {
@@ -298,7 +320,7 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
   return summary;
 }
 
-module.exports = { drainOutbox };
+module.exports = { drainOutbox, RESULTLESS_MAX };
 
 // CLI entry so session-start can fire the drain DETACHED (off the response
 // critical path) the same way it fires link-commits.js — argv: tag, perFileSec,

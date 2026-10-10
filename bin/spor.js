@@ -1778,20 +1778,27 @@ function chunkPutEntries(wire) {
 //     NOT land — "rejected", with the server's own error message — unless an
 //     earlier attempt of the same request was lost, which may have landed it;
 //   - anything else without per-entry results (a 5xx): "not confirmed".
+// A results array whose length is not the chunk's counts as no results.
 // Every later entry is "not sent". `write` is the re-run hint a transport
-// failure carries; `report`, when given, receives the failed chunk's reason
-// (put-node prints it; reconcile-landed's callers log the per-entry messages).
+// failure carries; `report`, when given, receives the failed chunk's reason,
+// the reply and the chunk's entries (put-node prints the reason;
+// reconcile-landed's callers log the per-entry messages).
 async function putNodesRemoteChunked(cfg, entries, { write, report = null }) {
   const results = [];
   for (const chunk of chunkPutEntries(entries.map((e) => e.wire))) {
     const batch = entries.slice(results.length, results.length + chunk.length);
     const r = await remote.post(cfg, "/v1/nodes", { nodes: chunk }, { timeoutMs: Math.min(120000, 15000 + 1000 * chunk.length) });
-    const rs = r.json && Array.isArray(r.json.results) ? r.json.results : null;
+    // A results array that is not one per entry sent cannot be matched to
+    // the entries: the chunk is unconfirmed, exactly as with no results.
+    const rs = r.json && Array.isArray(r.json.results) && r.json.results.length === chunk.length ? r.json.results : null;
     if (r.transport || !rs) {
       const msg = r.json && r.json.error && r.json.error.message;
-      const definite = !r.transport && !r.earlierAttemptUnknown && r.status >= 400 && r.status < 500;
-      const why = r.transport ? remote.describeTransport(r, { write }) : `put-node error ${r.status}${msg ? `: ${msg}` : ": no per-entry results returned"}`;
-      if (report) report(why, r);
+      const mismatch = r.json && Array.isArray(r.json.results);
+      const definite = !r.transport && !mismatch && !r.earlierAttemptUnknown && r.status >= 400 && r.status < 500;
+      const why = r.transport
+        ? remote.describeTransport(r, { write })
+        : `put-node error ${r.status}${msg ? `: ${msg}` : mismatch ? `: ${r.json.results.length} per-entry result(s) for ${chunk.length} entr(ies) sent` : ": no per-entry results returned"}`;
+      if (report) report(why, r, batch);
       for (const e of entries.slice(results.length)) {
         const label = !batch.includes(e) ? "not sent" : definite ? "rejected" : "not confirmed";
         results.push({ ok: false, id: e.id, status: "error", message: `${label} (${why})` });
@@ -4488,31 +4495,46 @@ async function resubmitDeferredDrafts(cfg, unsaved) {
     }
     entries.push({ id: parsed.node.id, node: parsed.node, raw: d.raw, wire: { node: d.raw, if_exists: "skip" } });
   }
-  // A chunk refused with a 5xx the server marked non-replayable (a busy with
-  // `retryable: false`): spooling it would have the drain re-send what the
-  // server said may double-apply, so those drafts go to outbox/dead/ instead.
-  let nonReplayable = false;
-  const report = (_why, r) => {
-    if (r && !r.transport && r.status >= 500 && !busy.serverAllowsReplay(r)) nonReplayable = true;
+  // A draft the server marked non-replayable must not reach the live outbox,
+  // where the drain would re-send what the server said may double-apply: the
+  // entries of a chunk refused whole with such a 5xx (a busy with
+  // `retryable: false`), and any entry whose OWN result inside a 2xx is a
+  // busy marked `retryable: false`. Those go to outbox/dead/; the rest
+  // (unconfirmed, not sent, retryable, or refused on content — a skip re-send
+  // of which is harmless, and the drain dead-letters it per entry) are
+  // spooled for the drain.
+  const refusedChunk = new Set();
+  const report = (_why, r, batch) => {
+    if (r && !r.transport && r.status >= 500 && !busy.serverAllowsReplay(r)) for (const e of batch || []) refusedChunk.add(e);
   };
   const results = entries.length ? await putNodesRemoteChunked(cfg, entries, { write: "run 'spor drain' (every write is if_exists: skip)", report }) : [];
   const failed = [...unsent];
+  const dead = [];
   results.forEach((res, i) => {
-    if (res && res.ok) out(`  ${res.status || "created"}: ${entries[i].id}`);
-    else failed.push({ raw: entries[i].raw, line: `  ${entries[i].id}: ${(res && res.message) || "not confirmed"}` });
+    if (res && res.ok) return out(`  ${res.status || "created"}: ${entries[i].id}`);
+    const f = { raw: entries[i].raw, line: `  ${entries[i].id}: ${(res && res.message) || "not confirmed"}` };
+    const nonReplayable = res && res.code === "busy" && res.retryable === false && !busy.entryLanded(res);
+    if (refusedChunk.has(entries[i]) || nonReplayable) dead.push(f);
+    else failed.push(f);
   });
-  if (!failed.length) {
+  if (!failed.length && !dead.length) {
     await opportunisticDrain(cfg);
     out(writeTargetLine(cfg));
     return 0;
   }
-  for (const f of failed) err(f.line);
-  const spool = spoolDeferredDrafts(cfg, capturePartial.deferredNodesBody(failed), { dead: nonReplayable });
-  err(spool
-    ? nonReplayable
-      ? `${failed.length} deferred draft(s) did not land and the server marked the re-send non-replayable — kept in ${spool} for inspection; re-submit them with 'spor put-node - --if-exists skip' once you have checked what landed.`
-      : `${failed.length} deferred draft(s) did not land — spooled to ${spool}; run 'spor drain' to re-send them (refused ones are kept in outbox/dead/).`
-    : `${failed.length} deferred draft(s) did not land and could not be spooled — re-submit them with 'spor put-node - --if-exists skip':\n\n${failed.map((f) => f.raw).join("\n")}`);
+  for (const f of [...failed, ...dead]) err(f.line);
+  if (dead.length) {
+    const kept = spoolDeferredDrafts(cfg, capturePartial.deferredNodesBody(dead), { dead: true });
+    err(kept
+      ? `${dead.length} deferred draft(s) did not land and the server marked the re-send non-replayable — kept in ${kept} for inspection; re-submit them with 'spor put-node - --if-exists skip' once you have checked what landed.`
+      : `${dead.length} deferred draft(s) did not land, the server marked the re-send non-replayable, and they could not be kept — check what landed, then re-submit them with 'spor put-node - --if-exists skip':\n\n${dead.map((f) => f.raw).join("\n")}`);
+  }
+  if (failed.length) {
+    const spool = spoolDeferredDrafts(cfg, capturePartial.deferredNodesBody(failed));
+    err(spool
+      ? `${failed.length} deferred draft(s) did not land — spooled to ${spool}; run 'spor drain' to re-send them (refused ones are kept in outbox/dead/).`
+      : `${failed.length} deferred draft(s) did not land and could not be spooled — re-submit them with 'spor put-node - --if-exists skip':\n\n${failed.map((f) => f.raw).join("\n")}`);
+  }
   return 1;
 }
 
