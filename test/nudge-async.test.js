@@ -461,6 +461,44 @@ test("SessionEnd (remote): posts an undrained finding to /v1/capture", async () 
   }
 });
 
+test("SessionEnd (remote): a partial_unsaved capture is final — its deferred draft is re-submitted, the capture never spooled", async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, "nodes"), { recursive: true });
+  const file = path.join(cwd, "notes.md");
+  seedOut(home, "s1", "r0", file, "1. a session-final finding");
+
+  const http = require("node:http");
+  const raw = "---\nid: task-deferred-x\ntype: task\ntitle: x\nsummary: x\n---\n\nx\n";
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      hits.push({ url: req.url, body });
+      if (req.url === "/v1/capture") {
+        res.writeHead(503, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { code: "partial_unsaved", retryable: false, landed: ["task-a"], deferred: ["task-deferred-x"], deferred_drafts: [{ id: "task-deferred-x", raw }] } }));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(req.url === "/v1/nodes" ? { results: [{ ok: true, status: "created" }] } : {}));
+    });
+  });
+  const base = await new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${srv.address().port}`)));
+  try {
+    const e = env(home, null, { SPOR_SERVER: base, SPOR_TOKEN: "spor_pat_test", SPOR_DISTILL: "0", SPOR_SESSION_LEASE: "0" });
+    await runAsync(["distill", "--host", "claude-code"], sessionEndPayload(cwd), e);
+    assert.strictEqual(hits.filter((h) => h.url === "/v1/capture").length, 1, "the capture is never re-sent");
+    const put = hits.find((h) => h.url === "/v1/nodes");
+    assert.ok(put, `expected the deferred draft re-submitted; hits: ${JSON.stringify(hits.map((h) => h.url))}`);
+    assert.deepStrictEqual(JSON.parse(put.body), { nodes: [raw], if_exists: "skip" });
+    const outbox = fs.existsSync(path.join(home, "outbox")) ? fs.readdirSync(path.join(home, "outbox")).filter((f) => f.endsWith(".json")) : [];
+    assert.deepStrictEqual(outbox, [], "nothing spooled");
+    assert.strictEqual(outFiles(home).length, 0, "the finding is consumed once its drafts are settled");
+  } finally {
+    srv.close();
+  }
+});
+
 test("SessionEnd (remote): a transport failure spools the finding to the outbox", async () => {
   const { home, cwd } = scratch();
   fs.rmSync(path.join(home, "nodes"), { recursive: true });

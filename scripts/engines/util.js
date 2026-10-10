@@ -1321,6 +1321,7 @@ function sleep(ms) {
 // Parse a Retry-After header to milliseconds (seconds or an HTTP-date; null
 // when absent/unparseable) — the one parser, shared with the CLI's busy retry.
 const busy = require(path.join(ROOT, "lib", "shell", "busy.js"));
+const capturePartial = require(path.join(ROOT, "lib", "shell", "capture-partial.js"));
 const { parseRetryAfter } = busy;
 
 // Delay before the next retry: honor a server-supplied Retry-After when
@@ -1364,6 +1365,84 @@ function classifyHttpFailure(http) {
 // Permanent kinds: dead-letter, never re-POST (API.md §5).
 function isPermanentHttpFailure(kind) {
   return kind === "auth" || kind === "rejected";
+}
+
+// A /v1/capture answer's partial reading (lib/shell/capture-partial.js) from a
+// curl()-shaped result: { unsaved } for the FINAL 503 partial_unsaved (never
+// spooled, never re-sent), { partial } for a 200 marked partial, else {}.
+function captureOutcome(res) {
+  const http = res ? String(res.http) : "000";
+  if (http !== "200" && http !== "503") return {};
+  const json = parseJsonOrNull(res.body || "");
+  if (http === "503") {
+    const unsaved = capturePartial.partialUnsaved(json);
+    return unsaved ? { unsaved } : {};
+  }
+  const partial = capturePartial.partialCapture(json);
+  return partial ? { partial } : {};
+}
+
+// Write a /v1/nodes batch body into the outbox (`dead` -> outbox/dead/).
+// Returns whether it landed on disk. A dead-letter never replaces an earlier
+// one under the same name (a re-spooled remainder keeps its base name, so its
+// later refusals would otherwise overwrite the first): it takes a unique
+// suffix instead.
+function spoolNodesBody(graph, name, body, { dead = false } = {}) {
+  const dir = dead ? path.join(graph, "outbox", "dead") : path.join(graph, "outbox");
+  if (!ensureDir(dir)) return false;
+  let file = path.join(dir, name);
+  if (dead && fs.existsSync(file)) file = path.join(dir, `${name.replace(/\.json$/, "")}.${Date.now()}-${crypto.randomBytes(4).toString("hex")}.json`);
+  try {
+    spool.writeSpoolFile(file, JSON.stringify(body));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Settle a FINAL partial_unsaved capture refusal: re-submit its deferred
+// drafts as explicit node writes (`POST /v1/nodes`, `if_exists: skip`), and
+// hand every draft that did not land to the outbox — a busy/transport one to
+// `outbox/<stem>.deferred.json`, which drain-outbox re-POSTs to /v1/nodes (a
+// skip batch is replay-safe), a refused one to `outbox/dead/` — so no draft
+// the server handed back is lost. Returns { durable }: every draft landed or
+// is on disk; when false the caller keeps whatever it already holds.
+async function settlePartialUnsaved(graph, unsaved, { stem, log = () => {}, timeoutMs = 30000 } = {}) {
+  const name = `${stem}.deferred.json`;
+  log(`${capturePartial.describePartialUnsaved(unsaved)} — the capture is final, never re-sent`);
+  if (!unsaved.drafts.length) {
+    log(`partial_unsaved carried no re-submittable drafts (deferred: ${unsaved.deferred.join(", ") || "none"})`);
+    return { durable: true };
+  }
+  const body = capturePartial.deferredNodesBody(unsaved.drafts);
+  const res = await curlWithRefresh(`${serverBase()}/v1/nodes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    timeoutMs,
+  }).catch(() => ({ http: "000", body: "" }));
+  const kind = classifyHttpFailure(res.http);
+  if (kind === "ok") {
+    const split = capturePartial.splitNodesResults(parseJsonOrNull(res.body || ""), body);
+    let durable = true;
+    if (split && split.retry) durable = spoolNodesBody(graph, name, split.retry) && durable;
+    if (split && split.dead) durable = spoolNodesBody(graph, name, split.dead, { dead: true }) && durable;
+    const landed = split ? split.landed : body.nodes.length;
+    log(
+      `re-submitted ${landed}/${body.nodes.length} deferred draft(s) (http=${res.http})` +
+        (split && split.retry ? `; ${split.retry.nodes.length} spooled to outbox/${name}` : "") +
+        (split && split.dead ? `; ${split.dead.nodes.length} refused, dead-lettered to outbox/dead/${name}` : "")
+    );
+    return { durable };
+  }
+  if (isPermanentHttpFailure(kind)) {
+    const durable = spoolNodesBody(graph, name, body, { dead: true });
+    log(`deferred draft re-submit refused (http=${res.http})${durable ? `; dead-lettered to outbox/dead/${name}` : "; dead-letter write failed"}`);
+    return { durable };
+  }
+  const durable = spoolNodesBody(graph, name, body);
+  log(`deferred draft re-submit failed (http=${res.http})${durable ? `; spooled to outbox/${name}` : "; outbox write failed"}`);
+  return { durable };
 }
 
 // A headless invocation the system itself spawned (the distiller, the capture
@@ -2119,6 +2198,10 @@ module.exports = {
   gcJournal,
   curl,
   classifyHttpFailure,
+  captureOutcome,
+  parseJsonOrNull,
+  settlePartialUnsaved,
+  spoolNodesBody,
   curlWithRefresh,
   isPermanentHttpFailure,
   isSystemSession,

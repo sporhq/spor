@@ -9,6 +9,8 @@
 const fs = require("fs");
 const path = require("path");
 const u = require("./util");
+const busy = require(path.join(u.ROOT, "lib", "shell", "busy.js"));
+const capturePartial = require(path.join(u.ROOT, "lib", "shell", "capture-partial.js"));
 
 // Returns a { attempted, drained, deadLettered, failed } tally so a caller (the
 // `spor drain` verb) can report the outcome; the detached/session-start callers
@@ -99,6 +101,27 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
       fs.renameSync(file, path.join(outbox, name));
     } catch {}
   };
+  const stampAttempt = (name) => {
+    try {
+      u.ensureDir(attempts);
+      fs.writeFileSync(stampOf(name), "");
+      const now = new Date();
+      fs.utimesSync(stampOf(name), now, now);
+    } catch {}
+  };
+  const deadLetter = (file, name, what) => {
+    try {
+      u.ensureDir(path.join(outbox, "dead"));
+      fs.renameSync(file, path.join(outbox, "dead", name));
+    } catch {
+      try {
+        fs.unlinkSync(file);
+      } catch {}
+    }
+    clearStamp(name);
+    summary.deadLettered++;
+    rlog(what);
+  };
   const drainOne = async (claimedName, name) => {
     const file = path.join(outbox, claimedName);
     const endpoint = name.endsWith(".capture.json") ? "/v1/capture" : "/v1/nodes";
@@ -109,22 +132,93 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
       release(file, name);
       return;
     }
-    const { http } = await u.curlWithRefresh(`${u.serverBase()}${endpoint}`, {
+    const res = await u.curlWithRefresh(`${u.serverBase()}${endpoint}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
       timeoutMs: maxTimeSec * 1000,
       retry,
     });
+    const { http } = res;
     summary.attempted++;
     const kind = u.classifyHttpFailure(http);
-    if (kind === "ok") {
+    const sent = u.parseJsonOrNull(body.toString("utf8"));
+    const isCapture = endpoint === "/v1/capture";
+    const outcome = isCapture ? u.captureOutcome(res) : {};
+    const reply = Number(http) >= 500 ? { status: Number(http), json: u.parseJsonOrNull(res.body || "") } : null;
+    // A capture whose idempotency key the server pins replays its original
+    // answer, so a re-POST of it can never double-apply.
+    const keyed = isCapture && sent && typeof sent.idempotency_key === "string" && sent.idempotency_key !== "";
+    // A /v1/nodes answer's per-entry verdicts: a 207 whose busy entries wrote
+    // nothing keeps exactly those spooled, and dead-letters the refused ones,
+    // instead of reading the whole file as drained.
+    const split = !isCapture && kind === "ok" ? capturePartial.splitNodesResults(u.parseJsonOrNull(res.body || ""), sent) : null;
+    const unlinkDrained = (what) => {
       try {
         fs.unlinkSync(file);
       } catch {}
       clearStamp(name);
       summary.drained++;
-      rlog(`drained ${name} (http=${http})`);
+      rlog(what);
+    };
+    if (outcome.unsaved) {
+      // FINAL (task-spor-client-capture-partial-unsaved-handling): the
+      // capture is never re-sent; its deferred drafts are re-submitted as
+      // node writes, and what did not land is handed to the outbox as a
+      // replay-safe /v1/nodes batch. Only if that handoff did not reach disk
+      // does a KEYED capture stay spooled (its replay answers the identical
+      // pinned body, drafts included); an unkeyed one is dead-lettered.
+      const stem = name.slice(0, -".capture.json".length);
+      const { durable } = await u.settlePartialUnsaved(graph, outcome.unsaved, { stem, log: (m) => rlog(`${name}: ${m}`), timeoutMs: maxTimeSec * 1000 });
+      if (durable) unlinkDrained(`settled ${name} (http=${http}, partial_unsaved)`);
+      else if (keyed) {
+        summary.failed++;
+        release(file, name);
+        rlog(`kept ${name} spooled: its deferred drafts could not be saved (a keyed replay returns them again)`);
+      } else deadLetter(file, name, `dead-lettered ${name} (http=${http}, partial_unsaved; deferred drafts not saved)`);
+    } else if (kind === "ok" && split && (split.retry || split.dead)) {
+      // Rewrite the file to the entries a re-send may still land, and
+      // dead-letter the refused ones under the same name.
+      let ok = true;
+      if (split.dead) ok = u.spoolNodesBody(graph, name, split.dead, { dead: true }) && ok;
+      // Only once the refused entries are safely dead-lettered may the file
+      // shrink to the re-sendable ones; otherwise it stays whole (a skip
+      // replay of the landed entries is harmless).
+      if (ok && split.retry) {
+        try {
+          u.writeSpoolFile(file, JSON.stringify(split.retry));
+        } catch {
+          ok = false;
+        }
+      }
+      if (!ok) {
+        summary.failed++;
+        release(file, name);
+        rlog(`drain of ${name} partly landed (http=${http}) but its refused entries could not be dead-lettered; leaving the file whole`);
+      } else if (split.retry) {
+        summary.failed++;
+        stampAttempt(name);
+        release(file, name);
+        rlog(
+          `drained ${split.landed}/${sent.nodes.length} of ${name} (http=${http}); ${split.retry.nodes.length} busy entr(ies) left spooled` +
+            (split.dead ? `, ${split.dead.nodes.length} refused (outbox/dead/${name})` : "")
+        );
+      } else {
+        try {
+          fs.unlinkSync(file);
+        } catch {}
+        clearStamp(name);
+        summary.deadLettered++;
+        rlog(`drained ${split.landed}/${sent.nodes.length} of ${name} (http=${http}); ${split.dead.nodes.length} refused, dead-lettered to outbox/dead/${name}`);
+      }
+    } else if (kind === "ok") {
+      if (outcome.partial) rlog(`${name}: ${capturePartial.describePartialCapture(outcome.partial)}`);
+      unlinkDrained(`drained ${name} (http=${http})`);
+    } else if (reply && !busy.serverAllowsReplay(reply) && !keyed) {
+      // The server said a re-send of these bytes may double-apply (a busy
+      // marked `retryable: false`): re-POSTing it every drain is the hazard,
+      // so it is dead-lettered for inspection rather than kept transient.
+      deadLetter(file, name, `dead-lettered ${name} (http=${http}, the server marked it non-replayable); kept in outbox/dead/ for inspection`);
     } else if (u.isPermanentHttpFailure(kind)) {
       // Permanent (u.classifyHttpFailure): dead-letter it so it can't starve
       // the drain. An auth failure means the token is revoked/invalid
@@ -153,12 +247,7 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
       summary.failed++;
       // Re-stamp the attempt so this file rotates behind every file not yet
       // tried: a head that keeps failing no longer starves the queue.
-      try {
-        u.ensureDir(attempts);
-        fs.writeFileSync(stampOf(name), "");
-        const now = new Date();
-        fs.utimesSync(stampOf(name), now, now);
-      } catch {}
+      stampAttempt(name);
       // Release the claim (rename back) so the file is retried later.
       release(file, name);
       rlog(`drain failed for ${name} (http=${http}); leaving spooled`);

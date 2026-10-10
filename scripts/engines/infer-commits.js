@@ -8,6 +8,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { spawnSync } = require("child_process");
 const u = require("./util");
 
@@ -100,13 +101,20 @@ async function inferCommits({ repo, journal, indexFile = "", index = "", slug = 
       const ev = p?.evidence;
       if (!ev) continue;
       const body = JSON.stringify({ text: ev, context: { project: slug, project_explicit: false }, source: "infer" });
-      const { http } = await u.curlWithRefresh(`${u.serverBase()}/v1/capture`, {
+      const res = await u.curlWithRefresh(`${u.serverBase()}/v1/capture`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,
         timeoutMs: 90000,
       });
-      rlog(`proposed ${sha.slice(0, 12)} -> capture http=${http}`);
+      rlog(`proposed ${sha.slice(0, 12)} -> capture http=${res.http}`);
+      // A FINAL partial_unsaved hands its deferred drafts back: re-submit them
+      // as node writes (task-spor-client-capture-partial-unsaved-handling).
+      const outcome = u.captureOutcome(res);
+      if (outcome.unsaved) {
+        const stem = `infer-${sha.slice(0, 12)}-${crypto.createHash("sha256").update(ev).digest("hex").slice(0, 12)}`;
+        await u.settlePartialUnsaved(graph, outcome.unsaved, { stem, log: (m) => rlog(`proposed ${sha.slice(0, 12)}: ${m}`) });
+      }
     }
     posted++;
   }

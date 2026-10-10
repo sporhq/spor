@@ -75,6 +75,7 @@ const { editUserConfig } = require(path.join(ROOT, "lib", "shell", "user-config.
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const { gitSpawn, gitOracle } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 const { writeSpoolFile } = require(path.join(ROOT, "lib", "shell", "spool.js"));
+const capturePartial = require(path.join(ROOT, "lib", "shell", "capture-partial.js"));
 const dispatchRuns = lazyModule(path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js"));
 const processIdentity = lazyModule(path.join(ROOT, "lib", "shell", "process-identity.js"));
 const dispatchTerminal = lazyModule(path.join(ROOT, "lib", "shell", "dispatch-terminal.js"));
@@ -4462,6 +4463,64 @@ function spoolCapture(cfg, body) {
   }
 }
 
+// Settle a FINAL `503 partial_unsaved` capture: name what landed, then
+// re-submit each deferred draft as an explicit node write (`if_exists: skip`,
+// through the same chunked door `spor put-node --dir` uses). Drafts that did
+// not confirm are spooled as a replay-safe /v1/nodes batch the drain re-sends
+// (and dead-letters per entry if the server refuses them). Exit 0 only when
+// every deferred draft landed.
+async function resubmitDeferredDrafts(cfg, unsaved) {
+  if (unsaved.landed.length) out(`captured: ${unsaved.landed.join(", ")} (partial)`);
+  err(`warning: ${capturePartial.describePartialUnsaved(unsaved)} — the capture is final and is not re-sent.`);
+  if (!unsaved.drafts.length) {
+    err(`error: the server returned no re-submittable drafts for ${unsaved.deferred.join(", ") || "the deferred part"}; re-file that part with 'spor add'.`);
+    return 1;
+  }
+  err(`re-submitting ${unsaved.drafts.length} deferred draft(s) as node writes (if_exists: skip)…`);
+  const entries = [];
+  const unsent = [];
+  for (const d of unsaved.drafts) {
+    const parsed = parsePutNode(d.raw, `${d.id || "deferred-draft"}.md`);
+    if (parsed.error) {
+      unsent.push({ raw: d.raw, line: `  ${d.id || "draft"}: not sent (${parsed.error})` });
+      continue;
+    }
+    entries.push({ id: parsed.node.id, node: parsed.node, raw: d.raw, wire: { node: d.raw, if_exists: "skip" } });
+  }
+  const results = entries.length ? await putNodesRemoteChunked(cfg, entries, { write: "run 'spor drain' (every write is if_exists: skip)" }) : [];
+  const failed = [...unsent];
+  results.forEach((res, i) => {
+    if (res && res.ok) out(`  ${res.status || "created"}: ${entries[i].id}`);
+    else failed.push({ raw: entries[i].raw, line: `  ${entries[i].id}: ${(res && res.message) || "not confirmed"}` });
+  });
+  if (!failed.length) {
+    await opportunisticDrain(cfg);
+    out(writeTargetLine(cfg));
+    return 0;
+  }
+  for (const f of failed) err(f.line);
+  const spool = spoolDeferredDrafts(cfg, capturePartial.deferredNodesBody(failed));
+  err(spool
+    ? `${failed.length} deferred draft(s) did not land — spooled to ${spool}; run 'spor drain' to re-send them (refused ones are kept in outbox/dead/).`
+    : `${failed.length} deferred draft(s) did not land and could not be spooled — re-submit them with 'spor put-node - --if-exists skip':\n\n${failed.map((f) => f.raw).join("\n")}`);
+  return 1;
+}
+
+// Spool a deferred-draft node batch to the shared outbox as a `*.json` file,
+// which the drain replays to /v1/nodes (if_exists: skip, so a re-send is
+// safe). Returns the path, or null when the write failed.
+function spoolDeferredDrafts(cfg, body) {
+  try {
+    const dir = path.join(cfg.graphHome(), "outbox");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `cli-${Date.now()}-${crypto.randomUUID()}.deferred.json`);
+    writeSpoolFile(file, JSON.stringify(body));
+    return file;
+  } catch {
+    return null;
+  }
+}
+
 async function cmdAdd(cfg, { values, positionals }) {
   const prose = positionals[0];
   if (!prose) {
@@ -4530,6 +4589,11 @@ async function cmdAdd(cfg, { values, positionals }) {
     // original capture replays and no second node is minted.
     const body = { text: prose, context, idempotency_key: dedupeKey || crypto.randomUUID() };
     const r = await remote.post(cfg, "/v1/capture", body, { timeoutMs: 30000 });
+    // A FINAL partial capture (task-spor-client-capture-partial-unsaved-
+    // handling): some drafts landed, the rest exist only in this 503. Never
+    // spooled or re-sent — its deferred drafts are re-submitted as node writes.
+    const unsaved = !r.transport && r.status === 503 ? capturePartial.partialUnsaved(r.json) : null;
+    if (unsaved) return await resubmitDeferredDrafts(cfg, unsaved);
     // Transport failure (server unreachable / >30s ingestion abort) or a transient
     // 5xx: the request never durably landed and a replay can still succeed. A
     // one-shot `spor add` has no hook loop to retry itself, so DON'T just print a
@@ -4578,6 +4642,10 @@ async function cmdAdd(cfg, { values, positionals }) {
     const replayed = Boolean(r.json && r.json.idempotent_replay);
     const suffix = replayed ? " (idempotent replay — the original capture, no new node)" : "";
     out(ids.length ? `captured: ${ids.join(", ")}${suffix}` : `captured (${(r.json && r.json.status) || "ok"})${suffix}`);
+    // A 200 marked partial is a success but never a FULL one: name what did
+    // not land and the capture-pending node its text was preserved as.
+    const partial = capturePartial.partialCapture(r.json);
+    if (partial) err(`warning: ${capturePartial.describePartialCapture(partial)}.`);
     // Self-heal: a pure-CLI user has no Claude Code session to run the drain, so a
     // successful capture (proof the server is reachable) is the moment to flush any
     // backlog the fail-open spool stranded (task-spor-cli-outbox-drain-verb). Only

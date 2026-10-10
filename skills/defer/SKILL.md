@@ -34,12 +34,25 @@ Read what it prints and tell the user, briefly:
 - `captured: <ids>` — report the node id(s) and what landed. Done.
 - `captured (pending)` — the text fit no schema; it was preserved as a `cap-…`
   node for later triage. Say so; nothing is lost.
+- a `warning: partial capture: …` line under `captured:` — some drafts landed,
+  the rest did not; the line names the `cap-…` node the text was preserved as.
+  Report both; nothing is lost and nothing needs re-sending.
+- `captured: … (partial)` followed by `re-submitting … deferred draft(s)` — the
+  server could not save the rest, so `spor add` re-submitted them itself as node
+  writes and listed each one. If any did not land it says they were spooled
+  (`spor drain` re-sends them); never re-run the same `spor add`, which would
+  file the landed part twice.
 - an `offline` / `error 503` line — the team graph's ingestion is unreachable or
   down. The capture is spooled to the outbox, not lost; it ships on the next Spor
   session, or run `spor drain` once the server is back to flush it now.
 
 **In Cowork (no shell)**, call the `capture` MCP tool with the same fields
-(`text`, `project`, `during`, and the `blocks`/`needed_by` below).
+(`text`, `project`, `during`, and the `blocks`/`needed_by` below). A result
+carrying `partial: true` landed only part of the text — report `landed`,
+`deferred` and the `pending_id` it was preserved as. A `partial_unsaved` error is
+FINAL: do not call `capture` again with the same text (that would duplicate
+what landed); write each of its `deferred_drafts[].raw` with `put_node`
+(`if_exists: skip`).
 
 ## Declaring a cross-project dependency
 

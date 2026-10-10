@@ -16,6 +16,7 @@ const u = require("./util");
 const { drainOutbox } = require("./drain-outbox");
 const { inferCommits } = require("./infer-commits");
 const graphLib = require(path.join(u.ROOT, "lib", "graph.js"));
+const capturePartial = require(path.join(u.ROOT, "lib", "shell", "capture-partial.js"));
 const { serializeNode } = require(path.join(u.ROOT, "lib", "kernel", "frontmatter.js"));
 
 // The nested-repo guard (graph home === code repo) now lives in util so the
@@ -618,8 +619,23 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, b
       // piling a second copy into the spool.
       const spoolName = `${session}-${key.slice(0, 16)}.capture.json`;
       const kind = u.classifyHttpFailure(post ? post.http : "000");
-      if (kind === "ok") {
-        rlog(`captured session-final finding from ${r.file}`);
+      const outcome = u.captureOutcome(post);
+      if (outcome.unsaved) {
+        // FINAL partial_unsaved (task-spor-client-capture-partial-unsaved-
+        // handling): never spooled or re-sent; its deferred drafts are
+        // re-submitted as node writes. The consume waits on that handoff, and
+        // a keyed replay of this capture answers the same drafts again.
+        const { durable } = await u.settlePartialUnsaved(graph, outcome.unsaved, {
+          stem: spoolName.slice(0, -".capture.json".length),
+          log: (m) => rlog(`session-final finding from ${r.file}: ${m}`),
+        });
+        if (durable) consume(fp);
+        else rlog(`session-final finding from ${r.file} kept in the spool: its deferred drafts could not be saved`);
+      } else if (kind === "ok") {
+        rlog(
+          `captured session-final finding from ${r.file}` +
+            (outcome.partial ? ` (${capturePartial.describePartialCapture(outcome.partial)})` : "")
+        );
         consume(fp);
       } else if (u.isPermanentHttpFailure(kind)) {
         // The server's verdict on this exact body — a re-post can only be
@@ -1220,15 +1236,35 @@ async function distill(input) {
         source: "distill",
         idempotency_key: crypto.createHash("sha256").update(`${session}\n${text}`).digest("hex"),
       });
-      const { http } = await u.curlWithRefresh(`${u.serverBase()}/v1/capture`, {
+      const res = await u.curlWithRefresh(`${u.serverBase()}/v1/capture`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,
         timeoutMs: 90000,
       });
+      const { http } = res;
       const kind = u.classifyHttpFailure(http);
       const spoolName = `${session}-${Math.floor(Date.now() / 1000)}-${spooled + rejected}.capture.json`;
-      if (kind === "ok") {
+      const outcome = u.captureOutcome(res);
+      if (outcome.unsaved) {
+        // FINAL partial_unsaved: re-submit the deferred drafts as node writes
+        // (u.settlePartialUnsaved) instead of spooling the capture. Only when
+        // that handoff could not reach disk is the KEYED capture spooled — its
+        // replay answers the identical pinned body, drafts included.
+        const { durable } = await u.settlePartialUnsaved(graph, outcome.unsaved, {
+          stem: spoolName.slice(0, -".capture.json".length),
+          log: (m) => rlog(`fact-${factNo}.txt: ${m}`),
+        });
+        if (durable) sent++;
+        else {
+          u.ensureDir(path.join(graph, "outbox"));
+          try {
+            u.writeSpoolFile(path.join(graph, "outbox", spoolName), body);
+          } catch {}
+          spooled++;
+        }
+      } else if (kind === "ok") {
+        if (outcome.partial) rlog(`fact-${factNo}.txt: ${capturePartial.describePartialCapture(outcome.partial)}`);
         sent++;
       } else if (u.isPermanentHttpFailure(kind)) {
         // PERMANENT (auth or rejected — u.classifyHttpFailure): dead-letter it

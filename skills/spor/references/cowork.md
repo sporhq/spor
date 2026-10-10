@@ -56,7 +56,10 @@ node carrying an `answers` edge to the question; write that node, `add_edge` the
 When the work produces a fact a teammate would need next week — a decision (with
 the why), a dismissed approach (with the reason), a new issue, a convention —
 record it. Unsure of the shape? Send raw prose to `capture` and let the server
-type it. For a precise write, use `put_node` with the full node markdown per the
+type it. A `capture` result with `partial: true` landed only some of its drafts
+(the rest preserved as the `pending_id` capture-pending node) — say so. A
+`partial_unsaved` error is final: never re-send the capture; write each
+`deferred_drafts[].raw` with `put_node` (`if_exists: skip`). For a precise write, use `put_node` with the full node markdown per the
 team's node format (frontmatter `id`/`type`/`project`/`title`/`summary` + typed
 `edges`); `id` is kebab-case and starts with the type prefix (`dec-`, `task-`,
 `issue-`, `norm-`, `spec-`/`art-`). The server validates, normalizes, attributes
