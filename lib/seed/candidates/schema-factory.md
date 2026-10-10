@@ -2,7 +2,7 @@
 id: schema-factory
 type: schema
 kind: node-schema
-schema_version: 2026.09.29.1
+schema_version: 2026.10.10.1
 title: Software-factory definition
 summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, the repos it may judge, protected test paths, test-change lane, risk classes those gates key on, an optional integration (merge-queue landing) stage, an optional rescue lane (a strong-model step before any human escalation), an optional implementation stage and the completion boundary that says who writes the resolving edge. Candidate pack; adopt it into a graph to use `spor work --factory`.
 date: 2026-08-26
@@ -184,6 +184,11 @@ convention schema nodes use:
   asks for. A block that refuses the factory adopted nothing and leaves the
   boundary on the agent, so a typo in the stage never moves who completes.
   The boundary is adoptable ALONE, with the stage left at its defaults.
+  `screenshots: optional|required` is an optional policy under controller
+  completion (undeclared means optional). The controller verifies the candidate
+  account's digest-pinned assets before writing its completion; missing required
+  evidence retains the execution hold and completion write debt. Optional upload
+  failures are text in the completion report. Images never attest gate success.
 - **What of this the runner executes.** All of it is PARSED and validated — a
   mistyped stage refuses to start the worker (2026.09.05.1 read the earlier
   `none`|`branch`|`bundle` publish vocabulary, which is why a `publish: none`

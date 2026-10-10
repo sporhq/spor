@@ -2131,14 +2131,15 @@ async function cmdAsset(cfg, { positionals, values }) {
           home, nodesDir, file, opts,
           putNode: (raw, id) => putNodeLocal(nodesDir, raw, require(path.join(ROOT, "lib", "graph.js")).parseFrontmatter(raw, `${id}.md`), "error", null, () => gitIdentity(path.dirname(nodesDir))),
         });
+      const embed = require(path.join(ROOT, "lib", "kernel", "completion-evidence.js")).embed(r.asset.alt || values.alt || "Image", r.asset.uri);
       if (values.json) {
-        out(JSON.stringify(r, null, 2));
+        out(JSON.stringify({ ...r, embed }, null, 2));
       } else {
         const a = r.asset;
         out(`${r.status} ${a.id}${r.descriptor && r.descriptor.revision ? ` @${String(r.descriptor.revision).slice(0, 12)}` : ""}`);
         out(`  ${a.media_type}, ${a.width}×${a.height} px, ${a.bytes} bytes`);
         out(`  ${a.uri}`);
-        out(`  embed: ![${values.alt ? "caption" : "image"}](${a.uri})`);
+        out(`  embed: ${embed}`);
         for (const w of r.warnings || []) err(`warning: ${w}`);
       }
       return 0;
@@ -15189,6 +15190,7 @@ async function completionReadItem(cfg, nodeId) {
       giveUp: terminal && resolution.isGiveUpStatus(status, fm.type, statusGraph),
       revision: r.json.revision || null,
       raw: r.json.raw,
+      usesAsset: Array.isArray(schema.json.edge_types) && schema.json.edge_types.some((e) => e.type === "uses-asset"),
       inbound,
       resolvedBy: (r.json.resolution && r.json.resolution.by) || null,
     };
@@ -15221,6 +15223,7 @@ async function completionReadItem(cfg, nodeId) {
     giveUp: resolution.isGiveUpStatus(status, n.type, g),
     revision: gitBlobSha(buf),
     raw: buf.toString("utf8"),
+    usesAsset: g.registry.isKnownEdge("uses-asset"),
     inbound: resolution.inboundResolvers(g, nodeId).map((x) => ({ by: x.by, edge: x.edge })),
     resolvedBy: res && res.by ? res.by : null,
   };
@@ -15317,6 +15320,24 @@ function makeCompletionDeps(cfg, { home = cfg.userConfigHome(), runId = null, ex
     // the fence confirmation before the resolving edge, the completion event
     // after the CAS, the end on a withdraw. Null for a legacy record.
     ...(execution ? { execution } : {}),
+    readEvidenceDocument: async (id, revision) => {
+      if (cfg.mode() !== "remote") {
+        const r = documentShell().getDocument(cfg.nodesDir(), { id, revision });
+        return r.ok ? r.document : null;
+      }
+      const q = revision ? `?revision=${encodeURIComponent(revision)}` : "";
+      const r = remoteDocumentResult(await remote.get(cfg, `/v1/documents/${encodeURIComponent(id)}${q}`, { timeoutMs: 15000 }));
+      return r.ok ? r.body : null;
+    },
+    verifyEvidenceAsset: async (uri) => {
+      const assets = require(path.join(ROOT, "lib", "shell", "asset.js"));
+      const ref = assets.parseRef(uri);
+      const mode = cfg.mode();
+      const described = mode === "remote" ? await assets.describeRemote({ cfg, remote, ref })
+        : assets.describeLocal({ home: cfg.graphHome(), nodesDir: cfg.nodesDir(), ref });
+      await assets.readBytes({ mode, cfg, remote, home: cfg.graphHome(), described, dest: null });
+      return described.asset;
+    },
     readItem: (nodeId) => completionReadItem(cfg, nodeId),
     casWrite: (args) => completionCasWrite(cfg, args, { home }),
     writeNode: (id, markdown) => writeGateNode(cfg, id, markdown),
@@ -15457,7 +15478,7 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
     impl_claim: {
       execution_id: executionId,
       claimed_at: held.pins.claimed_at,
-      completion: { by: factory.completion.by, after: factory.completion.after },
+      completion: { ...factory.completion },
       publish: impl ? { kind: impl.candidate.publish, bundle_store: impl.candidate.bundleStore || null, remote: impl.candidate.remote || null } : { kind: "bundle", bundle_store: null, remote: null },
       factory: { node_id: factory.id, revision: factory.revision || null },
       item_revision: held.pins.revision,
@@ -16137,6 +16158,7 @@ async function candidateResolverFromReport(cfg, producer, nodeId, fallback) {
   return {
     node: parsed.resolver,
     written: true,
+    ...(node.revision ? { revision: node.revision } : {}),
     resolves_edge: fallback.resolves_edge || edges.some((e) => e && (e.type === "resolves" || e.type === "answers") && e.to === nodeId),
   };
 }
@@ -17328,12 +17350,18 @@ async function restoreProposal(cfg, { blockerId, nodeId, record = null, home = c
       const resumed = await reporter.resume();
       if (!resumed.ok) return { ok: false, reason: `execution ${reporter.id} is not held by this worker (${resumed.code}); the completion is left owed` };
     }
+    // Older parked proposal records predate the split integration stamp. This
+    // door has the landed fact, so retain their explicit parked posture without
+    // teaching the general boundary predicate to trust the folded gate state.
+    const completionRecord = record.integration_state == null && record.gate_state === "parked"
+      ? { ...record, integration_state: "parked" } : record;
     let written;
     try {
       written = await completionShell.writeCompletion({
-        record, deps: makeCompletionDeps(cfg, { home, runId: record.run_id, execution: executionCompletionDeps(reporter) }), log: () => {},
+        record: completionRecord, deps: makeCompletionDeps(cfg, { home, runId: record.run_id, execution: executionCompletionDeps(reporter) }), log: () => {},
         facts: [...(Array.isArray(record.gate_facts) ? record.gate_facts : []), integrationRunner.integrationFactId(nodeId, record.run_id, "landed")],
         boundary: "integration",
+        landedFactPresent: true,
       });
     } finally {
       if (reporter) reporter.leave();

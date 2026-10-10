@@ -669,7 +669,14 @@ stage's own dispatch loop). Both `gate` and `factory` are
 worker will accept, so it is written deliberately) and both arrive by adoption
 rather than in the seed, for the same reason. WORKERS.md §10 documents the
 runtime contract; the payload keys are documented on the candidate nodes
-themselves. Every declared count or ms field in a gate/factory payload
+themselves.
+
+Screenshot evidence can be required with `completion.screenshots: required`
+under `by: controller`; omission means optional. Evidence is a candidate-bound
+account and digest-pinned `uses-asset` inclusions in the controller's artifact.
+Missing required evidence retains the hold; images never replace gate facts.
+
+Every declared count or ms field in a gate/factory payload
 (`cycles`, `reruns`, `timeout_ms`, `poll_ms`, `approval_timeout_ms`,
 `await_ms`, rescue's `attempts`) is parsed through a guarded helper
 (`countOr` in `lib/kernel/gates.js`): a value that isn't

@@ -467,6 +467,11 @@ Keys, with the defaults you get by writing nothing:
   stage the factory actually declares. **Writing `integration` without an
   `integration` block is a parse error** — the boundary would never be reached
   — so if you emit `after: integration`, emit §3b's block too.
+- **`completion.screenshots`** — `optional` (the undeclared default) or
+  `required`, under `by: controller` only. Require screenshots when a visible
+  result needs durable evidence. Missing uploads then retain the completion
+  debt and execution hold. Images never replace command, review or human gates;
+  optional failures appear as missing evidence in the completion artifact.
 
 Never write `command`, `args`, `argv`, `bin`, `exec`, `entrypoint`, `env`,
 `report`, `session`, `launch_mode` or `identity_mode` inside `implementation`.

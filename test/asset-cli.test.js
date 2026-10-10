@@ -209,6 +209,7 @@ test("local: import -> describe -> verify -> fetch round-trips byte-identical, p
   const r = JSON.parse(imp.stdout);
   assert.strictEqual(r.status, "created");
   const id = r.asset.id;
+  assert.strictEqual(r.embed, `![A test: image](${r.asset.uri})`);
   assert.match(id, /^art-asset-[0-9a-f]{16}$/);
   assert.deepStrictEqual(
     { digest: r.asset.digest, media_type: r.asset.media_type, bytes: r.asset.bytes, width: r.asset.width, height: r.asset.height },
@@ -567,6 +568,7 @@ test("remote: the same image imports and fetches with the same descriptor fields
     const lenv = { SPOR_HOME: await localHome() };
     const loc = JSON.parse((await run(args, { env: lenv })).stdout);
     assert.deepStrictEqual(r.asset, loc.asset);
+    assert.strictEqual(r.embed, loc.embed, "both modes return the captioned digest-pinned embed");
     assert.strictEqual(r.idempotency_key, loc.idempotency_key);
     const rd = JSON.parse((await run(["asset", "describe", r.asset.id, "--json"], { env: renv })).stdout);
     const ld = JSON.parse((await run(["asset", "describe", loc.asset.id, "--json"], { env: lenv })).stdout);

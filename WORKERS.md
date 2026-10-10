@@ -4259,6 +4259,69 @@ and factories using agent completion continue to judge the current tip.
 See test/gates.test.js (the validation table), test/worker-contract.test.js,
 test/candidate.test.js and test/completion-boundary.test.js.
 
+#### 10.14.1 Screenshot evidence in a completion account
+
+For a visible feature under controller completion, import each screenshot with
+`spor asset import <file> --alt <caption> --json`. The response includes the
+durable descriptor, digest-pinned asset URI and escaped Markdown `embed`.
+The upload writes image bytes and a descriptor; it does not resolve the task.
+
+Publish the candidate account with `spor put-document`. Include useful prose
+and one fenced `spor-completion-evidence` JSON block, then name the account in
+the usual first-line `CANDIDATE:` declaration:
+
+````markdown
+```spor-completion-evidence
+{
+  "schema": "spor.completion-evidence/1",
+  "execution_id": "exec-<the task's execution hold>",
+  "revision": "<full delivered commit SHA>",
+  "result": "The empty queue now explains how to admit another task.",
+  "design": "art-approved-queue-design",
+  "screenshots": [{
+    "uri": "spor-asset:art-queue-screenshot@sha256:<64 lowercase hex>",
+    "caption": "An empty queue shows the Admit task action.",
+    "provenance": "Queue view at 1280x800, empty fixture, captured with Playwright."
+  }]
+}
+```
+````
+
+Omit `design` when there is no design node. On an upload failure, replace the
+entry's `uri` with `missing`, a short reason, and retain its caption and capture
+provenance. Keep private paths, credentials and temporary preview URLs out of
+the account. There are at most four screenshots, captions up to 300 characters,
+provenance up to 400, missing reasons up to 300, and a result up to 1500. The
+rendered evidence must fit 4500 UTF-8 bytes, leaving space for the controller's
+candidate and gate facts. Oversized evidence is reported as missing.
+
+The candidate pins the account's node revision. The controller reads that
+complete document, checks the manifest's execution and delivered commit, and
+verifies every descriptor and its bytes through the same local/remote asset
+read door as `spor asset verify`. Its completion artifact contains readable
+result text, captions, capture provenance, execution and commit, descriptor
+revisions, digest-pinned image embeds, `uses-asset` edges, and a `derived-from`
+edge to the design when present. Inclusion requires the live registry's
+`uses-asset` schema; the controller does not activate or override it.
+
+`completion: {"by":"controller","after":"integration","screenshots":"required"}`
+requires at least one verified screenshot and no missing evidence. The policy
+is pinned at claim time. Missing required evidence retains the execution hold
+and the existing `completion_debt: write`; a later reconciliation retries the
+read and verification at the original pins. An upload-failure `missing` entry
+remains missing at that revision; editing the live account does not change a
+submitted candidate's evidence pins. With `screenshots: optional`, or no screenshot policy,
+failures remain explicit in the completion artifact and allow completion once
+the pinned boundary passes. An account without a manifest keeps legacy behavior
+under optional policy. Refresh the account after a fix changes the delivered
+commit; a manifest for the old commit is missing evidence for the new one.
+
+Images illustrate the result. Gate and integration facts still determine
+whether the completion boundary passed, and only the controller's existing
+resolver-then-task-CAS write releases dependents. Verification runs again before
+that CAS on a retry, including when the resolver already exists. No MCP image
+attachment or host download capability is needed for durable completion.
+
 ### 10.15 The execution store — server-authoritative in team mode, a compatible local store in personal mode
 
 §10.13's hold and completion write are the client's half of a two-sided

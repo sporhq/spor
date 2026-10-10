@@ -881,6 +881,12 @@ Path parameters (node ids, project slugs) must match
 `^[a-z0-9][a-z0-9-]*$`. Request bodies are capped at 1MB
 (`413 too_large`).
 
+`spor asset import --json` adds an `embed` field to the upload response: an
+escaped caption in a digest-pinned Markdown image. Screenshot completion
+accounts use this same upload and authorized read surface; their manifest,
+required/optional policy and controller boundary are documented in
+WORKERS.md §10.14.1. Uploading an asset does not resolve a task or attest a gate.
+
 ### 3.1 Workflow runs
 
 The run engine's claim/complete API. Full contract and the reference worker
