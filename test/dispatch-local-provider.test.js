@@ -161,6 +161,16 @@ const GOLDENS = {
   },
 };
 
+// A stub harness body that runs only once the prompt on stdin is fully read. A
+// stub that exits without reading it races the supervisor's prompt write, and
+// under load the write loses: EPIPE, and a run that exited 0 is recorded
+// `failed` / "write EPIPE" (issue-spor-dispatch-local-provider-golden-epipe,
+// the same race as issue-spor-agent-dispatch-runner-test-309-load-flake). These
+// tests are about the launch, not that race.
+function afterPrompt(body) {
+  return `process.stdin.resume(); process.stdin.on("end", () => {\n${body}\n});`;
+}
+
 // One golden dispatch with a stub harness, observed to its terminal record.
 // Returns the normalized capture.
 function goldenDispatch(shape = GOLDENS.worktree) {
@@ -174,7 +184,7 @@ function goldenDispatch(shape = GOLDENS.worktree) {
   // The node shape dispatches INTO the mapped checkout, whose identity must
   // match the node's `repo: golden` stamp (the slug→path corruption guard).
   if (!shape.worktree) fs.writeFileSync(path.join(repo, ".spor"), "project: golden\n");
-  const stub = writeSpawnableNodeStub(home, "claude-golden", 'process.stdout.write(""); process.exit(0);');
+  const stub = writeSpawnableNodeStub(home, "claude-golden", afterPrompt('process.stdout.write(""); process.exit(0);'));
   const runner = capturingRunner(home);
   const r = runCli(
     shape.args,
@@ -255,11 +265,11 @@ function conformanceSetup() {
   }));
   const cfg = loadConfig({ cwd: home, env: hermeticEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, HOME: home }) });
   const stubs = {
-    complete: writeSpawnableNodeStub(home, "claude-complete", `
+    complete: writeSpawnableNodeStub(home, "claude-complete", afterPrompt(`
       const { spawnSync } = require("child_process");
       const r = spawnSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "conformance candidate"], { cwd: process.cwd(), stdio: "ignore" });
       process.exit(r.status === 0 ? 0 : 3);
-    `),
+    `)),
     hold: writeSpawnableNodeStub(home, "claude-hold", "setInterval(() => {}, 1000);"),
   };
   const lines = { out: [], err: [] };
