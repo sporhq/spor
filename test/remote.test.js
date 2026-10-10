@@ -299,6 +299,122 @@ test("describeTransport: offline only for a connection never made; a reset or ti
   assert.strictEqual(describeTransport(slow), "server did not answer (timed out after 15000ms)");
 });
 
+// Merge review of issue-spor-cli-put-node-offline-fetch-failed: what one attempt
+// learned must survive every later one — the stale-socket retry AND the busy
+// re-sends. A reset (may have landed) answered by a busy re-send and then a
+// refused connect is NOT "offline".
+function fakeBusyResponse() {
+  return {
+    ok: false,
+    status: 503,
+    headers: { forEach: (fn) => fn("0", "retry-after") },
+    text: async () => JSON.stringify({ error: { code: "busy", message: "busy" } }),
+  };
+}
+function refusedError() {
+  const e = new TypeError("fetch failed");
+  e.cause = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9"), { code: "ECONNREFUSED" });
+  return e;
+}
+
+test("request(): reset → busy → refused is never offline — the reset attempt may have landed", async () => {
+  const cfg = remoteCfg();
+  let calls = 0;
+  await withFetch(
+    async () => {
+      calls++;
+      if (calls === 1) throw staleSocketError();
+      if (calls === 2) return fakeBusyResponse();
+      throw refusedError();
+    },
+    async () => {
+      const r = await remoteLib.request(cfg, "POST", "/v1/nodes", { body: { nodes: [{ node: "x", if_exists: "skip" }] } });
+      assert.strictEqual(calls, 3);
+      assert.strictEqual(r.transport, true);
+      assert.strictEqual(r.reachedServer, true);
+      assert.strictEqual(r.earlierAttemptUnknown, true);
+      assert.strictEqual(remoteLib.isUnreachable(r), false);
+      const line = remoteLib.describeTransport(r, { write: "re-run" });
+      assert.doesNotMatch(line, /offline/);
+      assert.match(line, /^connection to server failed \(fetch failed: connect ECONNREFUSED .*after an earlier attempt reached the server\) — the write may have landed; re-run$/);
+    }
+  );
+});
+
+test("request(): a multi-entry batch answered a top-level busy, then refused, is never offline", async () => {
+  const cfg = remoteCfg();
+  let calls = 0;
+  await withFetch(
+    async () => {
+      calls++;
+      if (calls === 1) return fakeBusyResponse();
+      throw refusedError();
+    },
+    async () => {
+      const body = { nodes: [{ node: "x", if_exists: "skip" }, { node: "y", if_exists: "skip" }] };
+      const r = await remoteLib.request(cfg, "POST", "/v1/nodes", { body });
+      assert.strictEqual(calls, 2);
+      assert.strictEqual(r.reachedServer, true);
+      assert.strictEqual(r.earlierAttemptUnknown, true);
+      assert.doesNotMatch(remoteLib.describeTransport(r, { write: "re-run" }), /offline/);
+    }
+  );
+});
+
+test("request(): earlierAttemptUnknown marks an answer only when an earlier attempt's outcome is unknown", async () => {
+  const cfg = remoteCfg();
+  const skipped = () => fakeResponse(200, { results: [{ ok: true, status: "skipped", id: "dec-x" }] });
+  const cases = [
+    // [label, fetch script, nodes, expected flag]
+    ["reset then skipped", [() => { throw staleSocketError(); }, skipped], 1, true],
+    ["plain skipped", [skipped], 1, undefined],
+    ["single-entry busy (wrote nothing) then skipped", [fakeBusyResponse, skipped], 1, undefined],
+  ];
+  for (const [label, script, n, want] of cases) {
+    let calls = 0;
+    await withFetch(
+      async () => script[calls++](),
+      async () => {
+        const nodes = Array.from({ length: n }, (_, i) => ({ node: `x${i}`, if_exists: "skip" }));
+        const r = await remoteLib.request(cfg, "POST", "/v1/nodes", { body: { nodes } });
+        assert.strictEqual(r.earlierAttemptUnknown, want, label);
+        assert.strictEqual(calls, script.length, label);
+      }
+    );
+  }
+});
+
+test("request(): a caller's abort reads as aborted — not a timeout, not a failed connection, never offline", async () => {
+  const cfg = remoteCfg();
+  const ctrl = new AbortController();
+  await withFetch(
+    (url, init) =>
+      new Promise((_, reject) => {
+        init.signal.addEventListener("abort", () => reject(Object.assign(new Error("This operation was aborted"), { name: "AbortError" })));
+        setTimeout(() => ctrl.abort(), 10);
+      }),
+    async () => {
+      const r = await remoteLib.request(cfg, "GET", "/v1/status", { signal: ctrl.signal, timeoutMs: 60000 });
+      assert.strictEqual(r.transport, true);
+      assert.strictEqual(r.aborted, true);
+      assert.strictEqual(r.timedOut, undefined);
+      assert.strictEqual(r.error, "aborted by the caller");
+      assert.strictEqual(remoteLib.isUnreachable(r), false);
+      assert.strictEqual(remoteLib.describeTransport(r), "request aborted (aborted by the caller)");
+    }
+  );
+});
+
+test("transportError: a caller abort is tagged and named apart from a timeout", () => {
+  const e = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+  const a = remoteLib.transportError(e, { aborted: true });
+  assert.strictEqual(a.aborted, true);
+  assert.strictEqual(a.error, "aborted by the caller");
+  const t = remoteLib.transportError(e, { timedOut: true, aborted: true, timeoutMs: 5 });
+  assert.strictEqual(t.timedOut, true);
+  assert.strictEqual(t.aborted, undefined, "our own timeout wins when both fired");
+});
+
 // ---------------------------------------------------------------------------
 // End-to-end: the literal acceptance-bar repro. A real HTTP server with a 1s
 // keepAliveTimeout, and a client that blocks the event loop for 2s via a real

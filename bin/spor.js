@@ -1245,6 +1245,7 @@ function renderPutNodeResult(cfg, res, json) {
   const id = res && res.id ? res.id : "(unknown)";
   const rev = res && res.revision ? ` @ ${res.revision}` : "";
   out(status === "skipped" ? `put-node skipped: ${id}${rev}` : `put-node ${status}: ${id}${rev}`);
+  if (res && res.note) err(`  note: ${res.note}`);
   renderPutNodeParts(res);
   renderPriorityStamp(id, res && res.priority_stamp);
   out(writeTargetLine(cfg));
@@ -1541,6 +1542,58 @@ async function stampCreatedPriorityIfNeeded(cfg, node, id) {
   return stampCreatedPriority(cfg, node, id);
 }
 
+// A `skipped` answer from a re-send whose earlier attempt's outcome is unknown
+// (remote.js `earlierAttemptUnknown`: a reset connection, a timeout, a busy
+// over several entries) may be that lost attempt's OWN create, not a node
+// that was already there — reporting it `skipped` would drop the create's
+// spill parts and its priority stamp. Re-read the node: when it carries
+// everything we sent (every frontmatter field we set, every edge, the body),
+// it is reported `created` (`recovered: true`) and the caller stamps its
+// priority as for any create; otherwise it stays `skipped` with a note that
+// the lost attempt may have written it. A pre-existing node identical to what
+// we sent reads as ours too — the same content either way, and the priority
+// re-set is a no-op on an unchanged value.
+function sentFieldsMatch(stored, sent) {
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const subset = (a, b) => a && b && typeof a === "object" && typeof b === "object" && Object.keys(a).every((k) => same(a[k], b[k]));
+  for (const k of Object.keys(sent)) {
+    if (k === "file") continue;
+    if (k === "body") {
+      if (String(sent.body || "").trim() !== String(stored.body || "").trim()) return false;
+    } else if (k === "edges" || k === "pin" || k === "exclude") {
+      const a = Array.isArray(sent[k]) ? sent[k] : [];
+      const b = Array.isArray(stored[k]) ? stored[k] : [];
+      // the server may stamp attributes onto an edge; what we sent must stand
+      if (a.length !== b.length || !a.every((x) => b.some((y) => (x && typeof x === "object" ? subset(x, y) : same(x, y))))) return false;
+    } else if (!same(sent[k], stored[k])) return false;
+  }
+  return true;
+}
+async function reconcileRetriedSkip(cfg, node, res0) {
+  const id = res0.id || node.id;
+  const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 8000 });
+  const raw = !r.transport && r.ok && r.json && typeof r.json.raw === "string" ? r.json.raw : null;
+  let stored = null;
+  if (raw != null) {
+    try {
+      stored = require(path.join(ROOT, "lib", "graph.js")).parseFrontmatter(raw, `${id}.md`);
+    } catch {
+      stored = null;
+    }
+  }
+  if (stored && sentFieldsMatch(stored, node)) {
+    return {
+      ...res0,
+      status: "created",
+      recovered: true,
+      revision: res0.revision || (r.json && r.json.revision) || undefined,
+      note: "an earlier attempt's response was lost and the re-send read 'skipped', but the node re-reads as exactly what was sent — the lost attempt created it",
+    };
+  }
+  const why = stored ? "it re-reads differently from what was sent (an existing node, or one the server reshaped, e.g. --spill)" : `it could not be re-read (${r.transport ? r.error : `HTTP ${r.status}`})`;
+  return { ...res0, uncertain: true, note: `an earlier attempt's response was lost, so the lost attempt may have written this node; ${why} — check with 'spor get ${id}'` };
+}
+
 function renderPriorityStamp(id, stamp) {
   if (!stamp) return;
   if (stamp.ok) out(`priority set: ${id} -> ${stamp.priority}`);
@@ -1751,6 +1804,7 @@ async function cmdPutNodeBatch(cfg, values, docs, policy) {
     if (res.ok) {
       const rev = res.revision ? ` @ ${res.revision}` : "";
       out(`put-node ${res.status || "ok"}: ${res.id || entry.id}${rev}`);
+      if (res.note) err(`  note: ${res.note}`);
       renderPutNodeParts(res);
       for (const w of res.warnings || []) err(`  warning: ${w}`);
       renderPriorityStamp(entry.id, res.priority_stamp);
@@ -1783,11 +1837,12 @@ async function cmdPutNodeBatch(cfg, values, docs, policy) {
         const res0 = rs[n];
         if (res0 && res0.ok) {
           const node = byId.get(e.id).node;
-          if (res0.status === "created" && carriesPriority(node)) {
-            const stamp = await stampCreatedPriorityIfNeeded(cfg, node, res0.id || e.id);
-            if (stamp) res0.priority_stamp = stamp;
+          const res = res0.status === "skipped" && r.earlierAttemptUnknown ? await reconcileRetriedSkip(cfg, node, res0) : res0;
+          if (res.status === "created" && carriesPriority(node)) {
+            const stamp = await stampCreatedPriorityIfNeeded(cfg, node, res.id || e.id);
+            if (stamp) res.priority_stamp = stamp;
           }
-          record(e, res0);
+          record(e, res);
         } else {
           const detail = res0 ? putNodeEntryDetail(res0) : "no result returned for this entry";
           record(e, { ...(res0 || {}), ok: false, id: e.id, status: "error", message: `${r.status}${detail ? `: ${detail}` : ""}` });
@@ -1910,13 +1965,14 @@ async function cmdPutNode(cfg, { values, positionals }) {
       err(remote.describeTransport(r, { write: `check with 'spor get ${id}' before retrying` }));
       return 1;
     }
-    const res0 = r.json && r.json.results && r.json.results[0];
+    let res0 = r.json && r.json.results && r.json.results[0];
     if (!(res0 && res0.ok)) {
       const top = r.json && r.json.error;
       if (top && !res0) err(`put-node error ${r.status}${top.message ? `: ${top.message}` : ""}`);
       else err(putNodeEntryError(res0, r.status));
       return 1;
     }
+    if (res0.status === "skipped" && r.earlierAttemptUnknown) res0 = await reconcileRetriedSkip(cfg, parsed.node, res0);
     if (res0.status === "created" && carriesPriority(parsed.node)) {
       const stamp = await stampCreatedPriorityIfNeeded(cfg, parsed.node, res0.id || id);
       if (stamp) res0.priority_stamp = stamp;

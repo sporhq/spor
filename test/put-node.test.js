@@ -340,6 +340,90 @@ test("put-node (remote) against a dead port still reads offline, naming the refu
   assert.match(blocked.stderr, /^offline — could not reach server \(fetch failed: bad port\)/);
 });
 
+// Merge review: a re-send whose lost first attempt CREATED the node reads
+// `skipped`. Re-read it: when it carries what was sent it is reported as our
+// create (and its priority still stamped); otherwise it stays skipped with a
+// note that the lost attempt may have written it.
+function lostCreateStub({ stored }) {
+  const hits = [];
+  let n = 0;
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      hits.push({ method: req.method, url: req.url, body });
+      const json = (code, obj) => {
+        res.writeHead(code, { "content-type": "application/json" });
+        res.end(JSON.stringify(obj));
+      };
+      if (req.url === "/v1/nodes" && req.method === "POST") {
+        if (n++ === 0) return req.socket.destroy(); // the create landed; its answer is lost
+        const ids = JSON.parse(body).nodes.map((e) => /\nid: (\S+)/.exec(e.node)[1]);
+        return json(200, { results: ids.map((id) => ({ ok: true, status: "skipped", id, revision: `rev-${id}` })) });
+      }
+      const m = /^\/v1\/nodes\/([^/?]+)(\/priority)?$/.exec(req.url);
+      if (m && m[2]) return json(200, { ok: true, revision: "rev-p" });
+      if (m) return stored[m[1]] ? json(200, { id: m[1], raw: stored[m[1]], revision: `rev-${m[1]}` }) : json(404, { error: { code: "not_found" } });
+      if (req.url === "/v1/status") return json(200, { capabilities: {} });
+      json(404, {});
+    });
+  });
+  return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+
+test("put-node (remote) a retried skip whose node re-reads as what was sent is reported created, and its priority is stamped", async () => {
+  const raw = nodeMd("dec-remote").replace("date: 2026-06-01\n", "date: 2026-06-01\npriority: p2\n");
+  // the server stamps fields of its own onto the stored copy
+  const stored = { "dec-remote": raw.replace("priority: p2\n", "priority: p2\ncreated_by: person-x\n") };
+  const file = tmpNodeFile(raw);
+  const { srv, hits, base } = await lostCreateStub({ stored });
+  try {
+    const r = await runAsync(["put-node", file, "--if-exists", "skip"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /put-node created: dec-remote @ rev-dec-remote/);
+    assert.match(r.stderr, /note: an earlier attempt's response was lost .* the lost attempt created it/);
+    assert.match(r.stdout, /priority set: dec-remote -> p2/);
+    assert.ok(hits.some((h) => h.url === "/v1/nodes/dec-remote/priority" && h.method === "POST"), "the priority stamp still runs");
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) a retried skip whose node re-reads differently stays skipped, noting the lost attempt may have written it", async () => {
+  const file = tmpNodeFile(nodeMd("dec-remote"));
+  const { srv, base } = await lostCreateStub({ stored: { "dec-remote": nodeMd("dec-remote", "Someone else's decision") } });
+  try {
+    const r = await runAsync(["put-node", file, "--if-exists", "skip", "--json"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const res = JSON.parse(r.stdout);
+    assert.strictEqual(res.status, "skipped");
+    assert.strictEqual(res.uncertain, true);
+    assert.match(res.note, /the lost attempt may have written this node; it re-reads differently/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) batch: a retried skip is reconciled per entry against what was sent", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-put-node-dir-"));
+  fs.writeFileSync(path.join(dir, "a.md"), nodeMd("dec-a"));
+  fs.writeFileSync(path.join(dir, "b.md"), nodeMd("dec-b"));
+  const { srv, base } = await lostCreateStub({ stored: { "dec-a": nodeMd("dec-a"), "dec-b": nodeMd("dec-b", "Pre-existing, different") } });
+  try {
+    const r = await runAsync(["put-node", "--dir", dir, "--if-exists", "skip", "--json"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const out = JSON.parse(r.stdout);
+    const byId = Object.fromEntries(out.results.map((x) => [x.id, x]));
+    assert.strictEqual(byId["dec-a"].status, "created");
+    assert.strictEqual(byId["dec-a"].recovered, true);
+    assert.strictEqual(byId["dec-b"].status, "skipped");
+    assert.strictEqual(byId["dec-b"].uncertain, true);
+    assert.deepStrictEqual(out.counts, { created: 1, skipped: 1 });
+  } finally {
+    srv.close();
+  }
+});
+
 // dec-spor-buildgraph-per-node-fault-isolation: the local put-node gate lints
 // the WHOLE graph, so once the loader started SKIPPING a malformed node file
 // instead of refusing to boot on it, an unrelated corrupt sibling would have
