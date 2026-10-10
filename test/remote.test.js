@@ -201,6 +201,104 @@ test("request(): a non-stale-socket transport error (e.g. connection refused) is
   );
 });
 
+// issue-spor-cli-put-node-offline-fetch-failed: put-node's POST /v1/nodes had
+// no stale-socket retry even under if_exists skip, where a re-send of a landed
+// entry just reads `skipped`.
+test("nodesWriteResendSafe: a POST /v1/nodes is re-sendable only when every entry is if_exists skip", () => {
+  const { nodesWriteResendSafe } = remoteLib;
+  assert.strictEqual(nodesWriteResendSafe("POST", "/v1/nodes", { nodes: [{ node: "x", if_exists: "skip" }] }), true);
+  assert.strictEqual(nodesWriteResendSafe("POST", "/v1/nodes", { if_exists: "skip", nodes: [{ node: "x" }, { node: "y" }] }), true);
+  assert.strictEqual(nodesWriteResendSafe("POST", "/v1/nodes", { nodes: [{ node: "x", if_exists: "error" }] }), false);
+  assert.strictEqual(nodesWriteResendSafe("POST", "/v1/nodes", { nodes: [{ node: "x", if_exists: "skip" }, { node: "y", if_exists: "update", revision: "r" }] }), false);
+  assert.strictEqual(nodesWriteResendSafe("POST", "/v1/nodes", { nodes: [] }), false);
+  assert.strictEqual(nodesWriteResendSafe("POST", "/v1/capture", { nodes: [{ node: "x", if_exists: "skip" }] }), false);
+  assert.strictEqual(nodesWriteResendSafe("PATCH", "/v1/nodes", { nodes: [{ node: "x", if_exists: "skip" }] }), false);
+});
+
+test("request(): a stale-socket failure on POST /v1/nodes is retried once under skip, never under error", async () => {
+  const cfg = remoteCfg();
+  for (const [policy, want] of [["skip", 2], ["error", 1]]) {
+    let calls = 0;
+    await withFetch(
+      async () => {
+        calls++;
+        if (calls === 1) throw staleSocketError();
+        return fakeResponse(200, { results: [{ ok: true, status: "created", id: "dec-x" }] });
+      },
+      async () => {
+        const r = await remoteLib.request(cfg, "POST", "/v1/nodes", { body: { nodes: [{ node: "x", if_exists: policy }] } });
+        assert.strictEqual(calls, want, policy);
+        assert.strictEqual(r.ok, want === 2, policy);
+      }
+    );
+  }
+});
+
+test("request(): a refused re-send after a stale-socket failure is not reported offline — the first attempt may have landed", async () => {
+  const cfg = remoteCfg();
+  let calls = 0;
+  await withFetch(
+    async () => {
+      calls++;
+      if (calls === 1) throw staleSocketError();
+      const e = new TypeError("fetch failed");
+      e.cause = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9"), { code: "ECONNREFUSED" });
+      throw e;
+    },
+    async () => {
+      const r = await remoteLib.request(cfg, "POST", "/v1/nodes", { body: { nodes: [{ node: "x", if_exists: "skip" }] } });
+      assert.strictEqual(calls, 2);
+      assert.strictEqual(r.reachedServer, true);
+      assert.strictEqual(remoteLib.isUnreachable(r), false);
+      assert.match(remoteLib.describeTransport(r, { write: "re-run" }), /^connection to server failed \(fetch failed: connect ECONNREFUSED .*after an earlier attempt failed with fetch failed: other side closed.*may have landed; re-run$/);
+    }
+  );
+});
+
+test("transportError: folds undici's cause (and an AggregateError's first error) into `error`, and names our own timeout", () => {
+  const { transportError } = remoteLib;
+  const r1 = transportError(staleSocketError());
+  assert.strictEqual(r1.error, "fetch failed: other side closed (UND_ERR_SOCKET)");
+  assert.strictEqual(r1.code, "UND_ERR_SOCKET");
+  assert.strictEqual(r1.cause, "other side closed");
+  const agg = new TypeError("fetch failed");
+  agg.cause = Object.assign(new AggregateError([Object.assign(new Error("connect ECONNREFUSED ::1:1"), { code: "ECONNREFUSED" })], ""), { code: "ECONNREFUSED" });
+  assert.strictEqual(transportError(agg).error, "fetch failed: connect ECONNREFUSED ::1:1");
+  const refused = new TypeError("fetch failed");
+  refused.cause = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" });
+  assert.strictEqual(transportError(refused).error, "fetch failed: connect ECONNREFUSED 127.0.0.1:1");
+  const aborted = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+  const t = transportError(aborted, { timedOut: true, timeoutMs: 15000 });
+  assert.strictEqual(t.error, "timed out after 15000ms");
+  assert.strictEqual(t.timedOut, true);
+  assert.strictEqual(transportError(aborted).error, "This operation was aborted", "a caller's abort keeps its own message");
+  assert.strictEqual(transportError(new Error("boom")).error, "boom");
+});
+
+test("describeTransport: offline only for a connection never made; a reset or timeout says the write may have landed", () => {
+  const { transportError, describeTransport, isUnreachable } = remoteLib;
+  const refused = new TypeError("fetch failed");
+  refused.cause = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" });
+  const dns = new TypeError("fetch failed");
+  dns.cause = Object.assign(new Error("getaddrinfo ENOTFOUND api.example"), { code: "ENOTFOUND" });
+  for (const e of [refused, dns]) {
+    const r = transportError(e);
+    assert.strictEqual(isUnreachable(r), true);
+    assert.match(describeTransport(r, { write: "x" }), /^offline — could not reach server \(fetch failed: /);
+    assert.doesNotMatch(describeTransport(r, { write: "x" }), /may have landed/);
+  }
+  const reset = transportError(staleSocketError());
+  assert.strictEqual(isUnreachable(reset), false);
+  assert.strictEqual(describeTransport(reset), "connection to server failed (fetch failed: other side closed (UND_ERR_SOCKET))");
+  assert.strictEqual(
+    describeTransport(reset, { write: "re-run with --if-exists skip" }),
+    "connection to server failed (fetch failed: other side closed (UND_ERR_SOCKET)) — the write may have landed; re-run with --if-exists skip"
+  );
+  const slow = transportError(new Error("aborted"), { timedOut: true, timeoutMs: 15000 });
+  assert.strictEqual(isUnreachable(slow), false);
+  assert.strictEqual(describeTransport(slow), "server did not answer (timed out after 15000ms)");
+});
+
 // ---------------------------------------------------------------------------
 // End-to-end: the literal acceptance-bar repro. A real HTTP server with a 1s
 // keepAliveTimeout, and a client that blocks the event loop for 2s via a real

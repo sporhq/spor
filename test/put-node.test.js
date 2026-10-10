@@ -276,6 +276,70 @@ test("put-node (remote) surfaces a batch validation failure with details", async
   }
 });
 
+// issue-spor-cli-put-node-offline-fetch-failed: a server (or a proxy in front
+// of it, mid-deploy) that RESETS the connection on the first write. get and
+// set-status were already retried once on that stale-socket shape; put-node
+// was not, and printed "offline — could not reach server (fetch failed)" — the
+// wrong diagnosis (the server was reached) with the cause dropped.
+function resettingStub({ resets = 1 } = {}) {
+  const hits = [];
+  let n = 0;
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      hits.push({ method: req.method, url: req.url, body });
+      if (req.url === "/v1/nodes" && req.method === "POST" && n++ < resets) return req.socket.destroy();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ results: [{ ok: true, status: "created", id: "dec-remote", revision: "rev-1", warnings: [] }] }));
+    });
+  });
+  return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+
+test("put-node (remote) --if-exists skip re-sends once after a connection reset and lands", async () => {
+  const file = tmpNodeFile(nodeMd("dec-remote"));
+  const { srv, hits, base } = await resettingStub();
+  try {
+    const r = await runAsync(["put-node", file, "--if-exists", "skip"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /put-node created: dec-remote @ rev-1/);
+    assert.strictEqual(hits.filter((h) => h.method === "POST" && h.url === "/v1/nodes").length, 2);
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) --if-exists error is not re-sent after a reset, and is not reported as offline", async () => {
+  const file = tmpNodeFile(nodeMd("dec-remote"));
+  const { srv, hits, base } = await resettingStub();
+  try {
+    const r = await runAsync(["put-node", file], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.strictEqual(hits.filter((h) => h.method === "POST" && h.url === "/v1/nodes").length, 1, "an error-policy create is never re-sent blind");
+    assert.doesNotMatch(r.stderr, /offline/);
+    assert.match(r.stderr, /connection to server failed \(fetch failed: \S/, "the undici cause is surfaced");
+    assert.match(r.stderr, /the write may have landed; check with 'spor get dec-remote'/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) against a dead port still reads offline, naming the refusal", async () => {
+  const file = tmpNodeFile(nodeMd("dec-remote"));
+  const probe = http.createServer();
+  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+  const r = await runAsync(["put-node", file, "--if-exists", "skip"], remoteEnv(`http://127.0.0.1:${port}`));
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /offline — could not reach server \(fetch failed: .*ECONNREFUSED/);
+  assert.doesNotMatch(r.stderr, /may have landed/);
+  // fetch's blocked-port refusal never dials either
+  const blocked = await runAsync(["put-node", file, "--if-exists", "skip"], remoteEnv("http://127.0.0.1:1"));
+  assert.match(blocked.stderr, /^offline — could not reach server \(fetch failed: bad port\)/);
+});
+
 // dec-spor-buildgraph-per-node-fault-isolation: the local put-node gate lints
 // the WHOLE graph, so once the loader started SKIPPING a malformed node file
 // instead of refusing to boot on it, an unrelated corrupt sibling would have

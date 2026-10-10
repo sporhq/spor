@@ -1769,7 +1769,7 @@ async function cmdPutNodeBatch(cfg, values, docs, policy) {
       const rs = r.json && Array.isArray(r.json.results) ? r.json.results : null;
       if (r.transport || !rs) {
         const why = r.transport
-          ? `offline — could not reach server (${r.error})`
+          ? remote.describeTransport(r, { write: "re-run with --if-exists skip" })
           : `put-node error ${r.status}${r.json && r.json.error && r.json.error.message ? `: ${r.json.error.message}` : ""}`;
         err(why);
         // outcome unknown for this chunk (a transport failure may have landed
@@ -1907,7 +1907,7 @@ async function cmdPutNode(cfg, { values, positionals }) {
     if (values.spill) entry.spill = true;
     const r = await remote.post(cfg, "/v1/nodes", { nodes: [entry] }, { timeoutMs: 15000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r, { write: `check with 'spor get ${id}' before retrying` }));
       return 1;
     }
     const res0 = r.json && r.json.results && r.json.results[0];
