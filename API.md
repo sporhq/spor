@@ -1106,12 +1106,19 @@ replaces, `PATCH /v1/nodes/{id}`). An appending POST (a capture without an
 idempotency key, a question, a token mint, a claim) reports the busy answer
 rather than re-sending it. A `POST /v1/nodes` batch applies its entries one at
 a time, so busy arrives there in two shapes: an entry whose own write lost
-the lock answers `{ok: false, code: "busy"}` inside the 207 — the CLI re-sends
-ONLY those entries (same bound and pacing) and splices their answers back into
-the original positions — while a top-level `503 busy` is no promise that the
-EARLIER entries wrote nothing, so a multi-entry batch is re-sent whole only
-when every entry is `if_exists: skip` or an unrevisioned, unspilled `update`
-(a landed entry then re-reads as success, never as a conflict).
+the lock answers `{ok: false, code: "busy"}` inside the 207, while a top-level
+`503 busy` is no promise that the EARLIER entries wrote nothing. Entry order is
+load-bearing (a born-terminal entry passes the completion gate only behind its
+resolver; with a duplicate id the later content wins), so the CLI never
+reorders a re-send: it re-sends the batch's TAIL from the first busy entry, in
+order (same bound and pacing), and splices the answers back into the original
+positions — but only when every entry in that tail that already landed is
+`if_exists: skip` or an unrevisioned, unspilled `update` (a landed entry then
+re-reads as success, never as a conflict); a single entry in flight is one
+atomic write and is always re-sent. A re-send answered without per-entry
+results replaces the stale busy result: a 4xx with its own error code, a
+lone entry still busy with `busy`, anything else (a 5xx, a transport failure)
+with `{ok: false, code: "unknown"}` — whether it was written is not known.
 
 A `429 rate_limited` response SHOULD carry a `Retry-After` header (delay
 seconds or an HTTP-date); clients honor it (and a `503`'s), otherwise backing

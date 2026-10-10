@@ -291,21 +291,21 @@ test("busyEntryIndexes reads only per-entry busy results of a 207", () => {
   assert.deepStrictEqual(busy.busyEntryIndexes({ status: 207, json: {} }), []);
 });
 
-test("POST /v1/nodes: per-entry busy in a 207 re-sends ONLY those entries and merges the answers", async () => {
+test("POST /v1/nodes: per-entry busy in a 207 re-sends the TAIL from the first busy entry, in order, and merges", async () => {
   const s = await scriptedServer([
     [207, { results: [OK("a"), ENTRY_BUSY, OK("c"), ENTRY_BUSY] }],
-    [207, { results: [OK("b"), ENTRY_BUSY] }],
+    [207, { results: [OK("b"), { ok: true, id: "c", status: "skipped" }, ENTRY_BUSY] }],
     [200, { results: [OK("d")] }],
   ]);
   try {
     const body = { nodes: [{ node: "A" }, { node: "B", if_exists: "error" }, "C", { node: "D", revision: "r1" }], if_exists: "skip" };
     const r = await remoteLib.post(cfgFor(s.url), "/v1/nodes", body);
     assert.strictEqual(s.seen.length, 3);
-    assert.deepStrictEqual(s.seen[1].body, { nodes: [{ node: "B", if_exists: "error" }, { node: "D", revision: "r1" }], if_exists: "skip" });
+    assert.deepStrictEqual(s.seen[1].body, { nodes: [{ node: "B", if_exists: "error" }, "C", { node: "D", revision: "r1" }], if_exists: "skip" });
     assert.deepStrictEqual(s.seen[2].body, { nodes: [{ node: "D", revision: "r1" }], if_exists: "skip" });
     assert.strictEqual(r.status, 200);
     assert.strictEqual(r.ok, true);
-    assert.deepStrictEqual(r.json.results.map((e) => e.id), ["a", "b", "c", "d"]);
+    assert.deepStrictEqual(r.json.results, [OK("a"), OK("b"), OK("c"), OK("d")], "a landed entry keeps its first result, not the re-send's skipped");
     assert.deepStrictEqual(JSON.parse(r.text), r.json);
   } finally {
     await s.close();
@@ -313,17 +313,105 @@ test("POST /v1/nodes: per-entry busy in a 207 re-sends ONLY those entries and me
 });
 
 test("POST /v1/nodes: a still-busy entry is bounded and reported in its original position", async () => {
-  const s = await scriptedServer([[207, { results: [OK("a"), ENTRY_BUSY, { ok: false, code: "invalid_node" }] }], [207, { results: [ENTRY_BUSY] }]]);
+  const INVALID = { ok: false, code: "invalid_node" };
+  const s = await scriptedServer([[207, { results: [OK("a"), ENTRY_BUSY, INVALID] }], [207, { results: [ENTRY_BUSY, INVALID] }]]);
   try {
     const r = await remoteLib.post(cfgFor(s.url), "/v1/nodes", { nodes: ["A", "B", "C"] });
     assert.strictEqual(s.seen.length, 1 + busy.BUSY_MAX_RETRIES);
-    for (const req of s.seen.slice(1)) assert.deepStrictEqual(req.body.nodes, ["B"]);
+    for (const req of s.seen.slice(1)) assert.deepStrictEqual(req.body.nodes, ["B", "C"]);
     assert.strictEqual(r.status, 207);
     assert.strictEqual(r.ok, true, "a 207 reads ok at the HTTP layer, merged or not");
-    assert.deepStrictEqual(r.json.results, [OK("a"), ENTRY_BUSY, { ok: false, code: "invalid_node" }]);
+    assert.deepStrictEqual(r.json.results, [OK("a"), ENTRY_BUSY, INVALID]);
   } finally {
     await s.close();
   }
+});
+
+// withBusyBatchRetry driven directly: `script` answers each send in turn.
+async function driveBatch(body, script, opts = {}) {
+  const sent = [];
+  const r = await busy.withBusyBatchRetry(
+    async (b) => {
+      sent.push(b.nodes);
+      return script[sent.length - 1];
+    },
+    body,
+    { sleep: async () => {}, landedResendSafe: (e) => remoteLib.entryResendSafe(body, e), ...opts },
+  );
+  return { r, sent };
+}
+const res = (status, json) => ({ ok: status < 400 || status === 207, status, json });
+const GATE = { ok: false, code: "completion_gate", message: "no resolver" };
+
+test("withBusyBatchRetry: a busy resolver re-sends the gate-failed born-terminal entry behind it (resolver-first order)", async () => {
+  const { r, sent } = await driveBatch({ nodes: ["R", "T"] }, [res(207, { results: [ENTRY_BUSY, GATE] }), res(200, { results: [OK("r"), OK("t")] })]);
+  assert.deepStrictEqual(sent, [["R", "T"], ["R", "T"]]);
+  assert.strictEqual(r.status, 200);
+  assert.deepStrictEqual(r.json.results, [OK("r"), OK("t")]);
+});
+
+test("withBusyBatchRetry: a duplicate id under update is re-sent in order, so the later content still wins", async () => {
+  const body = { nodes: ["X1", "X2"], if_exists: "update" };
+  const { r, sent } = await driveBatch(body, [res(207, { results: [ENTRY_BUSY, OK("x")] }), res(200, { results: [OK("x"), OK("x")] })]);
+  assert.deepStrictEqual(sent, [["X1", "X2"], ["X1", "X2"]], "never X1 alone after X2 landed");
+  assert.strictEqual(r.status, 200);
+});
+
+test("withBusyBatchRetry: a landed entry keeps its first result when a later re-send answers it busy or skipped", async () => {
+  const B_CREATED = OK("b");
+  const script = [res(207, { results: [ENTRY_BUSY, B_CREATED] }), res(207, { results: [ENTRY_BUSY, ENTRY_BUSY] })];
+  let { r } = await driveBatch({ nodes: ["A", "B"] }, [...script, res(200, { results: [OK("a"), { ok: true, id: "b", status: "skipped" }] })]);
+  assert.deepStrictEqual(r.json.results, [OK("a"), B_CREATED]);
+  ({ r } = await driveBatch({ nodes: ["A", "B"] }, script, { retries: 1 }));
+  assert.deepStrictEqual(r.json.results, [ENTRY_BUSY, B_CREATED], "b landed; it never reads busy");
+  // ...unless an earlier entry of that re-send wrote the same id over it.
+  ({ r } = await driveBatch({ nodes: ["X1", "X2"], if_exists: "update" }, [res(207, { results: [ENTRY_BUSY, OK("x")] }), res(207, { results: [OK("x"), ENTRY_BUSY] })], { retries: 1 }));
+  assert.deepStrictEqual(r.json.results, [OK("x"), ENTRY_BUSY]);
+  // ...and stays overwritten: a later re-send of it alone answering busy does not revive its first ok.
+  ({ r } = await driveBatch({ nodes: ["X1", "X2"], if_exists: "update" }, [res(207, { results: [ENTRY_BUSY, OK("x")] }), res(207, { results: [OK("x"), ENTRY_BUSY] }), res(207, { results: [ENTRY_BUSY] })], { retries: 2 }));
+  assert.strictEqual(r.status, 207);
+  assert.deepStrictEqual(r.json.results, [OK("x"), ENTRY_BUSY]);
+});
+
+test("withBusyBatchRetry: a tail holding a landed entry that would re-read as a conflict is not re-sent", async () => {
+  for (const body of [{ nodes: ["A", "B"], if_exists: "error" }, { nodes: ["A", { node: "B", if_exists: "update", revision: "r" }] }]) {
+    const { r, sent } = await driveBatch(body, [res(207, { results: [ENTRY_BUSY, OK("b")] })]);
+    assert.strictEqual(sent.length, 1, JSON.stringify(body));
+    assert.strictEqual(r.status, 207);
+    assert.deepStrictEqual(r.json.results, [ENTRY_BUSY, OK("b")]);
+  }
+  // A landed entry BEFORE the first busy one is never re-sent, so it does not block.
+  const { sent } = await driveBatch({ nodes: ["A", "B"], if_exists: "error" }, [res(207, { results: [OK("a"), ENTRY_BUSY] }), res(200, { results: [OK("b")] })]);
+  assert.deepStrictEqual(sent, [["A", "B"], ["B"]]);
+});
+
+test("withBusyBatchRetry: a re-send answered without per-entry results replaces the stale busy result", async () => {
+  const first = res(207, { results: [OK("a"), ENTRY_BUSY, GATE] });
+  // a transport failure or a 5xx: whether the tail landed is unknown
+  for (const answer of [{ ok: false, transport: true, error: "socket hang up" }, res(500, { error: { code: "internal" } }), res(207, { results: [OK("b")] })]) {
+    const { r, sent } = await driveBatch({ nodes: ["A", "B", "C"] }, [first, answer]);
+    assert.strictEqual(sent.length, 2);
+    assert.strictEqual(r.status, 207);
+    assert.deepStrictEqual(r.json.results[0], OK("a"));
+    for (const e of r.json.results.slice(1)) assert.strictEqual(e.code, "unknown", JSON.stringify(answer));
+  }
+  // a 4xx refused the whole re-send: the real error, not busy
+  for (const [status, err, code] of [
+    [401, { code: "unauthorized" }, "unauthorized"],
+    [413, { code: "payload_too_large", message: "too big" }, "payload_too_large"],
+    [422, { code: "invalid_request" }, "invalid_request"],
+  ]) {
+    const { r } = await driveBatch({ nodes: ["A", "B", "C"] }, [first, res(status, { error: err })]);
+    assert.deepStrictEqual(r.json.results.slice(1).map((e) => [e.code, e.status]), [[code, status], [code, status]]);
+  }
+});
+
+test("withBusyBatchRetry: a top-level busy that ends the retries reports busy for one entry, unknown for several", async () => {
+  const busyTop = res(503, { error: { code: "busy", message: "busy" } });
+  let { r } = await driveBatch({ nodes: ["A", "B"] }, [res(207, { results: [OK("a"), ENTRY_BUSY] }), busyTop, busyTop, busyTop]);
+  assert.deepStrictEqual(r.json.results.map((e) => e.code || e.id), ["a", "busy"]);
+  ({ r } = await driveBatch({ nodes: ["A", "B", "C"], if_exists: "error" }, [res(207, { results: [OK("a"), ENTRY_BUSY, GATE] }), busyTop]));
+  assert.deepStrictEqual(r.json.results.map((e) => e.code || e.id), ["a", "unknown", "unknown"]);
 });
 
 test("POST /v1/nodes: a 207 with no busy entry is returned as-is, not re-sent", async () => {
@@ -435,4 +523,5 @@ test("batchResendSafe: one entry always; several only under skip or an unrevisio
   assert.ok(!safe({ nodes: ["A", { node: "B", if_exists: "update", revision: "r" }] }));
   assert.ok(!safe({ nodes: ["A", { node: "B", if_exists: "update", spill: true }] }));
   assert.ok(safe({ nodes: ["A", { node: "B", spill: true }] }));
+  assert.ok(!remoteLib.entryResendSafe({ nodes: [] }, { node: "A", if_exists: "error" }), "a landed lone entry under error is not");
 });
