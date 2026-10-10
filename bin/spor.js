@@ -576,7 +576,7 @@ async function cmdNext(cfg, args) {
     const target = queueLimitTarget(args);
     let r = await fetchQueuePaged(cfg, queueQs(scopeSlug), target);
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r));
       return 1;
     }
     if (!r.ok) {
@@ -869,7 +869,7 @@ async function cmdGet(cfg, { positionals, values }) {
     const q = values.json ? "?inbound=1" : "";
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}${q}`, { timeoutMs: 6000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r));
       return 1;
     }
     if (r.status === 404) {
@@ -968,8 +968,10 @@ function renderDocumentRefusal(prefix, r) {
 }
 
 // A remote /v1/documents answer folded into the local arm's {ok, ...} shape.
-function remoteDocumentResult(r) {
-  if (r.transport) return { ok: false, offline: true, message: `offline — could not reach server (${r.error})` };
+// `write` (a hint) marks the PUT: a failure on a made connection may have
+// published the generation.
+function remoteDocumentResult(r, { write } = {}) {
+  if (r.transport) return { ok: false, offline: true, message: remote.describeTransport(r, { write }) };
   if (r.ok && r.json && !r.jsonError) return { ok: true, body: r.json };
   const e = (r.json && r.json.error) || {};
   return {
@@ -1054,7 +1056,7 @@ async function cmdPutDocument(cfg, { values, positionals }) {
   if (cfg.mode() === "remote") {
     const rr = remoteDocumentResult(await remote.request(cfg, "PUT", `/v1/documents/${encodeURIComponent(id)}`, {
       body: { node: input.raw, ...(snap.snapshot ? { snapshot: snap.snapshot } : {}) }, timeoutMs: 60000,
-    }));
+    }), { write: `check with 'spor get ${id} --document' before re-publishing` });
     if (!rr.ok && rr.offline) {
       err(rr.message);
       return 1;
@@ -1497,7 +1499,9 @@ async function stampCreatedPriority(cfg, node, id) {
   if (bad) return { ok: false, priority: "", error: bad };
   const priority = createPriority(node);
   const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/priority`, { priority }, { timeoutMs: 8000 });
-  if (r.transport) return { ok: false, priority, error: `offline — could not reach server (${r.error})` };
+  // An unconfirmed stamp (the request reached the server, no answer came
+  // back) may have landed; re-setting the same value is safe either way.
+  if (r.transport) return { ok: false, priority, error: remote.describeTransport(r), unconfirmed: !remote.isUnreachable(r) };
   if (!r.ok) {
     const msg = r.json && r.json.error && r.json.error.message;
     return { ok: false, priority, error: `priority error ${r.status}${msg ? `: ${msg}` : ""}` };
@@ -1546,25 +1550,53 @@ async function stampCreatedPriorityIfNeeded(cfg, node, id) {
 // (remote.js `earlierAttemptUnknown`: a reset connection, a timeout, a busy
 // over several entries) may be that lost attempt's OWN create, not a node
 // that was already there — reporting it `skipped` would drop the create's
-// spill parts and its priority stamp. Re-read the node: when it carries
-// everything we sent (every frontmatter field we set, every edge, the body),
-// it is reported `created` (`recovered: true`) and the caller stamps its
-// priority as for any create; otherwise it stays `skipped` with a note that
-// the lost attempt may have written it. A pre-existing node identical to what
-// we sent reads as ours too — the same content either way, and the priority
-// re-set is a no-op on an unchanged value.
+// spill parts and its priority stamp. Re-read the node: when it is exactly
+// what we sent — the same frontmatter keys and values (plus only the stamps
+// the server adds on create), the same edges with the same multiplicity, the
+// same body — it is reported `created` (`recovered: true`) and the caller
+// stamps its priority as for any create; otherwise it stays `skipped` with a
+// note that the lost attempt may have written it. A pre-existing node
+// identical to what we sent reads as ours too — the same content either way,
+// and the priority re-set is a no-op on an unchanged value.
+//
+// The stamps the server writes onto a create from the verified identity and
+// its own doors (spor-server reserved-fields.js: attribution, durability);
+// any OTHER key the stored node carries that we did not send means it is not
+// (only) our write.
+const SERVER_STAMPED_FIELDS = new Set([
+  "author", "authored_via", "authored_by_agent", "session", "created_by",
+  "created_at", "updated_at", "schema_version",
+  "priority_by", "priority_at", "priority_via",
+  "readiness_by", "readiness_at", "readiness_via",
+]);
+const LIST_KEYS = new Set(["edges", "pin", "exclude"]);
 function sentFieldsMatch(stored, sent) {
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const subset = (a, b) => a && b && typeof a === "object" && typeof b === "object" && Object.keys(a).every((k) => same(a[k], b[k]));
+  const present = (o, k) => o[k] !== undefined && !(LIST_KEYS.has(k) && Array.isArray(o[k]) && !o[k].length);
+  for (const k of Object.keys(stored)) {
+    if (k === "file" || k === "body" || !present(stored, k)) continue;
+    if (!present(sent, k) && !SERVER_STAMPED_FIELDS.has(k)) return false;
+  }
   for (const k of Object.keys(sent)) {
     if (k === "file") continue;
     if (k === "body") {
       if (String(sent.body || "").trim() !== String(stored.body || "").trim()) return false;
-    } else if (k === "edges" || k === "pin" || k === "exclude") {
+    } else if (LIST_KEYS.has(k)) {
       const a = Array.isArray(sent[k]) ? sent[k] : [];
       const b = Array.isArray(stored[k]) ? stored[k] : [];
-      // the server may stamp attributes onto an edge; what we sent must stand
-      if (a.length !== b.length || !a.every((x) => b.some((y) => (x && typeof x === "object" ? subset(x, y) : same(x, y))))) return false;
+      if (a.length !== b.length) return false;
+      // one-to-one: each sent entry claims a distinct stored entry. The
+      // server may stamp attributes onto an edge; what we sent must stand.
+      // Most-specific first, so a bare sent edge never takes the stored copy
+      // an attributed sibling needed.
+      const width = (x) => (x && typeof x === "object" ? Object.keys(x).length : 0);
+      const used = new Set();
+      for (const x of [...a].sort((p, q) => width(q) - width(p))) {
+        const j = b.findIndex((y, i) => !used.has(i) && (x && typeof x === "object" ? subset(x, y) : same(x, y)));
+        if (j < 0) return false;
+        used.add(j);
+      }
     } else if (!same(sent[k], stored[k])) return false;
   }
   return true;
@@ -1597,6 +1629,7 @@ async function reconcileRetriedSkip(cfg, node, res0) {
 function renderPriorityStamp(id, stamp) {
   if (!stamp) return;
   if (stamp.ok) out(`priority set: ${id} -> ${stamp.priority}`);
+  else if (stamp.unconfirmed) err(`  ${stamp.error} — ${id} was created but its priority stamp is unconfirmed; re-run 'spor priority ${id} ${stamp.priority}' (safe: it sets the same value)`);
   else err(`  ${stamp.error} — ${id} was created but its priority is unstamped; run 'spor priority ${id} ${stamp.priority || "<p1|p2|p3>"}'`);
 }
 
@@ -2134,7 +2167,7 @@ async function cmdBlame(cfg, { positionals, values }) {
     const q = repo ? `?repo=${encodeURIComponent(repo)}` : "";
     const r = await remote.get(cfg, `/v1/commits/${encodeURIComponent(sha)}${q}`, { timeoutMs: 6000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r));
       return 1;
     }
     if (r.status === 422) {
@@ -2241,11 +2274,14 @@ async function putNodesSkip(cfg, raws) {
       const batch = nodes.slice(results.length, results.length + chunk.length);
       const r = await remote.post(cfg, "/v1/nodes", { nodes: chunk }, { timeoutMs: Math.min(120000, 15000 + 1000 * chunk.length) });
       const rs = r.json && Array.isArray(r.json.results) ? r.json.results : null;
-      batch.forEach((n, i) => {
-        const res = rs && rs[i];
-        if (res && res.ok) results.push({ id: n.node.id, ok: true, status: res.status || "ok" });
-        else results.push({ id: n.node.id, ok: false, status: "error", message: r.transport ? `offline (${r.error})` : `${r.status}${res ? `: ${putNodeEntryDetail(res)}` : ""}` });
-      });
+      for (let i = 0; i < batch.length; i++) {
+        const n = batch[i];
+        let res = rs && rs[i];
+        // a `skipped` re-send may be the lost attempt's own create
+        if (res && res.ok && res.status === "skipped" && r.earlierAttemptUnknown) res = await reconcileRetriedSkip(cfg, n.node, res);
+        if (res && res.ok) results.push({ id: n.node.id, ok: true, status: res.status || "ok", ...(res.note ? { note: res.note } : {}) });
+        else results.push({ id: n.node.id, ok: false, status: "error", message: r.transport ? remote.describeTransport(r, { write: "re-run (every write is --if-exists skip)" }) : `${r.status}${res ? `: ${putNodeEntryDetail(res)}` : ""}` });
+      }
     }
     return results;
   }
@@ -2600,7 +2636,7 @@ async function historyList(cfg, history, id, values) {
     const q = limit != null ? `?limit=${encodeURIComponent(limit)}` : "";
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}/history${q}`, { timeoutMs: 10000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r));
       return 1;
     }
     if (r.status === 404) {
@@ -2657,7 +2693,7 @@ async function historyEntry(cfg, history, id, sha, values) {
       { timeoutMs: 10000 }
     );
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r));
       return 1;
     }
     if (r.status === 404) {
@@ -2741,7 +2777,7 @@ async function cmdLens(cfg, args) {
   if (!id) {
     const r = await remote.get(cfg, "/v1/lenses", { timeoutMs: 6000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r));
       return 1;
     }
     if (!r.ok) {
@@ -2781,7 +2817,7 @@ async function cmdLens(cfg, args) {
   }
   const r = await remote.get(cfg, `/v1/lens/${encodeURIComponent(id)}/render?${qs.join("&")}`, { timeoutMs: 10000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r));
     return 1;
   }
   if (r.status === 404) {
@@ -2879,7 +2915,7 @@ async function runStart(cfg, workflowId, values) {
   const body = inputs ? { inputs } : {};
   const r = await remote.post(cfg, `/v1/workflows/${encodeURIComponent(workflowId)}/run`, body, { timeoutMs: 15000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r, { write: "a run may have started; check the graph for its workflow-run node before re-running" }));
     return 1;
   }
   if (r.status === 404) {
@@ -2912,7 +2948,7 @@ async function runStart(cfg, workflowId, values) {
 async function runStatus(cfg, runId, wantJson) {
   const r = await remote.get(cfg, `/v1/runs/${encodeURIComponent(runId)}`, { timeoutMs: 8000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r));
     return 1;
   }
   if (r.status === 404) {
@@ -2973,7 +3009,7 @@ async function cmdShare(cfg, { values, positionals }) {
   const body = values.expires != null ? { expires: values.expires } : {};
   const r = await remote.post(cfg, `/v1/lens/${encodeURIComponent(id)}/ticket`, body, { timeoutMs: 8000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r, { write: "a share ticket may have been minted; re-run to mint a fresh one" }));
     return 1;
   }
   if (r.status === 404) {
@@ -3099,7 +3135,7 @@ async function compileRemote(cfg, args) {
   if (root) {
     const b = await remoteNodeBriefing(cfg, { root, project });
     if (b.transport) {
-      err(`offline — could not reach server (${b.error})`);
+      err(remote.describeTransport(b));
       return 1;
     }
     if (b.status === 404) {
@@ -3117,7 +3153,7 @@ async function compileRemote(cfg, args) {
     if (minSim != null) body.min_sim = parseFloat(minSim);
     const d = await remote.post(cfg, "/v1/digest", body, { timeoutMs: 8000 });
     if (d.transport) {
-      err(`offline — could not reach server (${d.error})`);
+      err(remote.describeTransport(d));
       return 1;
     }
     if (!d.ok) {
@@ -3213,7 +3249,7 @@ async function fetchRemoteExportNodes(cfg, label, { report = err, timeoutMs = 12
   const err = report; // callers that own their output (a work-loop hook) route these lines to their log
   const r = await remote.download(cfg, "/v1/export?gzip=1", { timeoutMs });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r));
     return { error: true };
   }
   if (!r.ok) {
@@ -3446,7 +3482,7 @@ async function analyticsRemote(cfg, args) {
   const query = qs.toString();
   const r = await remote.get(cfg, `/v1/analytics${query ? `?${query}` : ""}`, { timeoutMs: 10000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r));
     return 1;
   }
   if (!r.ok || !r.json) {
@@ -3557,7 +3593,7 @@ async function fetchResidentSchema(cfg, args, id) {
     }
   }
   const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
-  if (r.transport) return { error: `offline — could not reach server (${r.error})` };
+  if (r.transport) return { error: remote.describeTransport(r) };
   if (r.status === 404) return { resident: null };
   if (!r.ok || !r.json || typeof r.json.raw !== "string") return { error: `error ${r.status} reading ${id} from the server` };
   try {
@@ -3699,7 +3735,7 @@ async function cmdSchemaAdopt(cfg, args) {
     if (!creating) entry.revision = rres.revision;
     const r = await remote.post(cfg, "/v1/nodes", { nodes: [entry] }, { timeoutMs: 15000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r, { write: "check with 'spor schema' before retrying" }));
       return 1;
     }
     const res0 = r.json && r.json.results && r.json.results[0];
@@ -3775,7 +3811,7 @@ async function changesRemote(cfg, args) {
   const query = qs.toString();
   const r = await remote.get(cfg, `/v1/changes${query ? `?${query}` : ""}`, { timeoutMs: 10000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r));
     return 1;
   }
   if (r.status === 422) {
@@ -3910,7 +3946,7 @@ async function programRemote(cfg, id, args) {
   };
   const fail = (r) => {
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r));
       return 1;
     }
     if (r.status === 404) {
@@ -4048,7 +4084,7 @@ async function cmdExport(cfg, { values }) {
     const qs = params.length ? `?${params.join("&")}` : "";
     const r = await remote.download(cfg, `/v1/export${qs}`, { timeoutMs: 120000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r));
       return 1;
     }
     if (!r.ok) {
@@ -4241,7 +4277,7 @@ async function cmdMerge(cfg, { values, positionals }) {
 
   const r = await remote.post(cfg, "/v1/merge", body, { timeoutMs: 120000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r, { write: "check the graph before re-running the merge" }));
     return 1;
   }
   if (notAdminHint(r)) return 1;
@@ -4455,12 +4491,21 @@ async function cmdAdd(cfg, { values, positionals }) {
     // would only dead-letter on drain, so they fall through to the error path below.
     const retryable = r.transport || (typeof r.status === "number" && r.status >= 500);
     if (retryable) {
-      const reason = r.transport ? r.error : `HTTP ${r.status}`;
+      // A connection never made (or a 5xx) did not land; a reset or timeout
+      // MAY have — the spooled replay carries the same idempotency key, so a
+      // capture the lost attempt did land is replayed, not duplicated.
+      const reason = r.transport ? remote.describeTransport(r) : `server error (HTTP ${r.status})`;
+      const maybe = r.transport && !remote.isUnreachable(r);
+      const what = maybe ? "capture not confirmed" : "capture not shipped";
       const spool = spoolCapture(cfg, body);
       if (spool) {
-        err(`offline — capture not shipped (${reason}). Spooled to ${spool}; run 'spor drain' to ship it (or it drains on your next Spor session).`);
+        err(`${reason} — ${what}. Spooled to ${spool}; run 'spor drain' to ship it (or it drains on your next Spor session).`);
       } else {
-        err(`offline — capture not shipped (${reason}) and could not be spooled — capture lost. Re-run when the server is reachable.`);
+        // a hand re-run mints a fresh idempotency key, so one the lost attempt
+        // landed would be captured twice: check first.
+        err(maybe
+          ? `${reason} — ${what} and could not be spooled; the lost attempt may have landed it — check 'spor changes' before re-running.`
+          : `${reason} — ${what} and could not be spooled — capture lost. Re-run when the server is reachable.`);
       }
       return 1;
     }
@@ -4641,7 +4686,7 @@ async function cmdAsk(cfg, { values, positionals }) {
     // only /v1/capture bodies, so a failed question fails open like correct does.
     const r = await remote.post(cfg, "/v1/questions", body, { timeoutMs: 8000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r, { write: "check 'spor next' before re-filing the question" }));
       return 1;
     }
     if (!r.ok) {
@@ -4845,7 +4890,7 @@ async function cmdCorrect(cfg, { values, positionals }) {
     const body = { target, pin, exclude, guidance: guidance || "", title };
     const r = await remote.post(cfg, "/v1/corrections", body, { timeoutMs: 8000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r, { write: "a correction may have been filed; check before re-filing it" }));
       return 1;
     }
     if (!r.ok) {
@@ -4980,7 +5025,7 @@ async function stampField(cfg, { id, field, value }) {
     // <field>_by/_at/_via (via: rest) from the token.
     const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/${field}`, { [field]: value }, { timeoutMs: 8000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r, { write: "re-running it is safe (it sets an absolute value)" }));
       return 1;
     }
     if (r.status === 404) {
@@ -5273,7 +5318,7 @@ async function cmdSetStatus(cfg, { positionals }) {
     // the lease) — the response carries the lease so the user learns the outcome.
     const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/status`, { status: value }, { timeoutMs: 8000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r, { write: `check with 'spor get ${id}' before retrying` }));
       return 1;
     }
     if (r.status === 404) {
@@ -5479,7 +5524,7 @@ async function cmdPatch(cfg, { values, positionals }) {
     const body = revision ? { patch, revision } : { patch };
     const r = await remote.request(cfg, "PATCH", `/v1/nodes/${encodeURIComponent(id)}`, { body, timeoutMs: 8000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r, { write: `check with 'spor get ${id}' before retrying` }));
       return 1;
     }
     if (r.status === 404) {
@@ -5671,7 +5716,7 @@ async function cmdEdge(cfg, { values, positionals }) {
       // back as `skipped` and is reported as "not present" with exit 1.
       const r = await remote.del(cfg, `/v1/nodes/${encodeURIComponent(id)}/edges`, { body: { type, to }, timeoutMs: 8000 });
       if (r.transport) {
-        err(`offline — could not reach server (${r.error})`);
+        err(remote.describeTransport(r, { write: `check with 'spor get ${id}' before retrying` }));
         return 1;
       }
       if (!r.ok) {
@@ -5695,7 +5740,7 @@ async function cmdEdge(cfg, { values, positionals }) {
     if (attrs) body.attrs = attrs;
     const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/edges`, body, { timeoutMs: 8000 });
     if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+      err(remote.describeTransport(r, { write: "re-running it is safe (an existing edge is not duplicated)" }));
       return 1;
     }
     if (!r.ok) {
@@ -5967,7 +6012,7 @@ async function cmdLease(cfg, action, { positionals, values = {} }) {
 
   const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/${action}`, body, { timeoutMs: 8000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r, { write: `check with 'spor get ${id}' before retrying` }));
     return 1;
   }
   if (r.status === 404) {
@@ -6836,21 +6881,26 @@ async function cmdInvite(cfg, { values }) {
     }, { rawBody: true });
     const pr = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: md, if_exists: "skip" }] });
     if (pr.transport) {
-      err(`offline — could not reach server (${pr.error})`);
+      err(remote.describeTransport(pr, { write: "re-running 'spor invite' is safe (the person node is written --if-exists skip)" }));
       return 1;
     }
     if (notAdminHint(pr)) return 1;
-    const res0 = pr.json && pr.json.results && pr.json.results[0];
+    let res0 = pr.json && pr.json.results && pr.json.results[0];
     if (!pr.ok && !(res0 && res0.ok)) {
       err(`could not create person node: ${(res0 && res0.message) || pr.status}`);
       return 1;
     }
-    out(`person node ${labelledPerson(safeName, person)} ${res0 && res0.status === "skipped" ? "(already existed)" : "created"}`);
+    // a `skipped` re-send may be the lost attempt's own create
+    if (res0 && res0.status === "skipped" && pr.earlierAttemptUnknown) {
+      const parsed = parsePutNode(md, `${person}.md`);
+      if (!parsed.error) res0 = await reconcileRetriedSkip(cfg, parsed.node, res0);
+    }
+    out(`person node ${labelledPerson(safeName, person)} ${res0 && res0.status === "skipped" ? (res0.uncertain ? "(already existed, or created by an earlier attempt whose response was lost)" : "(already existed)") : "created"}`);
   }
 
   const r = await remote.post(cfg, "/v1/admin/tokens", { person, ...(expires ? { expires } : {}) });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r, { write: `a token may have been minted for ${person} — list with 'spor token list --all' and revoke a stray one` }));
     return 1;
   }
   if (notAdminHint(r)) return 1;
@@ -7225,7 +7275,7 @@ async function cmdAgentCreateRemote(cfg, { label, owner, pubkey }) {
   if (pubkey) body.pubkey = pubkey;
   const r = await remote.post(cfg, apiPath, body);
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r, { write: "check 'spor agent list' before re-creating it" }));
     return 1;
   }
   if (r.status === 403) {
@@ -7344,7 +7394,7 @@ async function cmdAgentCreateLocal(cfg, { label, owner, pubkey }) {
 async function cmdAgentListRemote(cfg) {
   const a = await remote.get(cfg, "/v1/agents", { timeoutMs: 6000 });
   if (a.transport) {
-    err(`offline — could not reach server (${a.error})`);
+    err(remote.describeTransport(a));
     return 1;
   }
   if (a.ok && a.json && Array.isArray(a.json.agents)) {
@@ -7459,7 +7509,7 @@ async function cmdAgentTokenMint(cfg, agent, args) {
   const body = { standing: true, ...(expires ? { expires } : {}), ...(label ? { label } : {}) };
   const r = await remote.post(cfg, `/v1/agents/${encodeURIComponent(agent)}/token`, body, { timeoutMs: 6000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r, { write: `a token may have been minted — check 'spor agent token ${agent} list' and revoke a stray one` }));
     return 1;
   }
   if (r.status === 403) {
@@ -7499,7 +7549,7 @@ async function cmdAgentTokenMint(cfg, agent, args) {
 async function cmdAgentTokenList(cfg, agent) {
   const r = await remote.get(cfg, `/v1/agents/${encodeURIComponent(agent)}/tokens`, { timeoutMs: 6000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r));
     return 1;
   }
   if (r.status === 403) {
@@ -7537,7 +7587,7 @@ async function cmdAgentTokenRevoke(cfg, agent, args) {
   }
   const r = await remote.del(cfg, `/v1/agents/${encodeURIComponent(agent)}/tokens/${encodeURIComponent(prefix)}`, { timeoutMs: 6000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r, { write: `check 'spor agent token ${agent} list'` }));
     return 1;
   }
   if (r.status === 403) {
@@ -7603,7 +7653,7 @@ async function cmdTokenCreate(cfg, args) {
   const body = { ...(expires ? { expires } : {}), ...(label ? { label } : {}) };
   const r = await remote.post(cfg, "/v1/me/tokens", body);
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r, { write: "a token may have been minted — check 'spor token list' and revoke a stray one" }));
     return 1;
   }
   if (notBoundHint(r)) return 1;
@@ -7625,7 +7675,7 @@ async function cmdTokenCreate(cfg, args) {
 async function cmdTokenListSelf(cfg) {
   const r = await remote.get(cfg, "/v1/me/tokens");
   if (r.transport) {
-    err(`offline (${r.error})`);
+    err(remote.describeTransport(r));
     return 1;
   }
   if (notBoundHint(r)) return 1;
@@ -7654,7 +7704,7 @@ async function cmdTokenRevokeSelf(cfg, args) {
   }
   const r = await remote.del(cfg, `/v1/me/tokens/${encodeURIComponent(prefix)}`);
   if (r.transport) {
-    err(`offline (${r.error})`);
+    err(remote.describeTransport(r, { write: "check 'spor token list'" }));
     return 1;
   }
   if (notBoundHint(r)) return 1;
@@ -7675,7 +7725,7 @@ async function cmdTokenRevokeSelf(cfg, args) {
 async function cmdTokenListAdmin(cfg) {
   const r = await remote.get(cfg, "/v1/admin/tokens");
   if (r.transport) {
-    err(`offline (${r.error})`);
+    err(remote.describeTransport(r));
     return 1;
   }
   if (notAdminHint(r)) return 1;
@@ -7705,7 +7755,7 @@ async function cmdTokenRevokeAdmin(cfg, args) {
   }
   const r = await remote.del(cfg, `/v1/admin/tokens/${encodeURIComponent(prefix)}`);
   if (r.transport) {
-    err(`offline (${r.error})`);
+    err(remote.describeTransport(r, { write: "check 'spor token list --all'" }));
     return 1;
   }
   if (notAdminHint(r)) return 1;
@@ -7785,7 +7835,7 @@ async function cmdAdminEraseJournal(cfg, args) {
   if (values["drop-unattributed-fragments"]) body.drop_unattributed_fragments = true;
   const r = await remote.post(cfg, "/v1/admin/journal/erase", body, { timeoutMs: 300000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r, { write: "the erase may have run — re-run with --dry-run to see what is left" }));
     return 1;
   }
   if (notAdminHint(r)) return 1;
@@ -7849,7 +7899,7 @@ async function cmdAdminGardener(cfg, args) {
   const json = args.includes("--json");
   const r = await remote.post(cfg, "/v1/gardener", {}, { timeoutMs: 120000 });
   if (r.transport) {
-    err(`offline — could not reach server (${r.error})`);
+    err(remote.describeTransport(r, { write: "the sweep may have run" }));
     return 1;
   }
   if (notAdminHint(r)) return 1;
@@ -13019,7 +13069,7 @@ function gateNodeEquivalent(occupant, candidate) {
 async function writeGateNode(cfg, id, markdown) {
   if (cfg.mode() === "remote") {
     const r = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: markdown, if_exists: "skip" }] }, { timeoutMs: 15000 });
-    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (r.transport) return { ok: false, reason: remote.describeTransport(r, { write: "re-read before retrying" }) };
     const res0 = r.json && r.json.results && r.json.results[0];
     if (res0 && res0.status === "skipped") {
       // The SAME distinction the local door draws below (review finding 5): a
@@ -13029,7 +13079,7 @@ async function writeGateNode(cfg, id, markdown) {
       // unreadable existing node is refused too (fail closed: it cannot be
       // shown to be this fact).
       const existing = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 8000 });
-      if (existing.transport) return { ok: false, id, existing: true, reason: `${id} already exists and could not be read back to compare (offline — ${existing.error})` };
+      if (existing.transport) return { ok: false, id, existing: true, reason: `${id} already exists and could not be read back to compare (${remote.describeTransport(existing)})` };
       const raw = existing.ok ? (existing.json && existing.json.raw) || existing.text || "" : "";
       if (!existing.ok || !raw) return { ok: false, id, existing: true, reason: `${id} already exists and could not be read back to compare (HTTP ${existing.status})` };
       return gateNodeEquivalent(raw, markdown) ? { ok: true, id, existing: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
@@ -13099,7 +13149,7 @@ function withoutFlakeEdges(markdown, issues) {
 async function addGateEdge(cfg, id, type, to) {
   if (cfg.mode() === "remote") {
     const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/edges/live`, { type, to, require_live_target: true }, { timeoutMs: 8000 });
-    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (r.transport) return { ok: false, reason: remote.describeTransport(r, { write: "re-read before retrying" }) };
     if (!r.ok) {
       const e = (r.json && r.json.error) || {};
       return { ok: false, code: e.code || null, reason: `edge error ${r.status}${e.message ? `: ${e.message}` : ""}` };
@@ -13446,7 +13496,7 @@ async function gateDemoteItem(cfg, id, { blockerId = null } = {}) {
 async function gateWriteStatus(cfg, id, value, graph = null) {
   if (cfg.mode() === "remote") {
     const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/status`, { status: value }, { timeoutMs: 8000 });
-    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (r.transport) return { ok: false, reason: remote.describeTransport(r, { write: "re-read before retrying" }) };
     if (!r.ok) {
       const e = (r.json && r.json.error) || {};
       return { ok: false, reason: `status ${r.status}${e.message ? `: ${e.message}` : ""}` };
@@ -14788,7 +14838,7 @@ async function graphEdgeMutation(cfg, from, type, to, { remove = false } = {}) {
     const r = remove
       ? await remote.del(cfg, `/v1/nodes/${encodeURIComponent(from)}/edges`, { body: { type, to }, timeoutMs: 8000 })
       : await remote.post(cfg, `/v1/nodes/${encodeURIComponent(from)}/edges`, { type, to }, { timeoutMs: 8000 });
-    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (r.transport) return { ok: false, reason: remote.describeTransport(r, { write: "re-read before retrying" }) };
     if (!r.ok) {
       const e = (r.json && r.json.error) || {};
       return { ok: false, reason: `edge error ${r.status}${e.message ? `: ${e.message}` : ""}` };
@@ -14870,7 +14920,7 @@ async function completionReadItem(cfg, nodeId) {
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
   if (cfg.mode() === "remote") {
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}`, { timeoutMs: 8000 });
-    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (r.transport) return { ok: false, reason: remote.describeTransport(r) };
     if (!r.ok) return { ok: false, reason: r.status === 404 ? `no such node: ${nodeId}` : `HTTP ${r.status}` };
     if (r.jsonError || !r.json || typeof r.json !== "object" || typeof r.json.raw !== "string") return { ok: false, reason: `${nodeId}: the server answered with no readable node body` };
     let fm = {};
@@ -14953,7 +15003,7 @@ async function completionReadItem(cfg, nodeId) {
 async function completionCasWrite(cfg, { nodeId, revision, raw }, { home = cfg.userConfigHome() } = {}) {
   if (cfg.mode() === "remote") {
     const r = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: raw, if_exists: "update", revision: revision || undefined }] }, { timeoutMs: 15000 });
-    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (r.transport) return { ok: false, reason: remote.describeTransport(r, { write: "re-read before retrying" }) };
     const res0 = r.json && r.json.results && r.json.results[0];
     if (res0 && res0.ok) return { ok: true, revision: res0.revision || null };
     // A batch entry's verdict is FLAT on the entry (`{ok, code, message,
@@ -18498,7 +18548,7 @@ async function readRepoNodeRaw(cfg, slug) {
   const id = `repo-${slug}`;
   if (cfg.mode() === "remote") {
     const g = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 8000 });
-    if (g.transport) return { error: `offline — could not reach server (${g.error})` };
+    if (g.transport) return { error: remote.describeTransport(g) };
     if (g.status === 404) return { missing: true };
     if (!g.ok) return { error: `error ${g.status}` };
     return { raw: (g.json && g.json.raw) || g.text, revision: g.json && g.json.revision };
@@ -18520,7 +18570,7 @@ async function writeRepoNodeRaw(cfg, slug, newRaw, revision) {
   const id = `repo-${slug}`;
   if (cfg.mode() === "remote") {
     const pr = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: newRaw, if_exists: "update", revision }] }, { timeoutMs: 8000 });
-    if (pr.transport) return { error: `offline — could not reach server (${pr.error})` };
+    if (pr.transport) return { error: remote.describeTransport(pr, { write: "re-read before retrying" }) };
     // A 207 with a failed single-node entry IS a failure here (unlike a multi-node
     // batch) — gate on the entry's own ok, and surface the server's generic
     // message plus its granular `details` list (the validator's specifics).

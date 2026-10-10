@@ -340,6 +340,30 @@ test("put-node (remote) against a dead port still reads offline, naming the refu
   assert.match(blocked.stderr, /^offline — could not reach server \(fetch failed: bad port\)/);
 });
 
+// task-spor-cli-remote-verb-transport-errors: the other remote verbs read a
+// reset the same way — never "offline", and a write verb says it may have
+// landed while a read does not.
+test("remote verbs: a reset connection is not 'offline'; a write verb says the write may have landed", async () => {
+  const srv = http.createServer((req) => req.on("data", () => {}).on("end", () => req.socket.destroy()));
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    const write = await runAsync(["set-status", "dec-remote", "superseded"], remoteEnv(base));
+    assert.strictEqual(write.status, 1);
+    assert.doesNotMatch(write.stderr, /offline/);
+    assert.match(write.stderr, /^connection to server failed \(.*\) — the write may have landed; check with 'spor get dec-remote' before retrying/m);
+    const edge = await runAsync(["edge", "dec-remote", "relates-to", "dec-other"], remoteEnv(base));
+    assert.strictEqual(edge.status, 1);
+    assert.match(edge.stderr, /^connection to server failed .* — the write may have landed;/m);
+    const read = await runAsync(["get", "dec-remote"], remoteEnv(base));
+    assert.strictEqual(read.status, 1);
+    assert.match(read.stderr, /^connection to server failed \(/m);
+    assert.doesNotMatch(read.stderr, /offline|may have landed/);
+  } finally {
+    srv.close();
+  }
+});
+
 // Merge review: a re-send whose lost first attempt CREATED the node reads
 // `skipped`. Re-read it: when it carries what was sent it is reported as our
 // create (and its priority still stamped); otherwise it stays skipped with a
@@ -399,6 +423,35 @@ test("put-node (remote) a retried skip whose node re-reads differently stays ski
     assert.strictEqual(res.status, "skipped");
     assert.strictEqual(res.uncertain, true);
     assert.match(res.note, /the lost attempt may have written this node; it re-reads differently/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) a retried skip is not 'created' when the stored node carries a key we did not send", async () => {
+  const file = tmpNodeFile(nodeMd("dec-remote"));
+  // server attribution stamps are allowed; any other extra key is not ours
+  const stored = nodeMd("dec-remote").replace("date: 2026-06-01\n", "date: 2026-06-01\nauthor: X <x@example.com>\nauthored_via: rest\nstatus: superseded\n");
+  const { srv, base } = await lostCreateStub({ stored: { "dec-remote": stored } });
+  try {
+    const r = await runAsync(["put-node", file, "--if-exists", "skip", "--json"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const res = JSON.parse(r.stdout);
+    assert.strictEqual(res.status, "skipped");
+    assert.strictEqual(res.uncertain, true);
+  } finally {
+    srv.close();
+  }
+});
+
+test("put-node (remote) a retried skip compares edges one-to-one, multiplicity included", async () => {
+  const withEdges = (edges) => nodeMd("dec-remote").replace("date: 2026-06-01\n", `date: 2026-06-01\nedges:\n${edges.map((e) => `  - {type: relates-to, to: ${e}}\n`).join("")}`);
+  const file = tmpNodeFile(withEdges(["dec-a", "dec-a"]));
+  const { srv, base } = await lostCreateStub({ stored: { "dec-remote": withEdges(["dec-a", "dec-b"]) } });
+  try {
+    const r = await runAsync(["put-node", file, "--if-exists", "skip", "--json"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(JSON.parse(r.stdout).status, "skipped", "two sent edges cannot both match one stored edge");
   } finally {
     srv.close();
   }

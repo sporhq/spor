@@ -299,6 +299,34 @@ test("describeTransport: offline only for a connection never made; a reset or ti
   assert.strictEqual(describeTransport(slow), "server did not answer (timed out after 15000ms)");
 });
 
+// A route error (EHOSTUNREACH/ENETUNREACH/EHOSTDOWN/ENETDOWN) can also hit an
+// ESTABLISHED socket, after the request went out: only a failing CONNECT is
+// "never connected"; a read/write one — or one we cannot place — may have
+// reached the server.
+test("describeTransport: a route error reads offline only when the connect failed", () => {
+  const { transportError, describeTransport, isUnreachable } = remoteLib;
+  const route = (code, syscall, msg) => {
+    const e = new TypeError("fetch failed");
+    e.cause = Object.assign(new Error(msg || `${syscall || "x"} ${code}`), { code }, syscall ? { syscall } : {});
+    return transportError(e);
+  };
+  for (const code of ["EHOSTUNREACH", "ENETUNREACH", "EHOSTDOWN", "ENETDOWN"]) {
+    const atConnect = route(code, "connect", `connect ${code} 10.0.0.1:443`);
+    assert.strictEqual(isUnreachable(atConnect), true, code);
+    assert.match(describeTransport(atConnect, { write: "x" }), /^offline — could not reach server/);
+    const midStream = route(code, "read", `read ${code}`);
+    assert.strictEqual(isUnreachable(midStream), false, code);
+    assert.match(describeTransport(midStream, { write: "x" }), /^connection to server failed .* — the write may have landed; x$/);
+    // no syscall: placed by the "connect <CODE>" message, else may-have-reached
+    assert.strictEqual(isUnreachable(route(code, null, `connect ${code} 10.0.0.1:443`)), true, code);
+    assert.strictEqual(isUnreachable(route(code, null, `socket ${code}`)), false, code);
+  }
+  // an AggregateError (dual-stack connect) carries its syscall on the inner error
+  const agg = new TypeError("fetch failed");
+  agg.cause = Object.assign(new AggregateError([Object.assign(new Error("connect EHOSTUNREACH ::1:443"), { code: "EHOSTUNREACH", syscall: "connect" })], ""), {});
+  assert.strictEqual(isUnreachable(transportError(agg)), true);
+});
+
 // Merge review of issue-spor-cli-put-node-offline-fetch-failed: what one attempt
 // learned must survive every later one — the stale-socket retry AND the busy
 // re-sends. A reset (may have landed) answered by a busy re-send and then a
