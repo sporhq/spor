@@ -47,6 +47,17 @@ spor-server `main` are **contended** — other people and jobs move them out fro
 under you. CAS makes "merge onto the main I just tested" atomic: if main moved,
 the swap fails and you re-rebase instead of clobbering someone's commit.
 
+**`land.sh` serializes itself — never wait on it by hand.** It holds a
+per-repository lock (`<git-common-dir>/spor-land.lock`) from reading main's
+tip through the CAS, the advance and `--verify`, so a second `land.sh` on the
+same repo — another merge agent, another worktree — simply waits for the first
+to finish (a note on stderr says so), and refuses `REFUSED
+reason=lock-timeout` without landing after `--lock-timeout` seconds (default
+3600). Do NOT `pgrep`/`ps` for a running `land.sh` to decide when to land: a
+pattern matches your own waiting shell (so it never clears) and misses a run it
+cannot see, and two lands overlapped on spor-server that way
+(issue-spor-orchestrator-land-sh-no-mutual-exclusion). Just run it.
+
 ## The flow (per finished branch)
 
 Run from the main checkout, not the worktree. `BR` is the agent's branch (= node
@@ -189,7 +200,9 @@ id, sanitized by dispatch).
    there, then `git worktree remove <dir>`.) The worktree is bare: spor is
    zero-dep, but a repo with dependencies (spor-server) must stage them in the
    command — `--verify "<its worktreeSetup script> && npm test"` — or a
-   missing `node_modules` reads as a regression. For a suite that may outlast the
+   missing `node_modules` reads as a regression. The command gets the same
+   `SPOR_WORKTREE` (the verify worktree) and `SPOR_MAIN_CHECKOUT` (the shared
+   root) a dispatch worktree-setup hook does, so that script runs unchanged. For a suite that may outlast the
    Bash tool's 10-minute cap, land without `--verify`, then run the suite in
    your own detached worktree detached-to-a-log and poll it in the foreground.
    `VERIFY-FAILED … worktree=<dir>` (exit 3) means the swap LANDED and the

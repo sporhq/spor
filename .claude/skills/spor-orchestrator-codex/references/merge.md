@@ -89,7 +89,11 @@ report or verdict; don't kill it.
    hand (no `reset --hard`): a ref-only move under a checked-out branch is
    exactly what left shared roots stale and made hand-commits revert merged
    work. `REFUSED reason=moved` means main moved; reconcile and repeat
-   affected checks. `REFUSED reason=not-descendant` means rebase again. Never
+   affected checks. `REFUSED reason=not-descendant` means rebase again.
+   `land.sh` holds a per-repository lock through the CAS and `--verify`, so a
+   concurrent land waits for it (`REFUSED reason=lock-timeout`, nothing landed,
+   after `--lock-timeout` seconds); never `pgrep`/`ps` for a running `land.sh`
+   to decide when to land — just run it. Never
    substitute a tip you did not test. Substitute the agreed target branch if
    this repo does not use `main`.
 5. There is no root sync step and no healer (scripts/heal-stale-root.js is
@@ -99,7 +103,9 @@ report or verdict; don't kill it.
 6. Run the required post-merge suite on that exact merged tree in a fresh
    detached worktree (`land.sh --verify "<cmd>"`, or `git worktree add
    --detach <dir> "$CANDIDATE"`), never the shared root. That worktree is
-   bare: stage dependencies in the command for a repo that has them. If it fails, report the regression immediately
+   bare: stage dependencies in the command for a repo that has them (it runs
+   with `SPOR_WORKTREE`/`SPOR_MAIN_CHECKOUT` set, like a dispatch
+   worktree-setup hook). If it fails, report the regression immediately
    and perform a reviewed revert within existing authorization, preserving
    commits that landed later. Do not force-push, blindly move main backwards,
    or claim successful completion. Keep the task unresolved pending recovery.

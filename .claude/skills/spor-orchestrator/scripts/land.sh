@@ -46,6 +46,11 @@
 #      shared root: `--verify "<cmd>"` runs there after the swap. The worktree
 #      is bare — no node_modules — so a repo with dependencies must stage them
 #      in the command itself (the same thing its dispatch.worktreeSetup does).
+#      The command runs with the env `spor dispatch` hands a worktree-setup
+#      hook — SPOR_WORKTREE (the verify worktree) and SPOR_MAIN_CHECKOUT (the
+#      repo's main worktree, where node_modules lives) — so that setup script
+#      runs there unchanged
+#      (issue-spor-orchestrator-land-verify-missing-main-checkout-env).
 #
 # THE TIP RESOLVES IN THE CALLER'S CWD. `--repo` is the shared root, which is
 # parked at (or near) the target, so a per-worktree name like HEAD resolved THERE
@@ -58,13 +63,29 @@
 # ref and ancestry probes), so a `refs/replace` graft cannot make ancestry read differently than
 # the objects a checkout will write.
 #
+# ONE LAND AT A TIME, PER REPOSITORY. Everything from reading the target's OLD
+# through the CAS, the advance and `--verify` runs under an exclusive lock on
+# `<git-common-dir>/spor-land.lock`, so a second land.sh on the same repo (from
+# any worktree of it, by any caller) WAITS instead of overlapping. Merge agents
+# used to serialize themselves by pgrep-ing for land.sh, which matched their own
+# waiting shell (and never cleared) or missed a detached run — two lands
+# overlapped on spor-server, the second verifying on a moving tip
+# (issue-spor-orchestrator-land-sh-no-mutual-exclusion). Callers just run
+# land.sh; waiting is its job. The lock is `flock` where installed (the kernel
+# drops it when this process dies), else an atomic pid symlink
+# (`spor-land.lock.pid`) whose holder is checked, so a crashed holder is
+# broken rather than waited on. A wait past `--lock-timeout` seconds (default 3600 — a
+# `--verify "npm test"` holds the lock for the whole suite) refuses as
+# `lock-timeout`, landing nothing. The verify command does not inherit the
+# lock's descriptor, so a daemon it leaves behind cannot keep the lock held.
+#
 # Usage:
-#   land.sh --repo <dir> --tip <commit-ish> [--target main] [--verify "<cmd>"] [--keep]
+#   land.sh --repo <dir> --tip <commit-ish> [--target main] [--verify "<cmd>"] [--keep] [--lock-timeout <s>]
 #
 # Output: one verdict line on stdout, `VERDICT key=value …`:
 #   LANDED   old=<sha> new=<sha> [parked=<path>,…] [behind=<path>,…] [verify=passed] [worktree=<dir>]
 #   NOOP     the target is already at the tip
-#   REFUSED  reason=not-descendant|moved|unresolvable|park-failed|… [parked=…] —
+#   REFUSED  reason=not-descendant|moved|unresolvable|park-failed|lock-timeout|… [parked=…] —
 #            the ref did not move (a checkout parked before a `moved` refusal
 #            stays parked, detached at its own commit, and is listed)
 #   VERIFY-FAILED  old=<sha> new=<sha> worktree=<dir> — the swap LANDED but the
@@ -74,9 +95,9 @@
 
 set -uo pipefail
 
-usage() { printf 'usage: land.sh --repo <dir> --tip <commit-ish> [--target <branch>] [--verify "<cmd>"] [--keep]\n' >&2; exit 2; }
+usage() { printf 'usage: land.sh --repo <dir> --tip <commit-ish> [--target <branch>] [--verify "<cmd>"] [--keep] [--lock-timeout <s>]\n' >&2; exit 2; }
 
-repo="" tip="" target="main" verify="" keep=0
+repo="" tip="" target="main" verify="" keep=0 locktimeout=3600
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) repo="${2:-}"; shift 2 || usage ;;
@@ -84,11 +105,13 @@ while [ $# -gt 0 ]; do
     --target) target="${2:-}"; shift 2 || usage ;;
     --verify) verify="${2:-}"; shift 2 || usage ;;
     --keep) keep=1; shift ;;
+    --lock-timeout) locktimeout="${2:-}"; shift 2 || usage ;;
     -h|--help) usage ;;
     *) printf 'land.sh: unknown argument: %s\n' "$1" >&2; usage ;;
   esac
 done
 [ -n "$repo" ] && [ -n "$tip" ] && [ -n "$target" ] || usage
+case "$locktimeout" in ''|*[!0-9]*) printf 'land.sh: --lock-timeout wants whole seconds, got: %s\n' "$locktimeout" >&2; usage ;; esac
 
 # git's repo-local variables would retarget every call below at whatever repo
 # the caller's environment names (the class lib/shell/git-exec.js
@@ -99,6 +122,10 @@ unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PA
   GIT_SHALLOW_FILE GIT_WORK_TREE
 
 refuse() { printf 'REFUSED reason=%s\n' "$1"; [ -n "${2:-}" ] && printf 'land.sh: %s\n' "$2" >&2; exit 1; }
+# Every git child runs WITHOUT the land lock's descriptor (fd 9, below): a
+# checkout's post-checkout hook, or the fsmonitor daemon, that outlived us
+# would otherwise keep the flock held and stall every later land.
+git() { command git "$@" 9>&-; }
 g() { GIT_NO_REPLACE_OBJECTS=1 git -C "$repo" "$@"; }
 
 # The tip, resolved where the caller stands (see THE TIP RESOLVES ABOVE).
@@ -112,6 +139,49 @@ else
     HEAD*|@*|ORIG_HEAD*|FETCH_HEAD*|MERGE_HEAD*|CHERRY_PICK_HEAD*|REVERT_HEAD*|REBASE_HEAD*)
       refuse symbolic-tip "tip '$tip' names a per-worktree ref and the caller's cwd is not a worktree of $repo — pass a sha or branch" ;;
   esac
+fi
+
+# Take the per-repository land lock (ONE LAND AT A TIME above) before the first
+# read of the target, so OLD, the ancestry verdict, the CAS, the advance and
+# the verify all belong to one uncontended land.
+lockfile="$(commondir "$repo")"
+[ -n "$lockfile" ] || refuse unresolvable "cannot find the git directory of $repo"
+lockfile="$lockfile/spor-land.lock"
+lockwait() { printf 'land.sh: another land holds %s — waiting up to %ss\n' "$lockfile" "$locktimeout" >&2; }
+if command -v flock >/dev/null 2>&1 && [ "${SPOR_LAND_LOCK:-}" != mkdir ]; then
+  exec 9>>"$lockfile" || refuse lock-failed "cannot open $lockfile"
+  if ! flock -n 9; then
+    lockwait
+    flock -w "$locktimeout" 9 || refuse lock-timeout "gave up after ${locktimeout}s waiting for $lockfile"
+  fi
+else
+  # No flock (stock macOS; SPOR_LAND_LOCK=mkdir forces this arm for tests):
+  # the lock is a symlink whose target is the holder's pid — `ln -s` creates
+  # it atomically WITH its owner, so there is no ownerless window. A lock whose
+  # holder is gone is broken only under the `.break` directory, re-read there:
+  # breakers are serialized, the dead holder cannot remove its own lock, and
+  # nobody can create a new one while it exists, so a breaker never removes a
+  # live lock. A `.break` left by a breaker that died mid-break (a few
+  # syscalls) is cleared once it is a minute old.
+  lockfile="$lockfile.pid"
+  breaker="$lockfile.break"
+  waited=0 noted=0
+  until ln -s "$$" "$lockfile" 2>/dev/null; do
+    holder=$(readlink "$lockfile" 2>/dev/null) || holder=""
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      find "$breaker" -maxdepth 0 -mmin +1 -exec rmdir {} \; 2>/dev/null
+      if mkdir "$breaker" 2>/dev/null; then
+        broke=0
+        [ "$(readlink "$lockfile" 2>/dev/null)" = "$holder" ] && rm -f "$lockfile" && broke=1
+        rmdir "$breaker"
+        [ "$broke" -eq 1 ] && continue
+      fi
+    fi
+    [ "$noted" -eq 1 ] || { lockwait; noted=1; }
+    [ "$waited" -ge "$locktimeout" ] && refuse lock-timeout "gave up after ${locktimeout}s waiting for $lockfile"
+    sleep 1; waited=$((waited + 1))
+  done
+  trap '[ "$(readlink "$lockfile" 2>/dev/null)" = "$$" ] && rm -f "$lockfile"' EXIT
 fi
 
 ref="refs/heads/$target"
@@ -206,7 +276,7 @@ if ! g worktree add --quiet --detach "$wtdir" "$new" >&2; then
   printf 'VERIFY-FAILED old=%s new=%s reason=worktree-add%s\n' "$old" "$new" "$extra"
   exit 3
 fi
-if (cd "$wtdir" && bash -c "$verify") >&2; then
+if (cd "$wtdir" && SPOR_WORKTREE="$wtdir" SPOR_MAIN_CHECKOUT="$mainwt" bash -c "$verify") >&2 9>&-; then
   if [ "$keep" -eq 1 ]; then
     printf 'LANDED old=%s new=%s%s verify=passed worktree=%s\n' "$old" "$new" "$extra" "$wtdir"
   else

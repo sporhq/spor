@@ -10,7 +10,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 const { gitInit, gitEnv } = require("./helpers/git.js");
 
@@ -194,4 +194,110 @@ test("a failing post-checkout hook on a parked root is advanced but reported on 
   assert.match(r.stderr, /advanced to .* but git checkout exited/);
   assert.equal(sha("HEAD"), sha("feature"));
   assert.equal(sha("main"), sha("feature"));
+});
+
+test("--verify sees SPOR_WORKTREE and SPOR_MAIN_CHECKOUT, like a dispatch worktree-setup hook", { skip }, () => {
+  const { root } = fixture();
+  const r = land(["--repo", root, "--tip", "feature", "--verify",
+    `test "$SPOR_WORKTREE" = "$PWD" && test "$SPOR_MAIN_CHECKOUT" = '${fs.realpathSync(root)}'`]);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /verify=passed$/m);
+});
+
+test("--lock-timeout must be whole seconds", { skip }, () => {
+  const { root } = fixture();
+  assert.equal(land(["--repo", root, "--tip", "feature", "--lock-timeout", "soon"]).status, 2);
+});
+
+// Two lands on one repo never overlap: the first holds the per-repo lock
+// through its --verify, so a second land.sh — from any worktree — waits on
+// it, and refuses as lock-timeout (landing nothing) when the wait runs out
+// (issue-spor-orchestrator-land-sh-no-mutual-exclusion). Run for flock and
+// for the mkdir fallback a flock-less host takes.
+for (const impl of ["flock", "mkdir"]) {
+  test(`a second land waits on the first and times out without landing (${impl === "mkdir" ? "pid-symlink" : impl} lock)`, { skip }, async () => {
+    const { base, root, wt, g, sha } = fixture();
+    const env = gitEnv({ TMPDIR: tmpBase, ...(impl === "mkdir" ? { SPOR_LAND_LOCK: "mkdir" } : {}) });
+    const started = path.join(base, "verify-started");
+    const release = path.join(base, "verify-release");
+    const first = spawn("bash", [LAND, "--repo", root, "--tip", "feature", "--verify",
+      `touch '${started}'; while [ ! -e '${release}' ]; do sleep 0.1; done`], { env, stdio: ["ignore", "pipe", "pipe"] });
+    let out1 = "";
+    first.stdout.on("data", (d) => { out1 += d; });
+    const done1 = new Promise((resolve) => first.on("exit", resolve));
+    try {
+      for (let i = 0; i < 300 && !fs.existsSync(started); i++) await new Promise((r) => setTimeout(r, 100));
+      assert.ok(fs.existsSync(started), "the first land reached its verify");
+      const landed = sha("main");
+      // A second branch on top of the landed tip: it WOULD land, but the lock is held.
+      fs.writeFileSync(path.join(wt, "b.txt"), "b\n");
+      g(["add", "b.txt"], wt);
+      g(["commit", "-q", "-m", "b"], wt);
+      const r = spawnSync("bash", [LAND, "--repo", root, "--tip", "HEAD", "--lock-timeout", "1"], { encoding: "utf8", cwd: wt, env });
+      assert.equal(r.status, 1, r.stdout + r.stderr);
+      assert.match(r.stdout, /^REFUSED reason=lock-timeout/);
+      assert.match(r.stderr, /another land holds .*spor-land\.lock/);
+      assert.equal(sha("main"), landed, "the waiting land moved nothing");
+      fs.writeFileSync(release, "");
+      assert.equal(await done1, 0, out1);
+      assert.match(out1, /verify=passed/);
+      // The lock went with the first land: the second now lands.
+      const again = spawnSync("bash", [LAND, "--repo", root, "--tip", "HEAD", "--lock-timeout", "1"], { encoding: "utf8", cwd: wt, env });
+      assert.equal(again.status, 0, again.stdout + again.stderr);
+      assert.match(again.stdout, /^LANDED /);
+      assert.equal(sha("main"), sha("HEAD", wt));
+    } finally {
+      fs.writeFileSync(release, "");
+      await done1;
+    }
+  });
+}
+
+test("a fallback lock left by a dead holder is broken, not waited on", { skip }, () => {
+  const { root, sha } = fixture();
+  const lock = path.join(root, ".git", "spor-land.lock.pid");
+  const dead = spawnSync("bash", ["-c", "echo $$"], { encoding: "utf8" }).stdout.trim();
+  fs.symlinkSync(dead, lock);
+  const r = spawnSync("bash", [LAND, "--repo", root, "--tip", "feature", "--lock-timeout", "1"],
+    { encoding: "utf8", env: gitEnv({ TMPDIR: tmpBase, SPOR_LAND_LOCK: "mkdir" }) });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(sha("main"), sha("feature"));
+  assert.throws(() => fs.lstatSync(lock), /ENOENT/, "the lock is released on exit");
+});
+
+test("a fallback lock held by a live process is waited on, not broken", { skip }, () => {
+  const { root, sha } = fixture();
+  const lock = path.join(root, ".git", "spor-land.lock.pid");
+  fs.symlinkSync(String(process.pid), lock);
+  const old = sha("main");
+  const r = spawnSync("bash", [LAND, "--repo", root, "--tip", "feature", "--lock-timeout", "1"],
+    { encoding: "utf8", env: gitEnv({ TMPDIR: tmpBase, SPOR_LAND_LOCK: "mkdir" }) });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /^REFUSED reason=lock-timeout/);
+  assert.equal(sha("main"), old);
+  assert.equal(fs.readlinkSync(lock), String(process.pid), "a live holder's lock is left alone");
+});
+
+test("a background process a git hook leaves behind does not keep the land lock held", { skip }, () => {
+  const { base, root, wt, g, sha } = fixture();
+  const pidFile = path.join(base, "hook-daemon.pid");
+  const hooks = path.join(root, ".git", "hooks");
+  fs.mkdirSync(hooks, { recursive: true });
+  // The "daemon" inherits whatever fds the hook had; it records its own pid so
+  // the test stops exactly the process it started.
+  fs.writeFileSync(path.join(hooks, "post-checkout"),
+    `#!/bin/sh\n[ -e '${pidFile}' ] || { sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '${pidFile}'; }\nexit 0\n`, { mode: 0o755 });
+  try {
+    assert.equal(land(["--repo", root, "--tip", "feature"]).status, 0);
+    assert.ok(fs.existsSync(pidFile), "the hook left its background process");
+    fs.writeFileSync(path.join(wt, "e.txt"), "e\n");
+    g(["add", "e.txt"], wt);
+    g(["commit", "-q", "-m", "e"], wt);
+    const r = land(["--repo", root, "--tip", sha("HEAD", wt), "--lock-timeout", "1"]);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^LANDED /);
+  } finally {
+    const pid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, "utf8")) : 0;
+    if (pid) try { process.kill(pid); } catch {}
+  }
 });
