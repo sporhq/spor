@@ -408,3 +408,261 @@ test("export --history and --auth together is rejected, exit 1", () => {
   assert.match(r.stderr, /--history and --auth are different export modes/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/);
 });
+
+// --- --assets (task-split-spor-e0dad1d2959b) ---------------------------------
+// The asset-inclusive export: GET /v1/export?assets=1 remotely, the same
+// layout (assets/sha256/<2>/<hex> + assets/manifest.json LAST, spor-assets/1)
+// built from $SPOR_HOME/assets/ locally. The oracle is the archive's entries,
+// the request the remote arm makes, and what lands on disk / stderr.
+const crypto = require("node:crypto");
+const { gitEnv } = require("./helpers/git.js");
+const tarLib = require("../lib/tar.js");
+
+const sha = (b) => crypto.createHash("sha256").update(b).digest("hex");
+const objName = (hex) => `assets/sha256/${hex.slice(0, 2)}/${hex}`;
+function descriptor(id, hex) {
+  return `---\nid: ${id}\ntype: artifact\nsummary: An image.\nasset_digest: sha256:${hex}\n---\nImage.\n`;
+}
+function putObject(dir, bytes) {
+  const hex = sha(bytes);
+  const p = path.join(dir, objName(hex));
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, bytes);
+  return hex;
+}
+function git(dir, args) {
+  const r = spawnSync("git", args, { cwd: dir, encoding: "utf8", env: gitEnv() });
+  assert.strictEqual(r.status, 0, r.stderr);
+}
+
+test("export (local) --assets carries current AND history-only descriptor bytes, manifest last", () => {
+  const { dir, nodes } = fixtureGraph();
+  const cur = Buffer.from("current-image-bytes");
+  const old = Buffer.from("historical-image-bytes");
+  const curHex = putObject(dir, cur);
+  const oldHex = putObject(dir, old);
+  git(dir, ["init", "-q"]);
+  // A descriptor that once named `old`, then was re-pointed at `cur`.
+  fs.writeFileSync(path.join(nodes, "art-img.md"), descriptor("art-img", oldHex));
+  git(dir, ["add", "nodes"]);
+  git(dir, ["commit", "-qm", "v1"]);
+  fs.writeFileSync(path.join(nodes, "art-img.md"), descriptor("art-img", curHex));
+  git(dir, ["add", "nodes"]);
+  git(dir, ["commit", "-qm", "v2"]);
+  const out = path.join(dir, "a.tar");
+  const r = run(["export", "--assets", "--out", out], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /exported 3 nodes \+ 2 asset objects/);
+  assert.doesNotMatch(r.stderr, /incomplete/);
+  const entries = tarLib.extract(fs.readFileSync(out));
+  const names = entries.map((e) => e.name);
+  assert.strictEqual(names[names.length - 1], "assets/manifest.json", "manifest is the last entry");
+  const byName = new Map(entries.map((e) => [e.name, e.data]));
+  assert.ok(byName.get(objName(curHex)).equals(cur));
+  assert.ok(byName.get(objName(oldHex)).equals(old));
+  const m = JSON.parse(byName.get("assets/manifest.json").toString("utf8"));
+  assert.strictEqual(m.format, "spor-assets/1");
+  assert.strictEqual(m.inventory, 2);
+  const cur1 = m.objects.find((o) => o.digest === `sha256:${curHex}`);
+  const old1 = m.objects.find((o) => o.digest === `sha256:${oldHex}`);
+  assert.deepStrictEqual([cur1.current, old1.current], [true, false]);
+  assert.deepStrictEqual(old1.descriptors, ["art-img"]);
+  assert.deepStrictEqual([m.missing, m.corrupt, m.unreadable], [[], [], []]);
+});
+
+test("export (local) --assets names missing and corrupt digests on stderr and in the manifest, still exits 0", () => {
+  const { dir, nodes } = fixtureGraph();
+  const goneHex = sha(Buffer.from("never-stored"));
+  const badHex = putObject(dir, Buffer.from("will-rot"));
+  fs.writeFileSync(path.join(dir, objName(badHex)), "rotted");
+  fs.writeFileSync(path.join(nodes, "art-gone.md"), descriptor("art-gone", goneHex));
+  fs.writeFileSync(path.join(nodes, "art-bad.md"), descriptor("art-bad", badHex));
+  const out = path.join(dir, "a.tar.gz");
+  const r = run(["export", "--assets", "--gzip", "--out", out], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /0 asset objects \(gzip\)/);
+  assert.match(r.stderr, /asset export is incomplete — 1 missing, 1 corrupt/);
+  assert.match(r.stderr, new RegExp(`missing: sha256:${goneHex} \\(art-gone\\)`));
+  assert.match(r.stderr, new RegExp(`corrupt: sha256:${badHex} \\(art-bad\\)`));
+  const entries = tarLib.extract(zlib.gunzipSync(fs.readFileSync(out)));
+  assert.ok(!entries.some((e) => e.name.startsWith("assets/sha256/")), "a rotted object is never exported under its name");
+  const m = JSON.parse(entries[entries.length - 1].data.toString("utf8"));
+  assert.deepStrictEqual(m.missing.map((x) => x.digest), [`sha256:${goneHex}`]);
+  assert.deepStrictEqual(m.corrupt.map((x) => x.digest), [`sha256:${badHex}`]);
+});
+
+test("export (local) without --assets is byte-identical to before (node-only, no assets/ entries)", () => {
+  const { dir, nodes, files } = fixtureGraph();
+  const hex = putObject(dir, Buffer.from("img"));
+  fs.writeFileSync(path.join(nodes, "art-img.md"), descriptor("art-img", hex));
+  const out = path.join(dir, "n.tar");
+  const r = run(["export", "--out", out], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const names = Object.keys(parseTar(fs.readFileSync(out))).sort();
+  assert.deepStrictEqual(names, [...Object.keys(files), "nodes/art-img.md"].sort());
+  assert.ok(fs.readFileSync(out).equals(tarLib.buildTarball(tarLib.collectNodeEntries(nodes).descriptors)));
+});
+
+test("export (local) --assets reads history from the enclosing repo when the graph home is nested in one", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-export-nested-"));
+  const dir = path.join(repo, "team-graph");
+  const nodes = path.join(dir, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const oldHex = putObject(dir, Buffer.from("only-in-history"));
+  git(repo, ["init", "-q"]);
+  fs.writeFileSync(path.join(nodes, "art-img.md"), descriptor("art-img", oldHex));
+  git(repo, ["add", "-A", "team-graph/nodes"]);
+  git(repo, ["commit", "-qm", "v1"]);
+  fs.rmSync(path.join(nodes, "art-img.md"));
+  const out = path.join(repo, "n.tar");
+  const r = run(["export", "--assets", "--out", out], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /0 nodes \+ 1 asset object/);
+  const m = JSON.parse(tarLib.extract(fs.readFileSync(out)).pop().data.toString("utf8"));
+  assert.deepStrictEqual(m.objects.map((o) => [o.digest, o.current]), [[`sha256:${oldHex}`, false]]);
+});
+
+test("export --assets --history is refused client-side, in either mode, exit 1", async () => {
+  const { dir } = fixtureGraph();
+  const r = run(["export", "--assets", "--history"], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /--assets cannot be combined with --history/);
+  const { srv, hits, base } = await exportStub();
+  try {
+    const rr = await runBin(["export", "--assets", "--history"], remoteEnv(base));
+    assert.strictEqual(rr.status, 1);
+    assert.match(rr.stderr, /--assets cannot be combined with --history/);
+    assert.strictEqual(hits.length, 0, "no request is made");
+  } finally {
+    srv.close();
+  }
+});
+
+// A well-formed remote asset export body: nodes + objects + manifest (last).
+function assetArchive({ objects = [], missing = [], dropManifest = false, lieAbout = null } = {}) {
+  const entries = [{ name: "nodes/dec-a.md", data: Buffer.from("---\nid: dec-a\n---\n"), mtime: 0 }];
+  const listed = [];
+  for (const b of objects) {
+    const hex = sha(b);
+    listed.push({ digest: `sha256:${hex}`, bytes: b.length, descriptors: ["art-x"], current: true });
+    entries.push({ name: objName(hex), data: b, mtime: 0 });
+  }
+  if (lieAbout) listed.push({ digest: `sha256:${sha(lieAbout)}`, bytes: lieAbout.length, descriptors: ["art-y"], current: true });
+  const manifest = { format: "spor-assets/1", generated_at: "2026-10-10T00:00:00.000Z", head: null, tenant: "t", inventory: listed.length + missing.length, objects: listed, missing, corrupt: [], unreadable: [] };
+  if (!dropManifest) entries.push({ name: "assets/manifest.json", data: Buffer.from(JSON.stringify(manifest)), mtime: 0 });
+  return tarLib.buildTarballEntries(entries);
+}
+const ASSET_HEADERS = { "x-substrate-node-count": "1", "x-spor-asset-format": "spor-assets/1", "x-spor-asset-inventory": "1" };
+
+test("export (remote) --assets forwards ?assets=1, verifies the manifest, reports the object count", async () => {
+  const body = assetArchive({ objects: [Buffer.from("png-bytes")] });
+  const { srv, hits, base } = await exportStub({ body, headers: ASSET_HEADERS });
+  try {
+    const out = path.join(ISO_HOME, "assets.tar");
+    const r = await runBin(["export", "--assets", "--out", out], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(fs.readFileSync(out).equals(body), "body passed through verbatim");
+    assert.match(r.stderr, /exported 1 node \+ 1 asset object →/);
+    assert.ok(hits.find((h) => h.url === "/v1/export?assets=1"));
+  } finally {
+    srv.close();
+  }
+});
+
+test("export (remote) --assets --auth --gzip forwards all three params and checks the gunzipped archive", async () => {
+  const body = zlib.gzipSync(assetArchive({ objects: [Buffer.from("a"), Buffer.from("b")] }));
+  const { srv, hits, base } = await exportStub({ body, headers: { ...ASSET_HEADERS, "x-substrate-auth-files": "2" } });
+  try {
+    const r = await runBin(["export", "--assets", "--auth", "--gzip"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(r.stdout.equals(body));
+    assert.match(r.stderr, /1 node \+ 2 auth files \+ 2 asset objects \(gzip\)/);
+    assert.ok(hits.find((h) => h.url === "/v1/export?assets=1&auth=1&gzip=1"));
+  } finally {
+    srv.close();
+  }
+});
+
+test("export (remote) --assets surfaces the manifest's missing list on stderr", async () => {
+  const gone = { digest: `sha256:${sha(Buffer.from("lost"))}`, descriptors: ["art-lost"], current: true };
+  const body = assetArchive({ missing: [gone] });
+  const { srv, base } = await exportStub({ body, headers: ASSET_HEADERS });
+  try {
+    const r = await runBin(["export", "--assets", "--out", path.join(ISO_HOME, "m.tar")], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stderr, /incomplete — 1 missing/);
+    assert.match(r.stderr, new RegExp(`missing: ${gone.digest} \\(art-lost\\)`));
+  } finally {
+    srv.close();
+  }
+});
+
+test("export (remote) --assets with no manifest (a cut-short transfer) exits 1 and writes nothing", async () => {
+  const body = assetArchive({ objects: [Buffer.from("x")], dropManifest: true });
+  const { srv, base } = await exportStub({ body, headers: ASSET_HEADERS });
+  try {
+    const out = path.join(ISO_HOME, "cut.tar");
+    const r = await runBin(["export", "--assets", "--out", out], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /cut short/);
+    assert.ok(!fs.existsSync(out), "nothing written");
+  } finally {
+    srv.close();
+  }
+});
+
+test("export (remote) --assets with a truncated gzip stream exits 1, nothing on stdout", async () => {
+  const full = zlib.gzipSync(assetArchive({ objects: [crypto.randomBytes(4096)] }));
+  const { srv, base } = await exportStub({ body: full.subarray(0, full.length - 40), headers: ASSET_HEADERS });
+  try {
+    const r = await runBin(["export", "--assets", "--gzip"], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /gzip stream is incomplete/);
+    assert.strictEqual(r.stdout.length, 0);
+  } finally {
+    srv.close();
+  }
+});
+
+test("export (remote) --assets refuses a manifest that lists an object the archive lacks", async () => {
+  const body = assetArchive({ lieAbout: Buffer.from("not-in-archive") });
+  const { srv, base } = await exportStub({ body, headers: ASSET_HEADERS });
+  try {
+    const r = await runBin(["export", "--assets"], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /does not carry it/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("export (remote) --assets against a server that ignores ?assets=1 (no format header) exits 1", async () => {
+  const { srv, base } = await exportStub({ body: Buffer.from("NODE-ONLY"), headers: { "x-substrate-node-count": "1" } });
+  try {
+    const out = path.join(ISO_HOME, "old.tar");
+    const r = await runBin(["export", "--assets", "--out", out], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /predates GET \/v1\/export\?assets=1/);
+    assert.ok(!fs.existsSync(out));
+  } finally {
+    srv.close();
+  }
+});
+
+test("export (remote) --assets: a transfer the server aborts mid-body is a failure, nothing written", async () => {
+  const srv = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/x-tar", ...ASSET_HEADERS });
+    res.write(Buffer.alloc(2048, 1));
+    setTimeout(() => res.destroy(), 20);
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const out = path.join(ISO_HOME, "abort.tar");
+    const r = await runBin(["export", "--assets", "--out", out], remoteEnv(`http://127.0.0.1:${srv.address().port}`));
+    assert.strictEqual(r.status, 1);
+    assert.ok(!fs.existsSync(out));
+    assert.doesNotMatch(r.stderr, /at Object/);
+  } finally {
+    srv.close();
+  }
+});

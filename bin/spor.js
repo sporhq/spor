@@ -4093,6 +4093,21 @@ function programLocal(cfg, id, args) {
 //     auth/*.json so a disaster restore reproduces the credential set, not just
 //     nodes/ (issue-cc-backup-restore-auth-state-loss). The 403 the server raises
 //     for a non-admin caller surfaces through the generic non-200 path below.
+//
+// --assets (task-split-spor-e0dad1d2959b, ASSET-STORAGE.md §13 in spor-server)
+// wraps ?assets=1: the node tarball PLUS every asset object any current or
+// historical descriptor names (`assets/sha256/<2>/<hex>`) and a versioned
+// `assets/manifest.json` (spor-assets/1) as the LAST entry. Opt-in — the
+// default export stays node-only, byte-identical. Combinable with --auth and
+// --gzip, refused with --history (assets ride the snapshot tarball, not the
+// git bundle; the server answers 400 too). Unlike the other two it is DUAL-mode:
+// local builds the same layout from $SPOR_HOME/assets/ over the same inventory
+// (lib/shell/asset-export.js). Either way the archive is checked before a byte
+// is written out — a missing manifest is a transfer that was cut short (the
+// server aborts a failed asset export rather than ending it cleanly), so it
+// exits 1 with nothing written — and the manifest's missing/corrupt/unreadable
+// lists are surfaced on stderr (the archive is still written: it is as whole
+// as the store could make it, and says so).
 function humanBytes(n) {
   if (n < 1024) return `${n} B`;
   const units = ["KB", "MB", "GB", "TB"];
@@ -4108,7 +4123,14 @@ async function cmdExport(cfg, { values }) {
   const gzip = !!values.gzip;
   const history = !!values.history;
   const auth = !!values.auth;
+  const assets = !!values.assets;
   const outPath = values.out || null;
+
+  // Assets ride the snapshot tarball; a git bundle has nowhere to put them.
+  if (assets && history) {
+    err("export: --assets cannot be combined with --history — asset bytes ride the snapshot tarball, not the git bundle (export the history bundle and an --assets snapshot separately).");
+    return 1;
+  }
 
   // --history and --auth are distinct, non-composable server modes: the history
   // bundle is a `git bundle --all` of the repo, whose .gitignore excludes auth/,
@@ -4133,9 +4155,10 @@ async function cmdExport(cfg, { values }) {
     err("export: --gzip has no effect with --history (a git bundle is already packed); ignoring it.");
   }
 
-  let buffer, head, count, skipped, authFiles;
+  let buffer, head, count, skipped, authFiles, assetManifest;
   if (cfg.mode() === "remote") {
     const params = [];
+    if (assets) params.push("assets=1");
     if (auth) params.push("auth=1");
     if (history) params.push("history=1");
     if (gzipEffective) params.push("gzip=1");
@@ -4162,6 +4185,15 @@ async function cmdExport(cfg, { values }) {
     count = r.headers["x-substrate-node-count"]; // absent on a history bundle / older server
     skipped = r.headers["x-substrate-skipped"];
     authFiles = r.headers["x-substrate-auth-files"]; // present only on an ?auth=1 export
+    if (assets) {
+      // A server that predates ?assets=1 ignores the param and answers the
+      // node-only export: refuse it rather than hand back a "backup" that
+      // silently carries no bytes.
+      if (!r.headers["x-spor-asset-format"]) {
+        err("export: the server did not return an asset-inclusive export (no x-spor-asset-format header) — it predates GET /v1/export?assets=1; nothing written.");
+        return 1;
+      }
+    }
   } else {
     const nodesDir = cfg.nodesDir();
     if (!fs.existsSync(nodesDir)) {
@@ -4169,14 +4201,47 @@ async function cmdExport(cfg, { values }) {
       return 1;
     }
     const tar = require(path.join(ROOT, "lib", "tar.js"));
-    const exported = tar.exportNodesDir(nodesDir);
-    buffer = gzip ? require("zlib").gzipSync(exported.buffer) : exported.buffer;
-    count = String(exported.count);
-    skipped = exported.skipped ? String(exported.skipped) : undefined;
     // Best-effort graph head, the local twin of x-substrate-head; a non-git home
     // simply has none.
     const h = u.git(cfg.graphHome(), ["rev-parse", "HEAD"]);
     head = h ? h.trim() : "";
+    let extra = [];
+    if (assets) {
+      const assetExport = require(path.join(ROOT, "lib", "shell", "asset-export.js"));
+      try {
+        const inventory = assetExport.assetInventory(nodesDir);
+        ({ entries: extra, manifest: assetManifest } = assetExport.assetExportEntries(cfg.graphHome(), inventory, { head }));
+      } catch (e) {
+        err(`export: ${e.message}; nothing written.`);
+        return 1;
+      }
+    }
+    const exported = tar.exportNodesDir(nodesDir, { extra });
+    buffer = gzip ? require("zlib").gzipSync(exported.buffer) : exported.buffer;
+    count = String(exported.count);
+    skipped = exported.skipped ? String(exported.skipped) : undefined;
+  }
+
+  // An asset export is checked before anything is written: the manifest must
+  // be the archive's last entry (else the transfer was cut short), carry a
+  // known format, and every object it lists must be present under its digest.
+  if (assets && cfg.mode() === "remote") {
+    const assetExport = require(path.join(ROOT, "lib", "shell", "asset-export.js"));
+    let tarBytes = buffer;
+    if (gzipEffective) {
+      try {
+        tarBytes = require("zlib").gunzipSync(buffer);
+      } catch (e) {
+        err(`export: the gzip stream is incomplete (${e.message}) — the transfer was cut short; nothing written.`);
+        return 1;
+      }
+    }
+    const read = assetExport.readArchiveManifest(require(path.join(ROOT, "lib", "tar.js")).extract(tarBytes));
+    if (read.error) {
+      err(`export: ${read.error}; nothing written.`);
+      return 1;
+    }
+    assetManifest = read.manifest;
   }
 
   // Emit: a named file, or stdout when piping. Binary-safe in both arms. The
@@ -4202,6 +4267,10 @@ async function cmdExport(cfg, { values }) {
   } else {
     const n = count != null ? `${count} node${count === "1" ? "" : "s"}` : "graph";
     label = n + (authFiles ? ` + ${authFiles} auth file${authFiles === "1" ? "" : "s"}` : "");
+    if (assetManifest) {
+      const objs = assetManifest.objects.length;
+      label += ` + ${objs} asset object${objs === 1 ? "" : "s"}`;
+    }
   }
   const dest = outPath || "stdout";
   err(
@@ -4209,6 +4278,9 @@ async function cmdExport(cfg, { values }) {
       (head ? `  head ${head.slice(0, 12)}` : "")
   );
   if (skipped) err(`  ${skipped} entr${skipped === "1" ? "y" : "ies"} skipped (name too long for the tar field)`);
+  if (assetManifest) {
+    for (const line of require(path.join(ROOT, "lib", "shell", "asset-export.js")).describeGaps(assetManifest)) err(line);
+  }
   return 0;
 }
 
@@ -20918,8 +20990,8 @@ const COMMANDS = {
     run: (cfg, args) => cmdCheck(cfg, args),
   },
   export: {
-    group: "Graph", parse: "strict", args: "[--gzip] [--history|--auth] [--out <file>]",
-    summary: "the nodes/ tarball, or the --history bundle / --auth restore backup (GET /v1/export)",
+    group: "Graph", parse: "strict", args: "[--gzip] [--assets] [--history|--auth] [--out <file>]",
+    summary: "the nodes/ tarball (+ --assets bytes), or the --history bundle / --auth restore backup (GET /v1/export)",
     help:
       "Stream the graph's nodes/ as a POSIX ustar tarball — the shell front-door for\n" +
       "GET /v1/export, for seeding a local read replica or bootstrapping a fresh graph\n" +
@@ -20938,16 +21010,27 @@ const COMMANDS = {
       "             disaster restore reproduces the credential set, not just nodes/. A\n" +
       "             non-admin caller gets a 403 from the server.\n" +
       "\n" +
+      "--assets (opt-in; the default stays node-only) ALSO carries the asset bytes every\n" +
+      "current or historical descriptor names, as assets/sha256/<2>/<hex>, plus a\n" +
+      "versioned assets/manifest.json (format spor-assets/1) as the LAST entry naming\n" +
+      "any digest it could not carry (missing / corrupt / unreadable — listed on stderr,\n" +
+      "the archive is still written). Remote requests GET /v1/export?assets=1; local\n" +
+      "builds the same layout from the graph home's assets/ store. Combinable with\n" +
+      "--auth and --gzip; refused with --history. An archive with no manifest (a\n" +
+      "transfer cut short) or whose objects do not match it exits 1, nothing written.\n" +
+      "\n" +
       "The output is written to --out, or to stdout when omitted so it pipes straight\n" +
       "into tar (`spor export --gzip | tar xz`); the node/auth count, size and graph\n" +
       "head ride stderr so they never pollute a piped tarball.\n" +
       "\n" +
       "  --gzip          gzip-compress the tarball (server-side remote, zlib local)\n" +
+      "  --assets        include asset bytes + assets/manifest.json (not with --history)\n" +
       "  --history       git bundle of the whole repo (remote-only; full provenance)\n" +
       "  --auth          include auth/*.json for restore (remote-only; admin-gated)\n" +
       "  --out <file>    write to <file> instead of stdout",
     options: {
       gzip: { type: "boolean", desc: "gzip-compress the tarball" },
+      assets: { type: "boolean", desc: "include asset bytes + assets/manifest.json (not with --history)" },
       history: { type: "boolean", desc: "git bundle of the whole repo (remote-only)" },
       auth: { type: "boolean", desc: "include auth/*.json for restore (remote-only, admin-gated)" },
       out: { type: "string", value: "file", desc: "write to <file> instead of stdout" },
@@ -20958,6 +21041,7 @@ const COMMANDS = {
       "spor export --gzip | tar xz",
       "spor export --history --out graph-history.bundle",
       "spor export --auth --gzip --out graph-restore.tar.gz",
+      "spor export --assets --gzip --out graph-with-assets.tar.gz",
     ],
     run: (cfg, p) => cmdExport(cfg, p),
   },

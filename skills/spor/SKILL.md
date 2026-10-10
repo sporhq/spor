@@ -168,7 +168,10 @@ spor check [--staged|--range <a..b>|--files <f...>] [--strict]   # coupling-drif
                                #   touched but targets are not, + couples_value_a/b value-invariant
                                #   disagreement. Advisory; --strict exits 1 (CI/pre-commit). The diff is
                                #   always local git; norms are mode-aware (local nodes dir / GET /v1/export)
-spor export [--gzip] [--history|--auth] [--out <file>]   # nodes/ ustar tarball (--history: git-bundle data-exit; --auth: admin-gated restore w/ auth files — both remote-only); local build / GET /v1/export
+spor export [--gzip] [--assets] [--history|--auth] [--out <file>]   # nodes/ ustar tarball (--history: git-bundle data-exit; --auth: admin-gated restore w/ auth files — both remote-only); local build / GET /v1/export
+                               #   --assets (opt-in, either mode, not with --history): + asset bytes as assets/sha256/<2>/<hex>
+                               #   and assets/manifest.json (spor-assets/1) LAST; missing/corrupt/unreadable digests listed on
+                               #   stderr; a cut-short archive (no manifest) exits 1, nothing written. GET /v1/export?assets=1
 spor asset import <file> [--title t] [--alt a] [--id id]   # verify an image + write its descriptor
                                #   (local: $SPOR_HOME/assets/ + put-node; remote: POST /v1/assets, metadata
                                #   in the query string). describe|fetch [--out p]|verify <id|spor-asset:uri>
