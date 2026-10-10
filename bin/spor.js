@@ -1568,6 +1568,8 @@ const SERVER_STAMPED_FIELDS = new Set([
   "created_at", "updated_at", "schema_version",
   "priority_by", "priority_at", "priority_via",
   "readiness_by", "readiness_at", "readiness_via",
+  // create-time default the server fills when the node was sent without one
+  "date",
 ]);
 const LIST_KEYS = new Set(["edges", "pin", "exclude"]);
 function sentFieldsMatch(stored, sent) {
@@ -1576,7 +1578,10 @@ function sentFieldsMatch(stored, sent) {
   const present = (o, k) => o[k] !== undefined && !(LIST_KEYS.has(k) && Array.isArray(o[k]) && !o[k].length);
   for (const k of Object.keys(stored)) {
     if (k === "file" || k === "body" || !present(stored, k)) continue;
-    if (!present(sent, k) && !SERVER_STAMPED_FIELDS.has(k)) return false;
+    if (present(sent, k) || SERVER_STAMPED_FIELDS.has(k)) continue;
+    // schema/workflow creates are forced to `status: proposed` when sent bare.
+    if (k === "status" && stored.status === "proposed" && (stored.type === "schema" || stored.type === "workflow")) continue;
+    return false;
   }
   for (const k of Object.keys(sent)) {
     if (k === "file") continue;
