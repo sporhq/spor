@@ -350,8 +350,8 @@ test("withBusyBatchRetry: a busy resolver re-sends the gate-failed born-terminal
   assert.deepStrictEqual(r.json.results, [OK("r"), OK("t")]);
 });
 
-test("withBusyBatchRetry: a duplicate id under update is re-sent in order, so the later content still wins", async () => {
-  const body = { nodes: ["X1", "X2"], if_exists: "update" };
+test("withBusyBatchRetry: a duplicate id is re-sent in order, so the later content still wins", async () => {
+  const body = { nodes: ["X1", "X2"] };
   const { r, sent } = await driveBatch(body, [res(207, { results: [ENTRY_BUSY, OK("x")] }), res(200, { results: [OK("x"), OK("x")] })]);
   assert.deepStrictEqual(sent, [["X1", "X2"], ["X1", "X2"]], "never X1 alone after X2 landed");
   assert.strictEqual(r.status, 200);
@@ -365,10 +365,10 @@ test("withBusyBatchRetry: a landed entry keeps its first result when a later re-
   ({ r } = await driveBatch({ nodes: ["A", "B"] }, script, { retries: 1 }));
   assert.deepStrictEqual(r.json.results, [ENTRY_BUSY, B_CREATED], "b landed; it never reads busy");
   // ...unless an earlier entry of that re-send wrote the same id over it.
-  ({ r } = await driveBatch({ nodes: ["X1", "X2"], if_exists: "update" }, [res(207, { results: [ENTRY_BUSY, OK("x")] }), res(207, { results: [OK("x"), ENTRY_BUSY] })], { retries: 1 }));
+  ({ r } = await driveBatch({ nodes: ["X1", "X2"] }, [res(207, { results: [ENTRY_BUSY, OK("x")] }), res(207, { results: [OK("x"), ENTRY_BUSY] })], { retries: 1 }));
   assert.deepStrictEqual(r.json.results, [OK("x"), ENTRY_BUSY]);
   // ...and stays overwritten: a later re-send of it alone answering busy does not revive its first ok.
-  ({ r } = await driveBatch({ nodes: ["X1", "X2"], if_exists: "update" }, [res(207, { results: [ENTRY_BUSY, OK("x")] }), res(207, { results: [OK("x"), ENTRY_BUSY] }), res(207, { results: [ENTRY_BUSY] })], { retries: 2 }));
+  ({ r } = await driveBatch({ nodes: ["X1", "X2"] }, [res(207, { results: [ENTRY_BUSY, OK("x")] }), res(207, { results: [OK("x"), ENTRY_BUSY] }), res(207, { results: [ENTRY_BUSY] })], { retries: 2 }));
   assert.strictEqual(r.status, 207);
   assert.deepStrictEqual(r.json.results, [OK("x"), ENTRY_BUSY]);
 });
@@ -430,7 +430,7 @@ test("POST /v1/nodes: a top-level busy re-sends a multi-entry batch only when a 
   const done = [200, { results: [OK("a"), OK("b")] }];
   for (const [body, expectResend] of [
     [{ nodes: ["A", "B"] }, true], // default skip
-    [{ nodes: [{ node: "A", if_exists: "update" }, "B"], if_exists: "skip" }, true],
+    [{ nodes: [{ node: "A", if_exists: "update" }, "B"], if_exists: "skip" }, false],
     [{ nodes: ["A", "B"], if_exists: "error" }, false],
     [{ nodes: [{ node: "A", if_exists: "update", revision: "r" }, "B"] }, false],
     [{ nodes: ["A", "B"], if_exists: "update", spill: true }, false],
@@ -514,14 +514,59 @@ test("a 401's nested token refresh stops re-sending once the request's signal ab
   }
 });
 
-test("batchResendSafe: one entry always; several only under skip or an unrevisioned, unspilled update", () => {
+test("batchResendSafe: one entry always; several only under skip", () => {
   const safe = (body) => remoteLib.batchResendSafe(body, body.nodes);
   assert.ok(safe({ nodes: [{ node: "A", if_exists: "error" }] }));
   assert.ok(safe({ nodes: ["A", "B"] }));
-  assert.ok(safe({ nodes: ["A", { node: "B", if_exists: "update" }] }));
+  assert.ok(!safe({ nodes: ["A", { node: "B", if_exists: "update" }] }), "an update carries a revision: landed, it re-reads as a conflict");
   assert.ok(!safe({ nodes: ["A", "B"], if_exists: "error" }));
   assert.ok(!safe({ nodes: ["A", { node: "B", if_exists: "update", revision: "r" }] }));
   assert.ok(!safe({ nodes: ["A", { node: "B", if_exists: "update", spill: true }] }));
   assert.ok(safe({ nodes: ["A", { node: "B", spill: true }] }));
   assert.ok(!remoteLib.entryResendSafe({ nodes: [] }, { node: "A", if_exists: "error" }), "a landed lone entry under error is not");
+});
+
+// The server's not-durable write: the node file stands, its git object or
+// journal entry does not (spor-server store-persist: code "internal",
+// landed: true, landed_ids) — "re-read the node before retrying".
+const LANDED_FAIL = (id) => ({
+  ok: false,
+  code: "internal",
+  landed: true,
+  landed_ids: [id],
+  id,
+  message: "the write is not durable and was not acknowledged: the node file was written but its git object or held commit journal entry was not — re-read the node before retrying",
+});
+
+test("withBusyBatchRetry: a landed:true failure after the first busy entry counts as landed — no unsafe re-send, its re-read signal kept", async () => {
+  for (const body of [{ nodes: ["A", "B"], if_exists: "error" }, { nodes: ["A", { node: "B", if_exists: "update", revision: "r1" }] }]) {
+    const { r, sent } = await driveBatch(body, [res(207, { results: [ENTRY_BUSY, LANDED_FAIL("b")] }), res(207, { results: [OK("a"), { ok: false, code: "conflict" }] })]);
+    assert.strictEqual(sent.length, 1, `never re-sent: B would re-read as a false conflict (${JSON.stringify(body)})`);
+    assert.strictEqual(r.status, 207);
+    assert.deepStrictEqual(r.json.results, [ENTRY_BUSY, LANDED_FAIL("b")]);
+  }
+  // landed via landed_ids alone (a door refusal naming the standing file)
+  const viaIds = { ok: false, code: "invalid_node", id: "b", landed_ids: ["b"] };
+  assert.ok(busy.entryLanded(viaIds));
+  assert.ok(!busy.entryLanded({ ok: false, code: "conflict", id: "b" }));
+  const { sent } = await driveBatch({ nodes: ["A", "B"], if_exists: "error" }, [res(207, { results: [ENTRY_BUSY, viaIds] })]);
+  assert.strictEqual(sent.length, 1);
+  // under skip the tail IS re-sent, but B keeps its landed failure (not the re-send's skipped)
+  const { r, sent: sent2 } = await driveBatch({ nodes: ["A", "B"] }, [res(207, { results: [ENTRY_BUSY, LANDED_FAIL("b")] }), res(207, { results: [OK("a"), { ok: true, id: "b", status: "skipped" }] })]);
+  assert.deepStrictEqual(sent2, [["A", "B"], ["A", "B"]]);
+  assert.strictEqual(r.status, 207, "a landed failure is still a failure");
+  assert.deepStrictEqual(r.json.results, [OK("a"), LANDED_FAIL("b")]);
+});
+
+test("withBusyBatchRetry: a skipped duplicate writes nothing, so it never un-lands the entry the batch created", async () => {
+  // X1 busy, X2 creates x; the re-send's X1 answers skipped (x exists) and X2 busy.
+  const X_CREATED = OK("x");
+  const { r, sent } = await driveBatch(
+    { nodes: ["X1", "X2"] },
+    [res(207, { results: [ENTRY_BUSY, X_CREATED] }), res(207, { results: [{ ok: true, id: "x", status: "skipped" }, ENTRY_BUSY] })],
+    { retries: 1 },
+  );
+  assert.strictEqual(sent.length, 2);
+  assert.strictEqual(r.status, 200);
+  assert.deepStrictEqual(r.json.results, [{ ok: true, id: "x", status: "skipped" }, X_CREATED], "x was created by this batch; never reported busy");
 });

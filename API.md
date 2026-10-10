@@ -1113,9 +1113,15 @@ resolver; with a duplicate id the later content wins), so the CLI never
 reorders a re-send: it re-sends the batch's TAIL from the first busy entry, in
 order (same bound and pacing), and splices the answers back into the original
 positions — but only when every entry in that tail that already landed is
-`if_exists: skip` or an unrevisioned, unspilled `update` (a landed entry then
-re-reads as success, never as a conflict); a single entry in flight is one
-atomic write and is always re-sent. A re-send answered without per-entry
+`if_exists: skip` (a landed entry then re-reads as `skipped`, never as a
+conflict; under `error`, or an `update` — which always carries a revision,
+since the server answers an unrevisioned one `not_found`/`conflict` — a landed
+entry re-reads as a conflict); a single entry in flight is one atomic write
+and is always re-sent. An entry counts as landed when it answered ok and was
+not `skipped`, or when it failed with `landed: true` (or its id in
+`landed_ids`): the not-durable `internal` failure whose node file stands. Such
+an entry blocks an unsafe re-send and keeps its own result, so its "re-read the
+node before retrying" signal reaches the caller. A re-send answered without per-entry
 results replaces the stale busy result: a 4xx with its own error code, a
 lone entry still busy with `busy`, anything else (a 5xx, a transport failure)
 with `{ok: false, code: "unknown"}` — whether it was written is not known.
