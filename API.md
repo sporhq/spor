@@ -1145,7 +1145,13 @@ only if that handoff cannot reach disk does a capture carrying an
 `idempotency_key` stay spooled, since its replay answers the same drafts), a
 busy marked `retryable: false` is dead-lettered unless it is a keyed capture,
 and a `/v1/nodes` `207` keeps exactly its busy entries spooled and
-dead-letters the refused ones instead of reading the whole file as drained. The execution store reports a `busy` refusal as transient with
+dead-letters the refused ones instead of reading the whole file as drained; a
+`/v1/nodes` `2xx` whose per-entry `results` are missing or not one per entry
+keeps the whole batch spooled, never counted landed. A deferred-draft
+re-submit answered with a non-replayable busy is dead-lettered (drafts kept),
+not spooled for the drain. A dead-letter never overwrites an earlier one of
+the same name (it takes a unique suffix, keeping its `.capture.json`/`.json`
+spool suffix), and one that cannot be written leaves the file spooled. The execution store reports a `busy` refusal as transient with
 `busy: true` (+ `retryable`/`retry_after`), never as the `unavailable`
 unserved surface a caller falls back to the local store for.
 

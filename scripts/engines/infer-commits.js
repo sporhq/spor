@@ -11,6 +11,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { spawnSync } = require("child_process");
 const u = require("./util");
+const capturePartial = require(path.join(u.ROOT, "lib", "shell", "capture-partial.js"));
 
 async function inferCommits({ repo, journal, indexFile = "", index = "", slug = "project", session = "unknown" }) {
   // Off by default; SPOR_INFER_COMMITS=1 (env) or inferCommits.enabled:true
@@ -100,7 +101,12 @@ async function inferCommits({ repo, journal, indexFile = "", index = "", slug = 
     for (const p of proposals) {
       const ev = p?.evidence;
       if (!ev) continue;
-      const body = JSON.stringify({ text: ev, context: { project: slug, project_explicit: false }, source: "infer" });
+      // Keyed on what the proposal IS (repo, commit, evidence), so a re-run
+      // over the same journal — or a capture that timed out client-side but
+      // landed — replays the server's pinned answer instead of filing the
+      // link proposal twice (the same content-addressed rule distill uses).
+      const key = crypto.createHash("sha256").update(`infer\n${slug}\n${sha}\n${ev}`).digest("hex");
+      const body = JSON.stringify({ text: ev, context: { project: slug, project_explicit: false }, source: "infer", idempotency_key: key });
       const res = await u.curlWithRefresh(`${u.serverBase()}/v1/capture`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -110,9 +116,12 @@ async function inferCommits({ repo, journal, indexFile = "", index = "", slug = 
       rlog(`proposed ${sha.slice(0, 12)} -> capture http=${res.http}`);
       // A FINAL partial_unsaved hands its deferred drafts back: re-submit them
       // as node writes (task-spor-client-capture-partial-unsaved-handling).
+      // A 200 marked partial names what landed, what did not, and the
+      // capture-pending node holding the rest.
       const outcome = u.captureOutcome(res);
+      if (outcome.partial) rlog(`proposed ${sha.slice(0, 12)}: ${capturePartial.describePartialCapture(outcome.partial)}`);
       if (outcome.unsaved) {
-        const stem = `infer-${sha.slice(0, 12)}-${crypto.createHash("sha256").update(ev).digest("hex").slice(0, 12)}`;
+        const stem = `infer-${sha.slice(0, 12)}-${key.slice(0, 12)}`;
         await u.settlePartialUnsaved(graph, outcome.unsaved, { stem, log: (m) => rlog(`proposed ${sha.slice(0, 12)}: ${m}`) });
       }
     }

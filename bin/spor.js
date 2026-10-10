@@ -76,6 +76,7 @@ const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const { gitSpawn, gitOracle } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 const { writeSpoolFile } = require(path.join(ROOT, "lib", "shell", "spool.js"));
 const capturePartial = require(path.join(ROOT, "lib", "shell", "capture-partial.js"));
+const busy = require(path.join(ROOT, "lib", "shell", "busy.js"));
 const dispatchRuns = lazyModule(path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js"));
 const processIdentity = lazyModule(path.join(ROOT, "lib", "shell", "process-identity.js"));
 const dispatchTerminal = lazyModule(path.join(ROOT, "lib", "shell", "dispatch-terminal.js"));
@@ -1790,7 +1791,7 @@ async function putNodesRemoteChunked(cfg, entries, { write, report = null }) {
       const msg = r.json && r.json.error && r.json.error.message;
       const definite = !r.transport && !r.earlierAttemptUnknown && r.status >= 400 && r.status < 500;
       const why = r.transport ? remote.describeTransport(r, { write }) : `put-node error ${r.status}${msg ? `: ${msg}` : ": no per-entry results returned"}`;
-      if (report) report(why);
+      if (report) report(why, r);
       for (const e of entries.slice(results.length)) {
         const label = !batch.includes(e) ? "not sent" : definite ? "rejected" : "not confirmed";
         results.push({ ok: false, id: e.id, status: "error", message: `${label} (${why})` });
@@ -4487,7 +4488,14 @@ async function resubmitDeferredDrafts(cfg, unsaved) {
     }
     entries.push({ id: parsed.node.id, node: parsed.node, raw: d.raw, wire: { node: d.raw, if_exists: "skip" } });
   }
-  const results = entries.length ? await putNodesRemoteChunked(cfg, entries, { write: "run 'spor drain' (every write is if_exists: skip)" }) : [];
+  // A chunk refused with a 5xx the server marked non-replayable (a busy with
+  // `retryable: false`): spooling it would have the drain re-send what the
+  // server said may double-apply, so those drafts go to outbox/dead/ instead.
+  let nonReplayable = false;
+  const report = (_why, r) => {
+    if (r && !r.transport && r.status >= 500 && !busy.serverAllowsReplay(r)) nonReplayable = true;
+  };
+  const results = entries.length ? await putNodesRemoteChunked(cfg, entries, { write: "run 'spor drain' (every write is if_exists: skip)", report }) : [];
   const failed = [...unsent];
   results.forEach((res, i) => {
     if (res && res.ok) out(`  ${res.status || "created"}: ${entries[i].id}`);
@@ -4499,19 +4507,22 @@ async function resubmitDeferredDrafts(cfg, unsaved) {
     return 0;
   }
   for (const f of failed) err(f.line);
-  const spool = spoolDeferredDrafts(cfg, capturePartial.deferredNodesBody(failed));
+  const spool = spoolDeferredDrafts(cfg, capturePartial.deferredNodesBody(failed), { dead: nonReplayable });
   err(spool
-    ? `${failed.length} deferred draft(s) did not land — spooled to ${spool}; run 'spor drain' to re-send them (refused ones are kept in outbox/dead/).`
+    ? nonReplayable
+      ? `${failed.length} deferred draft(s) did not land and the server marked the re-send non-replayable — kept in ${spool} for inspection; re-submit them with 'spor put-node - --if-exists skip' once you have checked what landed.`
+      : `${failed.length} deferred draft(s) did not land — spooled to ${spool}; run 'spor drain' to re-send them (refused ones are kept in outbox/dead/).`
     : `${failed.length} deferred draft(s) did not land and could not be spooled — re-submit them with 'spor put-node - --if-exists skip':\n\n${failed.map((f) => f.raw).join("\n")}`);
   return 1;
 }
 
 // Spool a deferred-draft node batch to the shared outbox as a `*.json` file,
 // which the drain replays to /v1/nodes (if_exists: skip, so a re-send is
-// safe). Returns the path, or null when the write failed.
-function spoolDeferredDrafts(cfg, body) {
+// safe) — or, with `dead`, to outbox/dead/, which nothing re-sends. Returns
+// the path, or null when the write failed.
+function spoolDeferredDrafts(cfg, body, { dead = false } = {}) {
   try {
-    const dir = path.join(cfg.graphHome(), "outbox");
+    const dir = path.join(cfg.graphHome(), "outbox", ...(dead ? ["dead"] : []));
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, `cli-${Date.now()}-${crypto.randomUUID()}.deferred.json`);
     writeSpoolFile(file, JSON.stringify(body));

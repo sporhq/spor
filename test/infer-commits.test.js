@@ -39,7 +39,7 @@ function git(cwd, args) {
 
 // Records every request; answers 200 with a body shaped like a real
 // /v1/capture response (see test/hookcli.test.js's stubServer).
-function stubServer() {
+function stubServer(answer = { status: "captured", ids: ["x"], nodes: [], summary: "ok" }) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -47,7 +47,7 @@ function stubServer() {
     req.on("end", () => {
       hits.push({ url: req.url, body });
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ status: "captured", ids: ["x"], nodes: [], summary: "ok" }));
+      res.end(JSON.stringify(answer));
     });
   });
   return new Promise((resolve) =>
@@ -105,4 +105,48 @@ test("infer-commits: /v1/capture body marks project_explicit false (ambient slug
     "commit inference derives project from the ambient cwd slug, never a user --project declaration — " +
       "omitting this let the ELABORATE fold falsely warn of a project mismatch"
   );
+});
+
+// One untrailered commit on a branch named after the candidate, run through
+// the engine against `answer`; returns the capture hits and the remote log.
+async function runOnce(answer) {
+  const { repo, home } = scratch();
+  git(repo, ["init", "-q", "-b", "task-test-node"]);
+  fs.writeFileSync(path.join(repo, "f.txt"), "x");
+  git(repo, ["add", "f.txt"]);
+  git(repo, ["commit", "-q", "-m", "wip"]);
+  const sha = git(repo, ["rev-parse", "HEAD"]).trim();
+  const journal = path.join(repo, "journal.jsonl");
+  fs.writeFileSync(journal, JSON.stringify({ tool: "git-commit", sha, nodes: [] }) + "\n");
+  const { srv, hits, base } = await stubServer(answer);
+  const saved = { SPOR_SERVER: process.env.SPOR_SERVER, SPOR_INFER_COMMITS: process.env.SPOR_INFER_COMMITS, SPOR_HOME: process.env.SPOR_HOME };
+  Object.assign(process.env, { SPOR_SERVER: base, SPOR_INFER_COMMITS: "1", SPOR_HOME: home });
+  const run = () => inferCommits({ repo, journal, index: "task-test-node — Some candidate title\n", slug: "projx", session: "sess-infer" });
+  try {
+    await run();
+    await run(); // a re-run over the same journal
+  } finally {
+    srv.close();
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  let log = "";
+  try {
+    log = fs.readFileSync(path.join(home, "journal", "remote.log"), "utf8");
+  } catch {}
+  return { caps: hits.filter((h) => h.url === "/v1/capture").map((h) => JSON.parse(h.body)), log };
+}
+
+test("infer-commits: every capture carries a content-addressed idempotency key, stable across re-runs", async () => {
+  const { caps } = await runOnce();
+  assert.strictEqual(caps.length, 2);
+  assert.match(caps[0].idempotency_key, /^[0-9a-f]{64}$/);
+  assert.strictEqual(caps[1].idempotency_key, caps[0].idempotency_key, "a re-run replays the same key so the server dedupes it");
+});
+
+test("infer-commits: a 200 marked partial is surfaced in the remote log", async () => {
+  const { log } = await runOnce({ status: "captured", ids: ["task-a"], partial: true, landed: ["task-a"], deferred: ["task-b"], pending_id: "cap-1" });
+  assert.match(log, /partial capture: task-a landed; task-b not written — the text is preserved as cap-1/);
 });

@@ -1382,16 +1382,26 @@ function captureOutcome(res) {
   return partial ? { partial } : {};
 }
 
-// Write a /v1/nodes batch body into the outbox (`dead` -> outbox/dead/).
-// Returns whether it landed on disk. A dead-letter never replaces an earlier
-// one under the same name (a re-spooled remainder keeps its base name, so its
-// later refusals would otherwise overwrite the first): it takes a unique
-// suffix instead.
+// The outbox/dead/ path a dead-letter named `name` takes: `name` itself, or —
+// when an earlier dead-letter already holds that name (a re-spooled remainder
+// keeps its base name, and two spool cycles can mint the same capture name) —
+// a unique-suffixed sibling that keeps the spool suffix (`.capture.json` /
+// `.json`), so a replay moved back into the outbox still routes to the same
+// endpoint. A dead-letter never replaces an earlier one.
+function deadLetterPath(dir, name) {
+  const file = path.join(dir, name);
+  if (!fs.existsSync(file)) return file;
+  const suffix = name.endsWith(".capture.json") ? ".capture.json" : ".json";
+  const stem = name.endsWith(suffix) ? name.slice(0, -suffix.length) : name;
+  return path.join(dir, `${stem}.${Date.now()}-${crypto.randomBytes(4).toString("hex")}${suffix}`);
+}
+
+// Write a /v1/nodes batch body into the outbox (`dead` -> outbox/dead/, under
+// deadLetterPath's never-overwrite rule). Returns whether it landed on disk.
 function spoolNodesBody(graph, name, body, { dead = false } = {}) {
   const dir = dead ? path.join(graph, "outbox", "dead") : path.join(graph, "outbox");
   if (!ensureDir(dir)) return false;
-  let file = path.join(dir, name);
-  if (dead && fs.existsSync(file)) file = path.join(dir, `${name.replace(/\.json$/, "")}.${Date.now()}-${crypto.randomBytes(4).toString("hex")}.json`);
+  const file = dead ? deadLetterPath(dir, name) : path.join(dir, name);
   try {
     spool.writeSpoolFile(file, JSON.stringify(body));
     return true;
@@ -1422,22 +1432,37 @@ async function settlePartialUnsaved(graph, unsaved, { stem, log = () => {}, time
     timeoutMs,
   }).catch(() => ({ http: "000", body: "" }));
   const kind = classifyHttpFailure(res.http);
+  const json = parseJsonOrNull(res.body || "");
   if (kind === "ok") {
-    const split = capturePartial.splitNodesResults(parseJsonOrNull(res.body || ""), body);
+    const split = capturePartial.splitNodesResults(json, body);
+    if (!split) {
+      // A 2xx with no usable per-entry results (missing, or not one per entry)
+      // says nothing about which drafts landed: keep the whole batch spooled
+      // (a skip re-send is replay-safe) rather than count it as landed.
+      const durable = spoolNodesBody(graph, name, body);
+      log(`deferred draft re-submit answered http=${res.http} without per-entry results${durable ? `; spooled to outbox/${name}` : "; outbox write failed"}`);
+      return { durable };
+    }
     let durable = true;
-    if (split && split.retry) durable = spoolNodesBody(graph, name, split.retry) && durable;
-    if (split && split.dead) durable = spoolNodesBody(graph, name, split.dead, { dead: true }) && durable;
-    const landed = split ? split.landed : body.nodes.length;
+    if (split.retry) durable = spoolNodesBody(graph, name, split.retry) && durable;
+    if (split.dead) durable = spoolNodesBody(graph, name, split.dead, { dead: true }) && durable;
     log(
-      `re-submitted ${landed}/${body.nodes.length} deferred draft(s) (http=${res.http})` +
-        (split && split.retry ? `; ${split.retry.nodes.length} spooled to outbox/${name}` : "") +
-        (split && split.dead ? `; ${split.dead.nodes.length} refused, dead-lettered to outbox/dead/${name}` : "")
+      `re-submitted ${split.landed}/${body.nodes.length} deferred draft(s) (http=${res.http})` +
+        (split.retry ? `; ${split.retry.nodes.length} spooled to outbox/${name}` : "") +
+        (split.dead ? `; ${split.dead.nodes.length} refused, dead-lettered to outbox/dead/` : "")
     );
     return { durable };
   }
-  if (isPermanentHttpFailure(kind)) {
+  // A 5xx the server marked non-replayable (a busy with `retryable: false`):
+  // spooling it would have the drain re-POST what the server said a re-send
+  // may double-apply, so the drafts are kept in outbox/dead/ for inspection.
+  const nonReplayable = Number(res.http) >= 500 && !busy.serverAllowsReplay({ status: Number(res.http), json });
+  if (isPermanentHttpFailure(kind) || nonReplayable) {
     const durable = spoolNodesBody(graph, name, body, { dead: true });
-    log(`deferred draft re-submit refused (http=${res.http})${durable ? `; dead-lettered to outbox/dead/${name}` : "; dead-letter write failed"}`);
+    log(
+      `deferred draft re-submit ${nonReplayable ? "refused as non-replayable" : "refused"} (http=${res.http})` +
+        (durable ? "; dead-lettered to outbox/dead/" : "; dead-letter write failed")
+    );
     return { durable };
   }
   const durable = spoolNodesBody(graph, name, body);
@@ -2202,6 +2227,7 @@ module.exports = {
   parseJsonOrNull,
   settlePartialUnsaved,
   spoolNodesBody,
+  deadLetterPath,
   curlWithRefresh,
   isPermanentHttpFailure,
   isSystemSession,

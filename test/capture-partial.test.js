@@ -323,3 +323,151 @@ test("drain: a later refusal of a re-spooled remainder never overwrites the earl
     srv.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// issue-spor-drain-outbox-deadletter-and-split
+
+const BUSY_FINAL = { error: { code: "busy", message: "busy", retryable: false, retry_after: 1 } };
+
+test("drain: a permanent reject never overwrites an earlier same-named dead-letter, and keeps its spool suffix", async () => {
+  const { home, outbox } = freshHome();
+  fs.mkdirSync(path.join(outbox, "dead"));
+  fs.writeFileSync(path.join(outbox, "dead", "s1.capture.json"), JSON.stringify({ text: "the first" }));
+  fs.writeFileSync(path.join(outbox, "s1.capture.json"), JSON.stringify({ text: "the second" }));
+  const { srv, base } = await stubServer({ "/v1/capture": [[422, { error: { code: "invalid" } }]] });
+  try {
+    await drain(home, base);
+    const dead = listJson(path.join(outbox, "dead"));
+    assert.strictEqual(dead.length, 2, JSON.stringify(dead));
+    assert.ok(dead.every((f) => f.endsWith(".capture.json")), "a replay moved back still routes to /v1/capture");
+    assert.deepStrictEqual(dead.map((f) => readJson(path.join(outbox, "dead", f)).text).sort(), ["the first", "the second"]);
+    assert.deepStrictEqual(listJson(outbox), []);
+  } finally {
+    srv.close();
+  }
+});
+
+test("drain: a permanent reject whose dead-letter cannot be written stays spooled, never discarded", async () => {
+  const { home, outbox } = freshHome();
+  fs.writeFileSync(path.join(outbox, "dead"), "not a directory");
+  fs.writeFileSync(path.join(outbox, "s1.capture.json"), JSON.stringify(CAPTURE));
+  const { srv, base } = await stubServer({ "/v1/capture": [[422, { error: { code: "invalid" } }]] });
+  try {
+    await drain(home, base);
+    assert.deepStrictEqual(listJson(outbox), ["s1.capture.json"]);
+    assert.match(remoteLog(home), /dead-letter write failed; left spooled/);
+  } finally {
+    srv.close();
+  }
+});
+
+for (const [label, answer] of [
+  ["no results", { ok: true }],
+  ["a results list that is not one per entry", { results: [{ ok: true }] }],
+]) {
+  test(`drain: a /v1/nodes 2xx with ${label} keeps the whole batch spooled — never read as landed`, async () => {
+    const { home, outbox } = freshHome();
+    const body = { nodes: ["n1", "n2"], if_exists: "skip" };
+    fs.writeFileSync(path.join(outbox, "batch.json"), JSON.stringify(body));
+    const { srv, base } = await stubServer({ "/v1/nodes": [[200, answer]] });
+    try {
+      await drain(home, base);
+      assert.deepStrictEqual(readJson(path.join(outbox, "batch.json")), body);
+      assert.deepStrictEqual(listJson(path.join(outbox, "dead")), []);
+      assert.match(remoteLog(home), /kept batch\.json spooled: http=200 carried no per-entry results/);
+    } finally {
+      srv.close();
+    }
+  });
+}
+
+test("drain: a deferred-draft re-submit answered busy retryable:false dead-letters the drafts and settles the capture", async () => {
+  const { home, outbox } = freshHome();
+  fs.writeFileSync(path.join(outbox, "s1-abc.capture.json"), JSON.stringify(CAPTURE));
+  const { srv, hits, base } = await stubServer({ "/v1/capture": [[503, UNSAVED]], "/v1/nodes": [[503, BUSY_FINAL]] });
+  try {
+    await drain(home, base);
+    await drain(home, base);
+    assert.deepStrictEqual(listJson(outbox), [], "nothing left for a drain to re-send");
+    assert.deepStrictEqual(listJson(path.join(outbox, "dead")), ["s1-abc.deferred.json"]);
+    assert.deepStrictEqual(readJson(path.join(outbox, "dead", "s1-abc.deferred.json")), { nodes: [draft("task-b"), draft("task-c")], if_exists: "skip" });
+    assert.strictEqual(hits.filter((h) => h.url === "/v1/nodes").length, 1, "the non-replayable re-submit is never re-sent");
+  } finally {
+    srv.close();
+  }
+});
+
+test("drain: a deferred-draft re-submit answered 2xx without per-entry results is spooled, not counted landed", async () => {
+  const { home, outbox } = freshHome();
+  fs.writeFileSync(path.join(outbox, "s1-abc.capture.json"), JSON.stringify(CAPTURE));
+  const { srv, base } = await stubServer({ "/v1/capture": [[503, UNSAVED]], "/v1/nodes": [[200, { ok: true }]] });
+  try {
+    await drain(home, base);
+    assert.deepStrictEqual(listJson(outbox), ["s1-abc.deferred.json"]);
+    assert.deepStrictEqual(readJson(path.join(outbox, "s1-abc.deferred.json")), { nodes: [draft("task-b"), draft("task-c")], if_exists: "skip" });
+    assert.match(remoteLog(home), /without per-entry results; spooled to outbox\/s1-abc\.deferred\.json/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("add (remote): a deferred-draft re-submit answered busy retryable:false is dead-lettered, not spooled for the drain", async () => {
+  const { home, outbox } = freshHome();
+  const { srv, hits, base } = await stubServer({ "/v1/capture": [[503, UNSAVED]], "/v1/nodes": [[503, BUSY_FINAL]] });
+  try {
+    const r = await runAsync(CLI, ["add", "a capture whose second half could not be saved"], { SPOR_SERVER: base, SPOR_TOKEN: "tok", SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.deepStrictEqual(listJson(outbox), []);
+    const dead = listJson(path.join(outbox, "dead"));
+    assert.strictEqual(dead.length, 1, r.stderr);
+    assert.match(dead[0], /\.deferred\.json$/);
+    assert.deepStrictEqual(readJson(path.join(outbox, "dead", dead[0])), { nodes: [draft("task-b"), draft("task-c")], if_exists: "skip" });
+    assert.match(r.stderr, /non-replayable/);
+    assert.strictEqual(hits.filter((h) => h.url === "/v1/nodes").length, 1);
+  } finally {
+    srv.close();
+  }
+});
+
+// The drain's tally is the `spor drain` verb's report: one file per settle
+// outcome, counted in-process over the engine's return value.
+test("drain: the returned tally counts each settled outcome once", async () => {
+  const { home, outbox } = freshHome();
+  fs.writeFileSync(path.join(outbox, "a-ok.capture.json"), JSON.stringify({ text: "ok", context: {} }));
+  fs.writeFileSync(path.join(outbox, "b-rejected.capture.json"), JSON.stringify({ text: "rejected", context: {} }));
+  fs.writeFileSync(path.join(outbox, "c-split.json"), JSON.stringify({ nodes: ["n1", "n2", "n3"], if_exists: "skip" }));
+  fs.writeFileSync(path.join(outbox, "d-refused.json"), JSON.stringify({ nodes: ["r1"], if_exists: "skip" }));
+  fs.writeFileSync(path.join(outbox, "e-down.json"), JSON.stringify({ nodes: ["x1"], if_exists: "skip" }));
+  const routes = {
+    "a-ok": [200, { status: "captured", ids: ["task-x"] }],
+    "b-rejected": [422, { error: { code: "invalid" } }],
+    "c-split": [207, { results: [{ ok: true }, { ok: false, code: "busy", retryable: true }, { ok: false, code: "invalid_node" }] }],
+    "d-refused": [207, { results: [{ ok: false, code: "invalid_node" }] }],
+    "e-down": [500, { error: { code: "internal" } }],
+  };
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const sent = JSON.parse(body);
+      const key = sent.text ? (sent.text === "ok" ? "a-ok" : "b-rejected") : { n1: "c-split", r1: "d-refused", x1: "e-down" }[sent.nodes[0]];
+      const [status, json] = routes[key];
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(json));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const saved = { ...process.env };
+  Object.assign(process.env, { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${srv.address().port}`, SPOR_TOKEN: "tok", SPOR_MODE: "remote" });
+  try {
+    const { drainOutbox } = require(DRAIN);
+    const s = await drainOutbox(home, { tag: "test", maxTimeSec: 5, retryOverride: 0 });
+    assert.deepStrictEqual(s, { attempted: 5, drained: 1, deadLettered: 2, failed: 2 });
+    assert.deepStrictEqual(listJson(outbox), ["c-split.json", "e-down.json"]);
+    assert.deepStrictEqual(listJson(path.join(outbox, "dead")).sort(), ["b-rejected.capture.json", "c-split.json", "d-refused.json"]);
+  } finally {
+    srv.close();
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+    Object.assign(process.env, saved);
+  }
+});

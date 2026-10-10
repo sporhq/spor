@@ -109,58 +109,73 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
       fs.utimesSync(stampOf(name), now, now);
     } catch {}
   };
-  const deadLetter = (file, name, what) => {
+  // The three settled outcomes every endpoint's settle function ends in, each
+  // owning its tally: DRAINED (the file is done with), DEAD-LETTERED (kept in
+  // outbox/dead/ under deadLetterPath's never-overwrite rule), or KEPT
+  // spooled for a later drain (`stamp` rotates it behind every untried file,
+  // so a head that keeps failing never starves the queue).
+  const drained = (f, what) => {
     try {
-      u.ensureDir(path.join(outbox, "dead"));
-      fs.renameSync(file, path.join(outbox, "dead", name));
+      fs.unlinkSync(f.file);
+    } catch {}
+    clearStamp(f.name);
+    summary.drained++;
+    rlog(what);
+  };
+  const keep = (f, what, { stamp = true } = {}) => {
+    summary.failed++;
+    if (stamp) stampAttempt(f.name);
+    release(f.file, f.name);
+    rlog(what);
+  };
+  // A dead-letter that cannot reach outbox/dead/ keeps the file spooled
+  // rather than discarding it: a permanent reject is preserved, never lost
+  // (API.md §5), and the attempt stamp keeps it from blocking the rest.
+  const deadLetter = (f, what) => {
+    try {
+      const dir = path.join(outbox, "dead");
+      if (!u.ensureDir(dir)) throw new Error("no dead-letter dir");
+      fs.renameSync(f.file, u.deadLetterPath(dir, f.name));
     } catch {
-      try {
-        fs.unlinkSync(file);
-      } catch {}
+      keep(f, `${what} — but the dead-letter write failed; left spooled`);
+      return;
     }
-    clearStamp(name);
+    clearStamp(f.name);
     summary.deadLettered++;
     rlog(what);
   };
-  const drainOne = async (claimedName, name) => {
-    const file = path.join(outbox, claimedName);
-    const endpoint = name.endsWith(".capture.json") ? "/v1/capture" : "/v1/nodes";
-    let body;
-    try {
-      body = fs.readFileSync(file);
-    } catch {
-      release(file, name);
-      return;
+
+  // A non-2xx answer to either endpoint. `replaySafe`: a re-POST of these
+  // exact bytes cannot double-apply (a keyed capture — the server replays its
+  // pinned answer), so even a 5xx the server marked non-replayable stays
+  // spooled; anything else it marked so is dead-lettered for inspection.
+  const settleFailure = (f, { replaySafe }) => {
+    const { http, kind } = f;
+    if (f.reply && !busy.serverAllowsReplay(f.reply) && !replaySafe) {
+      deadLetter(f, `dead-lettered ${f.name} (http=${http}, the server marked it non-replayable); kept in outbox/dead/ for inspection`);
+    } else if (kind === "auth") {
+      // A token revoked/invalid even after curlWithRefresh's one refresh
+      // (dec-cc-fail-open-hooks): re-POSTing never succeeds, so it is
+      // dead-lettered like any permanent reject, but louder — the fix is a new
+      // token, not patience.
+      deadLetter(
+        f,
+        `dead-lettered ${f.name} (http=${http}, revoked/invalid token); ` +
+          `re-mint SPOR_TOKEN and replay outbox/dead/ — auth will not recover on its own`
+      );
+    } else if (u.isPermanentHttpFailure(kind)) {
+      deadLetter(f, `dead-lettered ${f.name} (http=${http}, permanent); kept in outbox/dead/ for inspection`);
+    } else {
+      keep(f, `drain failed for ${f.name} (http=${http}); leaving spooled`);
     }
-    const res = await u.curlWithRefresh(`${u.serverBase()}${endpoint}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      timeoutMs: maxTimeSec * 1000,
-      retry,
-    });
-    const { http } = res;
-    summary.attempted++;
-    const kind = u.classifyHttpFailure(http);
-    const sent = u.parseJsonOrNull(body.toString("utf8"));
-    const isCapture = endpoint === "/v1/capture";
-    const outcome = isCapture ? u.captureOutcome(res) : {};
-    const reply = Number(http) >= 500 ? { status: Number(http), json: u.parseJsonOrNull(res.body || "") } : null;
+  };
+
+  // `*.capture.json` -> /v1/capture.
+  const settleCapture = async (f) => {
+    const outcome = u.captureOutcome(f.res);
     // A capture whose idempotency key the server pins replays its original
     // answer, so a re-POST of it can never double-apply.
-    const keyed = isCapture && sent && typeof sent.idempotency_key === "string" && sent.idempotency_key !== "";
-    // A /v1/nodes answer's per-entry verdicts: a 207 whose busy entries wrote
-    // nothing keeps exactly those spooled, and dead-letters the refused ones,
-    // instead of reading the whole file as drained.
-    const split = !isCapture && kind === "ok" ? capturePartial.splitNodesResults(u.parseJsonOrNull(res.body || ""), sent) : null;
-    const unlinkDrained = (what) => {
-      try {
-        fs.unlinkSync(file);
-      } catch {}
-      clearStamp(name);
-      summary.drained++;
-      rlog(what);
-    };
+    const keyed = Boolean(f.sent && typeof f.sent.idempotency_key === "string" && f.sent.idempotency_key !== "");
     if (outcome.unsaved) {
       // FINAL (task-spor-client-capture-partial-unsaved-handling): the
       // capture is never re-sent; its deferred drafts are re-submitted as
@@ -168,90 +183,94 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
       // replay-safe /v1/nodes batch. Only if that handoff did not reach disk
       // does a KEYED capture stay spooled (its replay answers the identical
       // pinned body, drafts included); an unkeyed one is dead-lettered.
-      const stem = name.slice(0, -".capture.json".length);
-      const { durable } = await u.settlePartialUnsaved(graph, outcome.unsaved, { stem, log: (m) => rlog(`${name}: ${m}`), timeoutMs: maxTimeSec * 1000 });
-      if (durable) unlinkDrained(`settled ${name} (http=${http}, partial_unsaved)`);
-      else if (keyed) {
-        summary.failed++;
-        release(file, name);
-        rlog(`kept ${name} spooled: its deferred drafts could not be saved (a keyed replay returns them again)`);
-      } else deadLetter(file, name, `dead-lettered ${name} (http=${http}, partial_unsaved; deferred drafts not saved)`);
-    } else if (kind === "ok" && split && (split.retry || split.dead)) {
-      // Rewrite the file to the entries a re-send may still land, and
-      // dead-letter the refused ones under the same name.
-      let ok = true;
-      if (split.dead) ok = u.spoolNodesBody(graph, name, split.dead, { dead: true }) && ok;
-      // Only once the refused entries are safely dead-lettered may the file
-      // shrink to the re-sendable ones; otherwise it stays whole (a skip
-      // replay of the landed entries is harmless).
-      if (ok && split.retry) {
-        try {
-          u.writeSpoolFile(file, JSON.stringify(split.retry));
-        } catch {
-          ok = false;
-        }
-      }
-      if (!ok) {
-        summary.failed++;
-        release(file, name);
-        rlog(`drain of ${name} partly landed (http=${http}) but its refused entries could not be dead-lettered; leaving the file whole`);
-      } else if (split.retry) {
-        summary.failed++;
-        stampAttempt(name);
-        release(file, name);
-        rlog(
-          `drained ${split.landed}/${sent.nodes.length} of ${name} (http=${http}); ${split.retry.nodes.length} busy entr(ies) left spooled` +
-            (split.dead ? `, ${split.dead.nodes.length} refused (outbox/dead/${name})` : "")
-        );
-      } else {
-        try {
-          fs.unlinkSync(file);
-        } catch {}
-        clearStamp(name);
-        summary.deadLettered++;
-        rlog(`drained ${split.landed}/${sent.nodes.length} of ${name} (http=${http}); ${split.dead.nodes.length} refused, dead-lettered to outbox/dead/${name}`);
-      }
-    } else if (kind === "ok") {
-      if (outcome.partial) rlog(`${name}: ${capturePartial.describePartialCapture(outcome.partial)}`);
-      unlinkDrained(`drained ${name} (http=${http})`);
-    } else if (reply && !busy.serverAllowsReplay(reply) && !keyed) {
-      // The server said a re-send of these bytes may double-apply (a busy
-      // marked `retryable: false`): re-POSTing it every drain is the hazard,
-      // so it is dead-lettered for inspection rather than kept transient.
-      deadLetter(file, name, `dead-lettered ${name} (http=${http}, the server marked it non-replayable); kept in outbox/dead/ for inspection`);
-    } else if (u.isPermanentHttpFailure(kind)) {
-      // Permanent (u.classifyHttpFailure): dead-letter it so it can't starve
-      // the drain. An auth failure means the token is revoked/invalid
-      // (dec-cc-fail-open-hooks: 4xx is dead-lettered) — re-POSTing it on
-      // every session start and distill cycle never succeeds, so it gets the
-      // same treatment, but louder: the fix is a new token, not patience.
-      try {
-        u.ensureDir(path.join(outbox, "dead"));
-        fs.renameSync(file, path.join(outbox, "dead", name));
-      } catch {
-        try {
-          fs.unlinkSync(file);
-        } catch {}
-      }
-      clearStamp(name);
-      summary.deadLettered++;
-      if (kind === "auth") {
-        rlog(
-          `dead-lettered ${name} (http=${http}, revoked/invalid token); ` +
-            `re-mint SPOR_TOKEN and replay outbox/dead/ — auth will not recover on its own`
-        );
-      } else {
-        rlog(`dead-lettered ${name} (http=${http}, permanent); kept in outbox/dead/ for inspection`);
-      }
+      const stem = f.name.slice(0, -".capture.json".length);
+      const { durable } = await u.settlePartialUnsaved(graph, outcome.unsaved, { stem, log: (m) => rlog(`${f.name}: ${m}`), timeoutMs: maxTimeSec * 1000 });
+      if (durable) drained(f, `settled ${f.name} (http=${f.http}, partial_unsaved)`);
+      else if (keyed) keep(f, `kept ${f.name} spooled: its deferred drafts could not be saved (a keyed replay returns them again)`, { stamp: false });
+      else deadLetter(f, `dead-lettered ${f.name} (http=${f.http}, partial_unsaved; deferred drafts not saved)`);
+    } else if (f.kind === "ok") {
+      if (outcome.partial) rlog(`${f.name}: ${capturePartial.describePartialCapture(outcome.partial)}`);
+      drained(f, `drained ${f.name} (http=${f.http})`);
     } else {
-      summary.failed++;
-      // Re-stamp the attempt so this file rotates behind every file not yet
-      // tried: a head that keeps failing no longer starves the queue.
-      stampAttempt(name);
-      // Release the claim (rename back) so the file is retried later.
-      release(file, name);
-      rlog(`drain failed for ${name} (http=${http}); leaving spooled`);
+      settleFailure(f, { replaySafe: keyed });
     }
+  };
+
+  // `*.json` -> /v1/nodes. Every client writer spools a `{nodes, if_exists:
+  // "skip"}` batch (settlePartialUnsaved, `spor add`'s deferred drafts, a
+  // 207's re-spooled remainder), whose per-entry verdicts are read here; a
+  // file without a `nodes` array (a legacy single-node body) has no entries
+  // to split, so its 2xx is its own success. A refused entry is dead-lettered,
+  // never read as landed — for a skip batch an existing id re-reads as
+  // `skipped` (landed), so a refusal is the server's verdict on the content;
+  // a legacy NON-skip batch's `already_exists` may be its own earlier landing,
+  // which dead-lettering preserves for inspection rather than dropping.
+  const settleNodes = (f) => {
+    if (f.kind !== "ok") return settleFailure(f, { replaySafe: false });
+    const sent = f.sent;
+    if (!sent || !Array.isArray(sent.nodes)) return drained(f, `drained ${f.name} (http=${f.http})`);
+    const split = capturePartial.splitNodesResults(u.parseJsonOrNull(f.res.body || ""), sent);
+    // A 2xx whose per-entry results are missing or not one per entry says
+    // nothing about which entries landed: the batch stays whole and spooled.
+    if (!split) return keep(f, `kept ${f.name} spooled: http=${f.http} carried no per-entry results for its ${sent.nodes.length} entr(ies)`);
+    if (!split.retry && !split.dead) return drained(f, `drained ${f.name} (http=${f.http})`);
+    // Dead-letter the refused entries first; only once they are safely in
+    // outbox/dead/ may the file shrink to the re-sendable ones, otherwise it
+    // stays whole (a skip replay of the landed entries is harmless).
+    let ok = !split.dead || u.spoolNodesBody(graph, f.name, split.dead, { dead: true });
+    if (ok && split.retry) {
+      try {
+        u.writeSpoolFile(f.file, JSON.stringify(split.retry));
+      } catch {
+        ok = false;
+      }
+    }
+    const tally = `${split.landed}/${sent.nodes.length} of ${f.name} (http=${f.http})`;
+    const refused = split.dead ? `${split.dead.nodes.length} refused, dead-lettered to outbox/dead/` : "";
+    if (!ok) {
+      keep(f, `drain of ${f.name} partly landed (http=${f.http}) but its refused entries could not be dead-lettered; leaving the file whole`, { stamp: false });
+    } else if (split.retry) {
+      keep(f, `drained ${tally}; ${split.retry.nodes.length} busy entr(ies) left spooled` + (refused ? `, ${refused}` : ""));
+    } else {
+      // Everything sent either landed or now sits in outbox/dead/.
+      try {
+        fs.unlinkSync(f.file);
+      } catch {}
+      clearStamp(f.name);
+      summary.deadLettered++;
+      rlog(`drained ${tally}; ${refused}`);
+    }
+  };
+
+  const drainOne = async (claimedName, name) => {
+    const file = path.join(outbox, claimedName);
+    const isCapture = name.endsWith(".capture.json");
+    let body;
+    try {
+      body = fs.readFileSync(file);
+    } catch {
+      release(file, name);
+      return;
+    }
+    const res = await u.curlWithRefresh(`${u.serverBase()}${isCapture ? "/v1/capture" : "/v1/nodes"}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      timeoutMs: maxTimeSec * 1000,
+      retry,
+    });
+    summary.attempted++;
+    const { http } = res;
+    const f = {
+      file,
+      name,
+      res,
+      http,
+      kind: u.classifyHttpFailure(http),
+      sent: u.parseJsonOrNull(body.toString("utf8")),
+      reply: Number(http) >= 500 ? { status: Number(http), json: u.parseJsonOrNull(res.body || "") } : null,
+    };
+    await (isCapture ? settleCapture(f) : settleNodes(f));
   };
   for (const { name: entry, base: name, suffix } of files) {
     if (maxFiles > 0 && summary.attempted >= maxFiles) {
