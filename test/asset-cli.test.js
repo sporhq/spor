@@ -713,19 +713,52 @@ test("remote: a derived key another principal owns falls back to a per-caller ke
 // issue-spor-cli-offline-wording-residuals: a reset upload followed by a
 // refused re-send is not "offline" — the reset attempt may have landed it.
 test("asset import (remote): a reset then a refused re-send says the upload may have landed, never 'offline'", async () => {
-  const { transportError } = require("../lib/remote.js");
+  const remote = require("../lib/remote.js");
   const work = scratch("spor-asset-work-");
   const src = path.join(work, "a.png");
   fs.writeFileSync(src, SAMPLE);
-  const fail = (code, message) => transportError(Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(message), { code, syscall: code === "ECONNREFUSED" ? "connect" : "read" }) }));
-  const answers = [fail("ECONNRESET", "read ECONNRESET"), fail("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:1")];
-  const remote = { exchange: async () => answers.shift() };
-  await assert.rejects(assetLib.importRemote({ cfg: {}, remote, file: src, opts: { id: "art-shot" } }), (e) => {
+  // The first upload is reset mid-request; the server is gone by the re-send.
+  const srv = http.createServer((req) => {
+    req.socket.destroy();
+    srv.close();
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const cfg = { server: () => base, token: () => "tok", get: () => undefined };
+  await assert.rejects(assetLib.importRemote({ cfg, remote, file: src, opts: { id: "art-shot" } }), (e) => {
     assert.doesNotMatch(e.message, /offline/);
-    assert.match(e.message, /^connection to server failed \(.*after an earlier attempt failed with .*ECONNRESET.*\) — the write may have landed; re-running the import is safe/);
+    assert.match(e.message, /^connection to server failed \(.*after an earlier attempt failed with .*\) — the write may have landed; re-running the import is safe/);
     return true;
   });
   // a refused connect on BOTH attempts never reached the server: offline
-  const refused = [fail("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:1"), fail("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:1")];
-  await assert.rejects(assetLib.importRemote({ cfg: {}, remote: { exchange: async () => refused.shift() }, file: src, opts: { id: "art-shot" } }), /offline — could not reach server/);
+  await assert.rejects(assetLib.importRemote({ cfg, remote, file: src, opts: { id: "art-shot" } }), /offline — could not reach server/);
+});
+
+// issue-spor-busy-retryable-flag-and-retry-layers: the transport re-send and
+// the busy re-sends share ONE budget, so an import is bounded to 1 +
+// BUSY_MAX_RETRIES attempts, never the two layers stacked (8).
+test("asset import (remote): busy and transport re-sends share one bounded budget", async () => {
+  const busyLib = require("../lib/shell/busy.js");
+  const work = scratch("spor-asset-work-");
+  const src = path.join(work, "a.png");
+  fs.writeFileSync(src, SAMPLE);
+  const BUSY = { ok: false, status: 503, json: { error: { code: "busy", retryable: true, retry_after: 0 } }, headers: {} };
+  const RESET = { ok: false, transport: true, error: "fetch failed: other side closed" };
+  const calls = [];
+  // the stub runs the real budget (busy.withBusyRetry) over a scripted wire
+  const scripted = (script) => ({
+    exchange: async (_cfg, _m, _p, o) => {
+      let n = 0;
+      return busyLib.withBusyRetry(async () => {
+        o.body();
+        calls.push(o.headers["idempotency-key"]);
+        return script[Math.min(calls.length - 1, script.length - 1)] || script[script.length - 1];
+      }, { retries: o.retries, transportRetries: o.transportRetries, replaySafe: true, sleep: async () => n++ });
+    },
+  });
+  await assert.rejects(assetLib.importRemote({ cfg: {}, remote: scripted([RESET, BUSY, RESET, RESET, RESET, BUSY]), file: src, opts: { id: "art-shot" } }));
+  assert.strictEqual(calls.length, 1 + busyLib.BUSY_MAX_RETRIES - 1, "one transport re-send only: reset, busy, reset, then stop");
+  calls.length = 0;
+  await assert.rejects(assetLib.importRemote({ cfg: {}, remote: scripted([BUSY]), file: src, opts: { id: "art-shot" } }));
+  assert.strictEqual(calls.length, 1 + busyLib.BUSY_MAX_RETRIES);
 });

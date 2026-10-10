@@ -1088,43 +1088,94 @@ means "behave as if the graph is empty" (§6).
 `503 busy` is the server's **retryable** refusal: its state store lost a
 write lock under the serving loop's budget, or its shared buffered-body
 budget is exhausted by concurrent uploads (a body over its own route cap
-still gets `413 too_large`). It writes nothing and carries `Retry-After`
-(seconds). The OAuth endpoints answer the same condition `503
-{"error": "temporarily_unavailable"}` + `Retry-After` (an authorization code,
-device_code, or refresh token is spent only after its mint commits, so the
-retry succeeds), and an MCP tool call answers a structured `busy` tool error
-(`structuredContent: {error: "busy", retryable: true, retry_after}`). Any
-other `503` (`ingestion_unavailable`, a proxy mid-deploy) makes no such
-promise. The CLI (`lib/remote.js`, `lib/auth.js`) re-sends a busy refusal up
-to 3 times, each after its `Retry-After` (else 1s·2^n), capped at 5s per wait
-(`lib/shell/busy.js`) — but only a request safe to re-send: a GET/PUT/DELETE,
-a POST carrying an `idempotency_key` or marked idempotent, or a route whose
-re-send is idempotent by construction (`busyRetryable` in `lib/remote.js`:
-id-keyed `POST /v1/nodes` with its `if_exists`/revision CAS, edge adds,
-status/priority/readiness sets, releases, digest/batch reads, capability
-replaces, `PATCH /v1/nodes/{id}`). An appending POST (a capture without an
-idempotency key, a question, a token mint, a claim) reports the busy answer
-rather than re-sending it. A `POST /v1/nodes` batch applies its entries one at
-a time, so busy arrives there in two shapes: an entry whose own write lost
-the lock answers `{ok: false, code: "busy"}` inside the 207, while a top-level
-`503 busy` is no promise that the EARLIER entries wrote nothing. Entry order is
-load-bearing (a born-terminal entry passes the completion gate only behind its
-resolver; with a duplicate id the later content wins), so the CLI never
-reorders a re-send: it re-sends the batch's TAIL from the first busy entry, in
-order (same bound and pacing), and splices the answers back into the original
-positions — but only when every entry in that tail that already landed is
-`if_exists: skip` (a landed entry then re-reads as `skipped`, never as a
-conflict; under `error`, or an `update` — which always carries a revision,
-since the server answers an unrevisioned one `not_found`/`conflict` — a landed
-entry re-reads as a conflict); a single entry in flight is one atomic write
-and is always re-sent. An entry counts as landed when it answered ok and was
-not `skipped`, or when it failed with `landed: true` (or its id in
-`landed_ids`): the not-durable `internal` failure whose node file stands. Such
-an entry blocks an unsafe re-send and keeps its own result, so its "re-read the
-node before retrying" signal reaches the caller. A re-send answered without per-entry
-results replaces the stale busy result: a 4xx with its own error code, a
-lone entry still busy with `busy`, anything else (a 5xx, a transport failure)
-with `{ok: false, code: "unknown"}` — whether it was written is not known.
+still gets `413 too_large`). It carries `Retry-After` (seconds) and, in the
+body, the server's own **replay verdict**
+(dec-spor-rest-busy-retryable-verdict-server-owned-2026-10-10):
+
+```json
+{ "error": { "code": "busy", "message": "...", "details": [], "retryable": true, "retry_after": 1 } }
+```
+
+`error.retryable` (boolean) says whether re-sending the SAME request verbatim
+can never double-apply; `error.retry_after` is the wait in seconds (=
+`Retry-After`). The server decides it from each route's declared busy-replay
+rule: GET/HEAD/OPTIONS are always `true`, a declared write route is `true`
+(set-to-value and read POSTs, keyed routes when the request carries the key
+the handler dedupes on, a whole `POST /v1/nodes` batch when every entry is
+`if_exists: skip` or a revisioned `update`), a body shed by the buffered-body
+budget is always `true` (no handler ran), and an UNDECLARED write answers
+`false` — today including the execution, program-run and work-request
+`/events` routes, pending an execution-contract decision. A declared route
+never answers busy after its write committed (a capture with a landed draft
+answers `200` marked partial, or a pinned non-retryable `503
+partial_unsaved`). The OAuth endpoints answer the same condition `503
+{"error": "temporarily_unavailable"}` + `Retry-After` with no verdict (an
+authorization code, device_code, or refresh token is spent only after its
+mint commits, so the retry succeeds). An MCP tool call answers a structured
+`busy` tool error (`structuredContent: {error: "busy", retryable: true,
+retry_after}`), and a request-level `/mcp` busy (the JSON-RPC transport's own
+`503`, e.g. the body budget) carries the verdict under the JSON-RPC error's
+`data`, not at the top level: `{"jsonrpc": "2.0", "error": {"code": -32000,
+"message": "...", "data": {"error": "busy", "retryable": true,
+"retry_after": 1}}}`. Any other `503` (`ingestion_unavailable`, the
+execution store's `unavailable`, a proxy mid-deploy) makes no such promise.
+
+The CLI (`lib/remote.js`, `lib/auth.js`) re-sends a busy refusal up to 3
+times, each after its `retry_after` (else `Retry-After`, else 1s·2^n), capped
+at 5s per wait (`lib/shell/busy.js`) — **when the body's `retryable` says
+so**. Only a busy body WITHOUT the field (an older server, OAuth) falls back to
+the client's own rule: a GET/PUT/DELETE, a POST carrying an `idempotency_key`
+or marked idempotent, or a route whose re-send is idempotent by construction
+(`busyRetryable` in `lib/remote.js`: id-keyed `POST /v1/nodes` with its
+`if_exists`/revision CAS, edge adds, status/priority/readiness sets, releases,
+digest/batch reads, capability replaces, `PATCH /v1/nodes/{id}`). The asset
+upload's one re-send after a connection reset shares that same bounded budget
+(at most 4 attempts per idempotency key, not a transport retry stacked on the
+busy ones; the per-caller salted key an `idempotency_key_reused` 409 falls
+back to spends only what the first key left, so 5 attempts per import at
+most). The execution store reports a `busy` refusal as transient with
+`busy: true` (+ `retryable`/`retry_after`), never as the `unavailable`
+unserved surface a caller falls back to the local store for.
+
+A `POST /v1/nodes` batch applies its entries one at a time, so busy arrives
+there in two shapes: an entry whose own write lost the lock answers inside the
+207, while a top-level `503 busy` is no promise that the EARLIER entries wrote
+nothing (its `retryable` is the whole-batch rule above). A per-entry busy
+result carries its own verdict:
+
+```json
+{ "ok": false, "code": "busy", "message": "...", "retryable": true, "retry_after": 1 }
+```
+
+and a born-terminal entry refused `transition_denied` by its completion gate
+ONLY because an EARLIER in-batch resolver was busy carries `retryable: true`,
+`retry_after`, and `retry_with: [<batch positions of those busy resolvers>]` —
+re-send it together with the entries it names, resolver first. Positions are
+indices into the request as sent. Entry order is load-bearing (a born-terminal
+entry passes the completion gate only behind its resolver), so the CLI never
+reorders a re-send. Against a server that states per-entry verdicts it
+re-sends exactly the `retryable: true` entries — each busy one, and each
+`retry_with` entry beside every entry it names — in their original order,
+paced by the longest `retry_after` among them; an entry that landed is never
+re-sent. Against an older server (busy entries without `retryable`) it
+re-sends the batch's TAIL from the first busy entry, in order, but only when
+every entry in that tail that already landed is `if_exists: skip` (a landed
+entry then re-reads as `skipped`, never as a conflict; under `error`, or an
+`update` — which always carries a revision, since the server answers an
+unrevisioned one `not_found`/`conflict` — a landed entry re-reads as a
+conflict); a single entry in flight is one atomic write and is always
+re-sent. Either way the answers are spliced back into the original positions
+(same bound). An entry counts as landed when it answered ok (a `skipped` one
+included — its node stands either way), or when it failed with `landed: true`
+(or its id in `landed_ids`): the not-durable `internal` failure whose node
+file stands. A landed entry keeps its own first result, so its "re-read the
+node before retrying" signal reaches the caller. A re-send answered without
+per-entry results replaces the stale busy result: a 4xx with its own error
+code, a lone entry still busy with `busy`, anything else (a 5xx, a transport
+failure, a top-level busy over several entries — `retryable: true` there
+promises only that the re-send cannot double-apply, not that the earlier
+entries wrote nothing) with `{ok: false, code: "unknown"}` — whether it was
+written is not known.
 
 A `429 rate_limited` response SHOULD carry a `Retry-After` header (delay
 seconds or an HTTP-date); clients honor it (and a `503`'s), otherwise backing

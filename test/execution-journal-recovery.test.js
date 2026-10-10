@@ -310,3 +310,20 @@ test('new repin invalidates integration identically on replay while historical r
   const historical = store.rebuildFromEvents(home, 'local', id, [...before, oldRow]);
   assert.equal(historical.integration.state, 'running');
 });
+
+// task-split-spor-abed5b0d5b56: a 503 `busy` is a served store that lost its
+// lock (transient, carries the server's verdict), never the `unavailable`
+// unserved surface a caller falls back to the local store for.
+test('remote 503 busy reads transient + busy, never unserved; 503 unavailable reads unserved', async t => {
+  const { home } = setup(t);
+  let answer;
+  const remote = { post: async () => answer, get: async () => answer };
+  const e = store.remoteExecutionAdapter({}, remote, { home, tenant: 'remote' });
+  answer = { ok: false, status: 503, json: { error: { code: 'busy', message: 'busy', retryable: false, retry_after: 2 } } };
+  const b = await e.open(args);
+  assert.equal(b.ok, false); assert.equal(b.code, 'busy'); assert.equal(b.transient, true); assert.equal(b.busy, true);
+  assert.equal(b.unserved, undefined); assert.equal(b.retryable, false); assert.equal(b.retry_after, 2);
+  answer = { ok: false, status: 503, json: { error: { code: 'unavailable', message: 'no store' } } };
+  const u = await e.open(args);
+  assert.equal(u.unserved, true); assert.equal(u.transient, true); assert.equal(u.busy, undefined);
+});

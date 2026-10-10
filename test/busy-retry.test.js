@@ -364,13 +364,6 @@ test("withBusyBatchRetry: a landed entry keeps its first result when a later re-
   assert.deepStrictEqual(r.json.results, [OK("a"), B_CREATED]);
   ({ r } = await driveBatch({ nodes: ["A", "B"] }, script, { retries: 1 }));
   assert.deepStrictEqual(r.json.results, [ENTRY_BUSY, B_CREATED], "b landed; it never reads busy");
-  // ...unless an earlier entry of that re-send wrote the same id over it.
-  ({ r } = await driveBatch({ nodes: ["X1", "X2"] }, [res(207, { results: [ENTRY_BUSY, OK("x")] }), res(207, { results: [OK("x"), ENTRY_BUSY] })], { retries: 1 }));
-  assert.deepStrictEqual(r.json.results, [OK("x"), ENTRY_BUSY]);
-  // ...and stays overwritten: a later re-send of it alone answering busy does not revive its first ok.
-  ({ r } = await driveBatch({ nodes: ["X1", "X2"] }, [res(207, { results: [ENTRY_BUSY, OK("x")] }), res(207, { results: [OK("x"), ENTRY_BUSY] }), res(207, { results: [ENTRY_BUSY] })], { retries: 2 }));
-  assert.strictEqual(r.status, 207);
-  assert.deepStrictEqual(r.json.results, [OK("x"), ENTRY_BUSY]);
 });
 
 test("withBusyBatchRetry: a tail holding a landed entry that would re-read as a conflict is not re-sent", async () => {
@@ -514,18 +507,15 @@ test("a 401's nested token refresh stops re-sending once the request's signal ab
   }
 });
 
-test("batchResendSafe: one entry always; several only under skip", () => {
-  const safe = (body) => remoteLib.batchResendSafe(body, body.nodes);
-  assert.ok(safe({ nodes: [{ node: "A", if_exists: "error" }] }));
-  assert.ok(safe({ nodes: ["A", "B"] }));
-  assert.ok(!safe({ nodes: ["A", { node: "B", if_exists: "update" }] }), "an update carries a revision: landed, it re-reads as a conflict");
-  assert.ok(!safe({ nodes: ["A", "B"], if_exists: "error" }));
-  assert.ok(!safe({ nodes: ["A", { node: "B", if_exists: "update", revision: "r" }] }));
-  assert.ok(!safe({ nodes: ["A", { node: "B", if_exists: "update", spill: true }] }));
-  assert.ok(safe({ nodes: ["A", { node: "B", spill: true }] }));
-  assert.ok(!remoteLib.entryResendSafe({ nodes: [] }, { node: "A", if_exists: "error" }), "a landed lone entry under error is not");
+test("entryResendSafe: a landed entry re-reads as success only under skip", () => {
+  const safe = (body, e) => remoteLib.entryResendSafe(body, e);
+  assert.ok(safe({}, "A"));
+  assert.ok(safe({}, { node: "B", spill: true }));
+  assert.ok(!safe({ if_exists: "error" }, "A"));
+  assert.ok(!safe({}, { node: "A", if_exists: "error" }));
+  assert.ok(!safe({}, { node: "B", if_exists: "update", revision: "r" }), "landed, a revisioned update re-reads as a conflict");
+  assert.ok(!("batchResendSafe" in remoteLib), "the whole-batch rule is the server's verdict now");
 });
-
 // The server's not-durable write: the node file stands, its git object or
 // journal entry does not (spor-server store-persist: code "internal",
 // landed: true, landed_ids) — "re-read the node before retrying".
@@ -569,4 +559,123 @@ test("withBusyBatchRetry: a skipped duplicate writes nothing, so it never un-lan
   assert.strictEqual(sent.length, 2);
   assert.strictEqual(r.status, 200);
   assert.deepStrictEqual(r.json.results, [{ ok: true, id: "x", status: "skipped" }, X_CREATED], "x was created by this batch; never reported busy");
+});
+
+// ---- task-split-spor-abed5b0d5b56: the server's busy verdict wins ----
+
+const VBUSY = (retryable, retryAfter = 2) => ({ error: { code: "busy", message: "busy", details: [], retryable, retry_after: retryAfter } });
+
+test("busyVerdict reads REST error.retryable and the /mcp JSON-RPC error.data, else null", () => {
+  assert.strictEqual(busy.busyVerdict({ status: 503, json: VBUSY(true) }), true);
+  assert.strictEqual(busy.busyVerdict({ status: 503, json: VBUSY(false) }), false);
+  assert.strictEqual(busy.busyVerdict({ status: 503, json: { error: { code: "busy" } } }), null);
+  assert.strictEqual(busy.busyVerdict({ status: 503, json: { error: "temporarily_unavailable" } }), null);
+  const mcp = { status: 503, json: { jsonrpc: "2.0", id: null, error: { code: -32000, message: "busy", data: { error: "busy", retryable: true, retry_after: 1 } } } };
+  assert.ok(busy.isBusy(mcp));
+  assert.strictEqual(busy.busyVerdict(mcp), true);
+  assert.strictEqual(busy.busyDelayMs(mcp, 0), 1000, "the data's retry_after paces it");
+  assert.ok(!busy.isBusy({ status: 503, json: { error: { code: -32000, data: { error: "other" } } } }));
+  // the body's retry_after wins over the header, and is capped
+  assert.strictEqual(busy.busyDelayMs({ status: 503, json: VBUSY(true, 3), headers: { "retry-after": "1" } }, 0), 3000);
+  assert.strictEqual(busy.busyDelayMs({ status: 503, json: VBUSY(true, 3600), headers: {} }, 0), busy.BUSY_WAIT_CAP_MS);
+});
+
+test("remote: a busy body's retryable overrides the client's fallback table both ways", async () => {
+  // retryable:true on an append the table would never re-send
+  let s = await scriptedServer([[503, VBUSY(true, 0)], [200, { ok: true }]]);
+  try {
+    const r = await remoteLib.post(cfgFor(s.url), "/v1/questions", { text: "q?" });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(s.seen.length, 2);
+  } finally {
+    await s.close();
+  }
+  // retryable:false on a route the table WOULD re-send (a keyed POST, a GET)
+  for (const [m, p, body] of [["POST", "/v1/executions/exec-1/events", { idempotency_key: "k" }], ["GET", "/v1/queue", undefined]]) {
+    s = await scriptedServer([[503, VBUSY(false, 0)], [200, { ok: true }]]);
+    try {
+      const r = await remoteLib.request(cfgFor(s.url), m, p, { body });
+      assert.strictEqual(r.status, 503, `${m} ${p}`);
+      assert.strictEqual(s.seen.length, 1, `${m} ${p}`);
+    } finally {
+      await s.close();
+    }
+  }
+  // no field (an older server): the table decides
+  s = await scriptedServer([[503, { error: { code: "busy" } }], [200, { ok: true }]]);
+  try {
+    const r = await remoteLib.post(cfgFor(s.url), "/v1/questions", { text: "q?" });
+    assert.strictEqual(r.status, 503);
+    assert.strictEqual(s.seen.length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+const VENTRY_BUSY = (after = 2) => ({ ok: false, code: "busy", message: "busy", retryable: true, retry_after: after });
+
+test("withBusyBatchRetry (server verdict): only the retryable entries are re-sent, paced by their retry_after", async () => {
+  const waits = [];
+  const { r, sent } = await driveBatch(
+    { nodes: ["A", "B", "C", "D"], if_exists: "error" },
+    [res(207, { results: [OK("a"), VENTRY_BUSY(1), OK("c"), VENTRY_BUSY(3)] }), res(200, { results: [OK("b"), OK("d")] })],
+    { sleep: async (ms) => waits.push(ms) },
+  );
+  assert.deepStrictEqual(sent, [["A", "B", "C", "D"], ["B", "D"]], "landed C is never re-sent, so if_exists error does not block");
+  assert.deepStrictEqual(waits, [3000], "the longest per-entry retry_after");
+  assert.strictEqual(r.status, 200);
+  assert.deepStrictEqual(r.json.results, [OK("a"), OK("b"), OK("c"), OK("d")]);
+});
+
+test("withBusyBatchRetry (server verdict): a retry_with gate entry is re-sent beside its busy resolver, resolver first", async () => {
+  const GATED = { ok: false, code: "transition_denied", message: "transition denied by schema", retryable: true, retry_after: 1, retry_with: [1] };
+  const { r, sent } = await driveBatch(
+    { nodes: ["A", "R", "X", "T"] },
+    [res(207, { results: [OK("a"), VENTRY_BUSY(1), { ok: false, code: "invalid_node" }, GATED] }), res(200, { results: [OK("r"), OK("t")] })],
+  );
+  assert.deepStrictEqual(sent[1], ["R", "T"], "the invalid entry is not re-sent; the gated one rides behind its resolver");
+  assert.strictEqual(r.status, 207);
+  assert.deepStrictEqual(r.json.results.map((e) => e.id || e.code), ["a", "r", "invalid_node", "t"]);
+  // retry_with positions are the RE-SEND's: mapped back to the original entries
+  const second = await driveBatch(
+    { nodes: ["R", "T"] },
+    [res(207, { results: [VENTRY_BUSY(0), { ...GATED, retry_with: [0] }] }), res(207, { results: [VENTRY_BUSY(0), { ...GATED, retry_with: [0] }] }), res(200, { results: [OK("r"), OK("t")] })],
+  );
+  assert.deepStrictEqual(second.sent, [["R", "T"], ["R", "T"], ["R", "T"]]);
+  assert.strictEqual(second.r.status, 200);
+  // a retry_with naming a non-retryable busy entry is not re-sent
+  const third = await driveBatch({ nodes: ["R", "T"] }, [res(207, { results: [{ ...VENTRY_BUSY(0), retryable: false }, { ...GATED, retry_with: [0] }] })]);
+  assert.strictEqual(third.sent.length, 1);
+  assert.strictEqual(third.r.status, 207);
+});
+
+test("withBusyBatchRetry (server verdict): a re-send failing at transport or non-busy marks its entries unknown", async () => {
+  for (const answer of [{ ok: false, transport: true, error: "socket hang up" }, res(500, { error: { code: "internal" } }), res(503, VBUSY(false, 0))]) {
+    const { r } = await driveBatch({ nodes: ["A", "B", "C"] }, [res(207, { results: [OK("a"), VENTRY_BUSY(0), VENTRY_BUSY(0)] }), answer]);
+    assert.deepStrictEqual(r.json.results.map((e) => e.id || e.code), ["a", "unknown", "unknown"], JSON.stringify(answer));
+  }
+  // a retryable top-level busy on the re-send is re-sent; if it never clears, a
+  // multi-entry re-send is still unknown (retryable is "cannot double-apply",
+  // not "wrote nothing"), a lone entry busy
+  let { r, sent } = await driveBatch({ nodes: ["A", "B", "C"], if_exists: "error" }, [res(207, { results: [OK("a"), VENTRY_BUSY(0), VENTRY_BUSY(0)] }), ...Array(busy.BUSY_MAX_RETRIES).fill(res(503, VBUSY(true, 0)))]);
+  assert.strictEqual(sent.length, 1 + busy.BUSY_MAX_RETRIES);
+  assert.deepStrictEqual(r.json.results.map((e) => e.id || e.code), ["a", "unknown", "unknown"]);
+  ({ r } = await driveBatch({ nodes: ["A", "B"], if_exists: "error" }, [res(207, { results: [OK("a"), VENTRY_BUSY(0)] }), ...Array(busy.BUSY_MAX_RETRIES).fill(res(503, VBUSY(true, 0)))]));
+  assert.deepStrictEqual(r.json.results.map((e) => e.id || e.code), ["a", "busy"]);
+});
+
+test("POST /v1/nodes: a top-level busy follows the server's retryable over the client's batch rule", async () => {
+  for (const [body, verdict, expectResend] of [
+    [{ nodes: ["A", "B"], if_exists: "error" }, true, true],
+    [{ nodes: ["A", "B"] }, false, false],
+  ]) {
+    const s = await scriptedServer([[503, VBUSY(verdict, 0)], [200, { results: [OK("a"), OK("b")] }]]);
+    try {
+      const r = await remoteLib.post(cfgFor(s.url), "/v1/nodes", body);
+      assert.strictEqual(s.seen.length, expectResend ? 2 : 1, JSON.stringify([body, verdict]));
+      assert.strictEqual(r.status, expectResend ? 200 : 503);
+    } finally {
+      await s.close();
+    }
+  }
 });
