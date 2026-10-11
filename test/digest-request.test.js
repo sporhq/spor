@@ -170,3 +170,20 @@ ${summary}
   assert.match(ctx, /task-neighbor-thing/);
   assert.doesNotMatch(ctx, /task-unrelated/);
 });
+
+// The anchor is coupled to the orchestrator's dispatch templates: a template
+// whose `## Your item` line drifts off the DISPATCH_ITEM shape would silently
+// fall back to querying on the whole template.
+test("digestRequest: every orchestrator dispatch template's item line anchors", () => {
+  const dir = path.join(__dirname, "..", ".claude", "skills", "spor-orchestrator", "assets");
+  const files = fs.readdirSync(dir).filter((f) => /-prompt.*\.md$/.test(f));
+  assert.ok(files.length > 0);
+  for (const f of files) {
+    const tpl = fs.readFileSync(path.join(dir, f), "utf8");
+    if (!/^## Your item/m.test(tpl)) continue;
+    const filled = tpl.replace(/\{\{title\}\}/g, "Some item title here").replace(/\{\{node\}\}/g, "task-some-item")
+      .replace(/\{\{[a-z_]+\}\}/g, "x");
+    const req = digestRequest(filled, null);
+    assert.deepEqual(req, { query: "Some item title here task-some-item" }, f);
+  }
+});

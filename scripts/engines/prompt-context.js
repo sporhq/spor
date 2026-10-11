@@ -253,7 +253,10 @@ function isRepeatedFollowup(graph, input, prompt, digest) {
   try {
     prev = JSON.parse(fs.readFileSync(p, "utf8"));
   } catch {}
-  return prev && prev.sig === sig && !hasHighSignalToken(prompt) && u.wordCount(prompt) <= 12;
+  // A bare node id is an explicit ask (a root walk), never a low-signal
+  // follow-up — even for prefixes (find-, inc-) hasHighSignalToken omits.
+  return prev && prev.sig === sig && !hasHighSignalToken(prompt) && !BARE_NODE_ID.test(prompt) &&
+    u.wordCount(prompt) <= 12;
 }
 
 // Record `digest` as shown, for isRepeatedFollowup's next comparison. Call
@@ -484,7 +487,7 @@ async function promptContext(input) {
     // LLM call. Both branches are gated on the EXPLICIT flag, so the default
     // path adds no syscall and stays byte-identical.
     const fresh = digest
-      ? spoolDigestIntent(graph, input, slug, stripSystemReminders(input.prompt ?? ""), digest)
+      ? spoolDigestIntent(graph, input, slug, stripTaskNotifications(stripSystemReminders(input.prompt ?? "")), digest)
       : "";
     // The drain always runs (consuming stale results) — suppressed from
     // injecting only when a fresh synchronous digest already takes the slot.
