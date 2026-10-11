@@ -56,6 +56,10 @@ function run(args, env) {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "", stderr = "";
+    // Decode as a stream: a pipe read can end mid-character (the document
+    // fixture's emoji), and `+= Buffer` would decode each chunk alone.
+    c.stdout.setEncoding("utf8");
+    c.stderr.setEncoding("utf8");
     c.stdout.on("data", (d) => (stdout += d));
     c.stderr.on("data", (d) => (stderr += d));
     c.on("close", (status) => resolve({ status, stdout, stderr }));
@@ -203,6 +207,10 @@ function runIn(home, args, env, input) {
       stdio: [input == null ? "ignore" : "pipe", "pipe", "pipe"],
     });
     let stdout = "", stderr = "";
+    // Decode as a stream: a pipe read can end mid-character (the document
+    // fixture's emoji), and `+= Buffer` would decode each chunk alone.
+    c.stdout.setEncoding("utf8");
+    c.stderr.setEncoding("utf8");
     c.stdout.on("data", (d) => (stdout += d));
     c.stderr.on("data", (d) => (stderr += d));
     c.on("close", (status) => resolve({ status, stdout, stderr }));
