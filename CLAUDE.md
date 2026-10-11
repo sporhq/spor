@@ -781,7 +781,13 @@ tests; point `SPOR_HOME` at a throwaway scratch dir instead.
   compile.js (4.5KB). Session-start truncates the briefing body at 7KB.
 - The digest relevance gate is `--min-sim` (default 0.08 top cosine); the
   trivial-prompt gate in the prompt-context engine is ≥6 words and not a
-  `/command`.
+  `/command`. Three prompt shapes are re-anchored first (`digestRequest`,
+  issue-spor-digest-query-anchoring-dispatch-notification-bare-id): a bare
+  node id is a `root` digest (exempt from the word floor), an orchestrator
+  dispatch prompt queries on its `## Your item` title + id rather than the
+  template, and `<task-notification>` blocks are stripped (a turn that is
+  only notifications retrieves nothing). Changing the `## Your item` line in
+  `.claude/skills/spor-orchestrator/assets/*-prompt*.md` changes the anchor.
 - Haiku-as-distiller invents edge-type variants (`related-to`,
   `supercedes`, `derives-from`); the distill engine normalizes them on write
   (EDGE_FIXES in scripts/engines/distill.js; the server does it via its own

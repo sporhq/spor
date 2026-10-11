@@ -27,8 +27,55 @@ function envelope(ctx) {
 // `query` for months while the local one scoped by project). Absent a slug the
 // request carries no `project` key, keeping both branches byte-identical to
 // their project-blind forms.
-function buildCompileRequest(prompt, slug) {
-  return slug ? { query: prompt, project: slug } : { query: prompt };
+//
+// `root` (a node id) asks for that node's neighborhood instead of a free-text
+// search; it replaces `query` (POST /v1/digest accepts either, API.md §3).
+function buildCompileRequest(prompt, slug, root) {
+  const req = root ? { root } : { query: prompt };
+  if (slug) req.project = slug;
+  return req;
+}
+
+// Prefixes a bare-id prompt may carry — the high-signal id set plus the
+// gardener's finding and incident ids.
+const NODE_ID_PREFIX = "(?:task|issue|dec|art|spec|norm|question|repo|proj|corr|find|inc)";
+const BARE_NODE_ID = new RegExp(`^\\s*\`?(${NODE_ID_PREFIX}-[a-z0-9][a-z0-9-]*)\`?\\s*[.?!]?\\s*$`);
+// The `## Your item` block every orchestrator dispatch template opens with
+// (.claude/skills/spor-orchestrator/assets/*-prompt*.md):
+//   **{{title}}** — `{{node}}`      (codex: {{title}} — {{node}})
+const DISPATCH_ITEM = new RegExp(
+  `^## Your item[ \\t]*\\n+[ \\t]*(?:\\*\\*)?(.+?)(?:\\*\\*)?[ \\t]+—[ \\t]+\`?(${NODE_ID_PREFIX}-[a-z0-9][a-z0-9-]*)\`?[ \\t]*$`,
+  "m"
+);
+
+// Harness-generated turns that carry no user intent: Claude Code delivers a
+// finished background task as a `<task-notification>` block in the user slot.
+// Retrieval over that text matched the notification boilerplate, not the work
+// (issue-spor-digest-query-anchoring-dispatch-notification-bare-id: a digest
+// on 96% of them, about half noise). Text the user typed alongside survives.
+function stripTaskNotifications(prompt) {
+  return String(prompt).replace(/<task-notification>[\s\S]*?<\/task-notification>/g, "").trim();
+}
+
+// What a prompt-time compile should retrieve for this prompt, or null to skip.
+// Two prompt shapes get a better anchor than their raw text
+// (issue-spor-digest-query-anchoring-dispatch-notification-bare-id):
+//   - a bare node id ("art-foo") is a root walk — it is below the word floor
+//     and as a free-text query matches nothing in particular. The walk lists
+//     the node's neighborhood; the node itself is the one the user named;
+//   - an orchestrator dispatch prompt (~24 KB of template whose detach-and-poll
+//     instructions outranked the item for the rerank filter) queries on its
+//     item's title + id. Its own briefing is already embedded in the prompt.
+// Everything else keeps the trivial-prompt gates and queries on its text.
+function digestRequest(prompt, slug) {
+  const bare = prompt.match(BARE_NODE_ID);
+  if (bare) return buildCompileRequest("", slug, bare[1]);
+  if (prompt.startsWith("/")) return null;
+  if (isContinuationPrompt(prompt)) return null;
+  if (u.wordCount(prompt) < 6) return null;
+  const item = prompt.match(DISPATCH_ITEM);
+  if (item) return buildCompileRequest(`${item[1].trim()} ${item[2]}`, slug);
+  return buildCompileRequest(prompt, slug);
 }
 
 function localCompile(graph, req, rlogFile) {
@@ -38,8 +85,7 @@ function localCompile(graph, req, rlogFile) {
       path.join(u.ROOT, "lib", "compile.js"),
       "--nodes",
       path.join(graph, "nodes"),
-      "--query",
-      req.query,
+      ...(req.root ? ["--root", req.root] : ["--query", req.query]),
       "--digest",
       "--quiet",
       // The session slug scopes `project:<slug>` corrections (issue-cc-
@@ -477,15 +523,13 @@ async function promptContext(input) {
 // combine it with any pending async nudge). Every prior `return null` here is a
 // `return ""`; every `return envelope(x)` is a `return x`.
 async function computeDigest(input, graph, slug, meta = {}) {
-  const prompt = stripSystemReminders(input.prompt ?? "");
+  const prompt = stripTaskNotifications(stripSystemReminders(input.prompt ?? ""));
 
-  // Skip trivial / continuation prompts BEFORE any network call. The second
-  // gate catches "ok let's do that" follow-ups that carry no new retrieval
-  // signal but can otherwise clear the word floor.
-  if (prompt.startsWith("/")) return "";
-  if (isContinuationPrompt(prompt)) return "";
-  if (u.wordCount(prompt) < 6) return "";
-  const req = buildCompileRequest(prompt, slug);
+  // Skip trivial / continuation prompts BEFORE any network call (digestRequest:
+  // the continuation gate catches "ok let's do that" follow-ups that carry no
+  // new retrieval signal but can otherwise clear the word floor).
+  const req = digestRequest(prompt, slug);
+  if (!req) return "";
 
   // -------------------------------------------------------------------------
   // REMOTE MODE
@@ -574,6 +618,8 @@ async function computeDigest(input, graph, slug, meta = {}) {
 module.exports = {
   promptContext,
   buildCompileRequest,
+  digestRequest,
+  stripTaskNotifications,
   mergeDigests,
   isContinuationPrompt,
   stripSystemReminders,
