@@ -207,6 +207,62 @@
       "project": "grammar"
     }
   },
+  "bad-inline-edges-multiline.md": {
+    "fault": "unparseable inline edges list \"[ - {type: blocks, to: bad-inline-edges}, {type: relates-to} ]\" in bad-inline-edges-multiline.md",
+    "crlf": false,
+    "lex": {
+      "entries": [
+        {
+          "kind": "scalar",
+          "key": "id",
+          "start": 0,
+          "end": 1
+        },
+        {
+          "kind": "scalar",
+          "key": "type",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "kind": "scalar",
+          "key": "title",
+          "start": 2,
+          "end": 3
+        },
+        {
+          "kind": "edges",
+          "key": "edges",
+          "start": 3,
+          "end": 7
+        },
+        {
+          "kind": "scalar",
+          "key": "status",
+          "start": 7,
+          "end": 8
+        }
+      ],
+      "edges": [],
+      "faults": [
+        {
+          "line": 3,
+          "message": "unparseable inline edges list \"[ - {type: blocks, to: bad-inline-edges}, {type: relates-to} ]\""
+        }
+      ]
+    },
+    "lenient": {
+      "edges": [],
+      "pin": [],
+      "exclude": [],
+      "body": "Strict throws; lenient records one fault, skips the whole gathered range (the\ninner flow line is not an edge) and keeps status.",
+      "file": "bad-inline-edges-multiline.md",
+      "id": "bad-inline-edges-multiline",
+      "type": "task",
+      "title": "A refused multi-line inline edges value never leaks its inner lines as edges",
+      "status": "open"
+    }
+  },
   "bad-inline-edges.md": {
     "fault": "unparseable inline edges list \"[{type: blocks}]\" in bad-inline-edges.md",
     "crlf": false,

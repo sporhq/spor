@@ -257,6 +257,37 @@ test("inline edges: a populated value that is not an edge list is a parse fault 
   }
 });
 
+test("inline edges: a refused multi-line value's inner lines never leak as edges in the lenient read (issue-spor-frontmatter-lenient-inline-edges-leak)", () => {
+  const cases = [
+    // closed but malformed: the whole gathered range is skipped
+    ["edges: [\n  - {type: blocks, to: x},\n  {type: relates-to}\n]\nstatus: open", { start: 2, end: 6 }],
+    ["edges: [{type: relates-to},\n- {type: blocks, to: x}]\nstatus: open", { start: 2, end: 4 }],
+    // closed, with a key-shaped line inside: still skipped whole
+    ["edges: [\nfoo: bar\n- {type: blocks, to: x}\n]\nstatus: open", { start: 2, end: 6 }],
+    // never closes: skipped up to the next top-level key, which still reads
+    ["edges: [\n  - {type: blocks, to: x}\n  {type: relates-to, to: y}\nstatus: open", { start: 2, end: 5 }],
+    ["edges: [\n  - {type: blocks, to: x}\ntags: [a]\nstatus: open", { start: 2, end: 4 }],
+  ];
+  for (const [body, range] of cases) {
+    const fmText = `id: a\ntype: task\n${body}`;
+    const raw = doc(fmText);
+    assert.throws(() => fm.parseFrontmatter(raw, "a.md"),
+      (e) => e.sporParse === true && /^unparseable inline edges list /.test(e.message), body);
+    const r = fm.readNode(raw, "a.md");
+    assert.equal(r.faults.length, 1, body);
+    assert.match(r.faults[0], /^unparseable inline edges list /, body);
+    assert.deepEqual(r.node.edges, [], body);
+    assert.equal(r.node.status, "open", body);
+    const lex = fm.lexFrontmatter(fmText, "a.md", { lenient: true });
+    const entry = lex.entries.find((e) => e.kind === "edges");
+    assert.deepEqual({ start: entry.start, end: entry.end }, range, body);
+  }
+  // a block line BELOW a closed refused value still accumulates, as before
+  const r = fm.readNode(doc("id: a\nedges: [\n  {type: blocks}\n]\n  - {type: mentions, to: z}\nstatus: open"), "a.md");
+  assert.deepEqual(r.node.edges, [{ type: "mentions", to: "z" }]);
+  assert.equal(r.faults.length, 1);
+});
+
 test("inline edges: the edge editors rewrite a readable inline header to block form, then splice by parsed identity", () => {
   const raw = doc('id: a\nedges: [{"type":"blocks","to":"x"},{"type":"relates-to","to":"y","note":"a b"}]\nstatus: open');
   assert.equal(fm.withoutEdge(raw, { type: "blocks", to: "x" }),
