@@ -518,7 +518,10 @@ Otherwise there is **no declarative field list and no status enum.** Custom fiel
 regex parser (`lib/kernel/frontmatter.js`, the one node-file grammar) accepts
 (simple `key: value` scalars, YAML-folded multi-line values, the allowlisted
 list keys as `[a, b]` inline or block lists, `- {type: X, to: Y}` flow-form or
-`- type: X` / `to: Y` block-form edges — and nothing fancier) is carried
+`- type: X` / `to: Y` block-form edges, or an inline `edges: [{type: X, to:
+Y}]` list in JSON or YAML flow style, which may span lines — a populated
+`edges:` value that is not such a list is a parse fault, never silently
+dropped — and nothing fancier) is carried
 verbatim on the node. What a field MUST contain, and which
 status changes are legal, are enforced **in attached code** — two pure functions
 the server runs on the write path:

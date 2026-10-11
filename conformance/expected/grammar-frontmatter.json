@@ -207,6 +207,62 @@
       "project": "grammar"
     }
   },
+  "bad-inline-edges.md": {
+    "fault": "unparseable inline edges list \"[{type: blocks}]\" in bad-inline-edges.md",
+    "crlf": false,
+    "lex": {
+      "entries": [
+        {
+          "kind": "scalar",
+          "key": "id",
+          "start": 0,
+          "end": 1
+        },
+        {
+          "kind": "scalar",
+          "key": "type",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "kind": "scalar",
+          "key": "title",
+          "start": 2,
+          "end": 3
+        },
+        {
+          "kind": "edges",
+          "key": "edges",
+          "start": 3,
+          "end": 4
+        },
+        {
+          "kind": "scalar",
+          "key": "status",
+          "start": 4,
+          "end": 5
+        }
+      ],
+      "edges": [],
+      "faults": [
+        {
+          "line": 3,
+          "message": "unparseable inline edges list \"[{type: blocks}]\""
+        }
+      ]
+    },
+    "lenient": {
+      "edges": [],
+      "pin": [],
+      "exclude": [],
+      "body": "Strict throws; lenient records the fault and keeps status.",
+      "file": "bad-inline-edges.md",
+      "id": "bad-inline-edges",
+      "type": "task",
+      "title": "A populated inline edges value that is not an edge list faults",
+      "status": "open"
+    }
+  },
   "bad-no-fence.md": {
     "fault": "no frontmatter in bad-no-fence.md",
     "crlf": null
@@ -869,6 +925,168 @@
       "date": "2026-09-27"
     },
     "serialized": "---\nid: task-block-edges\ntype: task\nproject: grammar\ntitle: Block-form edges with comments and blank lines\nsummary: Edges in YAML block form, opened by any key, target alias, extra attributes.\nstatus: open\ndate: 2026-09-27\nedges:\n  - {type: blocks, to: dec-flow-edges}\n  - {type: relates-to, to: corr-lists}\n  - {type: assigned, to: agent-x, profile: profile-y}\n  - {type: mentions, to: norm-inverse-alias}\n---\n\nBody of the block-form task.\n",
+    "roundtrip": true
+  },
+  "task-inline-edges.md": {
+    "node": {
+      "edges": [
+        {
+          "type": "blocks",
+          "to": "task-block-edges"
+        },
+        {
+          "type": "relates-to",
+          "to": "dec-flow-edges",
+          "note": "a b"
+        },
+        {
+          "type": "mentions",
+          "to": "norm-inverse-alias"
+        },
+        {
+          "type": "relates-to",
+          "to": "art-crlf",
+          "profile": "profile-x"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "Two inline headers; the reader accumulates both.",
+      "file": "task-inline-edges.md",
+      "id": "task-inline-edges",
+      "type": "task",
+      "title": "Inline edge lists are read, never dropped",
+      "summary": "A JSON array, a YAML flow sequence, and a flow list spanning lines all read as edges.",
+      "status": "open"
+    },
+    "crlf": false,
+    "lex": {
+      "entries": [
+        {
+          "kind": "scalar",
+          "key": "id",
+          "start": 0,
+          "end": 1
+        },
+        {
+          "kind": "scalar",
+          "key": "type",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "kind": "scalar",
+          "key": "title",
+          "start": 2,
+          "end": 3
+        },
+        {
+          "kind": "scalar",
+          "key": "summary",
+          "start": 3,
+          "end": 4
+        },
+        {
+          "kind": "edges",
+          "key": "edges",
+          "start": 4,
+          "end": 5,
+          "inline": {
+            "start": 4,
+            "end": 5
+          }
+        },
+        {
+          "kind": "scalar",
+          "key": "status",
+          "start": 5,
+          "end": 6
+        },
+        {
+          "kind": "edges",
+          "key": "edges",
+          "start": 6,
+          "end": 10,
+          "inline": {
+            "start": 6,
+            "end": 10
+          }
+        }
+      ],
+      "edges": [
+        {
+          "edge": {
+            "type": "blocks",
+            "to": "task-block-edges"
+          },
+          "form": "inline",
+          "start": 4,
+          "end": 5
+        },
+        {
+          "edge": {
+            "type": "relates-to",
+            "to": "dec-flow-edges",
+            "note": "a b"
+          },
+          "form": "inline",
+          "start": 4,
+          "end": 5
+        },
+        {
+          "edge": {
+            "type": "mentions",
+            "to": "norm-inverse-alias"
+          },
+          "form": "inline",
+          "start": 6,
+          "end": 10
+        },
+        {
+          "edge": {
+            "type": "relates-to",
+            "to": "art-crlf",
+            "profile": "profile-x"
+          },
+          "form": "inline",
+          "start": 6,
+          "end": 10
+        }
+      ],
+      "faults": []
+    },
+    "lenient": {
+      "edges": [
+        {
+          "type": "blocks",
+          "to": "task-block-edges"
+        },
+        {
+          "type": "relates-to",
+          "to": "dec-flow-edges",
+          "note": "a b"
+        },
+        {
+          "type": "mentions",
+          "to": "norm-inverse-alias"
+        },
+        {
+          "type": "relates-to",
+          "to": "art-crlf",
+          "profile": "profile-x"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "Two inline headers; the reader accumulates both.",
+      "file": "task-inline-edges.md",
+      "id": "task-inline-edges",
+      "type": "task",
+      "title": "Inline edge lists are read, never dropped",
+      "summary": "A JSON array, a YAML flow sequence, and a flow list spanning lines all read as edges.",
+      "status": "open"
+    },
+    "serialized": "---\nid: task-inline-edges\ntype: task\ntitle: Inline edge lists are read, never dropped\nsummary: A JSON array, a YAML flow sequence, and a flow list spanning lines all read as edges.\nstatus: open\nedges:\n  - {type: blocks, to: task-block-edges}\n  - type: relates-to\n    to: dec-flow-edges\n    note: a b\n  - {type: mentions, to: norm-inverse-alias}\n  - {type: relates-to, to: art-crlf, profile: profile-x}\n---\n\nTwo inline headers; the reader accumulates both.\n",
     "roundtrip": true
   }
 }

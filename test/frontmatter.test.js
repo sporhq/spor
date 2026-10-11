@@ -198,3 +198,77 @@ test("the lint reads list shapes off the parsed node: a block-form tags list on 
   assert.deepEqual(r.warnings.filter((w) => /tags/.test(w)), []);
   assert.deepEqual(r.nodes["repo-x"].tags, ["a", "b"]);
 });
+
+// issue-spor-frontmatter-inline-edges-silently-dropped: a populated inline
+// `edges: [...]` value was ignored by both reads, so a node written that way
+// (put_node, REST, capture, merge — models emit flow-style JSON) lost its edges
+// with no refusal. It is now read, or refused; never dropped.
+test("inline edges: a JSON array, a YAML flow sequence and a multi-line flow list all read as edges, in both reads", () => {
+  const cases = [
+    ['edges: [{"type":"blocks","to":"task-x"},{"type": "relates-to", "to": "dec-y", "profile": "p-1"}]',
+      [{ type: "blocks", to: "task-x" }, { type: "relates-to", to: "dec-y", profile: "p-1" }]],
+    ["edges: [{type: blocks, to: task-x}, {type: 'relates-to', target: \"dec-y\", note: \"a, b\"}]",
+      [{ type: "blocks", to: "task-x" }, { type: "relates-to", to: "dec-y", note: "a, b" }]],
+    ["edges: [\n  {type: blocks, to: task-x},\n  {type: relates-to, to: dec-y},\n]",
+      [{ type: "blocks", to: "task-x" }, { type: "relates-to", to: "dec-y" }]],
+    ["edges: []", []],
+    ["edges: ~", []],
+    ["edges: # none yet", []], // a YAML comment is an empty value, not a fault
+    ["edges: [{type: blocks, to: task-x}] # trailing", [{ type: "blocks", to: "task-x" }]],
+    ["edges: [ # list\n  {type: blocks, to: task-x}, # one\n  {type: mentions, to: \"y #2\"}\n]",
+      [{ type: "blocks", to: "task-x" }, { type: "mentions", to: "y #2" }]],
+    // an apostrophe inside an unquoted value is a literal, not an opening quote
+    ["edges: [{type: blocks, to: task-x, note: don't}]", [{ type: "blocks", to: "task-x", note: "don't" }]],
+    // and YAML's '' escape inside a single-quoted scalar does not close it
+    ["edges: [{type: blocks, to: task-x, note: 'it''s, # x'}]", [{ type: "blocks", to: "task-x", note: "it's, # x" }]],
+  ];
+  for (const [line, want] of cases) {
+    const raw = doc(`id: a\ntype: task\n${line}\nstatus: open`);
+    const node = fm.parseFrontmatter(raw, "a.md");
+    assert.deepEqual(node.edges, want, line);
+    assert.equal(node.status, "open", line); // the keys after the list still read
+    const lenient = fm.readNode(raw, "a.md");
+    assert.deepEqual(lenient.faults, [], line);
+    assert.deepEqual(lenient.node.edges, want, line);
+  }
+  // an inline header and block lines under it accumulate, as two headers do
+  const mixed = fm.parseFrontmatter(doc('id: a\nedges: [{"type":"blocks","to":"x"}]\n  - {type: mentions, to: y}'), "a.md");
+  assert.deepEqual(mixed.edges, [{ type: "blocks", to: "x" }, { type: "mentions", to: "y" }]);
+  // the lex range of an inline edge is its whole header
+  const lex = fm.lexFrontmatter("id: a\nedges: [\n  {type: blocks, to: x}\n]\nstatus: open");
+  assert.deepEqual(lex.edges.map((e) => [e.form, e.start, e.end]), [["inline", 1, 4]]);
+  assert.deepEqual(lex.entries.find((e) => e.kind === "edges").inline, { start: 1, end: 4 });
+});
+
+test("inline edges: a populated value that is not an edge list is a parse fault (strict throws, lenient records), never a silent drop", () => {
+  // (an attribute key the block form cannot re-emit is refused too: accepting
+  // it would make the node unloadable after its first edge edit)
+  for (const line of ["edges: [{type: blocks}]", "edges: foo", 'edges: {"outbound": [{"type":"blocks","to":"x"}]}',
+    "edges: [{type: blocks, to: {nested: 1}}]", 'edges: [{"type":"blocks","to":"x","my attr":"z"}]',
+    "edges: [{type: blocks, to: x, -lead: z}]", '[{"type":"blocks","to":"x"}, 3]'.replace(/^/, "edges: "), "edges: [{type: blocks, to: x}"]) {
+    const raw = doc(`id: a\ntype: task\n${line}\nstatus: open`);
+    assert.throws(() => fm.parseFrontmatter(raw, "a.md"),
+      (e) => e.sporParse === true && /^unparseable inline edges list .* in a\.md$/.test(e.message), line);
+    const r = fm.readNode(raw, "a.md");
+    assert.equal(r.faults.length, 1, line);
+    assert.match(r.faults[0], /^unparseable inline edges list /);
+    assert.deepEqual(r.node.edges, [], line);
+    assert.equal(r.node.status, "open", line); // an unclosed list does not swallow the lint's later keys
+  }
+});
+
+test("inline edges: the edge editors rewrite a readable inline header to block form, then splice by parsed identity", () => {
+  const raw = doc('id: a\nedges: [{"type":"blocks","to":"x"},{"type":"relates-to","to":"y","note":"a b"}]\nstatus: open');
+  assert.equal(fm.withoutEdge(raw, { type: "blocks", to: "x" }),
+    doc("id: a\nedges:\n  - type: relates-to\n    to: y\n    note: a b\nstatus: open"));
+  assert.equal(fm.withEdge(raw, "mentions", "z"),
+    doc("id: a\nedges:\n  - {type: blocks, to: x}\n  - type: relates-to\n    to: y\n    note: a b\n  - {type: mentions, to: z}\nstatus: open"));
+  // an empty inline header becomes a bare one rather than holding a block line under `[]`
+  assert.equal(fm.withEdge(doc("id: a\nedges: []"), "blocks", "x"), doc("id: a\nedges:\n  - {type: blocks, to: x}"));
+  assert.equal(fm.withoutEdge(raw, { type: "blocks", to: "nope" }), null);
+  // a non-edge editor leaves the inline header byte-for-byte
+  assert.equal(fm.withKey(raw, "status", "done"), raw.replace("status: open", "status: done"));
+  // an unreadable inline value is never rewritten by an edge editor
+  const bad = doc("id: a\nedges: [{type: blocks}]");
+  assert.equal(fm.withEdge(bad, "mentions", "z"), doc("id: a\nedges: [{type: blocks}]\n  - {type: mentions, to: z}"));
+});

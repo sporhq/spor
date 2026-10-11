@@ -72,8 +72,12 @@ client-facing contract is this repo's API.md.
   array; only these allowlisted keys get block-list support, everything else
   stays a folded scalar), and `- {type: X, to: Y}` edges, which may carry
   extra flat attributes (`- {type: assigned, to: agent-X, profile:
-  profile-Y}`, preserved on the edge object). Don't write nodes with any
-  other YAML constructs.
+  profile-Y}`, preserved on the edge object). An inline `edges: [...]` list
+  (JSON or YAML flow maps, possibly spanning lines) also reads as edges, and a
+  populated `edges:` value that is not one is a parse FAULT, never a silent
+  drop (issue-spor-frontmatter-inline-edges-silently-dropped); the edge
+  editors rewrite a readable inline header to block form before splicing.
+  Don't write nodes with any other YAML constructs.
 
 ## Verifying changes
 
