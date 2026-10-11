@@ -1144,5 +1144,98 @@
     },
     "serialized": "---\nid: task-inline-edges\ntype: task\ntitle: Inline edge lists are read, never dropped\nsummary: A JSON array, a YAML flow sequence, and a flow list spanning lines all read as edges.\nstatus: open\nedges:\n  - {type: blocks, to: task-block-edges}\n  - type: relates-to\n    to: dec-flow-edges\n    note: a b\n  - {type: mentions, to: norm-inverse-alias}\n  - {type: relates-to, to: art-crlf, profile: profile-x}\n---\n\nTwo inline headers; the reader accumulates both.\n",
     "roundtrip": true
+  },
+  "task-object-edges.md": {
+    "node": {
+      "edges": [
+        {
+          "type": "blocks",
+          "to": "task-inline-edges"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "Both reads take the outbound edge, ignore inbound, and the lenient lex notes\nthe shape as normalisable; the serialization is block/flow form.",
+      "file": "task-object-edges.md",
+      "id": "task-object-edges",
+      "type": "task",
+      "title": "The spor get --json edges object reads as its outbound edges",
+      "status": "open"
+    },
+    "crlf": false,
+    "lex": {
+      "entries": [
+        {
+          "kind": "scalar",
+          "key": "id",
+          "start": 0,
+          "end": 1
+        },
+        {
+          "kind": "scalar",
+          "key": "type",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "kind": "scalar",
+          "key": "title",
+          "start": 2,
+          "end": 3
+        },
+        {
+          "kind": "edges",
+          "key": "edges",
+          "start": 3,
+          "end": 4,
+          "inline": {
+            "start": 3,
+            "end": 4
+          }
+        },
+        {
+          "kind": "scalar",
+          "key": "status",
+          "start": 4,
+          "end": 5
+        }
+      ],
+      "edges": [
+        {
+          "edge": {
+            "type": "blocks",
+            "to": "task-inline-edges"
+          },
+          "form": "inline",
+          "start": 3,
+          "end": 4
+        }
+      ],
+      "faults": [],
+      "notes": [
+        {
+          "line": 3,
+          "message": "edges written as an {outbound, inbound} object — read as its 1 outbound edge(s), inbound ignored; normalise to block form"
+        }
+      ]
+    },
+    "lenient": {
+      "edges": [
+        {
+          "type": "blocks",
+          "to": "task-inline-edges"
+        }
+      ],
+      "pin": [],
+      "exclude": [],
+      "body": "Both reads take the outbound edge, ignore inbound, and the lenient lex notes\nthe shape as normalisable; the serialization is block/flow form.",
+      "file": "task-object-edges.md",
+      "id": "task-object-edges",
+      "type": "task",
+      "title": "The spor get --json edges object reads as its outbound edges",
+      "status": "open"
+    },
+    "serialized": "---\nid: task-object-edges\ntype: task\ntitle: The spor get --json edges object reads as its outbound edges\nstatus: open\nedges:\n  - {type: blocks, to: task-inline-edges}\n---\n\nBoth reads take the outbound edge, ignore inbound, and the lenient lex notes\nthe shape as normalisable; the serialization is block/flow form.\n",
+    "roundtrip": true
   }
 }

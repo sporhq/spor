@@ -243,7 +243,7 @@ test("inline edges: a JSON array, a YAML flow sequence and a multi-line flow lis
 test("inline edges: a populated value that is not an edge list is a parse fault (strict throws, lenient records), never a silent drop", () => {
   // (an attribute key the block form cannot re-emit is refused too: accepting
   // it would make the node unloadable after its first edge edit)
-  for (const line of ["edges: [{type: blocks}]", "edges: foo", 'edges: {"outbound": [{"type":"blocks","to":"x"}]}',
+  for (const line of ["edges: [{type: blocks}]", "edges: foo",
     "edges: [{type: blocks, to: {nested: 1}}]", 'edges: [{"type":"blocks","to":"x","my attr":"z"}]',
     "edges: [{type: blocks, to: x, -lead: z}]", '[{"type":"blocks","to":"x"}, 3]'.replace(/^/, "edges: "), "edges: [{type: blocks, to: x}"]) {
     const raw = doc(`id: a\ntype: task\n${line}\nstatus: open`);
@@ -254,6 +254,72 @@ test("inline edges: a populated value that is not an edge list is a parse fault 
     assert.match(r.faults[0], /^unparseable inline edges list /);
     assert.deepEqual(r.node.edges, [], line);
     assert.equal(r.node.status, "open", line); // an unclosed list does not swallow the lint's later keys
+  }
+});
+
+// issue-spor-nexavo-node-object-edges-unparseable-on-lib-0-31: a client pasted
+// the `spor get --json` edges object back as the header; lib 0.29 loaded the
+// node (dropping its edges) and 0.31.2 skipped it. It now reads as its outbound
+// edges, in both reads, with a normalisable note — and any other object faults.
+test("inline edges: the {outbound, inbound} object reads as its outbound edges, inbound ignored, with a normalisable note", () => {
+  const cases = [
+    ['edges: {"outbound": [], "inbound": []}', []],
+    ["edges: {}", []],
+    ["edges: { }", []],
+    ['edges: {"outbound": []}', []],
+    ['edges: {"outbound": [{"type":"blocks","to":"task-x"},{"type":"relates-to","to":"dec-y","note":"a b"}], "inbound": [{"from":"z","type":"blocks"}]}',
+      [{ type: "blocks", to: "task-x" }, { type: "relates-to", to: "dec-y", note: "a b" }]],
+    ['edges: {"inbound": [{"from":"z","type":"blocks"}], "outbound": [{"type":"blocks","to":"task-x"}]}', [{ type: "blocks", to: "task-x" }]],
+    ['edges: {"outbound": [{"type":"blocks","target":"task-x"}]} # pasted', [{ type: "blocks", to: "task-x" }]],
+    // a pretty-printed object spans lines until its closing brace
+    ['edges: {\n  "outbound": [\n    {"type": "blocks", "to": "task-x"}\n  ],\n  "inbound": []\n}', [{ type: "blocks", to: "task-x" }]],
+  ];
+  for (const [line, want] of cases) {
+    const raw = doc(`id: a\ntype: task\n${line}\nstatus: open`);
+    const node = fm.parseFrontmatter(raw, "a.md");
+    assert.deepEqual(node.edges, want, line);
+    assert.equal(node.status, "open", line);
+    const lenient = fm.readNode(raw, "a.md");
+    assert.deepEqual(lenient.faults, [], line);
+    assert.deepEqual(lenient.node.edges, want, line);
+    assert.equal(lenient.notes.length, 1, line);
+    assert.match(lenient.notes[0], /\{outbound, inbound\} object .*normalise to block form/, line);
+    assert.equal(lenient.node.status, "open", line);
+  }
+  // a list or block form carries no note
+  assert.deepEqual(fm.readNode(doc("id: a\nedges: [{type: blocks, to: x}]"), "a.md").notes, []);
+  // the editors expand it to block form (inbound dropped), like any inline list
+  const raw = doc('id: a\nedges: {"outbound": [{"type":"blocks","to":"x"}], "inbound": [{"from":"q","type":"mentions"}]}\nstatus: open');
+  assert.equal(fm.withEdge(raw, "mentions", "z"), doc("id: a\nedges:\n  - {type: blocks, to: x}\n  - {type: mentions, to: z}\nstatus: open"));
+  assert.equal(fm.withoutEdge(raw, { type: "blocks", to: "x" }), doc("id: a\nedges:\nstatus: open"));
+  assert.equal(fm.withEdge(doc('id: a\nedges: {"outbound": [], "inbound": []}'), "blocks", "x"), doc("id: a\nedges:\n  - {type: blocks, to: x}"));
+});
+
+test("inline edges: any other object shape still faults (strict throws, lenient records), never a silent drop", () => {
+  for (const line of [
+    'edges: {"inbound": [{"from":"z","type":"blocks"}]}', // no outbound
+    'edges: {"inbound": []}',
+    'edges: {"outbound": [], "other": []}', // an extra key
+    'edges: {"outbound": {"type":"blocks","to":"x"}}', // not an array
+    'edges: {"outbound": [], "inbound": {}}',
+    'edges: {"outbound": [{"type":"blocks"}]}', // an incomplete edge
+    'edges: {"outbound": [{"type":"blocks","to":"x"}, 3]}',
+    'edges: {"outbound": [{"type":"blocks","to":{"id":"x"}}]}', // nested value
+    'edges: {"outbound": [{"type":"blocks","to":"x"}], "outbound": []}', // a duplicated key would drop edges
+    'edges: {"outbound": [], "outbound": [{"type":"blocks","to":"x"}]}',
+    "edges: {outbound: [{type: blocks, to: x}]}", // YAML flow, not JSON
+    'edges: {"type":"blocks","to":"x"}', // a bare edge map
+    'edges: {"outbound": [{"type":"blocks","to":"x"}]', // unclosed
+    'edges: {"outbound": []} trailing',
+  ]) {
+    const raw = doc(`id: a\ntype: task\n${line}\nstatus: open`);
+    assert.throws(() => fm.parseFrontmatter(raw, "a.md"),
+      (e) => e.sporParse === true && /^unparseable inline edges list .* in a\.md$/.test(e.message), line);
+    const r = fm.readNode(raw, "a.md");
+    assert.equal(r.faults.length, 1, line);
+    assert.deepEqual(r.notes, [], line);
+    assert.deepEqual(r.node.edges, [], line);
+    assert.equal(r.node.status, "open", line);
   }
 });
 

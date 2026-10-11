@@ -161,6 +161,7 @@ const KINDS = {
       if (doc) {
         const lex = kfm.lexFrontmatter(doc.frontmatter, f, { lenient: true });
         rec.lex = { entries: lex.entries, edges: lex.edges, faults: lex.faults };
+        if (lex.notes.length) rec.lex.notes = lex.notes;
         rec.lenient = kfm.readNode(raw, f).node;
       }
       if (rec.node) {

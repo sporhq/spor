@@ -2026,6 +2026,35 @@ b
   assert.equal(v.nodes["task-bad"], undefined);
 });
 
+test("validateGraph: an {outbound, inbound} edges object loads (no error) and warns as normalisable (issue-spor-nexavo-node-object-edges-unparseable-on-lib-0-31)", () => {
+  const fx = tmpGraph({
+    "task-obj.md": `---
+id: task-obj
+type: task
+title: T
+summary: s
+date: 2026-10-07
+edges: {"outbound": [{"type": "relates-to", "to": "dec-a"}], "inbound": []}
+---
+b
+`,
+    "dec-a.md": `---
+id: dec-a
+type: decision
+title: A
+summary: s
+date: 2026-10-07
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.warnings.some((w) => /task-obj\.md: edges written as an \{outbound, inbound\} object/.test(w)), v.warnings.join("\n"));
+  assert.equal(v.count, 2);
+  assert.deepEqual(v.nodes["task-obj"].edges, [{ type: "relates-to", to: "dec-a" }]);
+});
+
 test("validateGraph: a loader-skipped schema file does not register its type — unknown-type still warns", () => {
   const fx = tmpGraph({
     "schema-node-widget.md": `---
