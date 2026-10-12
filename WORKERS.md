@@ -386,7 +386,18 @@ still goes through `deps.dispatch` → `cmdDispatch` with all its guards.
   or scope) are `local.no_capable_member`:
   reported, the run released for a capable machine and cooled locally; members
   stuck for a global reason (a person's call, a blocker) leave the run held and
-  visible, which the server's `blocked` overlay reports. Nothing local is ever
+  visible, which the server's `blocked` overlay reports. A verdict the graph
+  can change (not agent-ready, out of scope, human, declined, assigned
+  elsewhere) is never judged off a cooldown: those members are re-classified
+  from the current page every pass, so a readiness stamped after the skip makes
+  the member runnable on the next pass instead of releasing the run on a stale
+  reading. A run released over such members keeps their ids on its local
+  cooldown and re-reads just those from the queue each pass; the moment one
+  reads runnable here the cooldown lifts and the run is re-claimed (a release
+  over only capability or profile refusals keeps the full `retryAfterMs`).
+  A worker that owns no run polls at the base `intervalMs`, never the idle
+  backoff, so a fresh Start is claimed within one interval
+  (task-split-spor-2a9f439e2bae). Nothing local is ever
   written as run state, and nothing about a launch is persisted for the source:
   a restart re-derives its whole view from the server's run read and this box's
   own run journal (`spor work --status` shows the owned run under `serve`).

@@ -3786,10 +3786,15 @@ test("programStanding: moving while any member could still move; stuck readings 
   assert.strictEqual(workLoop.programStanding({ members: [m("c", { agents: ["agent-me"] })] }, { page: page([]), selfAgent: "agent-me" }).state, "halted");
   assert.strictEqual(workLoop.programStanding({ members: [m("c", { agents: ["agent-me", "agent-other"] })] }, { page: page([]), selfAgent: "agent-me" }).state, "halted", "also ours = ours");
   // The edge alone outlives a lease: back on the page, skipped as assigned
-  // elsewhere, it is stuck (named), never a wait without end.
+  // elsewhere, it is stuck (named), never a wait without end. The page's own
+  // reading decides, not the cooldown (an assigned-elsewhere cooldown is
+  // re-derived every pass, task-split-spor-2a9f439e2bae)...
   const elsewhere = new Map([["c", { reason: "assigned to agent agent-other", kind: "assigned-elsewhere", until: 99 }]]);
-  const stale = workLoop.programStanding({ members: [m("c", { agents: ["agent-other"] })] }, { page: page(["c"]), skipped: elsewhere, now: 1, selfAgent: "agent-me" });
+  const assignedPage = new Map([["c", { id: "c", readiness: "agent", assigned_agents: ["agent-other"] }]]);
+  const stale = workLoop.programStanding({ members: [m("c", { agents: ["agent-other"] })] }, { page: assignedPage, skipped: elsewhere, now: 1, selfAgent: "agent-me" });
   assert.deepStrictEqual(stale.stuck, [{ id: "c", why: "assigned to agent agent-other" }]);
+  // ...so once the page stops carrying the foreign assignment, it moves.
+  assert.strictEqual(workLoop.programStanding({ members: [m("c")] }, { page: page(["c"]), skipped: elsewhere, now: 1, selfAgent: "agent-me" }).state, "moving");
   // A human member is stuck even with a foreign routing edge.
   assert.strictEqual(workLoop.programStanding({ members: [m("h", { human: "requires human", agents: ["agent-other"] })] }, { page: page([]), selfAgent: "agent-me" }).state, "halted");
   // Everything done (or no members): complete.
