@@ -2630,9 +2630,12 @@ fix cycles): the implementer is dispatched back into the run's checkout with the
 person's note as the evidence, its commit moves the head, and the re-judged
 gate files a FRESH approval item for the new candidate (the id folds the head
 in), so the next round is a new sign-off on the new candidate — the server
-files nothing for it. The re-judge is the same gate first; once it passes, a
-moved head restarts the list from gate 0 as every fix cycle does, and an
-earlier passing approval of the same head is read back, not re-asked. With the
+files nothing for it. Unlike a review or command gate's fix cycle (which
+re-judges the same gate first), a rework that moved the head restarts the list
+from gate 0: the tests and the review judge the new candidate BEFORE a person
+is asked to sign off on it, and the human gate resumes at its next cycle when
+the list reaches it. Nothing is escalated while the rework is retrying — the
+approval item becomes the escalation only when the request settles. With the
 cycles spent the request settles exactly as a refusal: failed, escalated to the
 approval item, never rescued — and so does a request read back after a fix that
 left the head where it was (the gate re-read the SAME item, so nobody was asked

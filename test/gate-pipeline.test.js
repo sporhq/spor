@@ -928,6 +928,48 @@ test("a human gate's changes_requested sends the implementer back with the note 
   assert.match(refused.gates[0].detail, /requested changes/);
 });
 
+// The rework a person asked for is a NEW candidate: it goes back through the
+// tests and the review from gate 0 before anyone is asked to sign off again —
+// never the human gate re-asking first and the earlier gates re-judging after
+// the person already signed. And while the rework is still retrying, nothing
+// has been escalated, so no record says it was.
+test("a human gate's changes_requested rework restarts the list from gate 0 — tests and review judge the new candidate before sign-off is asked again", async () => {
+  const headOf = (n) => `headsha${String(n).repeat(33)}`;
+  const requested = { state: "changes_requested", by: "person-a", decision: "dec-signoff-abc", note: "Rename the flag." };
+  const order = [];
+  let fixed = 0;
+  const w = fakes({
+    approval: (seen) => (seen.human.length < 2 ? requested : { state: "approved", by: "dec-signoff-def" }),
+    fix: () => {
+      fixed += 1;
+      order.push("fix");
+      return { ok: true };
+    },
+  });
+  w.deps.changedPaths = async () => ({ ok: true, paths: ["lib/auth.js"], head: headOf(fixed ? 2 : 1), base: "basesha0000000000000000000000000000000002", trustedRef: "main", trustedSha: "trustsha000000000000000000000000000000003", branch: "task-demo" });
+  const { runSuite, review, fileHumanItem } = w.deps;
+  w.deps.runSuite = async (args) => { order.push(`acceptance@${fixed ? 2 : 1}`); return runSuite(args); };
+  w.deps.review = async (args) => { order.push(`review@${fixed ? 2 : 1}`); return review(args); };
+  w.deps.fileHumanItem = async (args) => { order.push(`signoff@${args.head === headOf(2) ? 2 : 1}`); return fileHumanItem(args); };
+  const factory = factoryOf({
+    ...BASE,
+    gates: [
+      { id: "acceptance", kind: "command", command: "npm test" },
+      { id: "review", kind: "agent-review", profile: "profile-review" },
+      { id: "signoff", kind: "human", risk: ["touches:auth"], cycles: 1 },
+    ],
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: w.deps });
+  assert.strictEqual(res.state, "passed", JSON.stringify(res));
+  assert.deepStrictEqual(order, ["acceptance@1", "review@1", "signoff@1", "fix", "acceptance@2", "review@2", "signoff@2"]);
+  assert.strictEqual(w.seen.fixes.length, 1);
+  assert.strictEqual(w.seen.escalations.length, 0);
+  for (const f of w.seen.facts) assert.doesNotMatch(f.markdown, /Escalated to task-approve-x/, `${f.id} records an escalation while the rework was retrying`);
+  const signoff = res.gates.filter((g) => g.gate === "signoff");
+  assert.strictEqual(signoff[signoff.length - 1].verdict, "passed");
+  assert.ok(res.gates.every((g) => g.escalated_to == null), JSON.stringify(res.gates));
+});
+
 test("a gate ordered after a failed one never runs — the pipeline stops at the first refusal", async () => {
   const factory = factoryOf({
     ...BASE,
@@ -2471,7 +2513,8 @@ test("an abandoned approval stamped changes_requested reads as a request for cha
   const verdict = gateRunner.approvalVerdict(read, { id: "task-approve-cr", head: "h" });
   assert.strictEqual(verdict.passed, false);
   assert.ok(!verdict.noRetry, "a request for changes is retryable");
-  assert.strictEqual(verdict.escalatedTo, "task-approve-cr");
+  assert.strictEqual(verdict.escalatedTo, undefined, "nothing is escalated while the request may still be reworked");
+  assert.strictEqual(verdict.changesRequested.approval, "task-approve-cr", "the cycle loop escalates to the approval item only when the request settles");
 
   // The stamp alone is not a request for changes.
   item("task-approve-nodec", "signoff_verdict: changes_requested\nsignoff_decision: dec-signoff-missing\n");
