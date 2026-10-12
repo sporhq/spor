@@ -403,7 +403,7 @@ function loopHarness({ server, clock, members = ["task-a", "task-b"], human = []
   const state = { dispatched: [], runs: new Map(), sleeps: [], candidateCalls: 0, pendingGateCalls: 0, published: [], rechecks: [] };
   const recheck = async (ids) => {
     state.rechecks.push(ids);
-    return ids.some((id) => members.includes(id) && readiness(id) === "agent");
+    return ids.filter((id) => members.includes(id) && readiness(id) === "agent");
   };
   const { source, log } = sourceFor(server, { clock, recheck, cooldownMs: 10_000 });
   const control = { stopping: false, reason: null, wake: () => {} };
@@ -568,20 +568,68 @@ test("a release over only capability/profile refusals keeps the full cooldown; a
   const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001" }] });
   const asked = [];
   let runnable = false;
-  const { source } = sourceFor(server, { clock, recheck: async (ids) => (asked.push(ids), runnable) });
+  const { source } = sourceFor(server, { clock, recheck: async (ids) => (asked.push(ids), runnable ? ids : []) });
   await source.pass();
   await source.release("local.no_capable_member", "task-b (profile-x not satisfiable)");
   assert.strictEqual((await source.pass()).owned, false);
   assert.deepStrictEqual(asked, [], "nothing to re-read: a capability refusal is not changed by the graph");
 
   await source.release("local.no_capable_member"); // no-op: not owned
-  const other = sourceFor(server, { clock, instance: "inst-2", recheck: async (ids) => (asked.push(ids), runnable) });
+  const other = sourceFor(server, { clock, instance: "inst-2", recheck: async (ids) => (asked.push(ids), runnable ? ids : []) });
   assert.strictEqual((await other.source.pass()).owned, true);
   await other.source.release("local.no_capable_member", "task-a (not agent-ready); task-b (profile)", { recheck: ["task-a"] });
   assert.strictEqual((await other.source.pass()).owned, false, "still not ready: cooled");
   assert.deepStrictEqual(asked, [["task-a"]]);
   runnable = true;
   assert.strictEqual((await other.source.pass()).owned, true, "ready now: the cooldown lifts and the run is claimed this pass");
+});
+
+test("cooled runs share ONE recheck read per claim attempt; a failed listing, claim or recheck read marks the pass an outage", async () => {
+  const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+  const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001" }, { run_id: "prun-0000000000000002" }] });
+  const asked = [];
+  let runnable = [];
+  let fail = false;
+  const { source } = sourceFor(server, {
+    clock,
+    recheck: async (ids) => {
+      asked.push(ids);
+      if (fail) throw new Error("queue down");
+      return ids.filter((id) => runnable.includes(id));
+    },
+  });
+  assert.strictEqual((await source.pass()).run_id, "prun-0000000000000001");
+  await source.release("local.no_capable_member", "task-a (not agent-ready)", { recheck: ["task-a"] });
+  assert.strictEqual((await source.pass()).run_id, "prun-0000000000000002", "the first run cools; the second is claimed");
+  await source.release("local.no_capable_member", "task-c (not agent-ready)", { recheck: ["task-c"] });
+  asked.length = 0;
+  let v = await source.pass();
+  assert.strictEqual(v.owned, false);
+  assert.strictEqual(v.outage, false);
+  assert.deepStrictEqual(asked, [["task-a", "task-c"]], "one read over both cooled runs' members, not one per run");
+  asked.length = 0;
+  runnable = ["task-c"];
+  v = await source.pass();
+  assert.strictEqual(v.run_id, "prun-0000000000000002", "only the run whose member reads runnable lifts");
+  assert.deepStrictEqual(asked, [["task-a", "task-c"]]);
+  await source.release("local.no_capable_member", "task-c (not agent-ready)", { recheck: ["task-c"] });
+  runnable = [];
+  fail = true;
+  v = await source.pass();
+  assert.strictEqual(v.owned, false);
+  assert.strictEqual(v.outage, true, "a failed recheck read is an outage: the idle backoff holds");
+  fail = false;
+  assert.strictEqual((await source.pass()).outage, false);
+  server.down = true;
+  assert.strictEqual((await source.pass()).outage, true, "a failed listing is an outage");
+  server.down = false;
+  // A listing that answers but a claim that does not (transport) is one too.
+  clock.now += 120_000; // both cooldowns lapse
+  const handle = server.handle;
+  server.handle = (method, p, body, bearer) => (p.endsWith("/claim") ? (server.requests.push({ method, path: p }), { transport: true, error: "ECONNRESET" }) : handle(method, p, body, bearer));
+  v = await source.pass();
+  assert.strictEqual(v.owned, false);
+  assert.strictEqual(v.outage, true, "a transient claim failure is an outage");
 });
 
 test("selectWorkCandidates / classifyProgramMember: a re-derivable cooldown never hides a fresh page reading; an attempt cooldown still does", () => {
