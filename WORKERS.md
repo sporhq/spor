@@ -2622,8 +2622,9 @@ task-spor-signoff-request-changes-server):
 The status is still a refusal's, deliberately: a client that predates this
 reads a request for changes as a refusal, which is the decided fallback. This
 client reads the stamp, then the decision it names: a decision that does not
-say `verdict: changes_requested` or does not link the item is the refusal the
-status says, and one that cannot be READ is still pending (the next poll asks
+say `verdict: changes_requested`, does not link the item by `relates-to`, or
+carries an `authored_by_agent` stamp (a dispatched agent wrote it, not a
+person) is the refusal the status says, and one that cannot be READ is still pending (the next poll asks
 again). The answer becomes a FIX CYCLE charged to the gate's own `cycles`
 (zero by default — a factory opts into reworks exactly as it opts into review
 fix cycles): the implementer is dispatched back into the run's checkout with the

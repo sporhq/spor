@@ -2524,6 +2524,14 @@ test("an abandoned approval stamped changes_requested reads as a request for cha
   assert.strictEqual((await sporCli.gateApprovalState(cfg, "task-approve-noverdict")).state, "rejected");
   item("task-approve-elsewhere", "signoff_verdict: changes_requested\nsignoff_decision: dec-signoff-cr\n");
   assert.strictEqual((await sporCli.gateApprovalState(cfg, "task-approve-elsewhere")).state, "rejected", "a decision about another item does not back the stamp");
+  // A decision linked by any edge but relates-to does not back the stamp.
+  item("task-approve-wrongedge", "signoff_verdict: changes_requested\nsignoff_decision: dec-signoff-wrongedge\n");
+  write("dec-signoff-wrongedge", "type: decision\ntitle: Changes requested on the signoff gate\nsummary: A person requested changes on the candidate at the signoff human gate from the workspace sign-off card.\nstatus: settled\nverdict: changes_requested\nedges:\n  - {type: blocks, to: task-approve-wrongedge}\n", "Note:\n\n> Rename the flag.");
+  assert.strictEqual((await sporCli.gateApprovalState(cfg, "task-approve-wrongedge")).state, "rejected");
+  // A decision a dispatched agent wrote is not a person's answer: the refusal stands.
+  item("task-approve-byagent", "signoff_verdict: changes_requested\nsignoff_decision: dec-signoff-byagent\n");
+  write("dec-signoff-byagent", "type: decision\ntitle: Changes requested on the signoff gate\nsummary: A person requested changes on the candidate at the signoff human gate from the workspace sign-off card.\nstatus: settled\nverdict: changes_requested\nauthored_by_agent: agent-impl\nedges:\n  - {type: relates-to, to: task-approve-byagent}\n", "Note:\n\n> Rename the flag.");
+  assert.strictEqual((await sporCli.gateApprovalState(cfg, "task-approve-byagent")).state, "rejected");
   // An open item with the stamp is still pending (the status is the signal).
   write("task-approve-open-cr", "type: task\ntitle: Approve the auth change\nsummary: A person must approve the security gate for the auth change before it counts as done.\nstatus: open\nsignoff_verdict: changes_requested\nsignoff_decision: dec-signoff-cr\n");
   assert.strictEqual((await sporCli.gateApprovalState(cfg, "task-approve-open-cr")).state, "pending");
