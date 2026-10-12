@@ -2599,9 +2599,45 @@ paths, and **blocks the resolve** while polling it:
 - it reaches any other terminal status (`abandoned`, `closed`, `superseded`, …)
   → **refused**, the gate fails; the approval item itself is the human record,
   so nothing further is filed;
+- it reaches that same non-resolving terminal status **and** is stamped as a
+  request for changes → **changes requested**, the one RETRYABLE answer (below);
 - nobody answers inside `approval_timeout_ms` (default 24h) → the pipeline
   reports **blocked**, the approval item stands, and the worker moves on rather
   than deciding on the person's behalf.
+
+**Request changes** (task-spor-gate-changes-requested-fix-cycle,
+dec-spor-run-signoff-self-requires-solo-and-request-changes-reworks). A person
+reviewing a candidate can send it back instead of refusing it. The wire shape
+the sign-off door writes (spor-server `run_signoff` `request_changes`,
+task-spor-signoff-request-changes-server):
+
+- ONE decision, written as the person, with `verdict: changes_requested` in its
+  frontmatter, an edge (`relates-to`) to the approval item, and the person's
+  note as the quoted (`> `) block under a body line reading exactly `Note:`;
+- the approval item stamped `signoff_verdict: changes_requested` and
+  `signoff_decision: <that decision's id>`, landed **no later than** its
+  status moving to `abandoned` — a poll that sees the status without the stamp
+  settles a refusal, and that is final.
+
+The status is still a refusal's, deliberately: a client that predates this
+reads a request for changes as a refusal, which is the decided fallback. This
+client reads the stamp, then the decision it names: a decision that does not
+say `verdict: changes_requested` or does not link the item is the refusal the
+status says, and one that cannot be READ is still pending (the next poll asks
+again). The answer becomes a FIX CYCLE charged to the gate's own `cycles`
+(zero by default — a factory opts into reworks exactly as it opts into review
+fix cycles): the implementer is dispatched back into the run's checkout with the
+person's note as the evidence, its commit moves the head, and the re-judged
+gate files a FRESH approval item for the new candidate (the id folds the head
+in), so the next round is a new sign-off on the new candidate — the server
+files nothing for it. The re-judge is the same gate first; once it passes, a
+moved head restarts the list from gate 0 as every fix cycle does, and an
+earlier passing approval of the same head is read back, not re-asked. With the
+cycles spent the request settles exactly as a refusal: failed, escalated to the
+approval item, never rescued — and so does a request read back after a fix that
+left the head where it was (the gate re-read the SAME item, so nobody was asked
+again; one answer is never charged to every cycle). The signal payload (`approval:<id>`) journals
+the decision id and the note, so a re-drive replays the same rework.
 
 The wait is durable (task-spor-gate-human-approval-await-signal): filing the
 item is the gate attempt's activity, and the wait is a workflow signal

@@ -877,6 +877,57 @@ test("a human gate files an approval item, blocks on it, and takes the person's 
   assert.ok(pending.seen.slept <= 11, "and the wait is bounded");
 });
 
+// task-spor-gate-changes-requested-fix-cycle: a person's REQUEST FOR CHANGES
+// is the one retryable human answer — charged to the gate's `cycles`, the
+// implementer sent back with the note, and the re-judged gate asks for
+// sign-off again on the NEW candidate. With no cycles declared it settles as
+// the refusal it always read as.
+test("a human gate's changes_requested sends the implementer back with the note and returns for sign-off on the new candidate", async () => {
+  const head = (n) => ({ ok: true, paths: ["lib/auth.js"], head: `headsha${String(n).repeat(33)}`, base: "basesha0000000000000000000000000000000002", trustedRef: "main", trustedSha: "trustsha000000000000000000000000000000003", branch: "task-demo" });
+  const requested = { state: "changes_requested", by: "person-a", decision: "dec-signoff-abc", note: "Rename the flag and add a test for the expiry path." };
+  const fixes = [];
+  const reworked = fakes({
+    approval: (seen) => (seen.human.length < 2 ? requested : { state: "approved", by: "dec-signoff-def" }),
+    fix: (args) => {
+      fixes.push(args);
+      return { ok: true };
+    },
+  });
+  // The fix commits: every read after it sees the new head.
+  reworked.deps.changedPaths = async () => head(fixes.length ? 2 : 1);
+  const factory = factoryOf({ ...BASE, gates: [{ id: "signoff", kind: "human", risk: ["touches:auth"], cycles: 1 }] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: reworked.deps });
+  assert.strictEqual(res.state, "passed", JSON.stringify(res));
+  assert.strictEqual(fixes.length, 1, "one fix cycle, charged to the gate's cycles");
+  assert.match(fixes[0].evidence, /Rename the flag and add a test for the expiry path\./, "the fixer is handed the person's note");
+  assert.match(fixes[0].detail, /person-a requested changes on the approval task-approve-x \(dec-signoff-abc\)/);
+  assert.strictEqual(reworked.seen.human.length, 2, "the new candidate is filed for sign-off again");
+  assert.deepStrictEqual(reworked.seen.human.map((h) => h.head), [head(1).head, head(2).head], "each round's approval is bound to its own candidate");
+  assert.strictEqual(reworked.seen.escalations.length, 0);
+  assert.strictEqual(reworked.seen.demotions.length, 0);
+
+  // A fix that commits nothing leaves the head — and so the approval item —
+  // where it was: the person's one answer is not charged to every cycle.
+  const stuck = fakes({ changed: ["lib/auth.js"], approval: () => requested });
+  const twice = factoryOf({ ...BASE, gates: [{ id: "signoff", kind: "human", risk: ["touches:auth"], cycles: 3 }] });
+  const unmoved = await gateRunner.runGatePipeline({ item: ITEM, factory: twice, deps: stuck.deps });
+  assert.strictEqual(unmoved.state, "failed");
+  assert.strictEqual(stuck.seen.fixes.length, 1, "one rework, then the unmoved head settles it");
+  assert.match(unmoved.gates[0].detail, /left the head at/);
+  assert.strictEqual(unmoved.escalated_to, "task-approve-x");
+
+  // Cycles spent (zero by default): the request settles as a refusal — the
+  // approval item IS the person's record, no second escalation, no rescue.
+  const spent = fakes({ changed: ["lib/auth.js"], approval: () => requested });
+  const once = factoryOf({ ...BASE, gates: [{ id: "signoff", kind: "human", risk: ["touches:auth"] }] });
+  const refused = await gateRunner.runGatePipeline({ item: ITEM, factory: once, deps: spent.deps });
+  assert.strictEqual(refused.state, "failed");
+  assert.strictEqual(refused.escalated_to, "task-approve-x");
+  assert.strictEqual(spent.seen.fixes.length, 0, "no cycles declared: no rework");
+  assert.strictEqual(spent.seen.escalations.length, 0);
+  assert.match(refused.gates[0].detail, /requested changes/);
+});
+
 test("a gate ordered after a failed one never runs — the pipeline stops at the first refusal", async () => {
   const factory = factoryOf({
     ...BASE,
@@ -2393,6 +2444,46 @@ test("an approval item approves ONLY on a resolving edge — every other termina
   const approved = await sporCli.gateApprovalState(cfg, "task-approve-y");
   assert.strictEqual(approved.state, "approved");
   assert.strictEqual(approved.by, "dec-approved-it");
+});
+
+// task-spor-gate-changes-requested-fix-cycle: the sign-off door's request
+// for changes is a refusal status PLUS the `signoff_verdict`/`signoff_decision`
+// stamps, backed by a decision carrying the note. A stamp the decision does not
+// back reads as the refusal the status says.
+test("an abandoned approval stamped changes_requested reads as a request for changes, with the decision's note", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-approve-cr-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const write = (id, front, body = "Body.") =>
+    fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-10-12\n---\n${body}\n`);
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_MODE: "local" } });
+  const item = (id, stamps) => write(id, `type: task\ntitle: Approve the auth change\nsummary: A person must approve the security gate for the auth change before it counts as done.\nstatus: abandoned\n${stamps}`);
+  const decision = (id, to, verdict = "verdict: changes_requested\n") =>
+    write(id, `type: decision\ntitle: Changes requested on the signoff gate\nsummary: A person requested changes on the candidate at the signoff human gate from the workspace sign-off card.\nstatus: settled\n${verdict}edges:\n  - {type: relates-to, to: ${to}}\n`,
+      "person-a chose **request changes**.\n\nAttestation (as checked):\n\n> I read the diff.\n\nNote:\n\n> Rename the flag.\n> \n> Add a test for expiry.\n\nThe approval item is set abandoned.");
+
+  item("task-approve-cr", "signoff_verdict: changes_requested\nsignoff_decision: dec-signoff-cr\n");
+  decision("dec-signoff-cr", "task-approve-cr");
+  const read = await sporCli.gateApprovalState(cfg, "task-approve-cr");
+  assert.strictEqual(read.state, "changes_requested");
+  assert.strictEqual(read.decision, "dec-signoff-cr");
+  assert.strictEqual(read.note, "Rename the flag.\n\nAdd a test for expiry.");
+  const verdict = gateRunner.approvalVerdict(read, { id: "task-approve-cr", head: "h" });
+  assert.strictEqual(verdict.passed, false);
+  assert.ok(!verdict.noRetry, "a request for changes is retryable");
+  assert.strictEqual(verdict.escalatedTo, "task-approve-cr");
+
+  // The stamp alone is not a request for changes.
+  item("task-approve-nodec", "signoff_verdict: changes_requested\nsignoff_decision: dec-signoff-missing\n");
+  assert.strictEqual((await sporCli.gateApprovalState(cfg, "task-approve-nodec")).state, "rejected");
+  item("task-approve-noverdict", "signoff_verdict: changes_requested\nsignoff_decision: dec-signoff-noverdict\n");
+  decision("dec-signoff-noverdict", "task-approve-noverdict", "");
+  assert.strictEqual((await sporCli.gateApprovalState(cfg, "task-approve-noverdict")).state, "rejected");
+  item("task-approve-elsewhere", "signoff_verdict: changes_requested\nsignoff_decision: dec-signoff-cr\n");
+  assert.strictEqual((await sporCli.gateApprovalState(cfg, "task-approve-elsewhere")).state, "rejected", "a decision about another item does not back the stamp");
+  // An open item with the stamp is still pending (the status is the signal).
+  write("task-approve-open-cr", "type: task\ntitle: Approve the auth change\nsummary: A person must approve the security gate for the auth change before it counts as done.\nstatus: open\nsignoff_verdict: changes_requested\nsignoff_decision: dec-signoff-cr\n");
+  assert.strictEqual((await sporCli.gateApprovalState(cfg, "task-approve-open-cr")).state, "pending");
 });
 
 // issue-spor-factory-rename-strands-pipelines: a factory rename is modeled
