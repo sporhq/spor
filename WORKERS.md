@@ -1289,6 +1289,36 @@ door(s) under `implementation.candidate`:
 | `branch` | `git push <resolved url> <commit>:refs/spor/candidates/<candidate_id> --force-with-lease=<ref>:` — the empty expectation, i.e. **create only if absent**, never `--force` | `{kind, locator, ref, commit, verified_at}` |
 | `both` | both, with the bundle as `reference` and `references[]` carrying both doors | as above |
 
+**The bundle as a tenant asset** (task-spor-worker-uploads-candidate-bundle-asset,
+dec-spor-candidate-bundle-as-tenant-asset). Hosted sign-off has no checkout to
+read a diff from and refuses a `file://` reference, so in **remote mode** a
+bundle publish that VERIFIED is also uploaded through the asset client
+(`POST /v1/assets`, the `spor asset import` door — `importRemote` with
+`mediaType: application/x-git-bundle`, so the image rules do not apply but the
+size cap and the digest pin do) under the idempotency key
+`spor-candidate.<sha256(candidate_id "\n" digest)[0..40]>`, captioned with the
+candidate id, commit and tree and stamped to the item's project. The upload is
+an ADDITION to the reference, never a condition of it: the `file://` (or
+`https://`) bundle stays the `reference`, and any upload failure — a server
+that takes no bundle assets, an object over the tenant's asset size limit, an
+outage — leaves the publish standing. The candidate records exactly one of:
+
+| field | shape | meaning |
+|---|---|---|
+| `asset` | `{id, uri, digest, bytes, media_type, uploaded_at}` | the uploaded bundle. `digest` is `sha256:` + the reference's own `sha256` (the asset IS the published bytes), `uri` the digest-pinned `spor-asset:<id>@sha256:<hex>`, `media_type` always `application/x-git-bundle`. An answer whose digest is not the bundle's is never recorded here |
+| `asset_error` | `{reason, code?, digest, bytes, at}` | the upload was attempted and failed; `code` is the asset error code when one came back (`unsupported_media`, `too_large`, `verification_failed`, `offline`, …). No `asset` is written |
+
+Neither field exists in local mode, or when the bundle publish itself failed.
+A re-publish replaces both (a stale `asset_error` never sits beside a later
+upload). The **human-gate approval item** carries the binding for the judged
+commit — frontmatter `candidate_id:`, `candidate_asset:` (the pinned URI) and
+`candidate_asset_digest:`, plus a body line — only when the run's current
+candidate's `commit` IS the item's `gate_head` and its `asset` landed; with an
+`asset_error` for that commit the body says the bundle was not uploaded and
+why, and the frontmatter carries no asset. A sign-off reader verifies the
+asset's digest, then the tree and pinned commit inside the bundle, before
+reading anything from it.
+
 Four properties the publisher is built around:
 
 - **The published object is immutable and keyed by `candidate_id`.** A re-pin
