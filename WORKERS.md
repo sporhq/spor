@@ -1319,7 +1319,7 @@ one of:
 | field | shape | meaning |
 |---|---|---|
 | `asset` | `{id, uri, digest, bytes, media_type, base, uploaded_at}` | the uploaded self-contained bundle. `digest` is `sha256:` over the uploaded bytes (its own, not the reference's), `uri` the digest-pinned `spor-asset:<id>@sha256:<hex>`, `media_type` always `application/x-git-bundle`, `base` the declared base the bundle carries — what the server records as the run's first-candidate anchor when the factory sets none. An answer whose digest is not the bundle's is never recorded here |
-| `asset_error` | `{reason, code?, digest?, bytes?, max_bytes?, base, at}` | the upload was attempted and failed; `code` is `too_large` (measured here: `bytes` and `max_bytes` say by how much, and nothing was sent; or the server's own limit), `not_self_contained` (the bundle did not verify in an empty repository), or the asset error code that came back (`unsupported_media`, `verification_failed`, `offline`, …). No `asset` is written; a card reads it as `requires_full_diff` with this reason |
+| `asset_error` | `{reason, code?, digest?, bytes?, max_bytes?, base, attempts, at}` | the upload was attempted and failed; `code` is `too_large` (measured here: `bytes` and `max_bytes` say by how much, and nothing was sent; or the server's own limit), `not_self_contained` (the bundle did not verify in an empty repository), or the asset error code that came back (`unsupported_media`, `verification_failed`, `offline`, …). No `asset` is written; a card reads it as `requires_full_diff` with this reason |
 
 Neither field exists in local mode, or when the publish itself failed. A
 re-publish replaces both (a stale `asset_error` never sits beside a later
@@ -1327,7 +1327,10 @@ upload). An owed upload is **retried at the next re-pin** of an
 already-published candidate — one published before the server took bundle
 assets, or during an outage — without re-publishing its reference
 (`assetUploadOwed`); `too_large` and `not_self_contained` — which an
-immutable candidate cannot outgrow — are not retried. The
+immutable candidate cannot outgrow — are not retried, and every other
+refusal is retried at most `ASSET_UPLOAD_MAX_ATTEMPTS` (5) times in all,
+counted on `asset_error.attempts`, so a server that will never take the
+bundle stops costing a bundle-create and an upload on every re-pin. The
 **human-gate approval item** carries the binding for the judged commit —
 frontmatter `candidate_id:`, `candidate_asset:` (the pinned URI),
 `candidate_asset_digest:` and `candidate_base:`, plus a body line — only when

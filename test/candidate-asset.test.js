@@ -353,6 +353,60 @@ test("a re-pin retries an owed upload on an already-published candidate without 
   assert.strictEqual(local.candidate, first.candidate);
 });
 
+test("an owed upload is retried a bounded number of times, never on every re-pin forever", async (t) => {
+  const refusing = await startStub({ bundles: false });
+  t.after(refusing.close);
+  const repo = producerRepo(t);
+  const store = pathToFileURL(scratch(t, "cand-asset-store")).href;
+  const opts = { cwd: repo.dir, publish: "bundle", bundleStore: store, uploadAsset: candidateAssetUploader(remoteCfg(refusing.url), { slug: "spor" }) };
+  let cur = (await publisher.publishCandidate(mintFor(repo), opts)).candidate;
+  assert.strictEqual(cur.asset_error.attempts, 1);
+  for (let n = 2; n <= publisher.ASSET_UPLOAD_MAX_ATTEMPTS; n++) {
+    assert.strictEqual(publisher.assetUploadOwed(cur), true, `try ${n} is still owed`);
+    const r = await publisher.publishCandidate(cur, opts);
+    assert.strictEqual(r.uploaded, true);
+    cur = r.candidate;
+    assert.strictEqual(cur.asset_error.attempts, n);
+  }
+  assert.strictEqual(publisher.assetUploadOwed(cur), false, "the cap stops the retry");
+  const before = refusing.uploads.length;
+  const done = await publisher.publishCandidate(cur, opts);
+  assert.strictEqual(done.candidate, cur);
+  assert.strictEqual(refusing.uploads.length, before, "no upload past the cap");
+  // A record from before the count existed reads as one try, so it is still owed.
+  const { attempts: _n, ...legacy } = cur.asset_error;
+  assert.strictEqual(publisher.assetUploadOwed({ ...cur, asset_error: legacy }), true);
+});
+
+test("the self-contained bundle never clobbers or deletes a ref it did not create", async (t) => {
+  const repo = producerRepo(t);
+  const g = (...args) => execFileSync("git", ["-C", repo.dir, ...args], { env: gitEnv(), encoding: "utf8" }).trim();
+  const store = pathToFileURL(scratch(t, "cand-asset-store")).href;
+  // Published with the upload refused, so the re-pin path (which runs ONLY the
+  // self-contained bundle, never the reference publish) is what is exercised.
+  const first = await publisher.publishCandidate(mintFor(repo), { cwd: repo.dir, publish: "bundle", bundleStore: store, uploadAsset: async () => ({ ok: false, reason: "not yet" }) });
+  assert.strictEqual(first.ok, true, first.reason);
+  assert.strictEqual(publisher.assetUploadOwed(first.candidate), true);
+  const cand = first.candidate;
+  const ref = publisher.candidateRef(cand.candidate_id);
+  const baseRef = publisher.candidateBaseRef(cand.candidate_id);
+  const opts = { cwd: repo.dir, publish: "bundle", bundleStore: store, uploadAsset: async ({ digest }) => ({ ok: true, asset: { id: "art-asset-cand", digest } }) };
+  // A pre-existing ref naming the RIGHT object is used and left in place.
+  g("update-ref", ref, repo.commit);
+  const ok = await publisher.publishCandidate(cand, opts);
+  assert.ok(ok.candidate.asset, ok.candidate.asset_error && ok.candidate.asset_error.reason);
+  assert.strictEqual(g("rev-parse", ref), repo.commit, "a found ref is not deleted");
+  assert.strictEqual(g("for-each-ref", baseRef), "", "the ref it made is removed");
+  // A pre-existing ref naming anything else is refused, never overwritten.
+  g("update-ref", "-d", ref);
+  g("update-ref", baseRef, repo.commit);
+  const refused = await publisher.publishCandidate(cand, opts);
+  assert.strictEqual(refused.ok, true, "the publish stands");
+  assert.match(refused.candidate.asset_error.reason, /already names/);
+  assert.strictEqual(g("rev-parse", baseRef), repo.commit, "a foreign ref is untouched");
+  assert.strictEqual(g("for-each-ref", ref), "", "the candidate ref it made is still cleaned up");
+});
+
 test("the approval item binds the candidate's asset only when it is the judged commit", () => {
   const head = "a".repeat(40);
   const asset = { id: "art-asset-1", uri: `spor-asset:art-asset-1@sha256:${"b".repeat(64)}`, digest: `sha256:${"b".repeat(64)}` };
