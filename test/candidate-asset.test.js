@@ -73,6 +73,7 @@ function mintFor(repo) {
 // past `maxBytes` (the tenant's asset size limit).
 async function startStub({ bundles = true, maxBytes = Infinity, forgeDigest = false } = {}) {
   const uploads = [];
+  const bodies = [];
   const journal = new Map();
   const send = (res, status, body) => {
     res.writeHead(status, { "content-type": "application/json" });
@@ -85,6 +86,7 @@ async function startStub({ bundles = true, maxBytes = Infinity, forgeDigest = fa
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const body = Buffer.concat(chunks);
+    bodies.push(body);
     const key = req.headers["idempotency-key"];
     const sp = url.searchParams;
     uploads.push({ key, query: Object.fromEntries(sp), contentType: req.headers["content-type"], length: body.length });
@@ -106,7 +108,7 @@ async function startStub({ bundles = true, maxBytes = Infinity, forgeDigest = fa
   });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
   const url = `http://127.0.0.1:${srv.address().port}`;
-  return { url, uploads, close: () => new Promise((r) => srv.close(r)) };
+  return { url, uploads, bodies, close: () => new Promise((r) => srv.close(r)) };
 }
 
 const remoteCfg = (url) => ({ mode: () => "remote", server: () => url, token: () => "tok", get: () => undefined });
@@ -129,9 +131,13 @@ test("remote: a verified bundle is uploaded as a digest-pinned tenant asset and 
   const a = r.candidate.asset;
   assert.ok(a, "the asset ref rides the candidate");
   assert.strictEqual(r.candidate.asset_error, undefined);
-  // The asset IS the published bundle: same digest, same byte count.
-  assert.strictEqual(a.digest, `sha256:${ref.sha256}`);
-  assert.strictEqual(a.bytes, ref.bytes);
+  // The asset is its OWN self-contained bundle, not the thin reference bytes:
+  // digest-pinned to what was uploaded, and carrying the declared base.
+  assert.match(a.digest, /^sha256:[0-9a-f]{64}$/);
+  assert.notStrictEqual(a.digest, `sha256:${ref.sha256}`);
+  assert.strictEqual(a.digest, shaBytes(stub.bodies[0]));
+  assert.strictEqual(a.bytes, stub.bodies[0].length);
+  assert.strictEqual(a.base, cand.base.merge_base);
   assert.strictEqual(a.media_type, publisher.BUNDLE_MEDIA_TYPE);
   assert.strictEqual(a.uri, content.formatAssetUri({ id: a.id, digest: a.digest }));
   assert.ok(a.uploaded_at);
@@ -172,7 +178,8 @@ test("a server that takes no bundle assets: the publish stands, asset_error says
   assert.strictEqual(r.candidate.asset, undefined);
   assert.strictEqual(r.candidate.asset_error.code, "unsupported_media");
   assert.match(r.candidate.asset_error.reason, /could not be uploaded to the tenant asset store/);
-  assert.strictEqual(r.candidate.asset_error.digest, `sha256:${r.candidate.reference.sha256}`);
+  assert.strictEqual(r.candidate.asset_error.digest, shaBytes(stub.bodies[0]));
+  assert.strictEqual(r.candidate.asset_error.base, r.candidate.base.merge_base);
 });
 
 test("a bundle over the server's asset size limit is recorded as too_large, never blocking the publish", async (t) => {
@@ -254,6 +261,98 @@ test("importRemote with a declared mediaType uploads a non-image under that type
   assert.strictEqual(stub.uploads.length, 1);
 });
 
+// The decision's reader: a server with NO checkout. What it was sent must
+// verify in an empty git dir and hold the pinned commit, its tree and the
+// declared base, with the base an ancestor of the commit inside the bundle.
+test("the uploaded bundle is self-contained: an empty git dir verifies it and finds the commit, tree and declared base", async (t) => {
+  const stub = await startStub();
+  t.after(stub.close);
+  const { repo: producer, cand, r } = await publishWith(t, candidateAssetUploader(remoteCfg(stub.url), { slug: "spor" }));
+  assert.strictEqual(r.ok, true, r.reason);
+  assert.ok(r.candidate.asset);
+  const dir = scratch(t, "cand-asset-empty");
+  const file = path.join(dir, "upload.bundle");
+  fs.writeFileSync(file, stub.bodies[0]);
+  const repo = path.join(dir, "empty.git");
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { env: gitEnv(), encoding: "utf8" }).trim();
+  execFileSync("git", ["init", "-q", "--bare", repo], { env: gitEnv(), stdio: "ignore" });
+  const verify = execFileSync("git", ["-C", repo, "bundle", "verify", file], { env: gitEnv(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.doesNotMatch(verify, /requires/i, "an empty repository needs no prerequisite");
+  const heads = execFileSync("git", ["bundle", "list-heads", file], { env: gitEnv(), encoding: "utf8" });
+  assert.match(heads, new RegExp(`${cand.commit} ${publisher.candidateRef(cand.candidate_id)}`));
+  assert.match(heads, new RegExp(`${cand.base.merge_base} ${publisher.candidateBaseRef(cand.candidate_id)}`));
+  g("fetch", "-q", file, `${publisher.candidateRef(cand.candidate_id)}:refs/c`, `${publisher.candidateBaseRef(cand.candidate_id)}:refs/b`);
+  assert.strictEqual(g("rev-parse", "refs/c"), cand.commit);
+  assert.strictEqual(g("rev-parse", "refs/c^{tree}"), cand.tree);
+  assert.strictEqual(g("rev-parse", "refs/b"), cand.base.merge_base);
+  execFileSync("git", ["-C", repo, "merge-base", "--is-ancestor", "refs/b", "refs/c"], { env: gitEnv() });
+  // And the producing checkout is left exactly as it was found: no temp refs.
+  const left = execFileSync("git", ["-C", producer.dir, "for-each-ref", "refs/spor"], { env: gitEnv(), encoding: "utf8" }).trim();
+  assert.strictEqual(left, "");
+});
+
+test("a self-contained bundle over the cap is measured, never sent, and recorded as too_large with the size and cap", async (t) => {
+  let called = 0;
+  const repo = producerRepo(t);
+  const store = pathToFileURL(scratch(t, "cand-asset-store")).href;
+  const cand = mintFor(repo);
+  const r = await publisher.publishCandidate(cand, {
+    cwd: repo.dir,
+    publish: "bundle",
+    bundleStore: store,
+    assetMaxBytes: 64,
+    uploadAsset: async () => {
+      called++;
+      return { ok: true, asset: {} };
+    },
+  });
+  assert.strictEqual(r.ok, true, r.reason);
+  assert.strictEqual(called, 0, "an over-cap bundle is never uploaded");
+  assert.strictEqual(r.candidate.asset, undefined);
+  const e = r.candidate.asset_error;
+  assert.strictEqual(e.code, "too_large");
+  assert.strictEqual(e.max_bytes, 64);
+  assert.ok(e.bytes > 64);
+  assert.strictEqual(e.base, cand.base.merge_base);
+  assert.match(e.reason, /over the 64-byte asset cap/);
+  // The default cap is the server's own asset limit.
+  assert.strictEqual(publisher.BUNDLE_ASSET_MAX_BYTES, content.ASSET_MAX_BYTES);
+  // Size is the one failure a re-pin does not retry.
+  assert.strictEqual(publisher.assetUploadOwed(r.candidate), false);
+});
+
+test("a re-pin retries an owed upload on an already-published candidate without re-publishing it", async (t) => {
+  const refusing = await startStub({ bundles: false });
+  t.after(refusing.close);
+  const repo = producerRepo(t);
+  const store = pathToFileURL(scratch(t, "cand-asset-store")).href;
+  const first = await publisher.publishCandidate(mintFor(repo), { cwd: repo.dir, publish: "bundle", bundleStore: store, uploadAsset: candidateAssetUploader(remoteCfg(refusing.url), { slug: "spor" }) });
+  assert.strictEqual(first.ok, true, first.reason);
+  assert.strictEqual(first.candidate.asset_error.code, "unsupported_media");
+  assert.strictEqual(publisher.assetUploadOwed(first.candidate), true);
+
+  // The server now takes bundles: the next pin uploads, the reference stands.
+  const taking = await startStub();
+  t.after(taking.close);
+  const again = await publisher.publishCandidate(first.candidate, { cwd: repo.dir, publish: "bundle", bundleStore: store, uploadAsset: candidateAssetUploader(remoteCfg(taking.url), { slug: "spor" }) });
+  assert.strictEqual(again.ok, true, again.reason);
+  assert.strictEqual(again.published, false);
+  assert.strictEqual(again.uploaded, true);
+  assert.ok(again.candidate.asset, "the owed asset landed");
+  assert.strictEqual(again.candidate.asset_error, undefined, "the stale error is replaced");
+  assert.deepStrictEqual(again.candidate.reference, first.candidate.reference);
+  assert.deepStrictEqual(again.candidate.publish_attempts, first.candidate.publish_attempts);
+  assert.strictEqual(publisher.assetUploadOwed(again.candidate), false);
+
+  // Nothing owed: no upload at all.
+  const third = await publisher.publishCandidate(again.candidate, { cwd: repo.dir, publish: "bundle", bundleStore: store, uploadAsset: candidateAssetUploader(remoteCfg(taking.url), { slug: "spor" }) });
+  assert.strictEqual(third.candidate, again.candidate);
+  assert.strictEqual(taking.uploads.length, 1);
+  // Local mode (no uploader) never retries either.
+  const local = await publisher.publishCandidate(first.candidate, { cwd: repo.dir, publish: "bundle", bundleStore: store });
+  assert.strictEqual(local.candidate, first.candidate);
+});
+
 test("the approval item binds the candidate's asset only when it is the judged commit", () => {
   const head = "a".repeat(40);
   const asset = { id: "art-asset-1", uri: `spor-asset:art-asset-1@sha256:${"b".repeat(64)}`, digest: `sha256:${"b".repeat(64)}` };
@@ -262,6 +361,8 @@ test("the approval item binds the candidate's asset only when it is the judged c
     candidate_asset: asset.uri,
     candidate_asset_digest: asset.digest,
   });
+  // The declared base rides along when the asset carries one.
+  assert.strictEqual(approvalAssetFields({ candidate_id: "cand-1", commit: head, asset: { ...asset, base: "d".repeat(40) } }, head).candidate_base, "d".repeat(40));
   assert.strictEqual(approvalAssetFields({ candidate_id: "cand-1", commit: "c".repeat(40), asset }, head), null);
   assert.strictEqual(approvalAssetFields({ candidate_id: "cand-1", commit: head }, head), null);
   assert.strictEqual(approvalAssetFields(null, head), null);

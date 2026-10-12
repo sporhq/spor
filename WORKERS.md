@@ -1290,34 +1290,52 @@ door(s) under `implementation.candidate`:
 | `both` | both, with the bundle as `reference` and `references[]` carrying both doors | as above |
 
 **The bundle as a tenant asset** (task-spor-worker-uploads-candidate-bundle-asset,
-dec-spor-candidate-bundle-as-tenant-asset). Hosted sign-off has no checkout to
-read a diff from and refuses a `file://` reference, so in **remote mode** a
-bundle publish that VERIFIED is also uploaded through the asset client
+task-spor-client-selfcontained-bundle-and-bundle-asset-class,
+dec-spor-signoff-diff-pinned-anchor). Hosted sign-off has no checkout to read a
+diff from and refuses a `file://` reference, so in **remote mode** a candidate
+whose publish VERIFIED (any kind) is also uploaded through the asset client
 (`POST /v1/assets`, the `spor asset import` door — `importRemote` with
-`mediaType: application/x-git-bundle`, so the image rules do not apply but the
-size cap and the digest pin do) under the idempotency key
+`mediaType: application/x-git-bundle`, the attachment-only asset class in
+`kernel/content.js`, so the image rules do not apply but the size cap and the
+digest pin do) under the idempotency key
 `spor-candidate.<sha256(candidate_id "\n" digest)[0..40]>`, captioned with the
-candidate id, commit and tree and stamped to the item's project. The upload is
-an ADDITION to the reference, never a condition of it: the `file://` (or
-`https://`) bundle stays the `reference`, and any upload failure — a server
-that takes no bundle assets, an object over the tenant's asset size limit, an
-outage — leaves the publish standing. The candidate records exactly one of:
+candidate id, commit, tree and declared base and stamped to the item's project.
+
+The uploaded object is **not** the reference's thin `merge_base..commit`
+bundle, which an empty server git dir refuses for its missing prerequisite. It
+is a **self-contained** bundle cut for that reader: no prerequisites, the
+candidate commit under `refs/spor/candidates/<candidate_id>` and the declared
+base (`base.merge_base`) under `refs/spor/candidate-bases/<candidate_id>`. Before
+anything is sent it is proven the way the server will read it — `git bundle
+verify` in an EMPTY repository, then both refs fetched and checked against the
+pinned commit, tree and base — and measured against the cap
+(`BUNDLE_ASSET_MAX_BYTES`, the server's own asset limit): an object over it is
+never sent. The upload is an ADDITION to the reference, never a condition of
+it: the `file://` (or `https://`) bundle stays the `reference` byte-for-byte as
+before, and any upload failure — over the cap, a server that takes no bundle
+assets, an outage — leaves the publish standing. The candidate records exactly
+one of:
 
 | field | shape | meaning |
 |---|---|---|
-| `asset` | `{id, uri, digest, bytes, media_type, uploaded_at}` | the uploaded bundle. `digest` is `sha256:` + the reference's own `sha256` (the asset IS the published bytes), `uri` the digest-pinned `spor-asset:<id>@sha256:<hex>`, `media_type` always `application/x-git-bundle`. An answer whose digest is not the bundle's is never recorded here |
-| `asset_error` | `{reason, code?, digest, bytes, at}` | the upload was attempted and failed; `code` is the asset error code when one came back (`unsupported_media`, `too_large`, `verification_failed`, `offline`, …). No `asset` is written |
+| `asset` | `{id, uri, digest, bytes, media_type, base, uploaded_at}` | the uploaded self-contained bundle. `digest` is `sha256:` over the uploaded bytes (its own, not the reference's), `uri` the digest-pinned `spor-asset:<id>@sha256:<hex>`, `media_type` always `application/x-git-bundle`, `base` the declared base the bundle carries — what the server records as the run's first-candidate anchor when the factory sets none. An answer whose digest is not the bundle's is never recorded here |
+| `asset_error` | `{reason, code?, digest?, bytes?, max_bytes?, base, at}` | the upload was attempted and failed; `code` is `too_large` (measured here: `bytes` and `max_bytes` say by how much, and nothing was sent; or the server's own limit), `not_self_contained` (the bundle did not verify in an empty repository), or the asset error code that came back (`unsupported_media`, `verification_failed`, `offline`, …). No `asset` is written; a card reads it as `requires_full_diff` with this reason |
 
-Neither field exists in local mode, or when the bundle publish itself failed.
-A re-publish replaces both (a stale `asset_error` never sits beside a later
-upload). The **human-gate approval item** carries the binding for the judged
-commit — frontmatter `candidate_id:`, `candidate_asset:` (the pinned URI) and
-`candidate_asset_digest:`, plus a body line — only when the run's current
-candidate's `commit` IS the item's `gate_head` and its `asset` landed; with an
-`asset_error` for that commit the body says the bundle was not uploaded and
-why, and the frontmatter carries no asset. A sign-off reader verifies the
-asset's digest, then the tree and pinned commit inside the bundle, before
-reading anything from it.
+Neither field exists in local mode, or when the publish itself failed. A
+re-publish replaces both (a stale `asset_error` never sits beside a later
+upload). An owed upload is **retried at the next re-pin** of an
+already-published candidate — one published before the server took bundle
+assets, or during an outage — without re-publishing its reference
+(`assetUploadOwed`); `too_large` and `not_self_contained` — which an
+immutable candidate cannot outgrow — are not retried. The
+**human-gate approval item** carries the binding for the judged commit —
+frontmatter `candidate_id:`, `candidate_asset:` (the pinned URI),
+`candidate_asset_digest:` and `candidate_base:`, plus a body line — only when
+the run's current candidate's `commit` IS the item's `gate_head` and its
+`asset` landed; with an `asset_error` for that commit the body says the bundle
+was not uploaded and why, and the frontmatter carries no asset. A sign-off
+reader verifies the asset's digest, then the tree and pinned commit inside the
+bundle, before reading anything from it.
 
 Four properties the publisher is built around:
 

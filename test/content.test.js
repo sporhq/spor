@@ -41,6 +41,14 @@ const descriptor = (over = {}) => ({
   ...over,
 });
 
+// The attachment-only class (task-spor-client-selfcontained-bundle-and-bundle-
+// asset-class): a git bundle names bytes with no pixels.
+const bundle = (over = {}) => ({
+  id: "art-bundle", type: "artifact", title: "t", summary: "s",
+  asset_digest: DIGEST, asset_media_type: "application/x-git-bundle", asset_bytes: "9000",
+  ...over,
+});
+
 // One corpus, two implementations: every row must get the SAME errors from
 // the kernel and from the seed schema's sandboxed mirror.
 const CORPUS = [
@@ -59,6 +67,13 @@ const CORPUS = [
   descriptor({ asset_hash: "x" }),
   descriptor({ asset_alt: "x".repeat(1001) }),
   { id: "art-half", asset_digest: DIGEST },
+  bundle(),
+  bundle({ asset_alt: "candidate bundle" }),
+  bundle({ asset_width: "640" }),
+  bundle({ asset_width: "640", asset_height: "480" }),
+  bundle({ asset_bytes: "" }),
+  bundle({ asset_bytes: "0" }),
+  bundle({ asset_media_type: "application/zip" }),
   { id: "art-alt-only", asset_alt: "orphan alt" },
   { id: "art-root", doc_sha256: HEX("b"), doc_bytes: "12000" },
   { id: "art-root-half", doc_sha256: HEX("b") },
@@ -184,6 +199,38 @@ test("asset descriptors: all-or-none, typed, and SVG is refused", () => {
   assert.equal(content.assetDescriptor({ id: "art-plain" }), null);
   // JSON numbers read the same as frontmatter strings
   assert.deepEqual(content.validateAssetDescriptor(descriptor({ asset_bytes: 2048, asset_width: 640, asset_height: 480 })), []);
+});
+
+test("attachment-only class: a git bundle needs digest/type/bytes, refuses dimensions, and is never an image", () => {
+  assert.deepEqual(content.validateAssetDescriptor(bundle()), []);
+  assert.equal(content.assetDelivery("application/x-git-bundle"), "attachment");
+  assert.equal(content.assetDelivery("image/png"), "inline");
+  assert.equal(content.assetDelivery("text/html"), null);
+  assert.match(content.validateAssetDescriptor(bundle({ asset_width: "640" })).join(), /asset_width must be absent for application\/x-git-bundle/);
+  assert.match(content.validateAssetDescriptor(bundle({ asset_bytes: "" })).join(), /missing asset_bytes \(an asset descriptor carries all of asset_digest, asset_media_type, asset_bytes\)/);
+  assert.match(content.validateAssetDescriptor(bundle({ asset_media_type: "application/zip" })).join(), /not one of image\/png, image\/jpeg, image\/gif, image\/webp, application\/x-git-bundle/);
+  // Every embedding/sizing reader keeps the image-only answer; a delivering
+  // reader opts in and gets the attachment shape.
+  assert.equal(content.assetDescriptor(bundle()), null);
+  assert.deepEqual(content.assetDescriptor(bundle(), { attachments: true }), {
+    id: "art-bundle", digest: DIGEST, media_type: "application/x-git-bundle", bytes: 9000, width: null, height: null, alt: null, delivery: "attachment",
+  });
+  assert.equal(content.assetDescriptor(bundle({ asset_width: "1" }), { attachments: true }), null);
+  // Images are unchanged by the opt-in.
+  assert.deepEqual(content.assetDescriptor(descriptor(), { attachments: true }), content.assetDescriptor(descriptor()));
+  // An image embed of a bundle does not resolve.
+  const r = content.reconcileAssetEdges(
+    { content_format: "markdown", body: "![b](spor-asset:art-bundle)", edges: [{ type: "uses-asset", to: "art-bundle" }] },
+    { resolve: (id) => (id === "art-bundle" ? bundle() : null) }
+  );
+  assert.deepEqual(r.unresolved, ["art-bundle"]);
+  assert.equal(content.assetFilename("art-bundle", DIGEST, "application/x-git-bundle"), "art-bundle.bundle");
+  // The canonical descriptor text validates as an attachment and carries no dimensions.
+  const text = content.assetDescriptorText({ id: "art-bundle", project: "spor" }, { digest: DIGEST, size: 9000, media_type: "application/x-git-bundle" });
+  const fm = graph.parseFrontmatter(text, "art-bundle.md");
+  assert.deepEqual(content.validateAssetDescriptor(fm), []);
+  assert.equal("asset_width" in fm, false);
+  assert.match(text, /attachment download, never rendered or embedded inline/);
 });
 
 test("asset URIs: id plus optional sha256 pin, round-tripping", () => {

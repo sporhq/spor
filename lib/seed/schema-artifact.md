@@ -2,7 +2,7 @@
 id: schema-artifact
 type: schema
 kind: node-schema
-schema_version: 2026.10.09.1
+schema_version: 2026.10.12.1
 title: Seed schema for artifact nodes
 summary: Node schema for the artifact type — a document, spec, module, or build product worth referencing, optionally carrying a delivery-stage status when it represents a change. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -154,6 +154,14 @@ rules (sandboxed code cannot require it), pinned to the same verdicts by
   SVG), `asset_bytes`, `asset_width`, `asset_height` (positive integers):
   all five or none, plus optional `asset_alt`. Any other `asset_*` key is a
   typo and is refused.
+- Attachment-only asset class (2026.10.12.1,
+  task-spor-client-selfcontained-bundle-and-bundle-asset-class):
+  `asset_media_type: application/x-git-bundle` (a factory candidate's
+  self-contained bundle) needs only `asset_digest`, `asset_media_type` and
+  `asset_bytes`, and REFUSES `asset_width`/`asset_height` — it has no pixels,
+  is never embedded or rendered inline, and is delivered only as an attachment
+  download. It only admits descriptors the previous version refused: no
+  stored-shape change, backward-readable, no upgrade chain.
 - Document stamps — `doc_sha256` + `doc_bytes` together (a generation root),
   `doc_generation` (a part: needs `continuation_of`, never beside
   `doc_sha256`), each 64 lowercase hex. Shape only: the exact-body check needs
@@ -249,7 +257,9 @@ export function validate(node) {
 // a node carrying none of them returns [].
 const FORMATS = ["markdown", "text"];
 const MEDIA = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+const ATTACH_MEDIA = ["application/x-git-bundle"];
 const ASSET_REQ = ["asset_digest", "asset_media_type", "asset_bytes", "asset_width", "asset_height"];
+const ATTACH_REQ = ["asset_digest", "asset_media_type", "asset_bytes"];
 const ASSET_ALL = ASSET_REQ.concat(["asset_alt"]);
 const ID_RE = /^[a-z0-9][a-z0-9-]*$/;
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -305,13 +315,19 @@ function contentErrors(f) {
     keys.forEach(function (k) {
       if (ASSET_ALL.indexOf(k) === -1) errs.push("unknown asset key '" + k + "' (known: " + ASSET_ALL.join(", ") + ")");
     });
-    const missing = ASSET_REQ.filter(function (k) { return !present(f[k]); });
-    if (missing.length) errs.push("asset descriptor is missing " + missing.join(", ") + " (an asset descriptor carries all of " + ASSET_REQ.join(", ") + ")");
-    if (present(f.asset_digest) && !DIGEST_RE.test(str(f.asset_digest))) errs.push("asset_digest '" + str(f.asset_digest) + "' must be sha256:<64 lowercase hex>");
-    if (present(f.asset_media_type) && MEDIA.indexOf(str(f.asset_media_type)) === -1) {
-      errs.push("asset_media_type '" + str(f.asset_media_type) + "' is not one of " + MEDIA.join(", "));
+    const attach = ATTACH_MEDIA.indexOf(str(f.asset_media_type)) !== -1;
+    const req = attach ? ATTACH_REQ : ASSET_REQ;
+    const missing = req.filter(function (k) { return !present(f[k]); });
+    if (missing.length) errs.push("asset descriptor is missing " + missing.join(", ") + " (an asset descriptor carries all of " + req.join(", ") + ")");
+    if (attach) {
+      const dims = ["asset_width", "asset_height"].filter(function (k) { return present(f[k]); });
+      if (dims.length) errs.push(dims.join(", ") + " must be absent for " + str(f.asset_media_type) + " (an attachment-only asset has no pixel dimensions)");
     }
-    ["asset_bytes", "asset_width", "asset_height"].forEach(function (k) {
+    if (present(f.asset_digest) && !DIGEST_RE.test(str(f.asset_digest))) errs.push("asset_digest '" + str(f.asset_digest) + "' must be sha256:<64 lowercase hex>");
+    if (present(f.asset_media_type) && MEDIA.indexOf(str(f.asset_media_type)) === -1 && !attach) {
+      errs.push("asset_media_type '" + str(f.asset_media_type) + "' is not one of " + MEDIA.concat(ATTACH_MEDIA).join(", "));
+    }
+    (attach ? ["asset_bytes"] : ["asset_bytes", "asset_width", "asset_height"]).forEach(function (k) {
       if (present(f[k]) && uint(f[k], false) === null) errs.push(k + " '" + str(f[k]) + "' must be a positive integer");
     });
     if (present(f.asset_alt) && str(f.asset_alt).length > 1000) errs.push("asset_alt is over 1000 chars");
