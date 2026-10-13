@@ -760,7 +760,7 @@ from the fetch URL is assumed to feed it (a push mirror): the read-back proves
 the push landed, not that the fetch URL already serves it — plus the report and log as `file://` references; `cancel` is SIGTERM to the supervisor's process group (identity-
 gated) on POSIX and, on Windows (or when no signal could be sent), the run's
 stop file `journal/dispatch/<run>.stop`, which the supervisor polls: it ends
-the harness tree itself (`taskkill /T /F` on Windows) and closes its record as
+the harness tree itself (on Windows the one start-time-checked tree kill, never `taskkill /T`) and closes its record as
 `cancelled` (signal `stop-requested`); a supervisor still running 30s later is
 terminated and the record closed by the provider. `force` is the TERM-then-KILL
 stop with the record closed as cancelled;

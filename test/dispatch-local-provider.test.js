@@ -238,11 +238,8 @@ for (const [name, shape] of Object.entries(GOLDENS)) {
       return;
     }
     const golden = JSON.parse(fs.readFileSync(shape.file, "utf8"));
-    // Start-time ticks are read from /proc, so a non-Linux record (Windows,
-    // macOS) carries none; compare there without them on either side.
-    const view = (v) => (process.platform !== "linux" && typeof v === "string" ? v.replace(/^ {2}"(runner|child)_started_ticks": <N>,\n/gm, "") : v);
     for (const key of ["stdout", "stderr", "record", "job", "prompt", "journal", "worktree"]) {
-      assert.deepStrictEqual(view(capture[key]), view(golden[key]), `${key} differs from the recorded golden`);
+      assert.deepStrictEqual(capture[key], golden[key], `${key} differs from the recorded golden`);
     }
   });
 }
@@ -610,7 +607,25 @@ test("a record the local provider closes carries the outcome dimension: cancelle
     assert.fail("never reached running");
   };
   const record = (handle) => JSON.parse(fs.readFileSync(path.join(home, "journal", "dispatch", `${handle.id}.run.json`), "utf8"));
-
+  // A crashed supervisor's harness child must not outlive release. On Windows
+  // the OS already took it down with the supervisor (libuv's child job is
+  // kill-on-close), so there is nothing of ours left to reap — only to confirm
+  // gone: no longer answering, or its pid now naming another process. An
+  // unreadable start time alone proves nothing, so it is never accepted.
+  const childGoneOnRelease = async (rec, msg) => {
+    if (process.platform === "win32" && rec.child_reaped !== true) {
+      const pi = require("../lib/shell/process-identity.js");
+      let gone = false;
+      for (let i = 0; i < 100 && !gone; i++) {
+        const now = pi.aliveProbe(rec.child_pid) ? pi.processStartTicks(rec.child_pid) : null;
+        gone = !pi.aliveProbe(rec.child_pid) || (now != null && Number.isFinite(rec.child_started_ticks) && now !== rec.child_started_ticks);
+        if (!gone) await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.ok(gone, msg);
+    } else {
+      assert.strictEqual(rec.child_reaped, true, msg);
+    }
+  };
   // A forced cancel: the record is closed as a cancel, with the unenforced
   // outcome every other terminal writer stamps, and the reaped child noted.
   const a = await req("submit", { attempt: driver.attempt(base(1), "hold"), idempotency_key: "shape-cancel" });
@@ -645,7 +660,7 @@ test("a record the local provider closes carries the outcome dimension: cancelle
   assert.strictEqual(vanished.termination_signal, "supervisor-gone");
   assert.strictEqual(vanished.terminal_state, "failed");
   assert.strictEqual(vanished.terminal_enforced, false);
-  assert.strictEqual(vanished.child_reaped, true, "the orphaned harness child was reaped on release");
+  await childGoneOnRelease(vanished, "the orphaned harness child was reaped on release");
 
   // A FORCED cancel of a crashed run takes the same reading through the
   // other door: lost, closed as a vanish, never a cancel.
@@ -661,7 +676,7 @@ test("a record the local provider closes carries the outcome dimension: cancelle
   const crashedForced = record(d.handle);
   assert.strictEqual(crashedForced.state, "vanished");
   assert.strictEqual(crashedForced.termination_class, "vanished");
-  assert.strictEqual(crashedForced.child_reaped, true);
+  await childGoneOnRelease(crashedForced, "the crashed run's harness child was reaped on a forced cancel");
   await req("release", { handle: d.handle });
 
   // A GRACEFUL cancel whose supervisor dies on the signal: the record is

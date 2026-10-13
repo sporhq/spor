@@ -268,13 +268,11 @@ test("reconcileRuns: a supervised run whose child is ALSO already gone reports n
   assert.strictEqual(out[0].child_reaped, undefined);
 });
 
-// The passive reconcile path must NEVER tree-kill on Windows: off Linux there
-// is no process start-time identity yet, so a stale record's child pid may be
-// an unrelated process that reused it, and `taskkill /T` would take that
-// stranger's whole tree (issue-spor-process-identity-start-time-off-linux). The
-// tree kill belongs to explicit stops (stopRun) only; reconcile keeps the
-// single-pid kill.
-test("reconcileRuns on Windows reaps an orphan by its single pid, never through a taskkill /T tree kill", async () => {
+// The passive reconcile path tree-kills on Windows only a PROVEN-ours child:
+// an UNPROVEN one (no recorded start token) may be an unrelated process that
+// reused the pid, so it gets its bare pid only and no tree walk at all
+// (issue-spor-process-identity-start-time-off-linux).
+test("reconcileRuns on Windows reaps an UNPROVEN orphan by its single pid, never through a tree kill", async () => {
   const home = scratch("spor-runs-store-");
   const child = liveChild();
   try {
@@ -285,8 +283,31 @@ test("reconcileRuns on Windows reaps an orphan by its single pid, never through 
     const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z", platform: "win32", run });
     assert.strictEqual(out[0].state, "vanished");
     assert.strictEqual(out[0].child_reaped, true);
-    assert.deepStrictEqual(calls, [], "the passive path never runs taskkill");
+    assert.deepStrictEqual(calls, [], "an unproven child never gets a tree walk");
     assert.ok(await waitUntilDead(child.pid), "the single-pid kill still ended the orphan");
+  } finally {
+    try { child.kill("SIGKILL"); } catch { /* already gone */ }
+  }
+});
+
+test("reconcileRuns on Windows takes a PROVEN orphan's tree through the start-time-checked tree kill, never taskkill", async () => {
+  const home = scratch("spor-runs-store-");
+  const child = liveChild();
+  try {
+    await new Promise((resolve) => child.once("spawn", resolve));
+    supervisedRecord(home, "sup-orphan-win-proven", { runner_pid: deadPid(), child_pid: child.pid, child_started_ticks: 1760000000123 });
+    const calls = [];
+    // The stub stands in for the PowerShell pass and kills nothing itself.
+    const run = (...a) => { calls.push(a); return { status: 0, stdout: `${child.pid}\r\n` }; };
+    const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z", platform: "win32", run, readTicks: () => 1760000000123 });
+    assert.strictEqual(out[0].state, "vanished");
+    assert.strictEqual(out[0].child_reaped, true);
+    assert.strictEqual(calls.length, 1, "one tree-kill pass");
+    assert.match(calls[0][0], /WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/);
+    const script = calls[0][1].at(-1);
+    assert.ok(script.includes(`$root = $byId[${child.pid}]`), "the tree is rooted at the recorded child");
+    assert.ok(script.includes(`${BigInt(1760000000123) * 10000n + 116444736000000000n}`), "and re-proves its recorded start time");
+    assert.doesNotMatch(script, /taskkill/i);
   } finally {
     try { child.kill("SIGKILL"); } catch { /* already gone */ }
   }
@@ -502,7 +523,7 @@ test("finalizeSupervisedRun: an identity MISMATCH closes the run immediately, no
 });
 
 test("finalizeSupervisedRun: identity unknown (no recorded tick count) still falls back to the silence heuristic", () => {
-  // An older record predating this feature, or a non-Linux host, carries no
+  // An older record predating this feature, or a host whose start time could not be read, carries no
   // `runner_started_ticks` — the pid-reuse guard must still degrade gracefully
   // to the freshness ceiling rather than believing an unreused pid forever.
   const home = scratch("spor-runs-store-");
@@ -696,7 +717,7 @@ test("workerAlive (bin/spor.js's alive() for `spor work --status`): a genuinely 
 
 // terminalOutcomeBackfill used to hold off repair on `isSameSupervisor(...)
 // .reallyAlive` alone, with no fallback for the identity-UNKNOWN case (no
-// recorded `runner_started_ticks` — an older record, or a non-Linux host):
+// recorded `runner_started_ticks` — an older record, or an unreadable start time):
 // a terminal record whose recorded pid was recycled into a permission-
 // restricted (or simply still-alive) unrelated process could be held
 // un-repaired indefinitely. `finalizeSupervisedRun` already had a staleMs
@@ -969,15 +990,57 @@ test("stopRun: the whole process GROUP is signalled, escalated to SIGKILL, and i
     }
   }
 
+  // Windows has no process groups: a PROVEN supervisor is stopped by its
+  // process TREE (killWindowsTree), which must reach a grandchild neither recorded
+  // pid names (issue-spor-process-identity-start-time-off-linux).
+  if (process.platform === "win32") {
+    const pidFile = path.join(scratch("spor-runs-tree-"), "grandchild.pid");
+    const grandchildSrc = `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1e9);`;
+    const leaderSrc = `
+      require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(grandchildSrc)}], { stdio: "ignore" });
+      setInterval(() => {}, 1e9);
+    `;
+    const leader = spawn(process.execPath, ["-e", leaderSrc], { stdio: "ignore", windowsHide: true });
+    let grandchild = 0;
+    try {
+      let pidText = "";
+      for (let i = 0; i < 400 && !pidText; i += 1) {
+        try { pidText = fs.readFileSync(pidFile, "utf8"); } catch { /* not yet */ }
+        if (!pidText) await new Promise((r) => setTimeout(r, 25));
+      }
+      grandchild = Number(pidText);
+      assert.ok(grandchild > 0 && runner.pidAlive(grandchild), "the fixture must actually have a live grandchild to stop");
+      // The REAL token: the tree kill re-proves the root's start time itself.
+      const ticks = runner.processStartTicks(leader.pid);
+      assert.strictEqual(typeof ticks, "number");
+      // A token that names another process is refused by the tree kill too.
+      const wrong = await runner.stopRun(
+        { run_id: "stop-tree-wrong", runner_pid: leader.pid, runner_started_ticks: ticks - 1 },
+        { graceMs: 50, readTicks: () => ticks - 1 }
+      );
+      assert.strictEqual(wrong.group, false, "the in-script start-time check refuses a token that is not the root's");
+      assert.strictEqual(runner.pidAlive(grandchild), true);
+      const stopped = await runner.stopRun(
+        { run_id: "stop-tree", runner_pid: leader.pid, runner_started_ticks: ticks },
+        { graceMs: 300 }
+      );
+      assert.strictEqual(stopped.group, true, "identity was proven, so the tree is taken");
+      assert.strictEqual(await gone(leader.pid), true);
+      assert.strictEqual(await gone(grandchild), true, "the grandchild goes with the tree");
+    } finally {
+      try { leader.kill("SIGKILL"); } catch { /* already gone */ }
+      if (grandchild) { try { process.kill(grandchild, "SIGKILL"); } catch { /* already gone */ } }
+    }
+  }
+
   // A supervisor whose identity could NOT be proven (no recorded ticks, or a
   // host with no /proc) keeps the single per-pid SIGTERM it always got — a
   // group blast inferred from an unverified pid is a far wider mistake.
   const unproven = alive();
   try {
     const stopped = await runner.stopRun({ run_id: "stop-unproven", runner_pid: unproven.pid }, { graceMs: 200 });
-    // On Windows the "group" is the taskkill /T tree, which explicit stops use
-    // without start-time identity (there is none off Linux yet).
-    assert.strictEqual(stopped.group, process.platform === "win32", "no identity, no POSIX group");
+    // Not on Windows either: the tree is gated on proven identity there too.
+    assert.strictEqual(stopped.group, false, "no identity, no group (nor tree)");
     assert.strictEqual(stopped.supervisor, true);
     assert.strictEqual(await gone(unproven.pid), true);
   } finally {
@@ -1084,60 +1147,69 @@ test("the run stop file: named beside the record, requested idempotently, read w
   assert.strictEqual(runner.requestRunStop(null).ok, false);
 
   const calls = [];
-  const child = { pid: 4242, kill: (sig) => { calls.push(["kill", sig]); return true; } };
-  const run = (cmd, args) => { calls.push([cmd, args]); return { status: 0 }; };
+  const child = { pid: 4242, exitCode: null, signalCode: null, kill: (sig) => { calls.push(["kill", sig]); return true; } };
+  const run = (cmd, args) => { calls.push([cmd, args]); return { status: 0, stdout: "4242\r\n" }; };
   assert.strictEqual(runner.killChildTree(child, "SIGTERM", { platform: "win32", env: { SystemRoot: "C:\\Windows" }, run }), true);
-  assert.deepStrictEqual(calls[0][1], ["/PID", "4242", "/T", "/F"]);
-  assert.match(calls[0][0], /System32[\\/]taskkill\.exe$/);
-  assert.strictEqual(calls.length, 1, "taskkill ended the tree; no second kill");
+  assert.match(calls[0][0], /System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/);
+  assert.ok(calls[0][1].at(-1).includes("$root = $byId[4242]"), "the tree is rooted at the live child");
+  assert.doesNotMatch(calls[0][1].at(-1), /taskkill/i, "never taskkill /T");
+  assert.strictEqual(calls.length, 1, "the tree kill ended it; no second kill");
   calls.length = 0;
-  runner.killChildTree(child, "SIGTERM", { platform: "win32", env: {}, run: () => ({ status: 1 }) });
-  assert.deepStrictEqual(calls, [["kill", undefined]], "a failed taskkill falls back to the child alone");
+  runner.killChildTree(child, "SIGTERM", { platform: "win32", env: {}, run: () => ({ status: 1, stdout: "" }) });
+  assert.deepStrictEqual(calls, [["kill", undefined]], "a tree kill that could not run falls back to the child alone");
   calls.length = 0;
+  runner.killChildTree(child, "SIGTERM", { platform: "win32", env: {}, run: () => ({ status: 3, stdout: "" }) });
+  assert.deepStrictEqual(calls, [["kill", undefined]], "any other answer falls back to the child's own handle, which cannot reach a recycled pid");
+  calls.length = 0;
+  runner.killChildTree({ ...child, exitCode: 0 }, "SIGTERM", { platform: "win32", env: {}, run });
+  assert.deepStrictEqual(calls, [], "an exited child's pid is vouched for by no handle: nothing is signalled");
   runner.killChildTree(child, "SIGTERM", { platform: "linux", run });
   assert.deepStrictEqual(calls, [["kill", "SIGTERM"]]);
 });
 
-test("stopRun on Windows ends the supervisor's and the child's TREES through taskkill, falling back to the bare pid kill", async () => {
+test("stopRun on Windows ends a PROVEN supervisor's tree in one start-time-checked pass, falling back to the bare pid kill only when it could not run", async () => {
   // Windows' doors injected, so this runs on every OS: the recorded pids are
-  // live processes of ours (so liveness passes), and `run` records the
-  // taskkill instead of executing it (issue-spor-windows-dispatch-stoprun-orphans-harness).
+  // live processes of ours (so liveness passes), `readTicks` proves them, and
+  // `run` records the PowerShell tree kill instead of executing it
+  // (issue-spor-windows-dispatch-stoprun-orphans-harness,
+  // issue-spor-process-identity-start-time-off-linux).
   const alive = () => spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], { stdio: "ignore" });
+  const T = 1760000000123;
+  const readTicks = () => T;
   const child = alive();
   const supervisor = alive();
   try {
     const calls = [];
-    const run = (cmd, args) => { calls.push([cmd, args]); return { status: 0 }; };
+    const run = (cmd, args) => { calls.push([cmd, args]); return { status: 0, stdout: `${supervisor.pid}\r\n${child.pid}\r\n` }; };
     const stopped = await runner.stopRun(
-      { run_id: "stop-win", child_pid: child.pid, runner_pid: supervisor.pid },
-      { graceMs: 0, platform: "win32", env: { SystemRoot: "C:\\Windows" }, run }
+      { run_id: "stop-win", child_pid: child.pid, child_started_ticks: T, runner_pid: supervisor.pid, runner_started_ticks: T },
+      { graceMs: 0, platform: "win32", env: { SystemRoot: "C:\\Windows" }, run, readTicks }
     );
-    assert.deepStrictEqual(calls.map((c) => c[1]), [
-      ["/PID", String(supervisor.pid), "/T", "/F"],
-      ["/PID", String(child.pid), "/T", "/F"],
-    ], "the supervisor's tree first (so it cannot close the record as the child's own failure), then the child's, never by identity-unproven group signals");
-    assert.match(calls[0][0], /System32[\\/]taskkill\.exe$/);
-    assert.strictEqual(stopped.child, true);
+    assert.strictEqual(calls.length, 1, "ONE tree kill, rooted at the supervisor: its child is in that tree");
+    assert.match(calls[0][0], /System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/);
+    const script = calls[0][1].at(-1);
+    assert.ok(script.includes(`$root = $byId[${supervisor.pid}]`));
+    assert.ok(script.includes(`${BigInt(T) * 10000n + 116444736000000000n}`), "the root's start time is re-proved in the kill pass");
+    assert.doesNotMatch(script, /taskkill/i);
+    assert.strictEqual(stopped.child, true, "ended with the supervisor's tree");
     assert.strictEqual(stopped.supervisor, true);
     assert.strictEqual(stopped.group, true, "the tree is Windows' group");
-    // The injected taskkill killed nothing, so the per-pid escalation still
-    // ends what answers.
-    for (const p of [child.pid, supervisor.pid]) {
-      for (let i = 0; i < 200 && runner.pidAlive(p); i += 1) await new Promise((r) => setTimeout(r, 25));
-      assert.strictEqual(runner.pidAlive(p), false);
-    }
+    // The injected kill killed nothing, so the per-pid escalation still ends
+    // the supervisor it signalled.
+    for (let i = 0; i < 200 && runner.pidAlive(supervisor.pid); i += 1) await new Promise((r) => setTimeout(r, 25));
+    assert.strictEqual(runner.pidAlive(supervisor.pid), false);
   } finally {
     child.kill("SIGKILL");
     supervisor.kill("SIGKILL");
   }
 
-  // A failed taskkill degrades to the terminate Windows always had.
+  // A tree kill that could not run degrades to the terminate Windows always had.
   const child2 = alive();
   const supervisor2 = alive();
   try {
     const stopped = await runner.stopRun(
-      { run_id: "stop-win-fallback", child_pid: child2.pid, runner_pid: supervisor2.pid },
-      { graceMs: 0, platform: "win32", env: {}, run: () => ({ status: 1 }) }
+      { run_id: "stop-win-fallback", child_pid: child2.pid, child_started_ticks: T, runner_pid: supervisor2.pid, runner_started_ticks: T },
+      { graceMs: 0, platform: "win32", env: {}, run: () => ({ status: 1, stdout: "" }), readTicks }
     );
     assert.strictEqual(stopped.group, false);
     assert.strictEqual(stopped.child, true);
@@ -1149,6 +1221,36 @@ test("stopRun on Windows ends the supervisor's and the child's TREES through tas
   } finally {
     child2.kill("SIGKILL");
     supervisor2.kill("SIGKILL");
+  }
+
+  // The tree kill re-proved the root NOT ours (a pid reused since the caller's
+  // read): nothing more is signalled at that pid — no bare-kill fallback.
+  const supervisor3 = alive();
+  try {
+    const stopped = await runner.stopRun(
+      { run_id: "stop-win-foreign", runner_pid: supervisor3.pid, runner_started_ticks: T },
+      { graceMs: 0, platform: "win32", env: {}, run: () => ({ status: 4, stdout: "" }), readTicks }
+    );
+    assert.deepStrictEqual(stopped, { child: false, supervisor: false, group: false, alive: false });
+    assert.strictEqual(runner.pidAlive(supervisor3.pid), true);
+  } finally {
+    supervisor3.kill("SIGKILL");
+  }
+
+  // An UNPROVEN supervisor (no recorded token) never gets a tree walk: only
+  // its bare terminate, the old bounded mistake if the pid was recycled.
+  const supervisor4 = alive();
+  try {
+    const calls = [];
+    const stopped = await runner.stopRun(
+      { run_id: "stop-win-unproven", runner_pid: supervisor4.pid },
+      { graceMs: 0, platform: "win32", env: {}, run: (...a) => { calls.push(a); return { status: 0, stdout: "" }; } }
+    );
+    assert.deepStrictEqual(calls, [], "no tree kill without proof");
+    assert.strictEqual(stopped.group, false);
+    assert.strictEqual(stopped.supervisor, true);
+  } finally {
+    supervisor4.kill("SIGKILL");
   }
 
   // A recycled child pid is still left alone: the identity check runs before
@@ -1176,10 +1278,11 @@ test("stopRun on Windows never tree-kills for an already-closed record: its pids
     const calls = [];
     const run = (...a) => { calls.push(a); return { status: 0 }; };
     const stopped = await runner.stopRun(
-      { run_id: "stop-win-closed", state: "done", child_pid: child.pid, runner_pid: supervisor.pid },
-      { graceMs: 0, platform: "win32", env: {}, run }
+      // Even PROVEN pids: a closed run has nothing left worth a tree walk.
+      { run_id: "stop-win-closed", state: "done", child_pid: child.pid, child_started_ticks: 7, runner_pid: supervisor.pid, runner_started_ticks: 7 },
+      { graceMs: 0, platform: "win32", env: {}, run, readTicks: () => 7 }
     );
-    assert.deepStrictEqual(calls, [], "no taskkill /T for a terminal record");
+    assert.deepStrictEqual(calls, [], "no tree kill for a terminal record");
     assert.strictEqual(stopped.group, false);
     assert.strictEqual(stopped.child, true, "the single-pid kill still runs");
   } finally {
@@ -1219,8 +1322,10 @@ test("stopRun on Windows: a grandchild behind a .cmd shim is gone after a forced
       const shimChild = await readPid(shimPid);
       grandchild = await readPid(grandPid);
       assert.ok(grandchild > 0 && runner.pidAlive(grandchild), "the fixture must actually have a live harness behind the shim");
-      const record = { run_id: `stop-win-${variant}`, runner_pid: supervisor.pid };
-      if (variant === "child-recorded") record.child_pid = shimChild;
+      // The REAL tokens: a Windows tree stop is gated on proven identity.
+      const record = { run_id: `stop-win-${variant}`, runner_pid: supervisor.pid, runner_started_ticks: runner.processStartTicks(supervisor.pid) };
+      assert.strictEqual(typeof record.runner_started_ticks, "number");
+      if (variant === "child-recorded") Object.assign(record, { child_pid: shimChild, child_started_ticks: runner.processStartTicks(shimChild) });
       const stopped = await runner.stopRun(record, { graceMs: 0 });
       assert.strictEqual(stopped.supervisor, true);
       for (let i = 0; i < 200 && runner.pidAlive(grandchild); i += 1) await new Promise((r) => setTimeout(r, 25));

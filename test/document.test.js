@@ -463,7 +463,7 @@ test("local: a pinned read refuses when git cannot answer, never reports the rev
   }
 });
 
-test("local: a spool lock naming a recycled pid (start ticks differ) is not a live publisher", { skip: process.platform !== "linux" && "start ticks are read from /proc" }, () => {
+test("local: a spool lock naming a recycled pid (start ticks differ) is not a live publisher", () => {
   const h = home();
   fs.mkdirSync(journal(h), { recursive: true });
   const { processStartTicks } = require("../lib/shell/process-identity.js");

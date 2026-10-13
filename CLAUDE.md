@@ -1096,7 +1096,21 @@ two that every controller pass re-drives (a hold naming a newer execution is
 preserved); an idle-stopped run closes its record before its lease is
 released. Run identity (pid + start ticks minted at launch) is ONE check,
 `isOurProcess` in `lib/shell/process-identity.js`, shared by the run store,
-the local execution lock and the spool claims. Two things it owns beyond dispatch: a slot frees
+the local execution lock and the spool claims. The start-time token is read on
+every OS (issue-spor-process-identity-start-time-off-linux): `/proc` ticks on
+Linux, `ps -o lstart` epoch seconds on macOS, PowerShell creation time in epoch
+ms on Windows — a per-host unit, only ever compared on the host that minted it.
+Off Linux a read is a process spawn, so batch several pids through
+`processStartTicksMany`. On Windows every process-tree kill — dispatch
+stopRun/reapOrphanChild (passive reconcile included, for a PROVEN child), the
+supervisor's own stop of its harness, the local provider's terminate, and
+git-network's timed-out-git reap — goes through the ONE helper
+`lib/shell/windows-process-tree.js` `killWindowsTree`: one PowerShell pass
+proves the root (recorded start token, a live handle, or a dead root's creation
+window), walks only descendants created no earlier than their parent, and stops
+each by pid; never `taskkill /T`, since Windows never reparents an orphan. An
+unproven pid gets only its bare terminate. OS binaries go by absolute path
+(`/bin/ps`, `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`). Two things it owns beyond dispatch: a slot frees
 only when the RUN RECORD goes terminal AND its outcome is settled — never when a
 launcher returns — and any item that was refused — or whose run ended WITHOUT resolving, which hands the
 lease back and returns it to the pool — cools off for `work.retryAfterMs` so the
@@ -1115,7 +1129,7 @@ is cleared by the contract write, and the hold is doubly bounded — it lasts on
 while the supervisor is demonstrably alive (pid identity-checked) AND inside
 `contractGraceMs` (60s, the contract's own worst case), because a supervisor
 killed mid-contract leaves the flag set forever and a recycled pid satisfies the
-bare probe a non-Linux host degrades to. The mirror hazard
+bare probe an unreadable start time degrades to. The mirror hazard
 is a slot held FOREVER: a run that never goes terminal at all, so
 `work.runMaxMs` (`--run-max`, default 24h) is the watchdog. (Every run is
 supervised: the native `claude --bg` launch — and its `claude agents --json` /

@@ -302,39 +302,19 @@ test("networkGit reaps by parentage on win32 only after a timeout or overflow, n
   assert.equal(reaped.length, 1, "a call that finished is not reaped");
 });
 
-test("descendantsOf walks a dead root's tree and refuses recycled-pid lookalikes", () => {
-  const { descendantsOf, parseSnapshot } = require("../lib/shell/git-network.js");
-  const rows = parseSnapshot([
-    "10 4 5000",   // the git launcher's child (mingw git), inside the window
-    "11 10 5100",  // sh
-    "12 11 5200",  // the ssh wrapper
-    "13 12 5300",  // its pipe-holding child
-    "20 4 100",    // claims the dead root as parent but predates the run: a recycled pid's orphan
-    "21 20 200",   // ...and its child
-    "30 12 1",     // claims the wrapper as parent but predates it: recycled
-    "bogus line",
-  ].join("\r\n"));
-  assert.equal(rows.length, 7);
-  assert.deepEqual(descendantsOf(rows, 4, { since: 4900, until: 6000 }).sort((a, b) => a - b), [10, 11, 12, 13]);
-  assert.deepEqual(descendantsOf(rows, 4, { since: 9000, until: 9500 }), [], "children created outside the window are not the root's");
-});
-
-test("reapWindowsTree taskkills the descendants it found and tolerates a failed snapshot", () => {
+test("reapWindowsTree stops a dead root's window-proven descendants through the shared tree kill, never taskkill /T", () => {
   const { reapWindowsTree } = require("../lib/shell/git-network.js");
   const calls = [];
   const env = { SystemRoot: "C:\\Windows" };
-  const run = (cmd, args) => {
-    calls.push([cmd, args]);
-    return /powershell/i.test(cmd) ? { status: 0, stdout: "10 4 5000\n11 10 5100\n99 1 5000\n" } : { status: 128 };
-  };
+  const run = (cmd, args) => { calls.push([cmd, args]); return { status: 0, stdout: "10\r\n11\r\n" }; };
   assert.deepEqual(reapWindowsTree(4, { since: 4900, until: 6000, env, run }), [10, 11]);
+  assert.equal(calls.length, 1, "one PowerShell pass proves, walks and kills");
   assert.match(calls[0][0], /WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/);
-  assert.match(calls[1][0], /System32[\\/]taskkill\.exe$/);
-  assert.deepEqual(calls[1][1], ["/F", "/PID", "10", "/PID", "11"], "no /T: its parent-pid walk would re-admit recycled lookalikes");
+  const script = calls[0][1].at(-1);
+  assert.doesNotMatch(script, /taskkill/i);
+  assert.doesNotMatch(script, /\$kill\.Add\(4\)/, "the unproven dead root itself is never signalled");
+  assert.match(script, /\$cft -ge \$pft/, "a deeper child must be created no earlier than its parent");
   calls.length = 0;
-  assert.deepEqual(reapWindowsTree(4, { since: 0, until: 1, env, run: (cmd, args) => { calls.push([cmd, args]); return { status: null, error: new Error("ETIMEDOUT"), stdout: "" }; } }), []);
-  assert.equal(calls.length, 1, "no taskkill without a snapshot");
-  calls.length = 0;
-  assert.deepEqual(reapWindowsTree(4, { since: 4900, until: 6000, env, run: (cmd, args) => { calls.push([cmd, args]); return /powershell/i.test(cmd) ? { status: 1, stdout: "10 4 5000\n" } : { status: 0 }; } }), [10], "a non-zero exit that still printed rows is used");
+  assert.deepEqual(reapWindowsTree(4, { since: 0, until: 1, env, run: (cmd, args) => { calls.push([cmd, args]); return { status: null, error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }), stdout: "" }; } }), []);
   assert.deepEqual(reapWindowsTree(0, { since: 0, until: 1, env, run }), []);
 });

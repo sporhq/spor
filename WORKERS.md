@@ -518,8 +518,8 @@ exactly as readily as the real holder — is provably not our launcher and is
 reaped at once, and conversely a **verified live holder keeps the candidate
 however long it takes**, which matters because the claimed region includes an
 operator's unbounded `dispatch.worktreeSetup` hook. The 30-minute TTL is only
-the fallback for the case identity cannot be verified (off Linux, where the tick
-count is unreadable), the same trade `supervisorStillWatching` already makes.
+the fallback for the case identity cannot be verified (a host where the start
+time could not be read), the same trade `supervisorStillWatching` already makes.
 
 It degrades open twice over: a journal it cannot write or read loses the race
 tiebreak rather than stopping a dispatch (said out loud, as a `warning:`), and

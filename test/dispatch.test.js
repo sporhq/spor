@@ -3292,7 +3292,7 @@ test("dispatch <node-id> --force (local): a race is not locked out from itself â
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const stub = writeSpawnableNodeStub(home, "claude-force-race", `
-require("node:fs").writeFileSync(require("node:path").join(${JSON.stringify(home)}, "forced-" + process.pid), "launched\\n");
+require("node:fs").writeFileSync(require("node:path").join(${JSON.stringify(home)}, "forced-" + process.pid + "-" + require("node:crypto").randomBytes(4).toString("hex")), "launched\\n");
 `);
   const env = bare({ SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
   const [r1, r2] = await Promise.all([

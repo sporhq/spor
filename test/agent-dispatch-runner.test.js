@@ -131,7 +131,7 @@ test("an observed exit does not let an early, recovered-from rate limit overshad
   const fixture = jobFixture(`
 const fs = require("node:fs");
 fs.writeSync(2, "API Error: rate_limit_error, retrying\\n");
-for (let i = 0; i < 200; i++) fs.writeSync(1, "resumed after backoff, run " + i + "\\n");
+for (let i = 0; i < 200; i++) fs.writeSync(2, "resumed after backoff, run " + i + "\\n");
 fs.writeSync(2, "Tests failed: 3 failing, 0 passing\\n");
 process.exit(1);
 `, "p\n");

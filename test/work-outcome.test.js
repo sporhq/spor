@@ -256,7 +256,9 @@ test("mintIdentity records this process's pid and start ticks, and verifies agai
   const me = identity.mintIdentity();
   assert.equal(me.pid, process.pid);
   assert.equal(identity.isOurProcess(me.pid, me.ticks).reallyAlive, true);
-  if (process.platform === "linux") assert.equal(typeof me.ticks, "number");
+  // Every supported OS has a start-time source now (issue-spor-process-identity-start-time-off-linux).
+  assert.equal(typeof me.ticks, "number");
+  assert.equal(identity.isOurProcess(me.pid, me.ticks).identityKnown, true);
 });
 
 test("the run store, the local execution lock and the spool all read the ONE identity check", () => {
