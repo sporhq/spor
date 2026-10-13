@@ -268,6 +268,30 @@ test("reconcileRuns: a supervised run whose child is ALSO already gone reports n
   assert.strictEqual(out[0].child_reaped, undefined);
 });
 
+// The passive reconcile path must NEVER tree-kill on Windows: off Linux there
+// is no process start-time identity yet, so a stale record's child pid may be
+// an unrelated process that reused it, and `taskkill /T` would take that
+// stranger's whole tree (issue-spor-process-identity-start-time-off-linux). The
+// tree kill belongs to explicit stops (stopRun) only; reconcile keeps the
+// single-pid kill.
+test("reconcileRuns on Windows reaps an orphan by its single pid, never through a taskkill /T tree kill", async () => {
+  const home = scratch("spor-runs-store-");
+  const child = liveChild();
+  try {
+    await new Promise((resolve) => child.once("spawn", resolve));
+    supervisedRecord(home, "sup-orphan-win", { runner_pid: deadPid(), child_pid: child.pid });
+    const calls = [];
+    const run = (...a) => { calls.push(a); return { status: 0 }; };
+    const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z", platform: "win32", run });
+    assert.strictEqual(out[0].state, "vanished");
+    assert.strictEqual(out[0].child_reaped, true);
+    assert.deepStrictEqual(calls, [], "the passive path never runs taskkill");
+    assert.ok(await waitUntilDead(child.pid), "the single-pid kill still ended the orphan");
+  } finally {
+    try { child.kill("SIGKILL"); } catch { /* already gone */ }
+  }
+});
+
 // task-spor-nested-codex-dispatch-sandbox-isolation: a run's scratch dir (an
 // isolated CODEX_HOME, for Codex) must not be ripped out from under a child
 // that may still be alive — `reapOrphanChild` only sends SIGTERM and returns,
