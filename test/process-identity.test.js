@@ -146,3 +146,183 @@ test("isOurProcess: a pid that dies DURING the start-time read is dead, not aliv
   assert.deepEqual(identity.isOurProcess(4242, null, { readTicks: () => { throw new Error("must not read"); }, alive: () => (probes++, true) }), { reallyAlive: true, identityKnown: false });
   assert.equal(probes, 1);
 });
+
+// --- identity passes (issue-spor-windows-identity-read-powershell-boot-hot-paths)
+// Off Linux every start-time read is a process spawn (a PowerShell boot on
+// Windows), so a hot path judging N pids must pay ONE read, not N. The host
+// seam drives the off-Linux path on any OS and counts the reads.
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+function fakeHost(platform = "win32") {
+  const calls = [];
+  const restore = identity._setHost({
+    platform,
+    read: (pids) => {
+      calls.push([...pids]);
+      return new Map(pids.map((p) => [p, 1000 + p]));
+    },
+  });
+  return { calls, restore };
+}
+
+function withSleepers(n, fn) {
+  const kids = Array.from({ length: n }, spawnSleeper);
+  return Promise.resolve()
+    .then(() => fn(kids.map((k) => k.pid)))
+    .finally(() => kids.forEach((k) => k.kill()));
+}
+
+test("outside a pass, every off-Linux read of another pid is a fresh spawn", async () => {
+  await withSleepers(1, ([pid]) => {
+    const { calls, restore } = fakeHost();
+    try {
+      assert.equal(identity.isOurProcess(pid, 1000 + pid).reallyAlive, true);
+      assert.equal(identity.isOurProcess(pid, 1000 + pid).reallyAlive, true);
+      assert.equal(calls.length, 2, "no cache across checks outside a pass");
+    } finally {
+      restore();
+    }
+  });
+});
+
+test("inside a pass, a prefetch reads every live pid in ONE spawn and the checks reuse it", async () => {
+  await withSleepers(3, (pids) => {
+    const { calls, restore } = fakeHost();
+    try {
+      const dead = 2 ** 22 + 12345; // beyond any default pid_max: not alive
+      const verdicts = identity.withIdentityPass(() => {
+        identity.prefetchStartTicks([...pids, dead, process.pid, pids[0]]);
+        assert.equal(calls.length, 1, "one read for the whole pass");
+        assert.deepEqual(calls[0].sort(), [...pids].sort(), "only live, distinct, non-self pids are read");
+        // nested pass shares the outer cache
+        return identity.withIdentityPass(() => pids.map((p) => identity.isOurProcess(p, 1000 + p)));
+      });
+      assert.equal(calls.length, 1, "the checks read nothing more");
+      assert.deepEqual(verdicts, pids.map(() => ({ reallyAlive: true, identityKnown: true })));
+      // a mismatch is still a mismatch from the cache
+      identity.withIdentityPass(() => {
+        identity.prefetchStartTicks(pids);
+        assert.deepEqual(identity.isOurProcess(pids[0], 7), { reallyAlive: false, identityKnown: true });
+      });
+      // the cache dies with the pass
+      identity.isOurProcess(pids[0], 1000 + pids[0]);
+      assert.equal(calls.length, 3);
+      // an un-prefetched pid inside a pass is read once, then reused
+      identity.withIdentityPass(() => {
+        identity.isOurProcess(pids[1], 1000 + pids[1]);
+        identity.isOurProcess(pids[1], 1000 + pids[1]);
+      });
+      assert.equal(calls.length, 4);
+      // an entry past its freshness bound is read again, even inside the pass
+      identity.withIdentityPass(() => {
+        identity.prefetchStartTicks(pids);
+        const until = Date.now() + identity.PASS_FRESH_MS + 20;
+        while (Date.now() < until) { /* a pass doing slow work between checks */ }
+        identity.isOurProcess(pids[2], 1000 + pids[2]);
+      });
+      assert.equal(calls.length, 6, "a stale entry is a miss");
+    } finally {
+      restore();
+    }
+  });
+});
+
+test("a failed (null) read inside a pass is not cached: the next check retries it", async () => {
+  await withSleepers(1, ([pid]) => {
+    let fail = true;
+    const calls = [];
+    const restore = identity._setHost({ platform: "win32", read: (pids) => (calls.push(pids), new Map(pids.map((p) => [p, fail ? null : 1000 + p]))) });
+    try {
+      identity.withIdentityPass(() => {
+        identity.prefetchStartTicks([pid]);
+        fail = false;
+        assert.deepEqual(identity.isOurProcess(pid, 1000 + pid), { reallyAlive: true, identityKnown: true });
+      });
+      assert.equal(calls.length, 2);
+    } finally {
+      restore();
+    }
+  });
+});
+
+test("prefetch outside a pass, and any pass on Linux, reads nothing", async () => {
+  await withSleepers(1, ([pid]) => {
+    let h = fakeHost();
+    try {
+      identity.prefetchStartTicks([pid]);
+      assert.equal(h.calls.length, 0);
+    } finally {
+      h.restore();
+    }
+    h = fakeHost("linux");
+    try {
+      identity.withIdentityPass(() => identity.prefetchStartTicks([pid]));
+      assert.equal(h.calls.length, 0, "Linux reads /proc per check and never caches");
+    } finally {
+      h.restore();
+    }
+  });
+});
+
+test("the hot paths judge N pids with ONE read: activeRuns, reconcileRuns, worker statuses, spool and workspace locks", async () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const workLoop = require("../lib/shell/work-loop.js");
+  const spool = require("../lib/shell/spool.js");
+  const preflight = require("../lib/shell/preflight.js");
+  await withSleepers(3, async (pids) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-identity-pass-"));
+    const { calls, restore } = fakeHost();
+    try {
+      const runDir = path.join(home, "journal", "dispatch");
+      fs.mkdirSync(runDir, { recursive: true });
+      pids.forEach((p, i) => {
+        const rec = { run_id: `r${i}`, state: "running", launch_mode: "supervised-jsonl", runner_pid: p, runner_started_ticks: 1000 + p, started_at: new Date().toISOString() };
+        fs.writeFileSync(path.join(runDir, `r${i}.run.json`), JSON.stringify(rec));
+      });
+      assert.equal(dispatchRuns.activeRuns(home, {}).length, 3);
+      assert.equal(calls.length, 1, "activeRuns: one read for three supervisors");
+
+      calls.length = 0;
+      const reconciled = dispatchRuns.reconcileRuns(home);
+      assert.equal(reconciled.filter((r) => r.state === "running").length, 3, "live supervisors stay open");
+      assert.equal(calls.length, 1, "reconcileRuns: one read for three supervisors");
+
+      calls.length = 0;
+      const workDir = path.join(home, "journal", "work");
+      fs.mkdirSync(workDir, { recursive: true });
+      pids.forEach((p, i) => fs.writeFileSync(path.join(workDir, `w${i}.work.json`), JSON.stringify({ worker_id: `w${i}`, pid: p, started_ticks: 1000 + p, started_at: new Date().toISOString() })));
+      const workers = workLoop.readWorkerStatuses(home, { alive: (p, t) => identity.isOurProcess(p, t).reallyAlive });
+      assert.equal(workers.filter((w) => w.live).length, 3);
+      assert.equal(calls.length, 1, "worker statuses: one read for three workers");
+
+      calls.length = 0;
+      const lockDir = path.join(home, "spool");
+      fs.mkdirSync(lockDir);
+      const old = Date.now() - 24 * 3600 * 1000; // expired, so only identity decides
+      pids.forEach((p) => fs.writeFileSync(path.join(lockDir, `h.redrive.lock-${p}-${old}-${(1000 + p).toString(16).padStart(16, "0")}abcd0123`), ""));
+      // A recycled pid (ticks mismatch) is reaped; the claim is ours.
+      fs.readdirSync(lockDir).forEach((f) => fs.renameSync(path.join(lockDir, f), path.join(lockDir, f.replace(/-[0-9a-f]{16}(abcd0123)$/, `-${"0".repeat(15)}7$1`))));
+      const release = spool.claimSpoolJob(lockDir, "h");
+      assert.ok(release, "recycled holders do not contend");
+      release();
+      assert.equal(calls.filter((c) => !c.includes(process.pid)).length, 1, "spool lock listing: one read for three rivals");
+
+      calls.length = 0;
+      const ws = path.join(home, "ws");
+      fs.mkdirSync(ws);
+      const wsLockDir = preflight.workspaceLockDir(home);
+      fs.mkdirSync(wsLockDir, { recursive: true });
+      const prefix = preflight.workspaceLockPrefix(ws);
+      pids.forEach((p) => fs.writeFileSync(path.join(wsLockDir, `${prefix}${p}-7-${Date.now()}-abcd`), ""));
+      const got = await preflight.acquireWorkspace(home, ws, { waitMs: 0 });
+      assert.equal(got.ok, true, "recycled holders do not hold the workspace");
+      preflight.releaseWorkspace(got.token);
+      assert.equal(calls.filter((c) => !c.includes(process.pid)).length, 1, "workspace lock listing: one read for three rivals");
+    } finally {
+      restore();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
