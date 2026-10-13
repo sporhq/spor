@@ -262,9 +262,11 @@ const cli = require(CLI);
 // The real local provider over a scratch home: the CLI's own worktree and
 // supervisor helpers as its host, a scratch repo mapped as `conformance` with
 // an https origin (a manifest's candidate must be fetchable off the
-// environment), and two stub harnesses — one that commits and exits, one that
-// holds until it is signalled.
-function conformanceSetup() {
+// environment), and three stub harnesses — one that commits and exits, one
+// that holds until it is signalled, and one that commits and THEN holds (a
+// candidate a cancel must still leave collectable). `providerOpts` reach
+// createLocalProvider (the platform whose stop doors it uses, the grace).
+function conformanceSetup(providerOpts = {}) {
   const home = scratchHome("spor-lprov-conf-");
   const repo = gitRepo("spor-lprov-conf-repo-");
   git(repo, ["remote", "add", "origin", "https://conformance.spor.invalid/conformance.git"]);
@@ -286,6 +288,11 @@ function conformanceSetup() {
       process.exit(r.status === 0 ? 0 : 3);
     `)),
     hold: writeSpawnableNodeStub(home, "claude-hold", "setInterval(() => {}, 1000);"),
+    commitHold: writeSpawnableNodeStub(home, "claude-commit-hold", afterPrompt(`
+      const { spawnSync } = require("child_process");
+      spawnSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "cancelled candidate"], { cwd: process.cwd(), stdio: "ignore" });
+      setInterval(() => {}, 1000);
+    `)),
   };
   const lines = { out: [], err: [] };
   const provider = createLocalProvider({
@@ -297,6 +304,7 @@ function conformanceSetup() {
       removeDispatchWorktree: cli.removeDispatchWorktree,
       launchSupervisedHarness: cli.launchSupervisedHarness,
     },
+    ...providerOpts,
   });
   const adapter = dispatchHarnesses.getHarness("claude-code");
   let n = 0;
@@ -674,6 +682,114 @@ test("a record the local provider closes carries the outcome dimension: cancelle
   assert.strictEqual(graceful.terminal_enforced, false);
   await req("release", { handle: e.handle });
   assert.strictEqual(provider.environments(), 0);
+});
+
+// A graceful cancel is the same wind-down on every platform
+// (issue-spor-windows-local-provider-graceful-cancel-hard-terminates):
+// stopping, then finished, the record closed as a cancel with its outcome
+// dimension, the harness gone, and the candidate the run committed before the
+// stop still collected into a manifest. `win32` is the provider's stop doors
+// as Windows has them — the stop file alone, no signal (a Windows SIGTERM is a
+// TerminateProcess no handler sees) — driven on EVERY OS so POSIX CI proves
+// the supervisor's own wind-down too; on the Windows shard it is the native
+// path.
+async function gracefulCancelWindDown(t, providerOpts) {
+  const { home, provider, driver } = conformanceSetup(providerOpts);
+  const n = providerOpts.platform === "win32" ? 6 : 5;
+  const base = {
+    contract_version: 1, attempt_id: `w:${n}`, execution_id: `exec-${String(n).repeat(16)}`, fence: 1, tenant: "t", node_id: "task-x",
+    harness: { id: "claude-code" }, mcp: [], skills: [], plugins: [], tools: [],
+    repos: [{ slug: "conformance", commit: "b".repeat(40), branch: "x" }], egress: { allow: [] }, secrets: [],
+    spor: { server: "https://spor.invalid", token_ref: "spor-attempt-token://exec-0123456789abcdef/1" }, deadline: new Date(Date.now() + 60000).toISOString(),
+    isolation: "worktree", prompt_bundle_ref: "https://x.invalid/p.tar",
+  };
+  const req = async (op, params) => {
+    const res = await provider.request({ contract_version: 1, id: op, op, params });
+    assert.strictEqual(res.ok, true, JSON.stringify(res));
+    return res.result;
+  };
+  const sub = await req("submit", { attempt: driver.attempt(base, "commitHold"), idempotency_key: `wind-down-${n}` });
+  t.after(() => provider.impl.release({ handle: sub.handle }).catch(() => {}));
+  const baseHead = git(sub.env.cwd, ["rev-parse", "HEAD"]).trim();
+  assert.ok(await waitFor(() => git(sub.env.cwd, ["rev-parse", "HEAD"]).trim() !== baseHead, { timeoutMs: 60000, intervalMs: 100 }), "the stub committed its candidate");
+  const record = () => dispatchRuns.readRecord(home, sub.handle.id);
+  assert.strictEqual(record().state, "running");
+  const childPid = record().child_pid;
+
+  assert.strictEqual((await req("cancel", { handle: sub.handle, force: false })).state, "stopping");
+  const seen = new Set();
+  let settled;
+  for (let i = 0; i < 600; i++) {
+    settled = await req("observe", { handle: sub.handle });
+    seen.add(settled.state);
+    if (settled.state !== "stopping") break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.strictEqual(settled.state, "finished", JSON.stringify(settled));
+  assert.deepStrictEqual([...seen].filter((s) => s !== "stopping" && s !== "finished"), [], "only stopping, then finished");
+  const rec = await waitFor(() => (record().contract_pending === true ? null : record()), { timeoutMs: 30000, intervalMs: 50 });
+  assert.ok(rec, "the terminal-state contract settled");
+  assert.strictEqual(rec.state, "failed");
+  assert.strictEqual(rec.termination_class, "cancelled");
+  assert.match(rec.termination_reason, /cancelled through the local provider \(graceful\)/);
+  assert.strictEqual(rec.terminal_state, "failed");
+  assert.strictEqual(rec.terminal_enforced, false);
+  // WHO closed the record names the door the stop came through: the
+  // supervisor itself (the stop file), or the provider after the supervisor
+  // died on the POSIX group signal.
+  assert.strictEqual(rec.termination_signal, providerOpts.platform === "win32" ? "stop-requested" : "provider-cancel");
+  assert.strictEqual(fs.existsSync(dispatchRuns.runPaths(home, sub.handle.id).stop), providerOpts.platform === "win32", "the stop file is Windows' door; POSIX signals");
+  assert.ok(await waitFor(() => !dispatchRuns.pidAlive(childPid), { timeoutMs: 15000, intervalMs: 100 }), "the harness is gone");
+
+  const collected = await req("collect", { handle: sub.handle });
+  assert.ok(collected.manifest, JSON.stringify(collected));
+  assert.strictEqual(collected.manifest.candidate.commit, git(sub.env.cwd, ["rev-parse", "HEAD"]).trim());
+  assert.notStrictEqual(collected.manifest.candidate.commit, baseHead);
+  assert.strictEqual((await req("release", { handle: sub.handle })).released, true);
+}
+
+test("a graceful cancel through the local provider winds down on this platform: stopping -> finished, a cancelled record, a manifest", async (t) => {
+  await gracefulCancelWindDown(t, { platform: process.platform });
+});
+
+test("a graceful cancel with Windows' stop doors (the stop file alone, no signal) gets the same wind-down from the supervisor itself", async (t) => {
+  await gracefulCancelWindDown(t, { platform: "win32" });
+});
+
+test("a graceful cancel the supervisor does not answer inside the grace window falls back to a terminate, closed as the cancel it was", async (t) => {
+  const home = scratchHome("spor-lprov-grace-");
+  const cfg = loadConfig({ cwd: home, env: hermeticEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, HOME: home }) });
+  // A "supervisor" that never polls the stop file: a live process of ours
+  // named by a run record this provider stamped (adopted by handle).
+  const deaf = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  t.after(() => { try { process.kill(deaf.pid, "SIGKILL"); } catch { /* gone */ } });
+  assert.ok(await waitFor(() => dispatchRuns.pidAlive(deaf.pid), { timeoutMs: 10000, intervalMs: 50 }));
+  const runId = "deaf-run";
+  const paths = dispatchRuns.runPaths(home, runId);
+  fs.mkdirSync(paths.dir, { recursive: true });
+  const ticks = dispatchRuns.processStartTicks(deaf.pid);
+  fs.writeFileSync(paths.record, JSON.stringify({
+    run_id: runId, state: "running", created_at: new Date().toISOString(), runner_pid: deaf.pid,
+    ...(ticks != null ? { runner_started_ticks: ticks } : {}),
+    provider_attempt: { provider: "local", idempotency_key: "deaf-key", attempt: {} },
+  }));
+  const host = { out() {}, err() {}, createDispatchWorktree: cli.createDispatchWorktree, removeDispatchWorktree: cli.removeDispatchWorktree, launchSupervisedHarness: cli.launchSupervisedHarness };
+  let clock = Date.now();
+  const provider = createLocalProvider({ cfg, host, platform: "win32", stopGraceMs: 30000, now: () => new Date(clock).toISOString() });
+  const handle = { provider: "local", id: runId };
+  assert.strictEqual((await provider.impl.cancel({ handle, force: false })).state, "stopping");
+  assert.ok(fs.existsSync(paths.stop), "the stop was requested through the file");
+  assert.ok(dispatchRuns.pidAlive(deaf.pid), "no signal went out with Windows' doors");
+  assert.strictEqual((await provider.impl.observe({ handle })).state, "stopping", "inside the grace window the stop is still pending");
+  clock += 30000;
+  const end = await provider.impl.observe({ handle });
+  assert.strictEqual(end.state, "finished", JSON.stringify(end));
+  assert.ok(await waitFor(() => !dispatchRuns.pidAlive(deaf.pid), { timeoutMs: 10000, intervalMs: 50 }), "the deaf supervisor was terminated");
+  const rec = dispatchRuns.readRecord(home, runId);
+  assert.strictEqual(rec.termination_class, "cancelled");
+  assert.strictEqual(rec.termination_signal, "provider-cancel");
+  assert.strictEqual(rec.signal, "SIGKILL");
+  assert.strictEqual(rec.terminal_enforced, false);
 });
 
 test("a restarted local provider adopts what an earlier process submitted: lookup and submit by the persisted key, observe and release by handle — one run (task-spor-work-attempt-handle-adoption)", async () => {

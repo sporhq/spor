@@ -1044,3 +1044,30 @@ test("stopIdleRun: a supervisor that finished in the same instant keeps its own 
   assert.strictEqual(out.terminal_state, "reported");
 });
 
+
+test("the run stop file: named beside the record, requested idempotently, read without blocking, and a Windows stop ends the harness TREE", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-run-stop-"));
+  const p = runner.runPaths(dir, "r1");
+  assert.strictEqual(runner.runStopPath(p.record), p.stop);
+  assert.strictEqual(runner.runStopPath("/x/not-a-record.json"), null);
+  fs.mkdirSync(p.dir, { recursive: true });
+  assert.strictEqual(runner.readRunStop(p.stop), null);
+  assert.deepStrictEqual(runner.requestRunStop(p.stop, "first reason\nsecond line"), { ok: true, path: p.stop });
+  assert.deepStrictEqual(runner.requestRunStop(p.stop, "another"), { ok: true, path: p.stop }, "an existing request stands");
+  assert.deepStrictEqual(runner.readRunStop(p.stop), { reason: "first reason" });
+  assert.strictEqual(runner.requestRunStop(null).ok, false);
+
+  const calls = [];
+  const child = { pid: 4242, kill: (sig) => { calls.push(["kill", sig]); return true; } };
+  const run = (cmd, args) => { calls.push([cmd, args]); return { status: 0 }; };
+  assert.strictEqual(runner.killChildTree(child, "SIGTERM", { platform: "win32", env: { SystemRoot: "C:\\Windows" }, run }), true);
+  assert.deepStrictEqual(calls[0][1], ["/PID", "4242", "/T", "/F"]);
+  assert.match(calls[0][0], /System32[\\/]taskkill\.exe$/);
+  assert.strictEqual(calls.length, 1, "taskkill ended the tree; no second kill");
+  calls.length = 0;
+  runner.killChildTree(child, "SIGTERM", { platform: "win32", env: {}, run: () => ({ status: 1 }) });
+  assert.deepStrictEqual(calls, [["kill", undefined]], "a failed taskkill falls back to the child alone");
+  calls.length = 0;
+  runner.killChildTree(child, "SIGTERM", { platform: "linux", run });
+  assert.deepStrictEqual(calls, [["kill", "SIGTERM"]]);
+});

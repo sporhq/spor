@@ -758,7 +758,12 @@ why. The fetch URL is the CONFIGURED `remote.origin.url` (never this box's
 credential-free is withheld, and with it the manifest. A push URL that differs
 from the fetch URL is assumed to feed it (a push mirror): the read-back proves
 the push landed, not that the fetch URL already serves it — plus the report and log as `file://` references; `cancel` is SIGTERM to the supervisor's process group (identity-
-gated), `force` the TERM-then-KILL stop with the record closed as cancelled;
+gated) on POSIX and, on Windows (or when no signal could be sent), the run's
+stop file `journal/dispatch/<run>.stop`, which the supervisor polls: it ends
+the harness tree itself (`taskkill /T /F` on Windows) and closes its record as
+`cancelled` (signal `stop-requested`); a supervisor still running 30s later is
+terminated and the record closed by the provider. `force` is the TERM-then-KILL
+stop with the record closed as cancelled;
 `release` stops anything still running and removes the worktree this submit
 created. Secrets are not materialized, since the harness runs with the
 operator's own environment. The extraction is byte-identical — same run
