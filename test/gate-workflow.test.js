@@ -959,6 +959,32 @@ test("a human gate's wait YIELDS between polls: judge files and returns, each pe
   assert.equal(world.polls, 3);
 });
 
+// task-spor-gate-changes-requested-fix-cycle: a request for changes delivered
+// by the driver's poll carries the sign-off decision and the note on the
+// JOURNALED signal, so a re-drive replays the same rework without re-reading.
+test("a changes_requested answer delivered through the approval signal journals the decision and the note", async () => {
+  const home = scratchHome("approval-cr");
+  const T0 = 1_700_000_000_000;
+  const clock = fakeClock(T0);
+  const world = humanWorld({ clock, home });
+  world.deps.checkApproval = async () => {
+    world.polls += 1;
+    return world.polls >= 2 ? { state: "changes_requested", by: "person-a", decision: "dec-signoff-abc", note: "Rename the flag." } : { state: "pending" };
+  };
+  const first = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps });
+  assert.equal(first.state, "interrupted");
+  clock.advanceTo(T0 + APPROVAL_POLL);
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps });
+  // HUMAN declares no cycles: the request settles as a refusal.
+  assert.equal(res.state, "failed", JSON.stringify(res));
+  assert.equal(res.escalated_to, "task-approve-x");
+  const sig = approvalJournal(home).filter((e) => e.kind === "signal").pop();
+  assert.deepEqual(sig.payload, { state: "changes_requested", by: "person-a", head: null, decision: "dec-signoff-abc", note: "Rename the flag." });
+  const again = await gateRunner.runGatePipeline({ item: ITEM, factory: HUMAN, deps: world.deps });
+  assert.deepEqual(again, res);
+  assert.equal(world.polls, 2, "the replay reads the journaled answer");
+});
+
 test("a wait resumed by a LATER worker continues under the SAME deadline: nothing is filed twice, each re-drive polls once, and an item still unanswered at the journaled deadline is BLOCKED", async () => {
   const home = scratchHome("approval-crash");
   const T0 = 1_700_000_000_000;

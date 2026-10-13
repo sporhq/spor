@@ -226,14 +226,14 @@ overrides that seed rule like any other.
 |---|---|---|
 | `content_format` | `markdown` \| `text` | `markdown` is CommonMark + GFM, the only format whose `spor-asset:` image embeds mean anything. `text` is plain. Absent = a legacy body, read as before, embedding nothing. |
 | `asset_digest` | `sha256:<64 lowercase hex>` | makes the node an **asset descriptor**: it names immutable bytes held OUTSIDE graph Git (`$SPOR_HOME/assets/` locally, a per-tenant object store hosted; dec-spor-chatgpt-asset-storage-contract-2026-10-08) |
-| `asset_media_type` | `image/png` \| `image/jpeg` \| `image/gif` \| `image/webp` | the verified type (SVG is refused because it can carry script) |
-| `asset_bytes`, `asset_width`, `asset_height` | positive integers | size and pixel dimensions |
+| `asset_media_type` | `image/png` \| `image/jpeg` \| `image/gif` \| `image/webp` \| `application/x-git-bundle` | the verified type (SVG is refused because it can carry script). `application/x-git-bundle` is the ATTACHMENT-ONLY class (a factory candidate's self-contained bundle): no pixel dimensions, never embedded or rendered inline, delivered only as an attachment download |
+| `asset_bytes`, `asset_width`, `asset_height` | positive integers | size and pixel dimensions (an attachment carries `asset_bytes` only; dimensions are refused) |
 | `asset_alt` | text, ≤1000 chars (optional) | alt text. The caption is the node's own `summary`, and provenance is its edges and attribution stamps. |
 | `doc_sha256` + `doc_bytes` | 64 hex + integer | a long-document **generation root** (the server's document-generation stamps) |
 | `doc_generation` | 64 hex | a generation **part**; needs `continuation_of` and never sits beside `doc_sha256` |
 | `selection` | a `spor-source:` / `spor-image:` URI | one exact selection the node is about (below) |
 
-The five required asset keys come together or not at all, and any other
+The five required asset keys (three for an attachment) come together or not at all, and any other
 `asset_*` key is refused as a typo. Only shape is checked at the door. That the
 bytes really hash to the digest is the upload path's single streaming
 verification, and only that path writes a descriptor. That a root's

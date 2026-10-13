@@ -13545,7 +13545,7 @@ async function gateApprovalState(cfg, id, { head = null } = {}) {
       const r = resolutionOf(g, id);
       if (r && r.by) return { state: "approved", by: r.by };
       const n = g.nodes[id];
-      if (n && isTerminalStatus(n.status, n.type, g)) return { state: "rejected", by: status };
+      if (n && isTerminalStatus(n.status, n.type, g)) return gateRefusalState(cfg, node, id, status);
       return { state: "pending" };
     } catch {
       // An unreadable graph is not an approval.
@@ -13561,9 +13561,29 @@ async function gateApprovalState(cfg, id, { head = null } = {}) {
   // an explicit `false` would be overruled by a seed pack that has not seen this
   // graph's resident schema — refusing an approval the person is still owed.
   if (graphLib.isNodeInertOffline(node.inert, status, node.type || null)) {
-    return { state: "rejected", by: status };
+    return gateRefusalState(cfg, node, id, status);
   }
   return { state: "pending" };
+}
+
+// A refused approval item is either a REFUSAL or a person's REQUEST FOR
+// CHANGES (task-spor-gate-changes-requested-fix-cycle): the latter is the same
+// non-resolving terminal status plus the `signoff_verdict: changes_requested`
+// / `signoff_decision:` stamps, backed by a decision carrying the note
+// (gates.readChangesRequest has the wire shape). A decision that cannot be
+// READ is pending — the next poll asks again rather than settling a rework as
+// a refusal off a read that never happened; one that is absent, or does not
+// back the stamp, is the refusal the status says.
+async function gateRefusalState(cfg, node, id, status) {
+  const rejected = { state: "rejected", by: status };
+  const decisionId = gatesKernel.changesRequestDecisionId(node.frontmatter);
+  if (!decisionId) return rejected;
+  const look = {};
+  const decision = await resolveNode(cfg, decisionId, look);
+  if (look.unreadable || nodeUnreadable(decision)) return { state: "pending", reason: `the sign-off decision ${decisionId} could not be read` };
+  const read = gatesKernel.readChangesRequest(decision, id);
+  if (!read.ok) return rejected;
+  return { state: "changes_requested", by: decision.author || null, decision: decisionId, note: read.note };
 }
 
 // --- demoting a refused item (WORKERS.md §10.7) ----------------------------

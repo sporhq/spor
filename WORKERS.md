@@ -386,7 +386,18 @@ still goes through `deps.dispatch` → `cmdDispatch` with all its guards.
   or scope) are `local.no_capable_member`:
   reported, the run released for a capable machine and cooled locally; members
   stuck for a global reason (a person's call, a blocker) leave the run held and
-  visible, which the server's `blocked` overlay reports. Nothing local is ever
+  visible, which the server's `blocked` overlay reports. A verdict the graph
+  can change (not agent-ready, out of scope, human, declined, assigned
+  elsewhere) is never judged off a cooldown: those members are re-classified
+  from the current page every pass, so a readiness stamped after the skip makes
+  the member runnable on the next pass instead of releasing the run on a stale
+  reading. A run released over such members keeps their ids on its local
+  cooldown and re-reads just those from the queue each pass; the moment one
+  reads runnable here the cooldown lifts and the run is re-claimed (a release
+  over only capability or profile refusals keeps the full `retryAfterMs`).
+  A worker that owns no run polls at the base `intervalMs`, never the idle
+  backoff, so a fresh Start is claimed within one interval
+  (task-split-spor-2a9f439e2bae). Nothing local is ever
   written as run state, and nothing about a launch is persisted for the source:
   a restart re-derives its whole view from the server's run read and this box's
   own run journal (`spor work --status` shows the owned run under `serve`).
@@ -1277,6 +1288,57 @@ door(s) under `implementation.candidate`:
 | `bundle` (default) | `git bundle create` of `base.merge_base..commit`, under `refs/spor/candidates/<candidate_id>`, into `candidate.bundle_store` (default `file://<userConfigHome>/candidates` — machine-local, **not** a marker-resolved shared graph home; gitignored in whichever directory the store itself resolves to, if that's a git working tree — task-spor-candidate-store-home-vs-shared-graph-home-trap) | `{kind, store, key, locator, commit, sha256, bytes, verified_at}` |
 | `branch` | `git push <resolved url> <commit>:refs/spor/candidates/<candidate_id> --force-with-lease=<ref>:` — the empty expectation, i.e. **create only if absent**, never `--force` | `{kind, locator, ref, commit, verified_at}` |
 | `both` | both, with the bundle as `reference` and `references[]` carrying both doors | as above |
+
+**The bundle as a tenant asset** (task-spor-worker-uploads-candidate-bundle-asset,
+task-spor-client-selfcontained-bundle-and-bundle-asset-class,
+dec-spor-signoff-diff-pinned-anchor). Hosted sign-off has no checkout to read a
+diff from and refuses a `file://` reference, so in **remote mode** a candidate
+whose publish VERIFIED (any kind) is also uploaded through the asset client
+(`POST /v1/assets`, the `spor asset import` door — `importRemote` with
+`mediaType: application/x-git-bundle`, the attachment-only asset class in
+`kernel/content.js`, so the image rules do not apply but the size cap and the
+digest pin do) under the idempotency key
+`spor-candidate.<sha256(candidate_id "\n" digest)[0..40]>`, captioned with the
+candidate id, commit, tree and declared base and stamped to the item's project.
+
+The uploaded object is **not** the reference's thin `merge_base..commit`
+bundle, which an empty server git dir refuses for its missing prerequisite. It
+is a **self-contained** bundle cut for that reader: no prerequisites, the
+candidate commit under `refs/spor/candidates/<candidate_id>` and the declared
+base (`base.merge_base`) under `refs/spor/candidate-bases/<candidate_id>`. Before
+anything is sent it is proven the way the server will read it — `git bundle
+verify` in an EMPTY repository, then both refs fetched and checked against the
+pinned commit, tree and base — and measured against the cap
+(`BUNDLE_ASSET_MAX_BYTES`, the server's own asset limit): an object over it is
+never sent. The upload is an ADDITION to the reference, never a condition of
+it: the `file://` (or `https://`) bundle stays the `reference` byte-for-byte as
+before, and any upload failure — over the cap, a server that takes no bundle
+assets, an outage — leaves the publish standing. The candidate records exactly
+one of:
+
+| field | shape | meaning |
+|---|---|---|
+| `asset` | `{id, uri, digest, bytes, media_type, base, uploaded_at}` | the uploaded self-contained bundle. `digest` is `sha256:` over the uploaded bytes (its own, not the reference's), `uri` the digest-pinned `spor-asset:<id>@sha256:<hex>`, `media_type` always `application/x-git-bundle`, `base` the declared base the bundle carries — what the server records as the run's first-candidate anchor when the factory sets none. An answer whose digest is not the bundle's is never recorded here |
+| `asset_error` | `{reason, code?, digest?, bytes?, max_bytes?, base, attempts, at}` | the upload was attempted and failed; `code` is `too_large` (measured here: `bytes` and `max_bytes` say by how much, and nothing was sent; or the server's own limit), `not_self_contained` (the bundle did not verify in an empty repository), or the asset error code that came back (`unsupported_media`, `verification_failed`, `offline`, …). No `asset` is written; a card reads it as `requires_full_diff` with this reason |
+
+Neither field exists in local mode, or when the publish itself failed. A
+re-publish replaces both (a stale `asset_error` never sits beside a later
+upload). An owed upload is **retried at the next re-pin** of an
+already-published candidate — one published before the server took bundle
+assets, or during an outage — without re-publishing its reference
+(`assetUploadOwed`); `too_large` and `not_self_contained` — which an
+immutable candidate cannot outgrow — are not retried, and every other
+refusal is retried at most `ASSET_UPLOAD_MAX_ATTEMPTS` (5) times in all,
+counted on `asset_error.attempts`, so a server that will never take the
+bundle stops costing a bundle-create and an upload on every re-pin. The
+**human-gate approval item** carries the binding for the judged commit —
+frontmatter `candidate_id:`, `candidate_asset:` (the pinned URI),
+`candidate_asset_digest:` and `candidate_base:`, plus a body line — only when
+the run's current candidate's `commit` IS the item's `gate_head` and its
+`asset` landed; with an `asset_error` for that commit the body says the bundle
+was not uploaded and why, and the frontmatter carries no asset. A sign-off
+reader verifies the asset's digest, then the tree and pinned commit inside the
+bundle, before reading anything from it.
 
 Four properties the publisher is built around:
 
@@ -2588,9 +2650,49 @@ paths, and **blocks the resolve** while polling it:
 - it reaches any other terminal status (`abandoned`, `closed`, `superseded`, …)
   → **refused**, the gate fails; the approval item itself is the human record,
   so nothing further is filed;
+- it reaches that same non-resolving terminal status **and** is stamped as a
+  request for changes → **changes requested**, the one RETRYABLE answer (below);
 - nobody answers inside `approval_timeout_ms` (default 24h) → the pipeline
   reports **blocked**, the approval item stands, and the worker moves on rather
   than deciding on the person's behalf.
+
+**Request changes** (task-spor-gate-changes-requested-fix-cycle,
+dec-spor-run-signoff-self-requires-solo-and-request-changes-reworks). A person
+reviewing a candidate can send it back instead of refusing it. The wire shape
+the sign-off door writes (spor-server `run_signoff` `request_changes`,
+task-spor-signoff-request-changes-server):
+
+- ONE decision, written as the person, with `verdict: changes_requested` in its
+  frontmatter, an edge (`relates-to`) to the approval item, and the person's
+  note as the quoted (`> `) block under a body line reading exactly `Note:`;
+- the approval item stamped `signoff_verdict: changes_requested` and
+  `signoff_decision: <that decision's id>`, landed **no later than** its
+  status moving to `abandoned` — a poll that sees the status without the stamp
+  settles a refusal, and that is final.
+
+The status is still a refusal's, deliberately: a client that predates this
+reads a request for changes as a refusal, which is the decided fallback. This
+client reads the stamp, then the decision it names: a decision that does not
+say `verdict: changes_requested`, does not link the item by `relates-to`, or
+carries an `authored_by_agent` stamp (a dispatched agent wrote it, not a
+person) is the refusal the status says, and one that cannot be READ is still pending (the next poll asks
+again). The answer becomes a FIX CYCLE charged to the gate's own `cycles`
+(zero by default — a factory opts into reworks exactly as it opts into review
+fix cycles): the implementer is dispatched back into the run's checkout with the
+person's note as the evidence, its commit moves the head, and the re-judged
+gate files a FRESH approval item for the new candidate (the id folds the head
+in), so the next round is a new sign-off on the new candidate — the server
+files nothing for it. Unlike a review or command gate's fix cycle (which
+re-judges the same gate first), a rework that moved the head restarts the list
+from gate 0: the tests and the review judge the new candidate BEFORE a person
+is asked to sign off on it, and the human gate resumes at its next cycle when
+the list reaches it. Nothing is escalated while the rework is retrying — the
+approval item becomes the escalation only when the request settles. With the
+cycles spent the request settles exactly as a refusal: failed, escalated to the
+approval item, never rescued — and so does a request read back after a fix that
+left the head where it was (the gate re-read the SAME item, so nobody was asked
+again; one answer is never charged to every cycle). The signal payload (`approval:<id>`) journals
+the decision id and the note, so a re-drive replays the same rework.
 
 The wait is durable (task-spor-gate-human-approval-await-signal): filing the
 item is the gate attempt's activity, and the wait is a workflow signal

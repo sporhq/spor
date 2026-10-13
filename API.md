@@ -62,7 +62,8 @@ graph's git repo. What a client sees:
   `lib/kernel/content.js`). An artifact may carry the optional flat keys
   `content_format` (`markdown|text`), the asset-descriptor set (`asset_digest`
   `sha256:<hex>`, `asset_media_type`, `asset_bytes`, `asset_width`,
-  `asset_height`, optional `asset_alt`), the generation stamps (`doc_sha256` +
+  `asset_height`, optional `asset_alt`; the attachment-only
+  `application/x-git-bundle` class carries no width/height), the generation stamps (`doc_sha256` +
   `doc_bytes`, `doc_generation`), and one canonical `selection` URI
   (`spor-source:<id>@<revision>[?doc=<hex>]#utf16=<s>,<e>` or
   `spor-image:<id>@sha256:<hex>[#xywh=x,y,w,h]`). They ride `get_node` /

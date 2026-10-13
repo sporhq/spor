@@ -156,13 +156,14 @@ function remoteFor(server, bearer) {
   return { get: (_cfg, p) => call("GET", p, null), post: (_cfg, p, body) => call("POST", p, body) };
 }
 
-function sourceFor(server, { bearer = "tok-a", machine = "box-1", instance = "inst-1", clock, eligible = null, log = [], cooldownMs = 60_000 } = {}) {
+function sourceFor(server, { bearer = "tok-a", machine = "box-1", instance = "inst-1", clock, eligible = null, recheck = null, log = [], cooldownMs = 60_000 } = {}) {
   const client = programRuns.createProgramRunClient({}, { remote: remoteFor(server, bearer), machine, instance });
   const source = programRuns.createRunSource({
     client,
     factoryId: "factory-x",
     capabilities: () => ({ factory: { node_id: "factory-x", revision: PIN.factory_revision }, concurrency: 2, machine: { harnesses: ["claude-code"], reachable_mcp: ["spor"], skills: [], plugins: [], deny: [], gh: true } }),
     eligible,
+    recheck,
     log: (l) => log.push(l),
     now: () => clock.now,
     cooldownMs,
@@ -394,9 +395,17 @@ test("admitThrough: carries the binding, and turns the run's own refusal into st
 
 // The loop over the real source and admission wrapper, with a fake queue: a
 // dispatched member finishes (and is done by graph truth) on the next wait.
-function loopHarness({ server, clock, members = ["task-a", "task-b"], human = [], unsatisfiable = [], extraQueue = [], refuse = () => null, opts = {}, maxPasses = 12, onTick = () => {}, pendingGates = null } = {}) {
-  const { source, log } = sourceFor(server, { clock });
-  const state = { dispatched: [], runs: new Map(), sleeps: [], candidateCalls: 0, pendingGateCalls: 0, published: [] };
+const observed = (server) => server.events.filter((e) => e.type === "worker.observed").map((e) => e.local_reason);
+
+// `readiness` (id -> readiness) overrides the page's "agent" for a member, and
+// is what the source's `recheck` reads while a released run cools.
+function loopHarness({ server, clock, members = ["task-a", "task-b"], human = [], unsatisfiable = [], extraQueue = [], refuse = () => null, opts = {}, maxPasses = 12, onTick = () => {}, pendingGates = null, readiness = () => "agent" } = {}) {
+  const state = { dispatched: [], runs: new Map(), sleeps: [], candidateCalls: 0, pendingGateCalls: 0, published: [], rechecks: [] };
+  const recheck = async (ids) => {
+    state.rechecks.push(ids);
+    return ids.filter((id) => members.includes(id) && readiness(id) === "agent");
+  };
+  const { source, log } = sourceFor(server, { clock, recheck, cooldownMs: 10_000 });
   const control = { stopping: false, reason: null, wake: () => {} };
   const done = () => {
     const r = [...server.runs.values()][0];
@@ -422,7 +431,7 @@ function loopHarness({ server, clock, members = ["task-a", "task-b"], human = []
     candidates: async () => {
       state.candidateCalls += 1;
       const taken = new Set(state.dispatched.map((d) => d.id));
-      const page = [...members, ...unsatisfiable, ...human].filter((id) => !done().has(id) && !taken.has(id)).map((id) => ({ id, readiness: human.includes(id) ? "human" : "agent", ...(human.includes(id) ? { readiness_reasons: ["requires human"] } : {}) }));
+      const page = [...members, ...unsatisfiable, ...human].filter((id) => !done().has(id) && !taken.has(id)).map((id) => ({ id, readiness: human.includes(id) ? "human" : readiness(id), ...(human.includes(id) ? { readiness_reasons: ["requires human"] } : {}) }));
       return page.concat(extraQueue.map((id) => ({ id, readiness: "agent" })));
     },
     dispatch: programRuns.admitThrough(source, async (item, binding) => {
@@ -484,6 +493,170 @@ test("loop: with no owned run the worker takes NO queue work at all", async () =
   await h.run();
   assert.strictEqual(h.candidateCalls, 0);
   assert.deepStrictEqual(h.dispatched, []);
+});
+
+test("loop: an idle serve worker with no owned run polls at the base interval, never the idle backoff", async () => {
+  const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+  const server = stubServer({ clock, runs: [] });
+  const h = loopHarness({ server, clock, maxPasses: 6 });
+  await h.run();
+  assert.deepStrictEqual(h.sleeps, [1000, 1000, 1000, 1000, 1000, 1000], "a Start is claimed within one intervalMs, not after a backoff to maxIntervalMs");
+});
+
+test("loop: an unowned serve worker whose run listing is FAILING keeps the idle backoff", async () => {
+  const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+  const server = stubServer({ clock, runs: [] });
+  server.down = true;
+  const h = loopHarness({ server, clock, maxPasses: 4 });
+  await h.run();
+  assert.deepStrictEqual(h.sleeps, [1000, 2000, 4000, 4000], "a dead server is not polled every interval");
+});
+
+test("loop: a member skipped as not agent-ready and stamped ready inside the cooldown is dispatched next pass — no release on the stale verdict", async () => {
+  const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+  const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001", admitted: ["task-f"] }] });
+  let ready = false;
+  const h = loopHarness({
+    server,
+    clock,
+    members: ["task-f"],
+    readiness: () => (ready ? "agent" : "untriaged"),
+    opts: { accept: "ready", concurrency: 1 },
+    maxPasses: 3,
+    // t1 = t0 + 1s, well inside retryAfterMs (10s).
+    onTick: (_s, n) => { if (n === 1) ready = true; },
+  });
+  await h.run();
+  assert.ok(h.log.some((l) => /skipping task-f — not agent-ready/.test(l)), h.log.join("\n"));
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-f"], h.log.join("\n"));
+  assert.ok(!observed(server).includes("local.no_capable_member"), `never released on the stale verdict:\n${h.log.join("\n")}`);
+});
+
+test("loop: a run released over a not-agent-ready member is re-claimed on the next pass once it reads ready", async () => {
+  const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+  const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001", admitted: ["task-f"] }] });
+  let ready = false;
+  let readyAtPass = null;
+  const h = loopHarness({
+    server,
+    clock,
+    members: ["task-f"],
+    readiness: () => (ready ? "agent" : "untriaged"),
+    opts: { accept: "ready", concurrency: 1 },
+    maxPasses: 6,
+    onTick: (_s, n) => {
+      if (!ready && observed(server).includes("local.no_capable_member")) {
+        ready = true;
+        readyAtPass = n;
+      }
+    },
+  });
+  await h.run();
+  assert.ok(readyAtPass, `the run was released first:\n${h.log.join("\n")}`);
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-f"], h.log.join("\n"));
+  assert.deepStrictEqual(h.rechecks[0], ["task-f"], "the cooled run re-reads the member it was released over");
+  assert.ok(h.log.some((l) => /released over now reads runnable here .*lifting its cooldown/.test(l)), h.log.join("\n"));
+  const claims = server.requests.filter((r) => r.path.endsWith("/claim"));
+  assert.strictEqual(claims.length, 2, "re-claimed once, inside the 10s cooldown");
+  // Re-claimed on the very next pass after readiness: ready was set at the end
+  // of sleep `readyAtPass`, and the claim's clock is one interval later.
+  assert.ok(h.log.findIndex((l) => /claimed program run .* at fence 2/.test(l)) > -1, h.log.join("\n"));
+});
+
+test("a release over only capability/profile refusals keeps the full cooldown; a re-derivable one lifts when the recheck says so", async () => {
+  const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+  const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001" }] });
+  const asked = [];
+  let runnable = false;
+  const { source } = sourceFor(server, { clock, recheck: async (ids) => (asked.push(ids), runnable ? ids : []) });
+  await source.pass();
+  await source.release("local.no_capable_member", "task-b (profile-x not satisfiable)");
+  assert.strictEqual((await source.pass()).owned, false);
+  assert.deepStrictEqual(asked, [], "nothing to re-read: a capability refusal is not changed by the graph");
+
+  await source.release("local.no_capable_member"); // no-op: not owned
+  const other = sourceFor(server, { clock, instance: "inst-2", recheck: async (ids) => (asked.push(ids), runnable ? ids : []) });
+  assert.strictEqual((await other.source.pass()).owned, true);
+  await other.source.release("local.no_capable_member", "task-a (not agent-ready); task-b (profile)", { recheck: ["task-a"] });
+  assert.strictEqual((await other.source.pass()).owned, false, "still not ready: cooled");
+  assert.deepStrictEqual(asked, [["task-a"]]);
+  runnable = true;
+  assert.strictEqual((await other.source.pass()).owned, true, "ready now: the cooldown lifts and the run is claimed this pass");
+});
+
+test("cooled runs share ONE recheck read per claim attempt; a failed listing, claim or recheck read marks the pass an outage", async () => {
+  const clock = { now: Date.parse("2026-10-09T12:00:00Z") };
+  const server = stubServer({ clock, runs: [{ run_id: "prun-0000000000000001" }, { run_id: "prun-0000000000000002" }] });
+  const asked = [];
+  let runnable = [];
+  let fail = false;
+  const { source } = sourceFor(server, {
+    clock,
+    recheck: async (ids) => {
+      asked.push(ids);
+      if (fail) throw new Error("queue down");
+      return ids.filter((id) => runnable.includes(id));
+    },
+  });
+  assert.strictEqual((await source.pass()).run_id, "prun-0000000000000001");
+  await source.release("local.no_capable_member", "task-a (not agent-ready)", { recheck: ["task-a"] });
+  assert.strictEqual((await source.pass()).run_id, "prun-0000000000000002", "the first run cools; the second is claimed");
+  await source.release("local.no_capable_member", "task-c (not agent-ready)", { recheck: ["task-c"] });
+  asked.length = 0;
+  let v = await source.pass();
+  assert.strictEqual(v.owned, false);
+  assert.strictEqual(v.outage, false);
+  assert.deepStrictEqual(asked, [["task-a", "task-c"]], "one read over both cooled runs' members, not one per run");
+  asked.length = 0;
+  runnable = ["task-c"];
+  v = await source.pass();
+  assert.strictEqual(v.run_id, "prun-0000000000000002", "only the run whose member reads runnable lifts");
+  assert.deepStrictEqual(asked, [["task-a", "task-c"]]);
+  await source.release("local.no_capable_member", "task-c (not agent-ready)", { recheck: ["task-c"] });
+  runnable = [];
+  fail = true;
+  v = await source.pass();
+  assert.strictEqual(v.owned, false);
+  assert.strictEqual(v.outage, true, "a failed recheck read is an outage: the idle backoff holds");
+  fail = false;
+  assert.strictEqual((await source.pass()).outage, false);
+  server.down = true;
+  assert.strictEqual((await source.pass()).outage, true, "a failed listing is an outage");
+  server.down = false;
+  // A listing that answers but a claim that does not (transport) is one too.
+  clock.now += 120_000; // both cooldowns lapse
+  const handle = server.handle;
+  server.handle = (method, p, body, bearer) => (p.endsWith("/claim") ? (server.requests.push({ method, path: p }), { transport: true, error: "ECONNRESET" }) : handle(method, p, body, bearer));
+  v = await source.pass();
+  assert.strictEqual(v.owned, false);
+  assert.strictEqual(v.outage, true, "a transient claim failure is an outage");
+});
+
+test("selectWorkCandidates / classifyProgramMember: a re-derivable cooldown never hides a fresh page reading; an attempt cooldown still does", () => {
+  const now = Date.parse("2026-10-09T12:00:00Z");
+  const cooledAs = (kind) => new Map([["task-a", { reason: "earlier", kind, until: now + 600_000 }]]);
+  const ready = { id: "task-a", readiness: "agent" };
+  for (const kind of ["policy", "scope", "human", "invalid", "declined", "assigned-elsewhere"]) {
+    const cleared = [];
+    const out = workLoop.selectWorkCandidates([ready], { skipped: cooledAs(kind), now, accept: "ready", onClear: (it) => cleared.push(it.id) });
+    assert.deepStrictEqual(out.map((it) => it.id), ["task-a"], kind);
+    assert.deepStrictEqual(cleared, ["task-a"], kind);
+    const m = workLoop.programStanding({ members: [{ id: "task-a", bucket: "open", status: "open" }], queue: { complete: true, located: new Map([["task-a", ready]]) } }, { page: new Map([["task-a", ready]]), policy: { accept: "ready" }, skipped: cooledAs(kind), now });
+    assert.strictEqual(m.members[0].bucket, "runnable", kind);
+  }
+  // Still ineligible under the SAME kind: skipped quietly (logged once, when cooled).
+  const skips = [];
+  const untriaged = { id: "task-a", readiness: "untriaged" };
+  assert.deepStrictEqual(workLoop.selectWorkCandidates([untriaged], { skipped: cooledAs("policy"), now, accept: "ready", onSkip: (it, r, k) => skips.push(k) }), []);
+  assert.deepStrictEqual(skips, []);
+  // ...and its standing is this pass's reading, not the cooldown's.
+  const st = workLoop.programStanding({ members: [{ id: "task-a", bucket: "open", status: "open" }], queue: { complete: true, located: new Map([["task-a", untriaged]]) } }, { page: new Map([["task-a", untriaged]]), policy: { accept: "ready" }, skipped: cooledAs("policy"), now });
+  assert.strictEqual(st.members[0].bucket, "ineligible");
+  assert.strictEqual(st.members[0].kind, "policy");
+  // An attempt cooldown (a dispatch refusal) still decides.
+  assert.deepStrictEqual(workLoop.selectWorkCandidates([ready], { skipped: cooledAs("refusal"), now, accept: "ready" }), []);
+  const rf = workLoop.programStanding({ members: [{ id: "task-a", bucket: "open", status: "open" }], queue: { complete: true, located: new Map([["task-a", ready]]) } }, { page: new Map([["task-a", ready]]), policy: { accept: "ready" }, skipped: cooledAs("refusal"), now });
+  assert.strictEqual(rf.members[0].bucket, "cooling");
 });
 
 test("loop: a paused run admits nothing, but open gate pipelines are still resumed", async () => {
@@ -768,8 +941,6 @@ test("a REPLAYED drift report (first reply lost) reads the server's verdict off 
 // standing-cooling-is-global): a member cooled after a refusal every machine
 // would hit is a GLOBAL halt — the run stays held and visible — while a
 // machine-local refusal releases it as local.no_capable_member.
-
-const observed = (server) => server.events.filter((e) => e.type === "worker.observed").map((e) => e.local_reason);
 
 // The refusal shapes the dispatcher hands the loop (bin/spor.js
 // claimExecutionHold / dispatchWorkItem / makeFactoryAvailabilityCheck).
