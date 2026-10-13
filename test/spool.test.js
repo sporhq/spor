@@ -170,3 +170,53 @@ test('linkOrReserve: a failed rename removes our empty reservation', () => {
     assert.ok(!fs.existsSync(path.join(d, 'f')));
   } finally { fs.linkSync = realL; fs.renameSync = realR; }
 });
+
+// issue-spor-main-ci-windows-dispatch-flakes-red-3ab8e46: on Windows a rename
+// that REPLACES a file fails EPERM while another process has the target open
+// (a poller reading a run record), so the replace retries for a bounded window;
+// POSIX keeps its single rename.
+test('replaceFileSync: on win32 a transient EPERM/EACCES/EBUSY replace is retried until it lands', () => {
+  for (const code of ['EPERM', 'EACCES', 'EBUSY']) {
+    let calls = 0;
+    const slept = [];
+    const rename = () => {
+      calls += 1;
+      if (calls < 4) throw Object.assign(new Error(code), { code });
+    };
+    spool.replaceFileSync('a', 'b', { platform: 'win32', rename, sleep: (ms) => slept.push(ms), now: () => 0 });
+    assert.strictEqual(calls, 4, `${code}: retried until the rename landed`);
+    assert.deepStrictEqual(slept, [1, 2, 4], `${code}: with a growing backoff`);
+  }
+});
+
+test('replaceFileSync: on win32 the error stands once the retry window is spent, and a non-transient one at once', () => {
+  let t = 0;
+  let calls = 0;
+  const busy = () => { calls += 1; throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); };
+  assert.throws(
+    () => spool.replaceFileSync('a', 'b', { platform: 'win32', rename: busy, sleep: (ms) => { t += ms; }, now: () => t, retryMs: 50 }),
+    { code: 'EPERM' }
+  );
+  assert.ok(calls > 1 && t >= 50, 'retried for the whole window, then gave up');
+  calls = 0;
+  const gone = () => { calls += 1; throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); };
+  assert.throws(() => spool.replaceFileSync('a', 'b', { platform: 'win32', rename: gone, sleep: () => {}, now: () => 0 }), { code: 'ENOENT' });
+  assert.strictEqual(calls, 1, 'a missing source is not a contended target');
+});
+
+test('replaceFileSync: off win32 an EPERM is never retried (one plain rename)', () => {
+  let calls = 0;
+  const rename = () => { calls += 1; throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); };
+  assert.throws(() => spool.replaceFileSync('a', 'b', { platform: 'linux', rename, sleep: () => assert.fail('no sleep') }), { code: 'EPERM' });
+  assert.strictEqual(calls, 1);
+});
+
+test('replaceFileSync replaces an existing file in place', () => {
+  const dir = scratch();
+  const file = path.join(dir, 'rec.json');
+  fs.writeFileSync(file, 'old');
+  fs.writeFileSync(`${file}.tmp`, 'new');
+  spool.replaceFileSync(`${file}.tmp`, file);
+  assert.strictEqual(fs.readFileSync(file, 'utf8'), 'new');
+  assert.ok(!fs.existsSync(`${file}.tmp`));
+});

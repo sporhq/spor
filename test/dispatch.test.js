@@ -136,7 +136,8 @@ test("repos add preserves other config.json keys (server/token)", () => {
   const { home, repo } = fixture();
   const cfgFile = path.join(home, "config.json");
   fs.writeFileSync(cfgFile, JSON.stringify({ server: "https://example", token: "t0" }) + "\n");
-  assert.strictEqual(run(["repos", "add", "demo", repo], { SPOR_HOME: home }).status, 0);
+  const added = run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  assert.strictEqual(added.status, 0, `spor repos add exited ${added.status}: ${added.stderr}`);
   const data = JSON.parse(fs.readFileSync(cfgFile, "utf8"));
   assert.strictEqual(data.server, "https://example");
   assert.strictEqual(data.token, "t0");
@@ -3764,6 +3765,15 @@ test("dispatch <node-id> (remote): a 2xx with an unparseable node body refuses t
 // graph); remote mode approximates it off the node's own frontmatter plus the
 // server's already-shipped get() hook `held` enrichment (see resolveNode).
 
+function dispatchRecords(home) {
+  const dir = path.join(home, "journal", "dispatch");
+  let names = [];
+  try { names = fs.readdirSync(dir).filter((name) => name.endsWith(".run.json")); } catch { return []; }
+  return names.map((name) => {
+    try { return JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")); } catch { return { state: "running" }; }
+  });
+}
+
 function readinessFixture() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-rdy-"));
   const nodes = path.join(home, "nodes");
@@ -3871,6 +3881,14 @@ test("dispatch <node-id> (local): a readiness:agent-stamped task and a plain unt
     assert.strictEqual(r.status, 0, r.stderr);
     assert.doesNotMatch(r.stderr, /readiness is human|requires a human/, `${id} must not warn`);
     assert.ok(await waitForFile(sentinel));
+    // Both ids target the one shared checkout, whose live-writer guard rightly
+    // refuses a second dispatch while the first run is still `running`. The
+    // stub's marker lands BEFORE its process exits and its supervisor closes
+    // the record — on Windows (cmd.exe shim, then node) that beat is long
+    // enough for the next dispatch to see the run live
+    // (issue-spor-main-ci-windows-dispatch-flakes-red-3ab8e46) — so wait for
+    // the run to end: this test is about readiness output, not occupancy.
+    assert.ok(await waitFor(() => !dispatchRecords(home).some((rec) => ["launching", "running"].includes(rec.state))), `${id}'s run ended`);
   }
 });
 

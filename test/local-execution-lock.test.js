@@ -117,3 +117,30 @@ test('a breaker whose own process died is cleared by the next acquirer (no 15-mi
   assert.equal((await withLocalExecutionLock(file, () => assert.fail('live breaker'), { attempts: 3, waitMs: 1 })).ok, false);
   assert.equal(JSON.parse(fs.readFileSync(`${file}.lock.break`, 'utf8')).token, 'live-breaker');
 });
+
+// issue-spor-main-ci-windows-dispatch-flakes-red-3ab8e46: on Windows a lock path
+// just unlinked while a contender still has it open is "delete pending", and
+// the exclusive create fails EPERM rather than EEXIST. That is a held lock to
+// wait out, not a failure — off Windows an EPERM is still a real error.
+test('a win32 pending-delete EPERM on the lock create is waited out; off win32 it still throws', async t => {
+  const home = setup(t), file = path.join(home, 'item.json');
+  const { withLocalExecutionLock } = require(lockModule);
+  const original = fs.openSync, platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  let refused = 0;
+  fs.openSync = function (p, ...rest) {
+    if (String(p) === `${file}.lock` && refused < 3) { refused++; throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' }); }
+    return original.call(this, p, ...rest);
+  };
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+    assert.deepEqual(await withLocalExecutionLock(file, () => 'held', { waitMs: 1 }), { ok: true, value: 'held' });
+    assert.equal(refused, 3);
+    refused = 0;
+    Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
+    await assert.rejects(withLocalExecutionLock(file, () => 'held', { waitMs: 1 }), { code: 'EPERM' });
+  } finally {
+    fs.openSync = original;
+    Object.defineProperty(process, 'platform', platform);
+  }
+  assert.ok(!fs.existsSync(`${file}.lock`));
+});

@@ -333,3 +333,50 @@ test("the bundle-store startup check applies the same decode: a store spelled in
   assert.match(check("file:///home/x/repo/%2egit/store"), /\.git directory/);
   assert.match(check("file:///home/x/%zz/store"), /malformed percent-escape/);
 });
+
+// issue-spor-main-ci-windows-dispatch-flakes-red-3ab8e46: on Windows a lock
+// path just unlinked while a contender still had it open is "delete pending",
+// and an exclusive create of it fails EPERM/EACCES rather than EEXIST. That is
+// contention for a bounded window, never a lock that cannot be taken — else the
+// supervisor's terminal write is dropped and the record reads
+// `contract_pending` forever.
+test("withRecordLock: a win32 pending-delete EPERM on the lock open is contention, retried until it opens", () => {
+  const home = scratch();
+  const file = seed(home, "11111111-2222-3333-4444-0000000000e1");
+  const lock = runner.recordLockPath(file);
+  const original = fs.openSync;
+  let refused = 0;
+  fs.openSync = function (p, ...rest) {
+    if (String(p) === lock && refused < 3) {
+      refused += 1;
+      throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+    }
+    return original.call(this, p, ...rest);
+  };
+  let held;
+  try { held = runner.withRecordLock(file, () => "wrote", { platform: "win32", waitMs: 1 }); }
+  finally { fs.openSync = original; }
+  assert.strictEqual(refused, 3);
+  assert.deepStrictEqual(held, { ok: true, value: "wrote" });
+  assert.ok(!fs.existsSync(lock), "released after the write");
+});
+
+test("withRecordLock: off win32 an EPERM on the lock open still fails at once", () => {
+  const home = scratch();
+  const file = seed(home, "11111111-2222-3333-4444-0000000000e2");
+  const lock = runner.recordLockPath(file);
+  const original = fs.openSync;
+  let refused = 0;
+  fs.openSync = function (p, ...rest) {
+    if (String(p) === lock) {
+      refused += 1;
+      throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+    }
+    return original.call(this, p, ...rest);
+  };
+  let held;
+  try { held = runner.withRecordLock(file, () => "wrote", { platform: "linux", waitMs: 1 }); }
+  finally { fs.openSync = original; }
+  assert.strictEqual(refused, 1);
+  assert.deepStrictEqual(held, { ok: false, reason: "EPERM" });
+});
