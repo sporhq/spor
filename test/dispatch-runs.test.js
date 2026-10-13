@@ -1078,6 +1078,97 @@ test("stopRun: the whole process GROUP is signalled, escalated to SIGKILL, and i
   assert.deepStrictEqual(await runner.stopRun({ run_id: "stop-3", launch_mode: "native-background" }), { child: false, supervisor: false, group: false, alive: false });
 });
 
+test("stopRun: the post-grace SIGKILL re-proves each survivor's identity before escalating", { skip: process.platform === "win32" && "no catchable SIGTERM: the first terminate already ends the child" }, async () => {
+  // A child that TRAPS SIGTERM, so it is still there after the grace and the
+  // escalation is what decides its fate. Announced only once the trap is in.
+  const pidFile = path.join(scratch("spor-runs-escalate-"), "child.pid");
+  const trapping = () => {
+    try { fs.unlinkSync(pidFile); } catch { /* first use */ }
+    const src = `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1e9);`;
+    return spawn(process.execPath, ["-e", src], { stdio: "ignore" });
+  };
+  const ready = async () => {
+    let text = "";
+    for (let i = 0; i < 200 && !text; i += 1) {
+      try { text = fs.readFileSync(pidFile, "utf8"); } catch { /* not yet */ }
+      if (!text) await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(Number(text) > 0, "the fixture must have installed its trap");
+  };
+  const gone = async (pid) => {
+    for (let i = 0; i < 200 && runner.pidAlive(pid); i += 1) await new Promise((r) => setTimeout(r, 25));
+    return !runner.pidAlive(pid);
+  };
+  const TICKS = 161803;
+
+  // The pid is REUSED inside the grace: the token read after it names another
+  // process, so the SIGKILL meant for our child must not reach it.
+  {
+    const proc = trapping();
+    try {
+      await ready();
+      let graced = false;
+      const stopped = await runner.stopRun(
+        { run_id: "esc-reused", child_pid: proc.pid, child_started_ticks: TICKS },
+        { graceMs: 0, sleep: async () => { graced = true; }, readTicks: () => (graced ? TICKS + 1 : TICKS) }
+      );
+      assert.strictEqual(stopped.child, true, "the child was proven and signalled");
+      await new Promise((r) => setTimeout(r, 200)); // a SIGKILLed child would be reaped by now
+      assert.strictEqual(runner.pidAlive(proc.pid), true, "a stranger holding the pid after the grace is never SIGKILLed");
+      assert.strictEqual(stopped.alive, false, "and our process is gone, so the stop took");
+    } finally {
+      proc.kill("SIGKILL");
+    }
+  }
+
+  // A token recorded but UNREADABLE after the grace is unverifiable, not ours:
+  // no SIGKILL, but the stop does not read as taken either (over-cool).
+  {
+    const proc = trapping();
+    try {
+      await ready();
+      let graced = false;
+      const stopped = await runner.stopRun(
+        { run_id: "esc-unreadable", child_pid: proc.pid, child_started_ticks: TICKS },
+        { graceMs: 0, sleep: async () => { graced = true; }, readTicks: () => (graced ? null : TICKS) }
+      );
+      assert.strictEqual(runner.pidAlive(proc.pid), true, "an unverifiable pid is not escalated against");
+      assert.strictEqual(stopped.alive, true, "and it still counts against the stop");
+    } finally {
+      proc.kill("SIGKILL");
+    }
+  }
+
+  // Re-proven ours: escalated, exactly as before.
+  {
+    const proc = trapping();
+    try {
+      await ready();
+      const stopped = await runner.stopRun(
+        { run_id: "esc-ours", child_pid: proc.pid, child_started_ticks: TICKS },
+        { graceMs: 50, readTicks: () => TICKS }
+      );
+      assert.strictEqual(await gone(proc.pid), true, "a TERM-trapping child that is still ours is SIGKILLed");
+      assert.strictEqual(stopped.alive, false);
+    } finally {
+      proc.kill("SIGKILL");
+    }
+  }
+
+  // No recorded token at all: signalled on its bare pid, escalated on it too.
+  {
+    const proc = trapping();
+    try {
+      await ready();
+      const stopped = await runner.stopRun({ run_id: "esc-unstamped", child_pid: proc.pid }, { graceMs: 50 });
+      assert.strictEqual(stopped.child, true);
+      assert.strictEqual(await gone(proc.pid), true, "an unstamped child keeps the bare-pid escalation it always had");
+    } finally {
+      proc.kill("SIGKILL");
+    }
+  }
+});
+
 test("observedActivityAt: a run with no readable output channel answers 0, never its launch timestamp", () => {
   // The idle ceiling keys on this: a native-background record whose session was
   // never bound has no transcript to read, and reading its LAUNCH as its last
