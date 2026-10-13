@@ -284,15 +284,25 @@ test("availability timeout ends the Windows Git/SSH descendant tree including a 
     if (!observed && fs.existsSync(f.record)) observed = JSON.parse(fs.readFileSync(f.record, "utf8"));
     for (const pid of observed ? [observed.pid, observed.child] : []) { try { process.kill(pid); } catch {} }
   });
+  // Record the git call so a failure names the timed-out git and how long the
+  // synchronous reap after it took (gitEnd -> probe return is the reap).
+  const { gitSpawn } = require("../lib/shell/git-exec.js");
+  const gitCalls = [];
+  const git = (...a) => { const t0 = Date.now(); const r = gitSpawn(...a); gitCalls.push({ args: a[1].join(" "), ms: Date.now() - t0, end: Date.now(), pid: r && r.pid, status: r && r.status, signal: r && r.signal, error: r && r.error && r.error.code }); return r; };
   const start = Date.now();
-  const result = await availability.probeFactoryAvailability({ ...f.args, factory: { integration: { mode: "push", targetRef: "origin/main" } } });
-  const elapsed = Date.now() - start;
+  const result = await availability.probeFactoryAvailability({ ...f.args, factory: { integration: { mode: "push", targetRef: "origin/main" } } }, { git });
+  const end = Date.now();
+  const elapsed = end - start;
+  const diag = () => {
+    const last = gitCalls.at(-1);
+    return ` [git: ${JSON.stringify(gitCalls.map(({ end: _e, ...c }) => c))}; reap took ~${last ? end - last.end : "?"}ms (pass budget ${TREE_KILL_TIMEOUT_MS}ms x ${REAP_PASSES}); wrapper ${observed && alive(observed.pid) ? "ALIVE" : "gone"}, child ${observed && alive(observed.child) ? "ALIVE" : "gone"}]`;
+  };
   assert.equal(result.ok, false);
-  assert.ok(elapsed >= 4500 && elapsed < WINDOWS_PROBE_BOUND_MS, `five-second probe returned in ${elapsed}ms`);
+  assert.ok(elapsed >= 4500 && elapsed < WINDOWS_PROBE_BOUND_MS, `five-second probe returned in ${elapsed}ms${diag()}`);
   observed = JSON.parse(fs.readFileSync(f.record, "utf8"));
   for (let attempt = 0; attempt < 100 && [observed.pid, observed.child].some(alive); attempt++) await new Promise(resolve => setTimeout(resolve, 50));
-  assert.ok(!alive(observed.pid), "SSH wrapper is no longer running");
-  assert.ok(!alive(observed.child), "inherited-pipe child is no longer running");
+  assert.ok(!alive(observed.pid), `SSH wrapper is no longer running${diag()}`);
+  assert.ok(!alive(observed.child), `inherited-pipe child is no longer running${diag()}`);
 });
 
 test("networkGit reaps by parentage on win32 only after a timeout or overflow, never by group signal", () => {
