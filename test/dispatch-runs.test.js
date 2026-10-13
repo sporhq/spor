@@ -975,7 +975,9 @@ test("stopRun: the whole process GROUP is signalled, escalated to SIGKILL, and i
   const unproven = alive();
   try {
     const stopped = await runner.stopRun({ run_id: "stop-unproven", runner_pid: unproven.pid }, { graceMs: 200 });
-    assert.strictEqual(stopped.group, false, "no identity, no group");
+    // On Windows the "group" is the taskkill /T tree, which explicit stops use
+    // without start-time identity (there is none off Linux yet).
+    assert.strictEqual(stopped.group, process.platform === "win32", "no identity, no POSIX group");
     assert.strictEqual(stopped.supervisor, true);
     assert.strictEqual(await gone(unproven.pid), true);
   } finally {
@@ -1111,9 +1113,9 @@ test("stopRun on Windows ends the supervisor's and the child's TREES through tas
       { graceMs: 0, platform: "win32", env: { SystemRoot: "C:\\Windows" }, run }
     );
     assert.deepStrictEqual(calls.map((c) => c[1]), [
-      ["/PID", String(child.pid), "/T", "/F"],
       ["/PID", String(supervisor.pid), "/T", "/F"],
-    ], "both the child and the supervisor are ended as trees, never by identity-unproven group signals");
+      ["/PID", String(child.pid), "/T", "/F"],
+    ], "the supervisor's tree first (so it cannot close the record as the child's own failure), then the child's, never by identity-unproven group signals");
     assert.match(calls[0][0], /System32[\\/]taskkill\.exe$/);
     assert.strictEqual(stopped.child, true);
     assert.strictEqual(stopped.supervisor, true);
