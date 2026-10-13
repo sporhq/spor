@@ -10373,12 +10373,28 @@ function localDispatchLockFile(home, name) {
 // `extra` merges in caller-specific fields (the integration lease's declared
 // `budgetMs`, see acquireLocalIntegrationLease) without changing the
 // dispatch lock's own byte-for-byte payload shape, since it never passes any.
-function writeLocalDispatchLock(file, extra = {}) {
+// On Windows a lock path a racer has just removed stays "delete pending" while
+// any process still has it open (every contender reads it), and a `wx` create
+// of that name fails EPERM/EACCES instead of EEXIST until the last handle
+// closes. Read as the unwritable journal the caller fails OPEN on, that let two
+// real processes both win a stale-lock reclaim
+// (issue-spor-main-ci-windows-dispatch-flakes-red-3ab8e46). So the create is
+// retried through that window; only a refusal that outlasts it is a real one.
+function writeLocalDispatchLock(file, extra = {}, { platform = process.platform, now = Date.now, sleep = sleepSyncMs } = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const payload = { pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), at: new Date().toISOString(), ...extra };
-  fs.writeFileSync(file, JSON.stringify(payload), { flag: "wx" });
-  return payload;
+  const deadline = now() + LOCAL_LOCK_PENDING_DELETE_MS;
+  for (;;) {
+    const payload = { pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), at: new Date().toISOString(), ...extra };
+    try {
+      fs.writeFileSync(file, JSON.stringify(payload), { flag: "wx" });
+      return payload;
+    } catch (e) {
+      if (platform !== "win32" || !e || (e.code !== "EPERM" && e.code !== "EACCES") || now() >= deadline) throw e;
+    }
+    sleep(5);
+  }
 }
+const LOCAL_LOCK_PENDING_DELETE_MS = 5000;
 // A short, synchronous, best-effort sleep (Atomics.wait needs a SharedArrayBuffer
 // and blocks the calling thread, which is exactly what a bounded retry here
 // wants — acquireLocalDispatchLock stays synchronous, matching every other

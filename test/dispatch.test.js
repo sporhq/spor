@@ -3076,6 +3076,38 @@ test("acquireLocalDispatchLock: an unreadable lock file cannot be honored as liv
   cli.releaseLocalDispatchLock(acquired);
 });
 
+// issue-spor-main-ci-windows-dispatch-flakes-red-3ab8e46: on Windows a racer's
+// just-removed lock is "delete pending" and a `wx` create of it fails EPERM,
+// which the fail-open arm used to read as an unwritable journal — so both racers
+// of a stale-lock reclaim "won". The create waits that window out instead.
+test("acquireLocalDispatchLock: a win32 pending-delete EPERM is waited out, never read as an unwritable journal", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-"));
+  const file = cli.localDispatchLockFile(home, "dec-x");
+  const original = fs.writeFileSync;
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  let refused = 0;
+  fs.writeFileSync = function (p, ...rest) {
+    if (String(p) === file && refused < 3) {
+      refused += 1;
+      throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+    }
+    return original.call(this, p, ...rest);
+  };
+  let acquired;
+  try {
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    acquired = cli.acquireLocalDispatchLock(home, "dec-x");
+  } finally {
+    fs.writeFileSync = original;
+    Object.defineProperty(process, "platform", platform);
+  }
+  assert.strictEqual(refused, 3);
+  assert.strictEqual(acquired.ok, true);
+  assert.strictEqual(acquired.file, file, "the lock was really taken, not failed open");
+  assert.ok(fs.existsSync(file));
+  cli.releaseLocalDispatchLock(acquired);
+});
+
 test("acquireLocalDispatchLock: an unwritable journal fails open (nothing to release)", () => {
   if (process.platform === "win32") return; // chmod-based read-only has no meaning there
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-"));
