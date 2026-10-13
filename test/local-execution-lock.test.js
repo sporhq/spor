@@ -144,3 +144,44 @@ test('a win32 pending-delete EPERM on the lock create is waited out; off win32 i
   }
   assert.ok(!fs.existsSync(`${file}.lock`));
 });
+
+// issue-spor-lock-handback-linksync-eexist-only-retry: the breaker's handback
+// link of a moved-aside LIVE lock meets the same win32 pending-delete EPERM a
+// create does; it is the path still occupied, retried within the bounded
+// attempts. Off win32 an EPERM still throws.
+test('a win32 pending-delete EPERM/EACCES on the handback link is waited out; off win32 it still throws', async t => {
+  const home = setup(t), file = path.join(home, 'item.json'), lock = `${file}.lock`;
+  const { withLocalExecutionLock } = require(lockModule);
+  const os = require('node:os');
+  const gone = () => { const r = require('node:child_process').spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }); return { host: os.hostname(), pid: Number(r.stdout), ticks: null, token: require('node:crypto').randomUUID() }; };
+  const live = { host: os.hostname(), pid: process.pid, ticks: null, token: 'successor' };
+  const rename = fs.renameSync, link = fs.linkSync, platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  let codes = [], links = 0;
+  // A successor takes the lock between the breaker's judgement and its move:
+  // the moved inode is LIVE, so the breaker must link it back.
+  fs.renameSync = function (from, to, ...rest) {
+    const r = rename.call(this, from, to, ...rest);
+    if (String(from) === lock && String(to).startsWith(`${lock}.dead-`)) fs.writeFileSync(to, JSON.stringify(live));
+    return r;
+  };
+  fs.linkSync = function (src, dst, ...rest) {
+    if (String(dst) === lock) { links++; if (codes.length) { const code = codes.shift(); throw Object.assign(new Error(code), { code }); } }
+    return link.call(this, src, dst, ...rest);
+  };
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+    fs.writeFileSync(lock, JSON.stringify(gone())); codes = ['EPERM', 'EACCES', 'EPERM'];
+    const r = await withLocalExecutionLock(file, () => assert.fail('a live successor holds it'), { attempts: 5, waitMs: 1 });
+    assert.equal(r.ok, false);
+    assert.equal(links, 4);
+    assert.equal(JSON.parse(fs.readFileSync(lock, 'utf8')).token, 'successor', 'the live lock is back on its path');
+    assert.deepEqual(fs.readdirSync(home).sort(), ['item.json.lock'], 'no breaker or moved copy left behind');
+    Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
+    fs.writeFileSync(lock, JSON.stringify(gone())); codes = ['EPERM']; links = 0;
+    await assert.rejects(withLocalExecutionLock(file, () => assert.fail('a live successor holds it'), { attempts: 5, waitMs: 1 }), { code: 'EPERM' });
+    assert.equal(links, 1);
+  } finally {
+    fs.renameSync = rename; fs.linkSync = link;
+    Object.defineProperty(process, 'platform', platform);
+  }
+});

@@ -435,3 +435,50 @@ test("withRecordLock: an open released for a mid-break breaker resets the win32 
   assert.deepStrictEqual(held, { ok: true, value: "wrote" });
   assert.ok(call >= 4);
 });
+
+// issue-spor-lock-handback-linksync-eexist-only-retry: a breaker that moved a
+// lock aside and found it LIVE links it back; on Windows an acquirer's
+// just-released lock at that path is delete-pending, so the link fails
+// EPERM/EACCES rather than EEXIST. That is the path still occupied — retried
+// inside the bounded handback, never a live holder's lock dropped.
+function liveLockHandback(platform, codes) {
+  const home = scratch();
+  const file = seed(home, "11111111-2222-3333-4444-0000000000e5");
+  const lock = runner.recordLockPath(file);
+  fs.writeFileSync(lock, "holder\n");
+  // The first age reading (before the move) says stale; every later one says
+  // live, as when the holder touched its lock in between.
+  let reads = 0;
+  const now = () => (reads++ === 0 ? Date.now() + 1e9 : Date.now());
+  const original = fs.linkSync;
+  let links = 0;
+  fs.linkSync = function (src, dst, ...rest) {
+    if (String(dst) === lock) {
+      links += 1;
+      if (codes.length) {
+        const code = codes.shift();
+        throw Object.assign(new Error(code), { code });
+      }
+    }
+    return original.call(this, src, dst, ...rest);
+  };
+  let broke;
+  try { broke = runner.breakStaleLock(lock, { staleMs: 30000, now, waitMs: 1, platform }); }
+  finally { fs.linkSync = original; }
+  const left = fs.readdirSync(path.dirname(lock)).filter((n) => n.startsWith(`${path.basename(lock)}.`));
+  return { broke, links, restored: fs.existsSync(lock) && fs.readFileSync(lock, "utf8"), left };
+}
+
+test("breakStaleLock: a win32 pending-delete EPERM/EACCES on the handback link is retried until the live lock is back", () => {
+  const r = liveLockHandback("win32", ["EPERM", "EACCES", "EEXIST", "EPERM"]);
+  assert.strictEqual(r.broke, false, "a live lock is handed back, not broken");
+  assert.strictEqual(r.links, 5);
+  assert.strictEqual(r.restored, "holder\n");
+  assert.deepStrictEqual(r.left, [], "no moved copy or breaker left behind");
+});
+
+test("breakStaleLock: off win32 an EPERM on the handback link is not retried", () => {
+  const r = liveLockHandback("linux", ["EPERM"]);
+  assert.strictEqual(r.broke, false);
+  assert.strictEqual(r.links, 1);
+});
