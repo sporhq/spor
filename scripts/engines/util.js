@@ -2293,6 +2293,7 @@ module.exports = {
   // reaching them through `u`.
   SPOOL_TTL: spool.SPOOL_TTL,
   writeSpoolFile: spool.writeSpoolFile,
+  replaceFileSync: spool.replaceFileSync,
   createExclusive: spool.createExclusive,
   claimSpoolResult: spool.claimSpoolResult,
   claimAndReadJson: spool.claimAndReadJson,

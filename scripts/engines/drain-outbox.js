@@ -99,6 +99,9 @@ async function drainOutbox(graph, { tag = "drain", maxTimeSec = 30, maxFiles = 0
   // Hand a claimed file back under its base name so a later drain retries it.
   // If even that rename fails the claimed name still ends in .json: it stays
   // counted, and is re-claimable once this process exits or the hold expires.
+  // A plain rename, not spool.js replaceFileSync: this drain claimed the base
+  // name away, so the target is normally absent and no process reads it open
+  // (a drain claims by rename before it reads) — and a failure here is benign.
   const release = (file, name) => {
     try {
       fs.renameSync(file, path.join(outbox, name));

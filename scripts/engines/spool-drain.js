@@ -299,7 +299,7 @@ function drainPendingNudges(graph, input, slug) {
           const heal = `${copy}.heal-${process.pid}`;
           try {
             fs.copyFileSync(plain, heal);
-            fs.renameSync(heal, copy);
+            u.replaceFileSync(heal, copy); // a live worker may be reading `copy`
           } catch {
             rm(heal);
             continue; // cannot re-arm it; the pair keeps the job owed

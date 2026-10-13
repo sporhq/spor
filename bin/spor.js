@@ -74,7 +74,7 @@ const auth = require(path.join(ROOT, "lib", "auth.js"));
 const { editUserConfig } = require(path.join(ROOT, "lib", "shell", "user-config.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const { gitSpawn, gitOracle } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
-const { writeSpoolFile } = require(path.join(ROOT, "lib", "shell", "spool.js"));
+const { writeSpoolFile, replaceFileSync } = require(path.join(ROOT, "lib", "shell", "spool.js"));
 const capturePartial = require(path.join(ROOT, "lib", "shell", "capture-partial.js"));
 const busy = require(path.join(ROOT, "lib", "shell", "busy.js"));
 const dispatchRuns = lazyModule(path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js"));
@@ -5834,7 +5834,7 @@ async function cmdPatch(cfg, { values, positionals }) {
   const tmp = `${file}.tmp-${process.pid}`;
   try {
     fs.writeFileSync(tmp, newRaw);
-    fs.renameSync(tmp, file);
+    replaceFileSync(tmp, file);
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch {}
     err(`could not write ${id}: ${e.message}`);
@@ -14161,7 +14161,7 @@ function writeReviewerCooldowns(home, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  fs.renameSync(tmp, file);
+  replaceFileSync(tmp, file);
 }
 function readReviewerCooldown(home, profile, now = Date.now()) {
   if (!profile) return null;
@@ -15176,7 +15176,7 @@ async function graphEdgeMutation(cfg, from, type, to, { remove = false } = {}) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(tmp, newRaw);
-    fs.renameSync(tmp, file);
+    replaceFileSync(tmp, file);
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch { /* already gone */ }
     return { ok: false, reason: `could not write ${srcId}: ${e.message}` };
@@ -15315,7 +15315,7 @@ async function completionCasWrite(cfg, { nodeId, revision, raw }, { home = cfg.u
     const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
     try {
       fs.writeFileSync(tmp, raw);
-      fs.renameSync(tmp, file);
+      replaceFileSync(tmp, file);
     } catch (e) {
       try { fs.unlinkSync(tmp); } catch { /* already gone */ }
       return { ok: false, reason: `could not write ${nodeId}: ${e.message}` };
