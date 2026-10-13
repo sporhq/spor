@@ -912,10 +912,26 @@ function graphServer(handler) {
   return { srv, hits };
 }
 
+// The stub drains its stdin before it writes and exits, as every real harness
+// does: a child that exits 0 without reading the prompt races the supervisor's
+// stdin write, and under load (macOS CI shard 4/4) the write loses — EPIPE ->
+// stdinError -> the run reads `failed` despite its exit 0
+// (issue-spor-dispatch-terminal-e2e-macos-flake; the same race as
+// issue-spor-agent-dispatch-runner-test-309-load-flake). These tests are about
+// the terminal-state contract, not that race; test/agent-dispatch-runner.test.js
+// owns the early-exit-during-the-prompt case.
 function jsonlStub(dir, lines) {
   const file = path.join(dir, "stub.js");
-  fs.writeFileSync(file, `${lines.map((l) => `process.stdout.write(${JSON.stringify(JSON.stringify(l))} + "\\n");`).join("\n")}\n`);
+  const writes = lines.map((l) => `process.stdout.write(${JSON.stringify(JSON.stringify(l))} + "\\n");`).join("\n");
+  fs.writeFileSync(file, `process.stdin.resume();\nprocess.stdin.on("end", () => {\n${writes}\n});\n`);
   return file;
+}
+
+// The fields that say WHY a run ended, for an assertion message: a flake that
+// reads `failed` must carry its reason into the CI log.
+function pickTermination(record) {
+  const { state, exit_code, signal, error, termination_class, termination_signal, termination_reason } = record || {};
+  return { state, exit_code, signal, error, termination_class, termination_signal, termination_reason };
 }
 
 async function runSupervisor(home, job, env) {
@@ -978,7 +994,7 @@ test("end to end: an unresolved supervised run files its report and releases its
       node_id: "task-x", release_node: "task-x", project: "demo",
     }, { SPOR_DISPATCH_RENEW_TOKEN: "agent-token", SPOR_DISPATCH_PIPE_DRAIN_MS: "60000" });
 
-    assert.strictEqual(record.state, "done");
+    assert.strictEqual(record.state, "done", `record termination: ${JSON.stringify(pickTermination(record))}`);
     assert.strictEqual(record.terminal_state, "reported");
     assert.strictEqual(record.terminal_enforced, true);
     assert.strictEqual(record.lease_released, true);
@@ -1020,6 +1036,7 @@ test("end to end: a resolving edge on the graph makes the same run resolved, wit
       node_id: "task-x", release_node: "task-x", project: "demo",
     }, { SPOR_DISPATCH_RENEW_TOKEN: "agent-token" });
 
+    assert.strictEqual(record.state, "done", `record termination: ${JSON.stringify(pickTermination(record))}`);
     assert.strictEqual(record.terminal_state, "resolved");
     assert.strictEqual(record.terminal_enforced, true);
     assert.strictEqual(record.resolved_by, "art-done");
