@@ -439,3 +439,96 @@ process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "env-th
     org: "acme", legacyOrg: null,
   });
 });
+
+// issue-spor-dispatch-runner-update-drops-record-write-failures: the
+// supervisor's stdio is ignored, so a record write that failed used to vanish —
+// and a failed FINAL write left the record `contract_pending: true` forever.
+test("writeSupervisorRecord: a final write that fails transiently is retried and lands", () => {
+  const { writeSupervisorRecord, RECORD_WRITE_FAILURE_LOG } = require("../lib/shell/agent-dispatch-runner.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-runner-write-"));
+  const file = path.join(dir, "r1.run.json");
+  let calls = 0;
+  const sleeps = [];
+  const result = writeSupervisorRecord(file, { run_id: "r1", contract_pending: false }, {
+    final: true,
+    write: (f, rec) => {
+      calls += 1;
+      if (calls < 3) throw new Error("run record r1.run.json not written: EPERM");
+      atomicJson(f, rec);
+    },
+    sleep: (ms) => sleeps.push(ms),
+  });
+  assert.deepStrictEqual(result, { ok: true, attempts: 3 });
+  assert.deepStrictEqual(sleeps, [250, 500]);
+  assert.strictEqual(readJson(file).contract_pending, false);
+  assert.ok(!fs.existsSync(path.join(dir, RECORD_WRITE_FAILURE_LOG)), "a write that landed leaves no failure trace");
+});
+
+test("writeSupervisorRecord: a final write that never lands is bounded and journaled beside the record", () => {
+  const { writeSupervisorRecord, RECORD_WRITE_FINAL_RETRIES, RECORD_WRITE_FAILURE_LOG } = require("../lib/shell/agent-dispatch-runner.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-runner-write-"));
+  const file = path.join(dir, "r2.run.json");
+  atomicJson(file, { run_id: "r2", state: "done", contract_pending: true });
+  let calls = 0;
+  const said = [];
+  const result = writeSupervisorRecord(file, { run_id: "r2", state: "done", contract_pending: false }, {
+    final: true,
+    write: () => { calls += 1; throw new Error("run record r2.run.json not written: lock open failed"); },
+    sleep: () => {},
+    now: () => "2026-10-13T00:00:00.000Z",
+    say: (line) => said.push(line),
+  });
+  assert.strictEqual(calls, 1 + RECORD_WRITE_FINAL_RETRIES);
+  assert.strictEqual(result.ok, false);
+  assert.strictEqual(result.journaled, true);
+  const lines = fs.readFileSync(path.join(dir, RECORD_WRITE_FAILURE_LOG), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.deepStrictEqual(lines, [{
+    at: "2026-10-13T00:00:00.000Z",
+    run_id: "r2",
+    record: "r2.run.json",
+    final: true,
+    attempts: 1 + RECORD_WRITE_FINAL_RETRIES,
+    intended_contract_pending: false,
+    left_contract_pending: true,
+    state: "done",
+    error: "run record r2.run.json not written: lock open failed",
+  }]);
+  assert.match(said.join(""), /FINAL run record write failed after 4 attempt/);
+});
+
+test("writeSupervisorRecord: an intermediate write is tried once, but its failure is still journaled", () => {
+  const { writeSupervisorRecord, RECORD_WRITE_FAILURE_LOG } = require("../lib/shell/agent-dispatch-runner.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-runner-write-"));
+  const file = path.join(dir, "r3.run.json");
+  let calls = 0;
+  const result = writeSupervisorRecord(file, { run_id: "r3", contract_pending: true }, {
+    write: () => { calls += 1; throw new Error("boom"); },
+    sleep: () => { throw new Error("an intermediate write must not wait"); },
+    say: () => {},
+  });
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(result.ok, false);
+  const [line] = fs.readFileSync(path.join(dir, RECORD_WRITE_FAILURE_LOG), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.strictEqual(line.final, false);
+  assert.strictEqual(line.intended_contract_pending, true);
+  assert.strictEqual(line.left_contract_pending, null, "no record on disk reads as unknown");
+  assert.strictEqual(line.error, "boom");
+});
+
+test("writeSupervisorRecord: a final write that already spent a full lock wait is not retried again", () => {
+  const { writeSupervisorRecord, RECORD_WRITE_FAILURE_LOG } = require("../lib/shell/agent-dispatch-runner.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-runner-write-"));
+  const file = path.join(dir, "r4.run.json");
+  let calls = 0;
+  const result = writeSupervisorRecord(file, { run_id: "r4" }, {
+    final: true,
+    write: () => { calls += 1; throw new Error("run record r4.run.json not written: record lock contended"); },
+    sleep: () => { throw new Error("a contended lock must not be waited out again"); },
+    say: () => {},
+  });
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(result.attempts, 1);
+  const [line] = fs.readFileSync(path.join(dir, RECORD_WRITE_FAILURE_LOG), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.strictEqual(line.attempts, 1);
+  assert.strictEqual(line.final, true);
+});
