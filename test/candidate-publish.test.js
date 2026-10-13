@@ -864,7 +864,7 @@ for (const transport of ["environment", "repository", "environment-over-reposito
     const conflict = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "branch", remote: "origin", git });
     assert.equal(conflict.ok, false); assert.equal(conflict.classification, "publish-conflict");
     const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
-    assert.ok(calls.some(c => c.cwd === repo.dir && c.args.some(a => a.includes("git-receive-pack"))));
+    assert.ok(calls.some(c => fs.realpathSync(c.cwd) === fs.realpathSync(repo.dir) && c.args.some(a => a.includes("git-receive-pack"))));
     const fetchCalls = networkCalls.filter(c => c.args.includes("fetch"));
     assert.ok(fetchCalls.length >= 2, "fresh verification repositories used the same configured transport");
     for (const call of fetchCalls) {

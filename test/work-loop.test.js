@@ -1295,7 +1295,7 @@ test("spor work --once --max 1 dispatches through the real guards, waits for the
 
   const invocations = fs.readFileSync(outfile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.strictEqual(invocations.length, 1, "exactly one launch, into the mapped repo");
-  assert.strictEqual(invocations[0].cwd, repo);
+  assert.strictEqual(fs.realpathSync(invocations[0].cwd), fs.realpathSync(repo));
   assert.match(invocations[0].prompt, /task-ready/);
 
   // The run record carries the outcome dimension, and the loop read it rather
@@ -1403,7 +1403,7 @@ test("a cooled-off refusal lets the next poll widen the page past it and dispatc
 
   const invocations = fs.readFileSync(outfile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.strictEqual(invocations.length, 1, "exactly one launch");
-  assert.strictEqual(invocations[0].cwd, repo);
+  assert.strictEqual(fs.realpathSync(invocations[0].cwd), fs.realpathSync(repo));
   assert.match(invocations[0].prompt, /task-ready/);
   assert.doesNotMatch(invocations[0].prompt, /task-refused/);
 
@@ -1475,7 +1475,7 @@ test("spor work auto-routes a queue item's `profile:` frontmatter — no manual 
 
   const invocations = fs.readFileSync(outfile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.strictEqual(invocations.length, 1, "the item with no assigned edge at all still launched, routed by its frontmatter alone");
-  assert.strictEqual(invocations[0].cwd, repo);
+  assert.strictEqual(fs.realpathSync(invocations[0].cwd), fs.realpathSync(repo));
 });
 
 test("spor work refuses a lane item it cannot satisfy — same as an explicit --profile would, never silently dropped or run bare", () => {

@@ -20,7 +20,9 @@ const skip = process.platform === "win32" ? "land.sh is bash operator tooling" :
 // A repo whose root checkout sits on `main` (the shape that used to go stale),
 // plus a feature branch one commit ahead of main in its own worktree.
 function fixture() {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "spor-land-"));
+  // Realpath'd: land.sh reports paths as git resolves them, and a symlinked
+  // temp root (macOS /var -> /private/var) would otherwise differ.
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "spor-land-")));
   const root = path.join(base, "root");
   const g = gitInit(root);
   g(["checkout", "-q", "-b", "main"]);

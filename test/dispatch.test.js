@@ -372,7 +372,11 @@ test("dispatch free-text from cwd: still resolves the launcher cwd (guard is nod
   const launcher = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-launcher-"));
   const r = run(["dispatch", "some free text work to do here", "--print", "--no-brief"], { SPOR_HOME: home }, launcher);
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stdout, new RegExp(`dir:    ${launcher.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via cwd`));
+  // The launcher dir is the child's process.cwd(), which the OS reports
+  // resolved — compare realpaths (macOS tmpdir is /var -> /private/var).
+  const shown = /^dir:\s+(.*?)\s+\(slug: .*via cwd\)$/m.exec(r.stdout);
+  assert.ok(shown, r.stdout);
+  assert.strictEqual(fs.realpathSync(shown[1]), fs.realpathSync(launcher));
   assert.doesNotMatch(r.stderr, /can't tell which repo/);
 });
 

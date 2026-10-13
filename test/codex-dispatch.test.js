@@ -276,7 +276,7 @@ test("Codex adapter launches detached, captures JSONL session, prompt, cwd, and 
 
   const invocation = await awaitJson(outfile);
   assert.ok(invocation, "the detached stub ran");
-  assert.strictEqual(invocation.cwd, repo);
+  assert.strictEqual(fs.realpathSync(invocation.cwd), fs.realpathSync(repo));
   // The judge's secrets never reach the dispatched harness (cross-model
   // review, blocking finding 1): the code under judgement cannot sign its
   // own attestation or act with the person's refresh/admin credentials.

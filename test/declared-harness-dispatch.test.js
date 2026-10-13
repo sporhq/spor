@@ -560,7 +560,7 @@ test("a declared dispatch launches the bound command, binds its session, and rec
 
   const invocation = await awaitJson(outfile);
   assert.ok(invocation, "the detached stub ran");
-  assert.strictEqual(invocation.cwd, repo);
+  assert.strictEqual(fs.realpathSync(invocation.cwd), fs.realpathSync(repo));
   assert.deepStrictEqual(invocation.args, ["run", "--jsonl", `--dir=${repo}`, "--model=profile-model"]);
   assert.match(invocation.prompt, /task-declared/, "the prompt arrives on stdin");
   assert.ok(!invocation.args.some((a) => a.includes("task-declared")), "and never in argv");

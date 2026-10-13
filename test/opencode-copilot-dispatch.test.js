@@ -320,7 +320,7 @@ test("a dispatch whose launcher is only in the config cascade is NOT refused on 
   assert.doesNotMatch(result.stderr, /can't satisfy profile/);
   const invocation = await awaitJson(outfile);
   assert.ok(invocation, "the configured launcher is the one that actually ran");
-  assert.strictEqual(invocation.cwd, repo);
+  assert.strictEqual(fs.realpathSync(invocation.cwd), fs.realpathSync(repo));
 });
 
 test("an absent default launcher is refused with a message naming the path tried and both override routes", () => {
@@ -479,7 +479,7 @@ for (const harness of ["opencode", "copilot"]) {
 
     const invocation = await awaitJson(outfile);
     assert.ok(invocation, "the detached stub ran");
-    assert.strictEqual(invocation.cwd, repo);
+    assert.strictEqual(fs.realpathSync(invocation.cwd), fs.realpathSync(repo));
     assert.ok(
       !invocation.args.some((a) => a.startsWith("__SPOR_")),
       "launcher-supplied placeholders are substituted before the harness sees them"

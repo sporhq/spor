@@ -315,7 +315,7 @@ test("a default claude-code dispatch launches supervised: print-mode argv, promp
 
   const invocation = await awaitJson(outfile);
   assert.ok(invocation, "the detached stub ran");
-  assert.strictEqual(invocation.cwd, repo);
+  assert.strictEqual(fs.realpathSync(invocation.cwd), fs.realpathSync(repo));
   assert.deepStrictEqual(invocation.args.slice(0, 4), ["-p", "--output-format", "stream-json", "--verbose"]);
   assert.ok(invocation.args.includes("--name") && invocation.args.includes("task-cc"));
   assert.ok(invocation.args.includes("--model") && invocation.args.includes("haiku"));

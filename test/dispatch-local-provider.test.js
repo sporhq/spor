@@ -238,9 +238,9 @@ for (const [name, shape] of Object.entries(GOLDENS)) {
       return;
     }
     const golden = JSON.parse(fs.readFileSync(shape.file, "utf8"));
-    // Start-time ticks are read from /proc, so a Windows record carries none;
-    // compare there without them on either side.
-    const view = (v) => (process.platform === "win32" && typeof v === "string" ? v.replace(/^ {2}"(runner|child)_started_ticks": <N>,\n/gm, "") : v);
+    // Start-time ticks are read from /proc, so a non-Linux record (Windows,
+    // macOS) carries none; compare there without them on either side.
+    const view = (v) => (process.platform !== "linux" && typeof v === "string" ? v.replace(/^ {2}"(runner|child)_started_ticks": <N>,\n/gm, "") : v);
     for (const key of ["stdout", "stderr", "record", "job", "prompt", "journal", "worktree"]) {
       assert.deepStrictEqual(view(capture[key]), view(golden[key]), `${key} differs from the recorded golden`);
     }
