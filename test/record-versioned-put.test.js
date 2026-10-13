@@ -404,3 +404,34 @@ test("withRecordLock: the win32 pending-delete window bounds one run of refusals
   finally { fs.openSync = original; }
   assert.deepStrictEqual(held, { ok: true, value: "wrote" });
 });
+
+test("withRecordLock: an open released for a mid-break breaker resets the win32 pending-delete window", () => {
+  const home = scratch();
+  const file = seed(home, "11111111-2222-3333-4444-0000000000e4");
+  const lock = runner.recordLockPath(file);
+  const breaker = runner.breakerLockPath(lock);
+  fs.writeFileSync(breaker, "breaker\n");
+  const original = fs.openSync;
+  // EPERM opens a window at t=0; the next open lands but a breaker is mid-break,
+  // so it is released and retried; the breaker finishes and the retry meets a
+  // fresh pending-delete EPERM long after the first window — it must get its
+  // own window rather than fail on the spent one.
+  let t = 0, call = 0;
+  fs.openSync = function (p, ...rest) {
+    if (String(p) === lock) {
+      call += 1;
+      if (call === 1) throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+      if (call === 3) {
+        fs.rmSync(breaker, { force: true });
+        t = 60000;
+        throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+      }
+    }
+    return original.call(this, p, ...rest);
+  };
+  let held;
+  try { held = runner.withRecordLock(file, () => "wrote", { platform: "win32", waitMs: 1, now: () => t }); }
+  finally { fs.openSync = original; }
+  assert.deepStrictEqual(held, { ok: true, value: "wrote" });
+  assert.ok(call >= 4);
+});
