@@ -18,6 +18,10 @@
 //     --no-push        commit + tag locally, then stop (print push commands)
 //     --no-release     skip local release creation (tag CI still attaches plugin.zip)
 //     --skip-tests     don't run `npm test` locally before releasing
+//     --allow-red-ci   release even though main's `test` workflow run is not
+//                      green (the explicit override; see scripts/release-ci-gate.js).
+//                      publish.yaml gates the tag on its own: set the repo
+//                      variable SPOR_RELEASE_ALLOW_RED_CI=true to override there
 //
 // Zero-dependency, plain Node + git/gh binaries — runs anywhere the plugin does.
 
@@ -28,6 +32,7 @@ const readline = require('readline');
 
 const ROOT = path.resolve(__dirname, '..');
 const { gitEnv } = require(path.join(ROOT, 'lib', 'shell', 'git-exec.js'));
+const ciGate = require(path.join(__dirname, 'release-ci-gate.js'));
 
 // The five version strings that MUST move together (publish.yaml enforces it).
 const MANIFESTS = [
@@ -78,7 +83,7 @@ function have(cmd) {
 }
 
 function parseArgs(argv) {
-  const flags = { yes: false, dryRun: false, push: true, release: true, tests: true };
+  const flags = { yes: false, dryRun: false, push: true, release: true, tests: true, allowRedCi: false };
   let bump = 'patch';
   for (const a of argv) {
     switch (a) {
@@ -87,6 +92,7 @@ function parseArgs(argv) {
       case '--no-push': flags.push = false; break;
       case '--no-release': flags.release = false; break;
       case '--skip-tests': flags.tests = false; break;
+      case '--allow-red-ci': flags.allowRedCi = true; break;
       default:
         if (a.startsWith('-')) die(`unknown flag: ${a}`);
         bump = a;
@@ -158,6 +164,19 @@ async function main() {
   const [behind] = counts.split(/\s+/).map(Number);
   if (behind > 0) die(`local main is ${behind} commit(s) behind origin/main — pull first`);
   ok(`preflight passed (branch=main, tree clean, ${tag} free, in sync with origin)`);
+
+  // ---- CI gate -------------------------------------------------------------
+  // The tip being released must have a green `test` matrix on main — Windows
+  // shards included; the publish workflow only re-runs the suite on ubuntu
+  // (task-spor-release-gate-refuses-red-main-ci). publish.yaml checks the
+  // release commit itself too; this refuses before anything is bumped.
+  const sha = git(['rev-parse', 'HEAD'], { capture: true });
+  const gateOpts = { sha, gh: ciGate.ghRunnerAt({ cwd: ROOT, env: gitEnv() }) };
+  const verdict = ciGate.readGate(gateOpts);
+  const line = ciGate.describe(verdict, gateOpts);
+  if (verdict.state === 'success') ok(line);
+  else if (flags.allowRedCi) info(`\x1b[33m⚠ --allow-red-ci: releasing anyway — ${line}\x1b[0m`);
+  else die(`CI gate: ${line}\n  Fix main (or wait for the run), or pass --allow-red-ci to override deliberately.`);
 
   // Commits that will ship, for the changelog / confirmation.
   const lastTag = git(['describe', '--tags', '--abbrev=0'], { capture: true, allowFail: true });

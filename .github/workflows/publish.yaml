@@ -8,6 +8,7 @@ on:
 permissions:
   id-token: write  # Required for OIDC
   contents: read
+  actions: read    # release-ci-gate reads the `test` workflow's runs
 
 jobs:
   publish:
@@ -18,6 +19,21 @@ jobs:
     environment: prod
     steps:
       - uses: actions/checkout@v6
+
+      # Refuse to publish over a red matrix (task-spor-release-gate-refuses-red-main-ci):
+      # `npm test` below runs on ubuntu only, so wait for the `test` workflow's
+      # push run on main for this exact commit — every Linux AND Windows shard
+      # plus conformance — and fail unless it concluded success. release.js
+      # pushes main before the tag, so that run is already underway. The
+      # explicit override is the repo variable SPOR_RELEASE_ALLOW_RED_CI=true.
+      - name: Require a green test matrix for this commit
+        if: vars.SPOR_RELEASE_ALLOW_RED_CI != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/release-ci-gate.js --sha "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --wait --timeout-min 75
+      - name: CI gate overridden
+        if: vars.SPOR_RELEASE_ALLOW_RED_CI == 'true'
+        run: echo "::warning::SPOR_RELEASE_ALLOW_RED_CI=true — publishing WITHOUT checking the test matrix for $GITHUB_SHA"
 
       - uses: actions/setup-node@v6
         with:
