@@ -61,7 +61,9 @@ async function fixture() {
   git(bare, ["init", "-q", "--bare"]);
   git(repo, ["push", "-q", bare, "main"]);
   const gitconfig = path.join(home, "runner.gitconfig");
-  fs.writeFileSync(gitconfig, `[url "${bare}"]\n\tinsteadOf = ${REMOTE_URL}\n`);
+  // Forward slashes: a gitconfig value is backslash-escaped, so a Windows path
+  // spelled natively (`C:\Users\…`) is an invalid escape and the file fails to parse.
+  fs.writeFileSync(gitconfig, `[url "${bare.replace(/\\/g, "/")}"]\n\tinsteadOf = ${REMOTE_URL}\n`);
   fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { repos: { demo: repo } } }));
   const store = executionStore.localExecutionEngine({ home, tenant: "local", worker: "worker-a", instance: "inst-a" });
   const opened = await store.open({ node_id: "task-attempt-demo", factory: "factory-demo", boundary: "gates" });
@@ -306,7 +308,9 @@ test("verifyBundle refuses pins that disagree with the attempt and unknown setti
   assert.match(bundleLib.verifyBundle(s, { env: {} }).errors.join("; "), /env\.json harness: unknown key 'command'/);
 });
 
-test("attempt run: a SIGTERM winds the run down through stopping, and the exit mirrors the absent manifest", async () => {
+// Windows has no catchable SIGTERM: child.kill() is TerminateProcess, so the
+// runner never sees the signal it is meant to wind down on.
+test("attempt run: a SIGTERM winds the run down through stopping, and the exit mirrors the absent manifest", { skip: process.platform === "win32" && "no catchable SIGTERM on Windows" }, async () => {
   const f = await fixture();
   const out = path.join(f.home, "bundle");
   assert.strictEqual(cli(["attempt", "build", f.execution.execution_id, "--out", out, "--no-brief", "--permission-mode", "bypassPermissions"], { SPOR_HOME: f.home }, f.repo).status, 0);

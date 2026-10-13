@@ -405,7 +405,12 @@ test("a spawned provider sees no ambient credential unless its declaration opts 
     AWS_SECRET_ACCESS_KEY: null,
     SPOR_TOKEN: null,
     VAULT_ADDR: "https://vault.invalid",
-    PATH: env.PATH === undefined ? null : env.PATH,
+    // Windows spells it `Path` in a copied environment, and a child's
+    // environment is case-insensitive there, so match the key the same way.
+    PATH: (() => {
+      const key = Object.keys(env).find((k) => (process.platform === "win32" ? k.toUpperCase() === "PATH" : k === "PATH"));
+      return key === undefined ? null : env[key];
+    })(),
   });
   const optedIn = bind({ ...declaration, inheritEnv: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] }, { env });
   const b = (await optedIn.request(req("describe"))).result.seen;

@@ -129,10 +129,22 @@ function normalize(text, { runId, home, repo, stub }) {
   const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   let t = String(text);
   t = t.split(runId).join("<RUN>");
-  t = t.split(JSON.stringify(home).slice(1, -1)).join("<HOME>");
-  t = t.split(JSON.stringify(repo).slice(1, -1)).join("<REPO>");
-  t = t.split(JSON.stringify(stub).slice(1, -1)).join("<STUB>");
-  t = t.split(home).join("<HOME>").split(repo).join("<REPO>").split(stub).join("<STUB>");
+  // Every spelling of a scratch path: on Windows os.tmpdir() can be an 8.3
+  // short path (RUNNER~1) that git and the CLI report in its long form, which
+  // only the native realpath recovers.
+  const spellings = (p) => [...new Set([p, fs.realpathSync.native(p)])].sort((a, b) => b.length - a.length);
+  for (const [value, mark] of [[home, "<HOME>"], [repo, "<REPO>"], [stub, "<STUB>"]]) {
+    for (const p of spellings(value)) {
+      t = t.split(JSON.stringify(p).slice(1, -1)).join(mark);
+      t = t.split(p).join(mark);
+    }
+  }
+  if (process.platform === "win32") {
+    // The goldens are recorded on POSIX: a path under a placeholder is spelled
+    // with `/`, and the Windows stub is the `.cmd` wrapper around the `.js`.
+    t = t.replace(/(<HOME>|<REPO>|<STUB>)((?:\\\\|\\)[^"\s]*)/g, (_, mark, rest) => mark + rest.replace(/\\\\|\\/g, "/"));
+    t = t.split("claude-golden.cmd").join("claude-golden.js");
+  }
   // The scratch repo's inferred project slug (its kebab-cased basename).
   t = t.split(path.basename(repo).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")).join("<SLUG>");
   t = t.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z/g, "<TS>");
@@ -226,8 +238,11 @@ for (const [name, shape] of Object.entries(GOLDENS)) {
       return;
     }
     const golden = JSON.parse(fs.readFileSync(shape.file, "utf8"));
+    // Start-time ticks are read from /proc, so a Windows record carries none;
+    // compare there without them on either side.
+    const view = (v) => (process.platform === "win32" && typeof v === "string" ? v.replace(/^ {2}"(runner|child)_started_ticks": <N>,\n/gm, "") : v);
     for (const key of ["stdout", "stderr", "record", "job", "prompt", "journal", "worktree"]) {
-      assert.deepStrictEqual(capture[key], golden[key], `${key} differs from the recorded golden`);
+      assert.deepStrictEqual(view(capture[key]), view(golden[key]), `${key} differs from the recorded golden`);
     }
   });
 }

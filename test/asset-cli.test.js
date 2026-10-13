@@ -393,7 +393,8 @@ test("shell: a fetch without --force never clobbers a file that appears mid-stre
   const fresh = path.join(out, "y.png");
   assert.strictEqual(await assetLib.writeVerified(plain(), asset, fresh), fresh);
   assert.ok(fs.readFileSync(fresh).equals(SAMPLE));
-  assert.strictEqual(fs.statSync(fresh).mode & 0o777, 0o644);
+  // Windows has no POSIX permission bits: a writable file always reads 0o666.
+  if (process.platform !== "win32") assert.strictEqual(fs.statSync(fresh).mode & 0o777, 0o644);
   assert.deepStrictEqual(fs.readdirSync(out).sort(), ["x.png", "y.png"]);
 });
 

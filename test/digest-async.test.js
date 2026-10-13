@@ -681,6 +681,9 @@ test("anthropic-call honours HTTPS_PROXY: CONNECTs through it, and a refusal fai
   const proxy = http.createServer();
   proxy.on("connect", (req, sock) => {
     seen.push(req.url);
+    // The client hangs up once it has read the refusal; on Windows that
+    // surfaces here as ECONNRESET, which unhandled would fail this test.
+    sock.on("error", () => {});
     sock.end("HTTP/1.1 403 Forbidden\r\n\r\n");
   });
   await new Promise((r) => proxy.listen(0, "127.0.0.1", r));
