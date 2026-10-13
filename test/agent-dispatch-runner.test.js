@@ -516,13 +516,15 @@ test("writeSupervisorRecord: an intermediate write is tried once, but its failur
 });
 
 test("writeSupervisorRecord: a final write that already spent a full lock wait is not retried again", () => {
-  const { writeSupervisorRecord, RECORD_WRITE_FAILURE_LOG } = require("../lib/shell/agent-dispatch-runner.js");
+  const { writeSupervisorRecord, RECORD_WRITE_FAILURE_LOG, RECORD_LOCK_CONTENDED } = require("../lib/shell/agent-dispatch-runner.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-runner-write-"));
   const file = path.join(dir, "r4.run.json");
   let calls = 0;
   const result = writeSupervisorRecord(file, { run_id: "r4" }, {
     final: true,
-    write: () => { calls += 1; throw new Error("run record r4.run.json not written: record lock contended"); },
+    // Matched on the stable code, not the prose: a contended error is told by
+    // `code`, whatever its message says.
+    write: () => { calls += 1; throw Object.assign(new Error("run record r4.run.json not written: lock busy"), { code: RECORD_LOCK_CONTENDED }); },
     sleep: () => { throw new Error("a contended lock must not be waited out again"); },
     say: () => {},
   });
@@ -531,4 +533,19 @@ test("writeSupervisorRecord: a final write that already spent a full lock wait i
   const [line] = fs.readFileSync(path.join(dir, RECORD_WRITE_FAILURE_LOG), "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.strictEqual(line.attempts, 1);
   assert.strictEqual(line.final, true);
+});
+
+test("writeSupervisorRecord: a contended-sounding message without the ERECORDLOCK code is still retried", () => {
+  const { writeSupervisorRecord, RECORD_WRITE_FINAL_RETRIES } = require("../lib/shell/agent-dispatch-runner.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-runner-write-"));
+  const file = path.join(dir, "r5.run.json");
+  let calls = 0;
+  const result = writeSupervisorRecord(file, { run_id: "r5" }, {
+    final: true,
+    write: () => { calls += 1; throw new Error("run record r5.run.json not written: record lock contended"); },
+    sleep: () => {},
+    say: () => {},
+  });
+  assert.strictEqual(calls, 1 + RECORD_WRITE_FINAL_RETRIES);
+  assert.strictEqual(result.ok, false);
 });

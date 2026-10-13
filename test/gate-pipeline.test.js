@@ -9054,7 +9054,7 @@ test("whole-record writers take the record lock: a held lock makes them wait, a 
   fs.writeFileSync(lock, "4242\n");
   const shortLock = (file, fn, o) => dispatchRuns.withRecordLock(file, fn, { ...o, attempts: 20, waitMs: 5 });
   const t0 = Date.now();
-  assert.throws(() => dispatchRuns.writeRecordCarryingGate(paths.record, { ...onDisk, note: "late" }, { lock: shortLock }), /not written: record lock contended/);
+  assert.throws(() => dispatchRuns.writeRecordCarryingGate(paths.record, { ...onDisk, note: "late" }, { lock: shortLock }), (e) => /not written: record lock contended/.test(e.message) && e.code === dispatchRuns.RECORD_LOCK_CONTENDED && e.code === "ERECORDLOCK");
   const waited = Date.now() - t0;
   assert.ok(waited >= 50, `waited for the lock (${waited}ms)`);
   assert.strictEqual(dispatchRuns.closeRun(paths.record, { state: "failed" }, null, { lock: shortLock }), null, "closeRun under a live lock did not write");
