@@ -466,7 +466,7 @@ function liveLockHandback(platform, codes) {
   try { broke = runner.breakStaleLock(lock, { staleMs: 30000, now, waitMs: 1, platform }); }
   finally { fs.linkSync = original; }
   const left = fs.readdirSync(path.dirname(lock)).filter((n) => n.startsWith(`${path.basename(lock)}.`));
-  return { broke, links, restored: fs.existsSync(lock) && fs.readFileSync(lock, "utf8"), left };
+  return { broke, links, restored: fs.existsSync(lock) && fs.readFileSync(lock, "utf8"), left, lock, file };
 }
 
 test("breakStaleLock: a win32 pending-delete EPERM/EACCES on the handback link is retried until the live lock is back", () => {
@@ -477,8 +477,87 @@ test("breakStaleLock: a win32 pending-delete EPERM/EACCES on the handback link i
   assert.deepStrictEqual(r.left, [], "no moved copy or breaker left behind");
 });
 
-test("breakStaleLock: off win32 an EPERM on the handback link is not retried", () => {
-  const r = liveLockHandback("linux", ["EPERM"]);
+// issue-spor-record-lock-handback-fails-open: a handback that cannot land
+// fails CLOSED — the live lock stays moved aside, the breaker stays (marked
+// with the moved copy's name), and no acquirer holds while its holder runs.
+function assertHandbackKept(r) {
   assert.strictEqual(r.broke, false);
+  assert.strictEqual(r.restored, false, "the lock path is not re-created behind the holder's back");
+  const moved = r.left.filter((n) => n.includes(".stale-"));
+  assert.strictEqual(moved.length, 1, "the moved-aside live lock is kept, not unlinked");
+  assert.strictEqual(fs.readFileSync(path.join(path.dirname(r.lock), moved[0]), "utf8"), "holder\n");
+  const breaker = runner.breakerLockPath(r.lock);
+  assert.ok(fs.existsSync(breaker), "the breaker stays in place");
+  assert.strictEqual(fs.readFileSync(breaker, "utf8").split("\n")[1], `handback ${moved[0]}`);
+  let entered = false;
+  const held = runner.withRecordLock(r.file, () => { entered = true; }, { attempts: 3, waitMs: 1 });
+  assert.strictEqual(held.ok, false, "no second holder while the breaker stands");
+  assert.strictEqual(entered, false);
+  assert.ok(fs.existsSync(breaker) && fs.existsSync(path.join(path.dirname(r.lock), moved[0])), "a fresh handback breaker is not cleared");
+  return { breaker, moved: path.join(path.dirname(r.lock), moved[0]) };
+}
+
+test("breakStaleLock: off win32 an EPERM on the handback link is not retried, and fails closed", () => {
+  const r = liveLockHandback("linux", ["EPERM"]);
   assert.strictEqual(r.links, 1);
+  assertHandbackKept(r);
+});
+
+test("breakStaleLock: a handback whose attempts are exhausted keeps the moved lock and the breaker", () => {
+  const r = liveLockHandback("linux", Array(runner.RECORD_LOCK_HANDBACK_ATTEMPTS).fill("EEXIST"));
+  assert.strictEqual(r.links, runner.RECORD_LOCK_HANDBACK_ATTEMPTS);
+  assertHandbackKept(r);
+});
+
+test("a kept handback breaker and moved lock are cleared once both are stale, and the record lock is taken again", () => {
+  const r = liveLockHandback("linux", ["EIO"]);
+  const { breaker, moved } = assertHandbackKept(r);
+  const staleMs = runner.RECORD_LOCK_STALE_MS;
+  const old = new Date(Date.now() - staleMs - 5000);
+  // The breaker alone going stale is not enough: the moved lock is still live.
+  fs.utimesSync(breaker, old, old);
+  assert.strictEqual(runner.recoverHandbackBreaker(r.lock, { staleMs, now: Date.now }), false);
+  assert.ok(fs.existsSync(breaker) && fs.existsSync(moved));
+  // A recovery guard someone else holds means "not now".
+  fs.utimesSync(moved, old, old);
+  fs.writeFileSync(`${breaker}.clear`, "other\n");
+  assert.strictEqual(runner.recoverHandbackBreaker(r.lock, { staleMs, now: Date.now }), false);
+  assert.ok(fs.existsSync(breaker) && fs.existsSync(moved));
+  fs.unlinkSync(`${breaker}.clear`);
+  // Both stale: the next acquirer clears them and holds.
+  const held = runner.withRecordLock(r.file, () => "wrote", { attempts: 5, waitMs: 1 });
+  assert.deepStrictEqual(held, { ok: true, value: "wrote" });
+  const left = fs.readdirSync(path.dirname(r.lock)).filter((n) => n.startsWith(`${path.basename(r.lock)}.`));
+  assert.deepStrictEqual(left, [], "breaker, moved copy and guard are all gone");
+  assert.ok(!fs.existsSync(r.lock), "the recovering holder released its own lock");
+});
+
+test("a stale corpse behind a stale kept handback breaker: breakStaleLock clears the breaker, then the corpse breaks", () => {
+  const r = liveLockHandback("linux", ["EIO"]);
+  const { breaker, moved } = assertHandbackKept(r);
+  const staleMs = runner.RECORD_LOCK_STALE_MS;
+  const old = new Date(Date.now() - staleMs - 5000);
+  fs.writeFileSync(r.lock, "corpse\n");
+  for (const f of [breaker, moved, r.lock]) fs.utimesSync(f, old, old);
+  assert.strictEqual(runner.breakStaleLock(r.lock, { staleMs, now: Date.now, waitMs: 1 }), false, "the breaker could not be taken this pass");
+  assert.ok(!fs.existsSync(breaker) && !fs.existsSync(moved), "but the stale handback breaker was recovered");
+  assert.strictEqual(runner.breakStaleLock(r.lock, { staleMs, now: Date.now, waitMs: 1 }), true);
+  assert.ok(!fs.existsSync(r.lock));
+});
+
+test("recoverHandbackBreaker never clears an unmarked breaker, nor one naming a path outside the lock's siblings", () => {
+  const home = scratch();
+  const file = seed(home, "11111111-2222-3333-4444-0000000000e6");
+  const lock = runner.recordLockPath(file);
+  const breaker = runner.breakerLockPath(lock);
+  const old = new Date(Date.now() - runner.RECORD_LOCK_STALE_MS - 5000);
+  const victim = path.join(home, "victim");
+  fs.writeFileSync(victim, "keep\n");
+  for (const body of ["abandoned\n", `t\nhandback ../victim\n`, `t\nhandback victim\n`]) {
+    fs.writeFileSync(breaker, body);
+    fs.utimesSync(breaker, old, old);
+    assert.strictEqual(runner.recoverHandbackBreaker(lock, { staleMs: runner.RECORD_LOCK_STALE_MS, now: Date.now }), false, body);
+    assert.ok(fs.existsSync(breaker));
+  }
+  assert.ok(fs.existsSync(victim));
 });

@@ -5170,7 +5170,15 @@ unlinking its pathname because that pathname may already name a live successor.
 If a worker dies while holding `<run-record>.lock.break`, stop all writers of
 that run record before removing that abandoned breaker and resuming work.
 Ordinary stale record locks still use the serialized rename-and-recheck path;
-no observer automatically removes an abandoned breaker lock.
+no observer automatically removes an abandoned breaker lock. The one breaker
+that is cleared automatically is a HANDBACK breaker: a breaker that moved a
+lock aside, found it live, and could not link it back keeps both the moved
+copy and its breaker (fail closed, so no second holder runs beside the live
+one) and marks the breaker with the moved copy's name; once the breaker and
+the moved copy are both past the stale window, an acquirer clears them under
+the exclusive `<run-record>.lock.break.clear` guard. A guard left by a clearer
+that died mid-clear is never aged out either: remove it with the abandoned
+breaker under the same stopped-writers rule.
 
 PR refresh first reads the current body and replaces only Spor's managed
 `spor-proposal` block (or the legacy `spor-attestation` block). Human text and
