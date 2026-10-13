@@ -820,7 +820,7 @@ test("publish_pending survives an in-process whole-record write, like the rest o
 });
 
 for (const transport of ["environment", "repository", "environment-over-repository", "environment-relative", "repository-relative"]) {
-  test(`branch publication preserves ${transport} SSH transport through push and isolated verification`, { skip: process.platform === "win32" }, async t => {
+  test(`branch publication preserves ${transport} SSH transport through push and isolated verification`, async t => {
     const repo = producerRepo(t);
     const remote = scratch(t, "candidate-ssh-remote");
     execFileSync("git", ["init", "--bare", "-q", remote], { env: gitEnv() });
@@ -829,7 +829,15 @@ for (const transport of ["environment", "repository", "environment-over-reposito
     const wrapper = path.join(path.dirname(log), "ssh wrapper");
     fs.writeFileSync(wrapper, `#!${process.execPath}\nconst fs=require('node:fs');\nconst args=process.argv.slice(2);\nfs.appendFileSync(${JSON.stringify(log)},JSON.stringify({cwd:process.cwd(),args,command:process.env.GIT_SSH_COMMAND,variant:process.env.GIT_SSH_VARIANT,terminal:process.env.GIT_TERMINAL_PROMPT,askpass:process.env.GIT_ASKPASS,signing:process.env.SPOR_ATTESTATION_KEY})+'\\n');\nconst mode=args.some(arg=>arg.includes('git-receive-pack'))?'receive-pack':'upload-pack';\nconst r=require('node:child_process').spawnSync('git',[mode,${JSON.stringify(remote)}],{stdio:'inherit'});process.exit(r.status??1);\n`, { mode: 0o700 });
     const commandPath = transport.endsWith("-relative") ? path.relative(repo.dir, wrapper) : wrapper;
-    const command = `'${commandPath.replaceAll("'", "'\\''")}' --configured-wrapper`;
+    const quote = p => `'${p.replaceAll("'", "'\\''")}'`;
+    // Git for Windows runs the SSH command through its bundled sh, which cannot
+    // exec a `#!` script whose interpreter is a Windows path, so there the
+    // command names node and hands it the same wrapper — still a configured
+    // wrapper, and a relative script path still resolves against the producer's
+    // cwd (issue-spor-candidate-publish-ssh-windows-untested).
+    const command = process.platform === "win32"
+      ? `${quote(process.execPath.replaceAll("\\", "/"))} ${quote(commandPath.replaceAll("\\", "/"))} --configured-wrapper`
+      : `${quote(commandPath)} --configured-wrapper`;
     const keys = ["GIT_SSH_COMMAND", "GIT_SSH", "GIT_SSH_VARIANT", "SPOR_ATTESTATION_KEY"];
     const old = Object.fromEntries(keys.map(k => [k, process.env[k]]));
     for (const k of keys) delete process.env[k];
@@ -864,7 +872,7 @@ for (const transport of ["environment", "repository", "environment-over-reposito
     const conflict = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "branch", remote: "origin", git });
     assert.equal(conflict.ok, false); assert.equal(conflict.classification, "publish-conflict");
     const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
-    assert.ok(calls.some(c => fs.realpathSync(c.cwd) === fs.realpathSync(repo.dir) && c.args.some(a => a.includes("git-receive-pack"))));
+    assert.ok(calls.some(c => fs.realpathSync.native(c.cwd) === fs.realpathSync.native(repo.dir) && c.args.some(a => a.includes("git-receive-pack"))));
     const fetchCalls = networkCalls.filter(c => c.args.includes("fetch"));
     assert.ok(fetchCalls.length >= 2, "fresh verification repositories used the same configured transport");
     for (const call of fetchCalls) {
