@@ -307,7 +307,9 @@ test("the hot paths judge N pids with ONE read: activeRuns, reconcileRuns, worke
       const release = spool.claimSpoolJob(lockDir, "h");
       assert.ok(release, "recycled holders do not contend");
       release();
-      assert.equal(calls.filter((c) => !c.includes(process.pid)).length, 1, "spool lock listing: one read for three rivals");
+      // One read lists all three rivals; clearing each one is a destructive act,
+      // re-judged by its own FRESH read (dec-spor-process-identity-per-pass-batched-read).
+      assert.deepEqual(calls.filter((c) => !c.includes(process.pid)).map((c) => c.length), [3, 1, 1, 1], "spool lock listing: one read for three rivals, one fresh read per lock cleared");
 
       calls.length = 0;
       const ws = path.join(home, "ws");
@@ -319,10 +321,64 @@ test("the hot paths judge N pids with ONE read: activeRuns, reconcileRuns, worke
       const got = await preflight.acquireWorkspace(home, ws, { waitMs: 0 });
       assert.equal(got.ok, true, "recycled holders do not hold the workspace");
       preflight.releaseWorkspace(got.token);
-      assert.equal(calls.filter((c) => !c.includes(process.pid)).length, 1, "workspace lock listing: one read for three rivals");
+      assert.deepEqual(calls.filter((c) => !c.includes(process.pid)).map((c) => c.length), [3, 1, 1, 1], "workspace lock listing: one read for three rivals, one fresh read per lock cleared");
     } finally {
       restore();
       fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+// --- destructive acts read FRESH (dec-spor-process-identity-per-pass-batched-read)
+// A pass's cache may serve listing/status/liveness answers, but a kill or a
+// lock break must re-read the kernel immediately before acting. These drive a
+// cached "ours" (or "not ours") and then flip what a fresh read says, as a
+// recycled pid would, and prove the destructive site acts on the FRESH answer.
+test("a kill site ignores a cached identity: stopRun reads supervisor and child fresh inside a pass", async () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  await withSleepers(2, async ([sup, kid]) => {
+    let recycled = false;
+    const calls = [];
+    const restore = identity._setHost({ platform: "darwin", read: (pids) => (calls.push([...pids]), new Map(pids.map((p) => [p, recycled ? 7 : 1000 + p]))) });
+    try {
+      const record = { run_id: "r", state: "running", launch_mode: "supervised-jsonl", runner_pid: sup, runner_started_ticks: 1000 + sup, child_pid: kid, child_started_ticks: 1000 + kid };
+      const pending = identity.withIdentityPass(() => {
+        identity.prefetchStartTicks([sup, kid]);
+        recycled = true; // both pids now name strangers
+        // the cache still says ours: a listing inside the pass would believe it
+        assert.equal(identity.isOurProcess(sup, 1000 + sup).reallyAlive, true, "the cached answer is stale-ours");
+        return dispatchRuns.stopRun(record, { platform: "darwin", sleep: async () => {}, graceMs: 0 });
+      });
+      const stopped = await pending;
+      assert.equal(stopped.supervisor, false, "a supervisor proven not ours by a fresh read is never signalled");
+      assert.equal(stopped.child, false, "a child proven not ours by a fresh read is never signalled");
+      assert.equal(identity.aliveProbe(sup) && identity.aliveProbe(kid), true, "nothing was killed");
+      assert.ok(calls.length >= 3, "the kill decision paid its own fresh reads");
+    } finally {
+      restore();
+    }
+  });
+});
+
+test("a lock break ignores a cached identity: a cached not-ours holder that a fresh read finds ours is not cleared", async () => {
+  const spool = require("../lib/shell/spool.js");
+  await withSleepers(1, ([pid]) => {
+    let cachedWrong = true;
+    const restore = identity._setHost({ platform: "win32", read: (pids) => new Map(pids.map((p) => [p, p === process.pid ? 1 : cachedWrong ? 7 : 1000 + p])) });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-identity-fresh-"));
+    try {
+      const lock = `h.redrive.lock-${pid}-${Date.now()}-${(1000 + pid).toString(16).padStart(16, "0")}abcd0123`;
+      fs.writeFileSync(path.join(dir, lock), "");
+      const release = identity.withIdentityPass(() => {
+        identity.prefetchStartTicks([pid]); // cached: a mismatch (not ours, so prunable)
+        cachedWrong = false; // the kernel, read fresh: the holder IS ours and live
+        return spool.claimSpoolJob(dir, "h");
+      });
+      assert.equal(release, null, "the live holder still owns the pair");
+      assert.ok(fs.existsSync(path.join(dir, lock)), "its lock was not cleared on the cached verdict");
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });
