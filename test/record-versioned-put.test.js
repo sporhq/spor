@@ -380,3 +380,27 @@ test("withRecordLock: off win32 an EPERM on the lock open still fails at once", 
   assert.strictEqual(refused, 1);
   assert.deepStrictEqual(held, { ok: false, reason: "EPERM" });
 });
+
+test("withRecordLock: the win32 pending-delete window bounds one run of refusals, not the whole acquire", () => {
+  const home = scratch();
+  const file = seed(home, "11111111-2222-3333-4444-0000000000e3");
+  const lock = runner.recordLockPath(file);
+  const original = fs.openSync;
+  // EPERM, then a long ordinary hold (EEXIST) that outlasts the window, then
+  // EPERM again as the holder's release goes delete-pending — the second run
+  // of refusals gets its own window.
+  const script = ["EPERM", ...Array(5).fill("EEXIST"), "EPERM", "EPERM"];
+  let t = 0;
+  fs.openSync = function (p, ...rest) {
+    if (String(p) === lock && script.length) {
+      t += 4000;
+      const code = script.shift();
+      throw Object.assign(new Error(code), { code });
+    }
+    return original.call(this, p, ...rest);
+  };
+  let held;
+  try { held = runner.withRecordLock(file, () => "wrote", { platform: "win32", waitMs: 1, now: () => t }); }
+  finally { fs.openSync = original; }
+  assert.deepStrictEqual(held, { ok: true, value: "wrote" });
+});
