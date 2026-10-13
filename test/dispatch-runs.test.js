@@ -1071,3 +1071,117 @@ test("the run stop file: named beside the record, requested idempotently, read w
   runner.killChildTree(child, "SIGTERM", { platform: "linux", run });
   assert.deepStrictEqual(calls, [["kill", "SIGTERM"]]);
 });
+
+test("stopRun on Windows ends the supervisor's and the child's TREES through taskkill, falling back to the bare pid kill", async () => {
+  // Windows' doors injected, so this runs on every OS: the recorded pids are
+  // live processes of ours (so liveness passes), and `run` records the
+  // taskkill instead of executing it (issue-spor-windows-dispatch-stoprun-orphans-harness).
+  const alive = () => spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], { stdio: "ignore" });
+  const child = alive();
+  const supervisor = alive();
+  try {
+    const calls = [];
+    const run = (cmd, args) => { calls.push([cmd, args]); return { status: 0 }; };
+    const stopped = await runner.stopRun(
+      { run_id: "stop-win", child_pid: child.pid, runner_pid: supervisor.pid },
+      { graceMs: 0, platform: "win32", env: { SystemRoot: "C:\\Windows" }, run }
+    );
+    assert.deepStrictEqual(calls.map((c) => c[1]), [
+      ["/PID", String(child.pid), "/T", "/F"],
+      ["/PID", String(supervisor.pid), "/T", "/F"],
+    ], "both the child and the supervisor are ended as trees, never by identity-unproven group signals");
+    assert.match(calls[0][0], /System32[\\/]taskkill\.exe$/);
+    assert.strictEqual(stopped.child, true);
+    assert.strictEqual(stopped.supervisor, true);
+    assert.strictEqual(stopped.group, true, "the tree is Windows' group");
+    // The injected taskkill killed nothing, so the per-pid escalation still
+    // ends what answers.
+    for (const p of [child.pid, supervisor.pid]) {
+      for (let i = 0; i < 200 && runner.pidAlive(p); i += 1) await new Promise((r) => setTimeout(r, 25));
+      assert.strictEqual(runner.pidAlive(p), false);
+    }
+  } finally {
+    child.kill("SIGKILL");
+    supervisor.kill("SIGKILL");
+  }
+
+  // A failed taskkill degrades to the terminate Windows always had.
+  const child2 = alive();
+  const supervisor2 = alive();
+  try {
+    const stopped = await runner.stopRun(
+      { run_id: "stop-win-fallback", child_pid: child2.pid, runner_pid: supervisor2.pid },
+      { graceMs: 0, platform: "win32", env: {}, run: () => ({ status: 1 }) }
+    );
+    assert.strictEqual(stopped.group, false);
+    assert.strictEqual(stopped.child, true);
+    assert.strictEqual(stopped.supervisor, true);
+    for (const p of [child2.pid, supervisor2.pid]) {
+      for (let i = 0; i < 200 && runner.pidAlive(p); i += 1) await new Promise((r) => setTimeout(r, 25));
+      assert.strictEqual(runner.pidAlive(p), false);
+    }
+  } finally {
+    child2.kill("SIGKILL");
+    supervisor2.kill("SIGKILL");
+  }
+
+  // A recycled child pid is still left alone: the identity check runs before
+  // any tree kill is attempted.
+  const bystander = alive();
+  try {
+    const calls = [];
+    const stopped = await runner.stopRun(
+      { run_id: "stop-win-recycled", child_pid: bystander.pid, child_started_ticks: 1 },
+      { graceMs: 0, readTicks: () => 2, platform: "win32", run: (...a) => { calls.push(a); return { status: 0 }; } }
+    );
+    assert.strictEqual(stopped.child, false);
+    assert.deepStrictEqual(calls, []);
+    assert.strictEqual(runner.pidAlive(bystander.pid), true);
+  } finally {
+    bystander.kill("SIGKILL");
+  }
+});
+
+// The real thing, on a real Windows host: the harness behind a `.cmd` shim is a
+// grandchild of the supervisor, and a forced cancel (stopRun at grace 0) must
+// leave it gone — TerminateProcess of the recorded pids alone would orphan it.
+test("stopRun on Windows: a grandchild behind a .cmd shim is gone after a forced cancel", { skip: process.platform !== "win32" && "Windows-only: the .cmd shim tree" }, async () => {
+  for (const variant of ["child-recorded", "supervisor-only"]) {
+    const dir = scratch("spor-runs-win-tree-");
+    const grandPid = path.join(dir, "grandchild.pid");
+    const shimPid = path.join(dir, "shim.pid");
+    const grandJs = path.join(dir, "grandchild.js");
+    fs.writeFileSync(grandJs, `require("node:fs").writeFileSync(${JSON.stringify(grandPid)}, String(process.pid)); setInterval(() => {}, 1e9);\n`);
+    const shim = path.join(dir, "harness.cmd");
+    fs.writeFileSync(shim, `@echo off\r\n"${process.execPath}" "${grandJs}"\r\n`);
+    const supSrc = `
+      const c = require("node:child_process").spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", '"' + ${JSON.stringify(shim)} + '"'], { stdio: "ignore", windowsVerbatimArguments: true, windowsHide: true });
+      require("node:fs").writeFileSync(${JSON.stringify(shimPid)}, String(c.pid));
+      setInterval(() => {}, 1e9);
+    `;
+    const supervisor = spawn(process.execPath, ["-e", supSrc], { stdio: "ignore", windowsHide: true });
+    const readPid = async (file) => {
+      let text = "";
+      for (let i = 0; i < 400 && !text; i += 1) {
+        try { text = fs.readFileSync(file, "utf8"); } catch { /* not yet */ }
+        if (!text) await new Promise((r) => setTimeout(r, 25));
+      }
+      return Number(text);
+    };
+    let grandchild = 0;
+    try {
+      const shimChild = await readPid(shimPid);
+      grandchild = await readPid(grandPid);
+      assert.ok(grandchild > 0 && runner.pidAlive(grandchild), "the fixture must actually have a live harness behind the shim");
+      const record = { run_id: `stop-win-${variant}`, runner_pid: supervisor.pid };
+      if (variant === "child-recorded") record.child_pid = shimChild;
+      const stopped = await runner.stopRun(record, { graceMs: 0 });
+      assert.strictEqual(stopped.supervisor, true);
+      for (let i = 0; i < 200 && runner.pidAlive(grandchild); i += 1) await new Promise((r) => setTimeout(r, 25));
+      assert.strictEqual(runner.pidAlive(grandchild), false, `${variant}: the harness behind the .cmd shim must not survive the cancel`);
+    } finally {
+      try { supervisor.kill(); } catch { /* gone */ }
+      if (grandchild) try { process.kill(grandchild); } catch { /* gone */ }
+    }
+  }
+});
