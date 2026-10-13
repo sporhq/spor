@@ -438,3 +438,14 @@ test("attempt run refuses a result directory that already holds a run, overwriti
   assert.strictEqual(fs.readFileSync(path.join(home, "result", "manifest.json"), "utf8"), "previous\n");
   assert.deepStrictEqual(fs.readdirSync(path.join(home, "result")), ["manifest.json"]);
 });
+
+test("the stop file is a sentinel: a non-regular `stop` still counts as a stop, and is never read or written through", () => {
+  const runner = require("../lib/shell/attempt.js");
+  const out = tmp("spor-attempt-stopdir-");
+  assert.strictEqual(runner.readStopRequest(out), null);
+  fs.mkdirSync(path.join(out, runner.STOP_FILE));
+  assert.match(runner.readStopRequest(out), /a stop was requested through .*stop$/);
+  const r = runner.requestStop(out, "again");
+  assert.strictEqual(r.ok, true);
+  assert.ok(fs.statSync(path.join(out, runner.STOP_FILE)).isDirectory());
+});
