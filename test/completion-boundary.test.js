@@ -1074,3 +1074,47 @@ test("dispatchWorkItem refusal under `completion.by: controller`: the execution 
   const debts = fs.existsSync(path.join(t.dir, "journal", "work-outcome")) ? fs.readdirSync(path.join(t.dir, "journal", "work-outcome")) : [];
   assert.deepEqual(debts, [], lines.join("\n"));
 });
+
+// replaceIfUnchanged (issue-spor-audit-plain-rename-replace-sites-windows): the
+// local compare-and-writes (patch, edge rewrite, completion CAS) replace through
+// the win32-retrying replaceFileSync, and every RETRY re-runs the compare — a
+// change that lands while a blocked replace waits refuses instead of being
+// overwritten by stale bytes. Off win32 it is exactly one plain rename.
+test("replaceIfUnchanged: a win32 retry re-runs the compare and refuses a change that landed meanwhile", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-replace-cas-"));
+  const file = path.join(dir, "n.md");
+  fs.writeFileSync(file, "old");
+  fs.writeFileSync(`${file}.tmp`, "new");
+  let calls = 0;
+  const rename = (from, to) => {
+    calls += 1;
+    if (calls === 1) {
+      fs.writeFileSync(to, "someone else's edit"); // lands while the replace is blocked
+      throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+    }
+    return fs.renameSync(from, to);
+  };
+  assert.throws(() => spor.replaceIfUnchanged(`${file}.tmp`, file, "old", { platform: "win32", rename, sleep: () => {} }), { code: "ECONFLICT" });
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(fs.readFileSync(file, "utf8"), "someone else's edit");
+});
+
+test("replaceIfUnchanged: an unchanged target lands on the win32 retry; off win32 one plain rename, no compare", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-replace-cas-"));
+  const file = path.join(dir, "n.md");
+  fs.writeFileSync(file, "old");
+  fs.writeFileSync(`${file}.tmp`, "new");
+  let calls = 0;
+  const rename = (from, to) => {
+    calls += 1;
+    if (calls === 1) throw Object.assign(new Error("EBUSY"), { code: "EBUSY" });
+    return fs.renameSync(from, to);
+  };
+  spor.replaceIfUnchanged(`${file}.tmp`, file, Buffer.from("old"), { platform: "win32", rename, sleep: () => {} });
+  assert.strictEqual(calls, 2);
+  assert.strictEqual(fs.readFileSync(file, "utf8"), "new");
+  let linuxCalls = 0;
+  const failing = () => { linuxCalls += 1; throw Object.assign(new Error("EPERM"), { code: "EPERM" }); };
+  assert.throws(() => spor.replaceIfUnchanged("a", "b", "x", { platform: "linux", rename: failing, sleep: () => assert.fail("no sleep") }), { code: "EPERM" });
+  assert.strictEqual(linuxCalls, 1);
+});

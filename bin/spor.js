@@ -5728,6 +5728,33 @@ function parsePatchArgs(positionals, unset) {
   return { patch };
 }
 
+// replaceFileSync for a compare-and-write: the caller compared `file` against
+// `expected` (the bytes it read) just before the write. On Windows a replace
+// blocked by a reader is retried for a bounded window (spool.js), so each
+// RETRY first re-runs that compare — a change that landed while the replace
+// was waiting refuses the write instead of being overwritten by stale bytes.
+// The first attempt is the plain rename, so off Windows nothing changes.
+function replaceIfUnchanged(tmp, file, expected, { rename = (from, to) => fs.renameSync(from, to), ...opts } = {}) {
+  const want = Buffer.isBuffer(expected) ? expected : Buffer.from(String(expected));
+  let retry = false;
+  return replaceFileSync(tmp, file, {
+    ...opts,
+    rename: (from, to) => {
+      if (retry) {
+        let cur = null;
+        try { cur = fs.readFileSync(to); } catch { /* gone: changed */ }
+        if (!cur || !cur.equals(want)) {
+          const e = new Error(`${path.basename(to)} changed while the write was waiting — re-read and retry`);
+          e.code = "ECONFLICT";
+          throw e;
+        }
+      }
+      retry = true;
+      return rename(from, to);
+    },
+  });
+}
+
 async function cmdPatch(cfg, { values, positionals }) {
   const id = positionals[0];
   if (!id) {
@@ -5834,7 +5861,7 @@ async function cmdPatch(cfg, { values, positionals }) {
   const tmp = `${file}.tmp-${process.pid}`;
   try {
     fs.writeFileSync(tmp, newRaw);
-    replaceFileSync(tmp, file);
+    replaceIfUnchanged(tmp, file, raw);
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch {}
     err(`could not write ${id}: ${e.message}`);
@@ -15176,7 +15203,7 @@ async function graphEdgeMutation(cfg, from, type, to, { remove = false } = {}) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(tmp, newRaw);
-    replaceFileSync(tmp, file);
+    replaceIfUnchanged(tmp, file, raw);
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch { /* already gone */ }
     return { ok: false, reason: `could not write ${srcId}: ${e.message}` };
@@ -15315,7 +15342,7 @@ async function completionCasWrite(cfg, { nodeId, revision, raw }, { home = cfg.u
     const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
     try {
       fs.writeFileSync(tmp, raw);
-      replaceFileSync(tmp, file);
+      replaceIfUnchanged(tmp, file, current);
     } catch (e) {
       try { fs.unlinkSync(tmp); } catch { /* already gone */ }
       return { ok: false, reason: `could not write ${nodeId}: ${e.message}` };
@@ -22472,7 +22499,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { resumeProviderAttempt, providerAttemptSweep, gcExecutionsDue, gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess, createDispatchWorktree, removeDispatchWorktree };
+module.exports = { resumeProviderAttempt, providerAttemptSweep, gcExecutionsDue, gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, replaceIfUnchanged, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess, createDispatchWorktree, removeDispatchWorktree };
 
 if (require.main === module) {
   main()
