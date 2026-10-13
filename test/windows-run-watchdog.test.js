@@ -86,6 +86,48 @@ test("watchSupervisor: the pipe closing undisarmed reaps the tree in the run's w
   assert.deepEqual(await p3, { action: "reaped", pids: [] }, "a pipe error is the supervisor's death too; a failed reap never throws");
 });
 
+// A supervisor that disarms and then simply lets its event loop drain (as
+// runJob does: process.exitCode, never process.exit) must still DELIVER the
+// disarm through the unref'd pipe before it exits — a lost disarm reads as a
+// crash and would reap a finished run's leftovers. Real processes, every OS:
+// the watchdog script is swapped for a probe that records what reached it.
+test("armRunWatchdog: a disarm written just before the supervisor exits naturally still reaches the watchdog", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-wd-disarm-"));
+  const got = path.join(dir, "got.txt");
+  const probe = path.join(dir, "probe.js");
+  fs.writeFileSync(probe, `let b = ""; process.stdin.on("data", (c) => { b += c; }); process.stdin.on("end", () => { require("node:fs").writeFileSync(${JSON.stringify(got)}, b); process.exit(0); });`);
+  const sup = path.join(dir, "supervisor.js");
+  fs.writeFileSync(sup, [
+    `const { spawn } = require("node:child_process");`,
+    `const wd = require(${JSON.stringify(require.resolve("../lib/shell/windows-run-watchdog.js"))});`,
+    `const spawnImpl = (cmd, args, opts) => spawn(cmd, [${JSON.stringify(probe)}], opts);`,
+    `const w = wd.armRunWatchdog({ pid: 1 }, { since: Date.now(), platform: "win32", spawnImpl });`,
+    `if (!w) process.exitCode = 3; else w.disarm();`,
+  ].join("\n"));
+  const code = await new Promise((r) => spawn(process.execPath, [sup], { stdio: "ignore" }).once("exit", r));
+  assert.equal(code, 0, "the supervisor armed and exited on its own");
+  const end = Date.now() + 15000;
+  while (!fs.existsSync(got) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+  assert.equal(fs.readFileSync(got, "utf8"), `${wd.DISARM}\n`, "the disarm line arrived before the pipe closed");
+});
+
+// A disarmed watchdog exits at once: a normal run leaves no watchdog (and no
+// PowerShell, which only a reap starts) behind. The real script, every OS; the
+// root it names is a process already gone, so even a broken disarm reaps
+// nothing of ours.
+test("the watchdog script exits as soon as it is disarmed: no process outlives a normal run", async () => {
+  const gone = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await new Promise((r) => gone.once("exit", r));
+  const since = Date.now();
+  const w = spawn(process.execPath, [require.resolve("../lib/shell/windows-run-watchdog.js"), String(gone.pid), String(since)], { stdio: ["pipe", "ignore", "ignore"] });
+  const exited = new Promise((r) => w.once("exit", (code) => r(code)));
+  w.stdin.write(`${wd.DISARM}\n`); // the pipe stays open: only the disarm line can end it
+  const code = await Promise.race([exited, new Promise((r) => setTimeout(() => r("still running"), 10000))]);
+  try { w.stdin.end(); } catch { /* gone */ }
+  if (code === "still running") { try { w.kill(); } catch { /* gone */ } }
+  assert.equal(code, 0, "a disarmed watchdog exits 0 without waiting for the pipe to close");
+});
+
 // --- the real crash, on Windows ---------------------------------------------
 
 const winOnly = { skip: process.platform !== "win32" && "Windows-only: a real supervisor crash" };
