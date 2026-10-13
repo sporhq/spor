@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import struct
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,7 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 FILES = {
     "plugin.json": "adapters/chatgpt/plugin.json",
     "mcp.json": "adapters/chatgpt/mcp.json",
+    "assets/icon.png": "adapters/chatgpt/assets/icon.png",
     "skills/spor/SKILL.md": "adapters/chatgpt/skills/spor/SKILL.md",
+    "skills/workspace-onboarding/SKILL.md": "adapters/chatgpt/skills/workspace-onboarding/SKILL.md",
+    "skills/workspace-onboarding/references/factory-worker.md": "adapters/chatgpt/skills/workspace-onboarding/references/factory-worker.md",
     "LICENSE": "LICENSE",
     "NOTICE": "NOTICE",
 }
@@ -38,6 +42,25 @@ def build(root, output, tag=None):
         raise ValueError("Plugin name must match its archive directory")
     if len(manifest["extensions"]["com.openai"]["interface"]["shortDescription"]) > 30:
         raise ValueError("Plugin subtitle exceeds 30 characters")
+    for field in ("logo", "composerIcon"):
+        asset = manifest["extensions"]["com.openai"]["interface"].get(field)
+        if not isinstance(asset, str) or not asset.startswith("./assets/") or "spor/" + asset[2:] not in entries:
+            raise ValueError(f"{field} must point to a packaged branding asset")
+        # This package uses a PNG for both icons. Validate the IHDR before shipping.
+        data = entries["spor/" + asset[2:]]
+        if not asset.endswith(".png") or len(data) < 33 or data[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR":
+            raise ValueError(f"{field} must be a PNG with a valid image header")
+        width, height = struct.unpack(">II", data[16:24])
+        if width != height or not 48 <= width <= 4096 or len(data) > 5 * 1024 * 1024:
+            raise ValueError(f"{field} must be square, 48..4096 pixels, and at most 5 MiB")
+    onboarding = manifest["extensions"]["com.openai"].get("onboardingSkill")
+    if onboarding is not None and (
+        not isinstance(onboarding, str)
+        or not onboarding.startswith("./skills/")
+        or not onboarding.endswith("/SKILL.md")
+        or "spor/" + onboarding[2:] not in entries
+    ):
+        raise ValueError("onboardingSkill must point to a packaged skill")
     entries["spor/plugin.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
     output.parent.mkdir(parents=True, exist_ok=True)
     # Fixed timestamps, order, and permissions make rebuilds reproducible.
