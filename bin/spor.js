@@ -19449,12 +19449,14 @@ async function cmdProvider(cfg, args) {
 // adapter, relays status lines on stdout and leaves the result manifest.
 const ATTEMPT_USAGE =
   "usage: spor attempt build <execution-id> --out <dir|file.tar> [--branch <b>] [--ref <rev>] [--deadline <dur>] [--isolation worktree|container|vm] [--egress <host>]... [--tool <bin>]... [--profile <id>] [--model <m>] [--permission-mode <m>] [--sandbox <s>] [--approval-policy <p>] [--no-brief] [--local] [--json]\n" +
-  "       spor attempt run <bundle> [--workdir <dir>] [--out <dir>] [--repo <slug>=<path|url>]...";
+  "       spor attempt run <bundle> [--workdir <dir>] [--out <dir>] [--repo <slug>=<path|url>]...\n" +
+  "       spor attempt stop <out-dir> [--reason <text>]";
 
 async function cmdAttempt(cfg, args) {
   const sub = args[0];
   if (sub === "build") return cmdAttemptBuild(cfg, args.slice(1));
   if (sub === "run") return cmdAttemptRun(cfg, args.slice(1));
+  if (sub === "stop") return cmdAttemptStop(cfg, args.slice(1));
   err(ATTEMPT_USAGE);
   return 1;
 }
@@ -19619,14 +19621,16 @@ async function cmdAttemptRun(cfg, args) {
     const v = spec.slice(eq + 1);
     sources[spec.slice(0, eq)] = /^[a-z][a-z0-9+.-]*:\/\//i.test(v) ? v : path.resolve(v);
   }
-  // A provider's cancel arrives as a signal: wind the run down (the collect
-  // window), then report and exit as usual.
+  // A provider's cancel arrives as a signal or as the stop file (`spor attempt
+  // stop`, the one that works on Windows, where SIGTERM cannot be caught): wind
+  // the run down (the collect window), then report and exit as usual.
+  // SIGBREAK is Windows' catchable console stop (CTRL_BREAK_EVENT).
   const stopSignal = { stop: null };
   const onSignal = (sig) => {
     stopSignal.stop = `the runner received ${sig}`;
   };
-  process.on("SIGTERM", onSignal);
-  process.on("SIGINT", onSignal);
+  const signals = process.platform === "win32" ? ["SIGTERM", "SIGINT", "SIGBREAK"] : ["SIGTERM", "SIGINT"];
+  for (const sig of signals) process.on(sig, onSignal);
   try {
     const { code } = await attemptRunner.runAttempt({
       cfg,
@@ -19641,9 +19645,31 @@ async function cmdAttemptRun(cfg, args) {
     });
     return code;
   } finally {
-    process.removeListener("SIGTERM", onSignal);
-    process.removeListener("SIGINT", onSignal);
+    for (const sig of signals) process.removeListener(sig, onSignal);
   }
+}
+
+// `spor attempt stop <out-dir>` — the platform-neutral stop: writes the stop
+// file the runner writing into <out-dir> polls (attemptRunner.requestStop). It
+// returns once the request is filed; the runner's own exit and manifest are
+// the answer. A run that already wrote its manifest is settled: nothing is
+// written, exit 0.
+function cmdAttemptStop(_cfg, args) {
+  const parsed = parseAttemptArgs(args, { reason: { type: "string" } });
+  if (!parsed) return 1;
+  const { values, positionals } = parsed;
+  if (positionals.length !== 1) {
+    err(ATTEMPT_USAGE);
+    return 1;
+  }
+  const r = attemptRunner.requestStop(path.resolve(positionals[0]), values.reason || "");
+  if (!r.ok) {
+    err(`spor attempt stop: could not write ${r.path}: ${r.error}`);
+    return 1;
+  }
+  if (r.created) err(`note: ${path.resolve(positionals[0])} did not exist — created it; the stop takes effect when a runner starts writing there (check the path if one is already running)`);
+  out(r.settled ? `the attempt writing into ${path.resolve(positionals[0])} has already settled; nothing to stop` : `stop requested: ${r.path}`);
+  return 0;
 }
 
 // A dispatcher whose plan output goes to stderr (`spor attempt build` keeps
@@ -22000,7 +22026,7 @@ const COMMANDS = {
   },
   attempt: {
     group: "Dispatch (background agents)", parse: "raw",
-    args: "build <execution-id> --out <dir|file.tar> [...] | run <bundle> [--workdir <d>] [--out <d>] [--repo <slug>=<src>]...",
+    args: "build <execution-id> --out <dir|file.tar> [...] | run <bundle> [--workdir <d>] [--out <d>] [--repo <slug>=<src>]... | stop <out-dir> [--reason <t>]",
     summary: "build a portable attempt bundle, or run one inside a provider's environment",
     help:
       "The two halves of an attempt that runs where an execution provider put it\n" +
@@ -22028,10 +22054,17 @@ const COMMANDS = {
       "      candidate branch is pushed to the repo's url and read back before the\n" +
       "      manifest names it. --out (default <bundle>/../result; must be absent or\n" +
       "      empty) receives manifest.json, status.jsonl, report.md and harness.jsonl.\n" +
-      "      Exit 0: a manifest. 1: no candidate. 2: refused before launch.",
+      "      Exit 0: a manifest. 1: no candidate. 2: refused before launch.\n\n" +
+      "  spor attempt stop <out-dir> [--reason <text>]\n" +
+      "      Asks the runner writing into <out-dir> to wind down: it writes <out-dir>/stop,\n" +
+      "      which the runner polls. Same wind-down as a SIGTERM (harness stopped, candidate\n" +
+      "      collected, manifest written, exit 1 when nothing was produced) and the one stop\n" +
+      "      that works on Windows, where SIGTERM cannot be caught. A stop that lands before\n" +
+      "      launch is a refusal (exit 2).",
     examples: [
       "spor attempt build exec-3f9c0a1b2c3d4e5f --out /tmp/attempt.tar",
       "spor attempt run /tmp/attempt.tar --workdir /work --out /result",
+      "spor attempt stop /result --reason 'cancelled by the worker'",
     ],
     run: (cfg, args) => cmdAttempt(cfg, args),
   },

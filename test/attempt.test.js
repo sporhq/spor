@@ -308,13 +308,19 @@ test("verifyBundle refuses pins that disagree with the attempt and unknown setti
   assert.match(bundleLib.verifyBundle(s, { env: {} }).errors.join("; "), /env\.json harness: unknown key 'command'/);
 });
 
-// Windows has no catchable SIGTERM: child.kill() is TerminateProcess, so the
-// runner never sees the signal it is meant to wind down on.
-test("attempt run: a SIGTERM winds the run down through stopping, and the exit mirrors the absent manifest", { skip: process.platform === "win32" && "no catchable SIGTERM on Windows" }, async () => {
+// The wind-down, asked for two ways. A SIGTERM is the POSIX door; Windows has
+// no catchable SIGTERM (child.kill() is TerminateProcess, so the runner never
+// sees it), and `spor attempt stop` — the stop file the runner polls — is the
+// door that works on every platform (issue-spor-windows-attempt-stop-unsupported).
+// Both must land on the same wind-down: stopping, finished, no manifest, exit 1.
+async function windDown(stop) {
   const f = await fixture();
   const out = path.join(f.home, "bundle");
+  const result = path.join(f.home, "result");
   assert.strictEqual(cli(["attempt", "build", f.execution.execution_id, "--out", out, "--no-brief", "--permission-mode", "bypassPermissions"], { SPOR_HOME: f.home }, f.repo).status, 0);
-  const hold = writeSpawnableNodeStub(f.home, "claude-hold", "setInterval(() => {}, 1000);");
+  // Bounded, so a harness a Windows TerminateProcess orphans cannot outlive
+  // the suite.
+  const hold = writeSpawnableNodeStub(f.home, "claude-hold", "setTimeout(() => {}, 120000);");
   const child = spawn(process.execPath, [CLI, "attempt", "run", out], { env: hermeticEnv({ SPOR_HOME: f.home, XDG_CONFIG_HOME: f.home, SPOR_CLAUDE_CMD: hold, GIT_CONFIG_GLOBAL: f.gitconfig }), cwd: f.home });
   let stdout = "";
   let signalled = false;
@@ -324,7 +330,7 @@ test("attempt run: a SIGTERM winds the run down through stopping, and the exit m
     stdout += c;
     if (!signalled && /"state":"running"/.test(stdout)) {
       signalled = true;
-      child.kill("SIGTERM");
+      stop(child, { home: f.home, result });
     }
   });
   const code = await new Promise((resolve) => child.on("exit", (c) => resolve(c)));
@@ -336,6 +342,55 @@ test("attempt run: a SIGTERM winds the run down through stopping, and the exit m
   assert.strictEqual(states[states.length - 1], "finished");
   assert.strictEqual(lines[lines.length - 1].manifest, null);
   assert.match(lines[lines.length - 1].no_candidate.reason, /still the attempt's base commit/);
+  assert.ok(fs.existsSync(path.join(result, "manifest.json")), "the manifest was written");
+  return { lines, result, home: f.home };
+}
+
+test("attempt run: a SIGTERM winds the run down through stopping, and the exit mirrors the absent manifest", { skip: process.platform === "win32" && "no catchable SIGTERM on Windows — the stop-file variant below covers it" }, async () => {
+  const { lines } = await windDown((child) => child.kill("SIGTERM"));
+  assert.ok(lines.some((l) => l.state === "stopping" && /received SIGTERM/.test(l.detail || "")), JSON.stringify(lines));
+});
+
+test("attempt run: `spor attempt stop` (the stop file) winds the run down exactly as a SIGTERM does, on every platform", async () => {
+  let stopped;
+  const { lines, result, home } = await windDown((_child, { home: h, result: r }) => {
+    stopped = cli(["attempt", "stop", r, "--reason", "cancelled by the test"], { SPOR_HOME: h }, h);
+  });
+  assert.strictEqual(stopped.status, 0, stopped.stdout + stopped.stderr);
+  assert.match(stopped.stdout, /stop requested: /);
+  assert.ok(lines.some((l) => l.state === "stopping" && /a stop was requested through .*stop: cancelled by the test/.test(l.detail || "")), JSON.stringify(lines));
+  // A settled run is not stopped again: nothing is written into its result dir.
+  fs.rmSync(path.join(result, "stop"));
+  const again = cli(["attempt", "stop", result], { SPOR_HOME: home }, home);
+  assert.strictEqual(again.status, 0, again.stdout + again.stderr);
+  assert.match(again.stdout, /already settled/);
+  assert.ok(!fs.existsSync(path.join(result, "stop")));
+});
+
+test("a stop ends the wait for an attempt token that has not arrived, instead of sitting out the whole wait", async () => {
+  const runner = require("../lib/shell/attempt.js");
+  const home = tmp("spor-attempt-tokstop-");
+  const file = path.join(home, "token");
+  let polls = 0;
+  const started = Date.now();
+  const r = await runner.resolveAttemptToken({ [runner.TOKEN_FILE_VAR]: file }, { waitMs: 60000, pollMs: 1, stopped: () => (++polls >= 3 ? "stop" : null) });
+  assert.deepStrictEqual(r, { token: "", source: "file", stopped: true });
+  assert.ok(Date.now() - started < 10000);
+});
+
+test("attempt run: a stop filed before the runner starts refuses the attempt before anything is checked out or launched", () => {
+  const home = tmp("spor-attempt-prestop-");
+  bundleLib.writeBundle(goodBundle(), path.join(home, "b"));
+  const stop = cli(["attempt", "stop", path.join(home, "result")], { SPOR_HOME: home }, home);
+  assert.strictEqual(stop.status, 0, stop.stdout + stop.stderr);
+  assert.match(stop.stderr, /did not exist — created it/);
+  const r = cli(["attempt", "run", path.join(home, "b")], { SPOR_HOME: home }, home);
+  assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+  const lines = statusLines(r.stdout);
+  assert.deepStrictEqual(lines.filter((l) => l.kind === "status").map((l) => l.state), ["pending", "failed"]);
+  assert.match(lines[lines.length - 1].no_candidate.reason, /stopped before launch: a stop was requested through/);
+  assert.ok(!fs.existsSync(path.join(home, "work")), "nothing was checked out");
+  assert.ok(!fs.existsSync(path.join(home, "journal", "dispatch")), "nothing was launched");
 });
 
 test("attempt build refuses an unattended attempt whose harness would stop at its first write; run refuses such a bundle too", async () => {

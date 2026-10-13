@@ -1134,9 +1134,39 @@ added. Unknown fields are ignored, so every line validates:
 The states run `pending` (bundle verified) → `provisioning` (checkouts, then
 the supervisor starting) → `running` → `stopping` (the harness exited or was
 told to stop, and the candidate is being collected) → `finished`, with the
-harness exit. A refusal before launch is a single `failed`. A SIGTERM to the
-runner, or the attempt's `deadline` passing, stops the harness through the
-supervisor and then collects what is there.
+harness exit. A refusal before launch is a single `failed`. A stop request, or
+the attempt's `deadline` passing, stops the harness through the supervisor and
+then collects what is there.
+
+**Stopping a runner.** There are two doors, and both lead to the same
+wind-down: the harness is stopped through its supervisor, the candidate is
+collected, the manifest is written and the exit code mirrors it (`1` when the
+stop left nothing to publish).
+
+- **A signal.** SIGTERM or SIGINT to the runner, and on Windows also SIGBREAK
+  (a `CTRL_BREAK_EVENT` sent to the runner's console process group).
+- **The stop file.** `spor attempt stop <out-dir> [--reason <text>]` writes
+  `<out-dir>/stop`, and the runner polls for it at its status cadence (and
+  while it waits for the attempt token). A stop that arrives during a checkout
+  is honoured once that checkout returns. A
+  provider can also write that file itself, for example through a mounted
+  result volume or an `exec`. This is the door to use on Windows. There, node's
+  `kill` is `TerminateProcess`, which runs no handler, so a "SIGTERM" from
+  another process ends the runner without a wind-down, and without a manifest.
+  The stop file is also the one door that works the same way on every
+  platform, so a provider that runs attempts on mixed hosts should use it
+  everywhere. `stop` is the only entry a fresh `--out` may already hold. A stop
+  filed before the runner reaches launch is a refusal (`failed`, exit `2`), and
+  nothing is launched. `spor attempt stop` on a run that has already written
+  its manifest writes nothing and exits `0`. When `<out-dir>` does not exist yet,
+  the command creates it and says so on stderr, since a mistyped path would
+  otherwise look like a stop that was delivered.
+
+On Windows the runner's own stop of the supervisor is a terminate rather than a
+graceful signal, so its supervisor dies without closing the run record. The
+runner closes that record as the stop it was (`cancelled`, signal
+`attempt-runner-stop`), just as it does on POSIX when a supervisor dies on the
+signal.
 
 At exit the runner **publishes the candidate honestly**. It pushes the
 checkout's HEAD, if it moved past the pin, to `refs/heads/<branch>` at the
