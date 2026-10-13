@@ -261,3 +261,80 @@ test("availability timeout kills the owned POSIX Git/SSH group including a child
   assert.ok(terminated(observed.pid), "SSH wrapper is no longer running");
   assert.ok(terminated(observed.child), "inherited-pipe child is no longer running");
 });
+
+// issue-spor-network-git-windows-timeout-no-tree-kill: on Windows spawnSync's
+// timeout ends only the direct git process; its descendants must be reaped.
+test("availability timeout ends the Windows Git/SSH descendant tree including a child holding output pipes", { skip: process.platform !== "win32", timeout: 45000 }, async t => {
+  isolatedSshEnv(t);
+  const f = sshFixture(t, { hanging: true });
+  // Git for Windows' sh cannot exec a `#!` naming a Windows path, so the
+  // configured command names node on the same wrapper (as candidate-publish).
+  const quote = p => `'${p.replaceAll("\\", "/").replaceAll("'", "'\\''")}'`;
+  process.env.GIT_SSH_COMMAND = `${quote(process.execPath)} ${quote(f.wrapper)}`;
+  process.env.GIT_SSH_VARIANT = "simple";
+  const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+  let observed;
+  t.after(() => {
+    if (!observed && fs.existsSync(f.record)) observed = JSON.parse(fs.readFileSync(f.record, "utf8"));
+    for (const pid of observed ? [observed.pid, observed.child] : []) { try { process.kill(pid); } catch {} }
+  });
+  const start = Date.now();
+  const result = await availability.probeFactoryAvailability({ ...f.args, factory: { integration: { mode: "push", targetRef: "origin/main" } } });
+  const elapsed = Date.now() - start;
+  assert.equal(result.ok, false);
+  assert.ok(elapsed >= 4500 && elapsed < 30000, `five-second probe returned in ${elapsed}ms`);
+  observed = JSON.parse(fs.readFileSync(f.record, "utf8"));
+  for (let attempt = 0; attempt < 100 && [observed.pid, observed.child].some(alive); attempt++) await new Promise(resolve => setTimeout(resolve, 50));
+  assert.ok(!alive(observed.pid), "SSH wrapper is no longer running");
+  assert.ok(!alive(observed.child), "inherited-pipe child is no longer running");
+});
+
+test("networkGit reaps by parentage on win32 only after a timeout or overflow, never by group signal", () => {
+  const { networkGit } = require("../lib/shell/git-network.js");
+  const reaped = [];
+  const reapWindows = (pid, window) => reaped.push({ pid, window });
+  const before = Date.now();
+  networkGit(() => ({ pid: 4242, status: null, signal: "SIGKILL", error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }) }), "/r", ["ls-remote"], { timeout: 5, platform: "win32", reapWindows });
+  assert.equal(reaped.length, 1);
+  assert.equal(reaped[0].pid, 4242);
+  assert.ok(reaped[0].window.since >= before && reaped[0].window.until >= reaped[0].window.since);
+  networkGit(() => ({ pid: 4243, status: 0, signal: null }), "/r", ["ls-remote"], { timeout: 5, platform: "win32", reapWindows });
+  assert.equal(reaped.length, 1, "a call that finished is not reaped");
+});
+
+test("descendantsOf walks a dead root's tree and refuses recycled-pid lookalikes", () => {
+  const { descendantsOf, parseSnapshot } = require("../lib/shell/git-network.js");
+  const rows = parseSnapshot([
+    "10 4 5000",   // the git launcher's child (mingw git), inside the window
+    "11 10 5100",  // sh
+    "12 11 5200",  // the ssh wrapper
+    "13 12 5300",  // its pipe-holding child
+    "20 4 100",    // claims the dead root as parent but predates the run: a recycled pid's orphan
+    "21 20 200",   // ...and its child
+    "30 12 1",     // claims the wrapper as parent but predates it: recycled
+    "bogus line",
+  ].join("\r\n"));
+  assert.equal(rows.length, 7);
+  assert.deepEqual(descendantsOf(rows, 4, { since: 4900, until: 6000 }).sort((a, b) => a - b), [10, 11, 12, 13]);
+  assert.deepEqual(descendantsOf(rows, 4, { since: 9000, until: 9500 }), [], "children created outside the window are not the root's");
+});
+
+test("reapWindowsTree taskkills the descendants it found and tolerates a failed snapshot", () => {
+  const { reapWindowsTree } = require("../lib/shell/git-network.js");
+  const calls = [];
+  const env = { SystemRoot: "C:\\Windows" };
+  const run = (cmd, args) => {
+    calls.push([cmd, args]);
+    return /powershell/i.test(cmd) ? { status: 0, stdout: "10 4 5000\n11 10 5100\n99 1 5000\n" } : { status: 128 };
+  };
+  assert.deepEqual(reapWindowsTree(4, { since: 4900, until: 6000, env, run }), [10, 11]);
+  assert.match(calls[0][0], /WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/);
+  assert.match(calls[1][0], /System32[\\/]taskkill\.exe$/);
+  assert.deepEqual(calls[1][1], ["/F", "/PID", "10", "/PID", "11"], "no /T: its parent-pid walk would re-admit recycled lookalikes");
+  calls.length = 0;
+  assert.deepEqual(reapWindowsTree(4, { since: 0, until: 1, env, run: (cmd, args) => { calls.push([cmd, args]); return { status: null, error: new Error("ETIMEDOUT"), stdout: "" }; } }), []);
+  assert.equal(calls.length, 1, "no taskkill without a snapshot");
+  calls.length = 0;
+  assert.deepEqual(reapWindowsTree(4, { since: 4900, until: 6000, env, run: (cmd, args) => { calls.push([cmd, args]); return /powershell/i.test(cmd) ? { status: 1, stdout: "10 4 5000\n" } : { status: 0 }; } }), [10], "a non-zero exit that still printed rows is used");
+  assert.deepEqual(reapWindowsTree(0, { since: 0, until: 1, env, run }), []);
+});
