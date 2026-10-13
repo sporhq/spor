@@ -1166,6 +1166,26 @@ test("stopRun on Windows ends the supervisor's and the child's TREES through tas
   }
 });
 
+test("stopRun on Windows never tree-kills for an already-closed record: its pids may have been reused (issue-spor-process-identity-start-time-off-linux)", async () => {
+  const alive = () => spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], { stdio: "ignore" });
+  const child = alive();
+  const supervisor = alive();
+  try {
+    const calls = [];
+    const run = (...a) => { calls.push(a); return { status: 0 }; };
+    const stopped = await runner.stopRun(
+      { run_id: "stop-win-closed", state: "done", child_pid: child.pid, runner_pid: supervisor.pid },
+      { graceMs: 0, platform: "win32", env: {}, run }
+    );
+    assert.deepStrictEqual(calls, [], "no taskkill /T for a terminal record");
+    assert.strictEqual(stopped.group, false);
+    assert.strictEqual(stopped.child, true, "the single-pid kill still runs");
+  } finally {
+    child.kill("SIGKILL");
+    supervisor.kill("SIGKILL");
+  }
+});
+
 // The real thing, on a real Windows host: the harness behind a `.cmd` shim is a
 // grandchild of the supervisor, and a forced cancel (stopRun at grace 0) must
 // leave it gone — TerminateProcess of the recorded pids alone would orphan it.
