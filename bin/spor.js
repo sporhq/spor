@@ -10394,7 +10394,11 @@ function writeLocalDispatchLock(file, extra = {}, { platform = process.platform,
     sleep(5);
   }
 }
-const LOCAL_LOCK_PENDING_DELETE_MS = 5000;
+// A pending delete lasts as long as a racer's read — milliseconds — so the
+// window stays well inside the breaker lock's own wait (BREAKER_LOCK_WAIT_MS)
+// and stale (BREAKER_LOCK_STALE_MS) horizons: a create retried under a held
+// breaker must never age it into a reclaimable one.
+const LOCAL_LOCK_PENDING_DELETE_MS = 1000;
 // A short, synchronous, best-effort sleep (Atomics.wait needs a SharedArrayBuffer
 // and blocks the calling thread, which is exactly what a bounded retry here
 // wants — acquireLocalDispatchLock stays synchronous, matching every other
