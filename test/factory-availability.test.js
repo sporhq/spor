@@ -264,7 +264,13 @@ test("availability timeout kills the owned POSIX Git/SSH group including a child
 
 // issue-spor-network-git-windows-timeout-no-tree-kill: on Windows spawnSync's
 // timeout ends only the direct git process; its descendants must be reaped.
-test("availability timeout ends the Windows Git/SSH descendant tree including a child holding output pipes", { skip: process.platform !== "win32", timeout: 45000 }, async t => {
+// The reap is synchronous inside the probe and may spend REAP_PASSES full
+// PowerShell budgets on a starved runner, so the upper bound is that budget
+// past the five-second probe, not a fixed figure a loaded box can outrun.
+const { REAP_PASSES } = require("../lib/shell/git-network.js");
+const { TIMEOUT_MS: TREE_KILL_TIMEOUT_MS } = require("../lib/shell/windows-process-tree.js");
+const WINDOWS_PROBE_BOUND_MS = 5000 + REAP_PASSES * TREE_KILL_TIMEOUT_MS + 10000;
+test("availability timeout ends the Windows Git/SSH descendant tree including a child holding output pipes", { skip: process.platform !== "win32", timeout: WINDOWS_PROBE_BOUND_MS + 30000 }, async t => {
   isolatedSshEnv(t);
   const f = sshFixture(t, { hanging: true });
   // Git for Windows' sh cannot exec a `#!` naming a Windows path, so the
@@ -282,7 +288,7 @@ test("availability timeout ends the Windows Git/SSH descendant tree including a 
   const result = await availability.probeFactoryAvailability({ ...f.args, factory: { integration: { mode: "push", targetRef: "origin/main" } } });
   const elapsed = Date.now() - start;
   assert.equal(result.ok, false);
-  assert.ok(elapsed >= 4500 && elapsed < 30000, `five-second probe returned in ${elapsed}ms`);
+  assert.ok(elapsed >= 4500 && elapsed < WINDOWS_PROBE_BOUND_MS, `five-second probe returned in ${elapsed}ms`);
   observed = JSON.parse(fs.readFileSync(f.record, "utf8"));
   for (let attempt = 0; attempt < 100 && [observed.pid, observed.child].some(alive); attempt++) await new Promise(resolve => setTimeout(resolve, 50));
   assert.ok(!alive(observed.pid), "SSH wrapper is no longer running");
@@ -316,5 +322,26 @@ test("reapWindowsTree stops a dead root's window-proven descendants through the 
   assert.match(script, /\$cft -ge \$pft/, "a deeper child must be created no earlier than its parent");
   calls.length = 0;
   assert.deepEqual(reapWindowsTree(4, { since: 0, until: 1, env, run: (cmd, args) => { calls.push([cmd, args]); return { status: null, error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }), stdout: "" }; } }), []);
+  assert.equal(calls.length, 2, "a timed-out pass is retried once, then given up");
   assert.deepEqual(reapWindowsTree(0, { since: 0, until: 1, env, run }), []);
+});
+
+// issue-spor-network-git-windows-tree-reap-test-flaky: under CI load the first
+// PowerShell + CIM pass outran its budget and the reap gave up, leaving the
+// SSH wrapper running. An unfinished pass is re-proven once; a finished one
+// is never repeated.
+test("reapWindowsTree retries an unfinished pass once, keeping what it already stopped", () => {
+  const { reapWindowsTree } = require("../lib/shell/git-network.js");
+  const env = { SystemRoot: "C:\\Windows" };
+  const script = (answers) => { const scripts = []; return { scripts, run: (cmd, args) => { scripts.push(args.at(-1)); return answers.shift(); } }; };
+  const timedOut = { status: null, signal: "SIGTERM", error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }), stdout: "10\r\n" };
+  let s = script([timedOut, { status: 0, stdout: "11\r\n12\r\n" }]);
+  assert.deepEqual(reapWindowsTree(4, { since: 4900, until: 6000, env, run: s.run }), [10, 11, 12]);
+  assert.equal(s.scripts.length, 2);
+  assert.equal(s.scripts[1], s.scripts[0], "the retry is the same window-bound proof, not a bare kill");
+  s = script([{ status: null, error: Object.assign(new Error("spawn"), { code: "ENOENT" }), stdout: "" }, { status: 0, stdout: "10\r\n" }]);
+  assert.deepEqual(reapWindowsTree(4, { since: 4900, until: 6000, env, run: s.run }), [10], "a PowerShell that never started is retried");
+  s = script([{ status: 0, stdout: "" }, { status: 0, stdout: "10\r\n" }]);
+  assert.deepEqual(reapWindowsTree(4, { since: 4900, until: 6000, env, run: s.run }), [], "a finished pass that found nothing is final");
+  assert.equal(s.scripts.length, 1);
 });
