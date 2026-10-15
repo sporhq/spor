@@ -2618,7 +2618,14 @@ before judging the same run and candidate under it
 carries is a newer owner: the successor is ended and the re-gate refused. Each
 step is idempotent, so an interrupted re-gate is re-driven by running it
 again. A pipeline that resumes under an ended execution reports it as
-terminal, never as "held by another worker".
+terminal, never as "held by another worker". A member still bound to a live
+program run opens only through that run's admission (the server refuses an
+unbound open `admitted_to_run`), so the successor is re-opened carrying the
+run's binding (`admitSuccessorThroughRun`): an unowned or lapsed run lease is
+taken for the open and released straight after; a run controlled by a `spor
+work` worker live on THIS box (same principal) admits through that worker's
+binding; a run controlled anywhere else is refused naming its holder — never
+stolen.
 
 The same reading is what the loop's own surfaces report: a terminal run whose
 class is not `completed` carries `execution_class` on its `spor work --status`

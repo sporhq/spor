@@ -42,6 +42,10 @@ const STATUS_BY_CODE = {
   lease_expired: 409,
   execution_terminal: 409,
   execution_open: 409,
+  admitted_to_run: 409,
+  run_terminal: 409,
+  run_paused: 409,
+  not_admitted: 409,
   boundary_not_reached: 409,
   candidate_conflict: 409,
   no_candidate: 409,
@@ -65,7 +69,17 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
     unservedEnveloped: false,
     unavailable: false,
     engines: new Map(),
+    // A minimal model of the server's program runs (spor-server
+    // server/program-runs.ts): run_id -> {run_id, state, admitted: [node id],
+    // owner: {worker, machine, instance, fence, lease_expires_at} | null,
+    // fence, children: [execution id]}. A member of a `running` run is BOUND:
+    // an execution open on it without `program_run` is refused
+    // `admitted_to_run` (openGuard), and one carrying the binding is admitted
+    // only when (worker, machine, instance, fence) is the run's live owner.
+    programRuns: new Map(),
   };
+  const runLive = (o) => !!(o && Date.parse(o.lease_expires_at) > Date.now());
+  const boundRun = (nodeId) => [...state.programRuns.values()].find((r) => r.state === "running" && r.admitted.includes(nodeId)) || null;
   const engineFor = (bearer, machine = null, instance = null) => {
     const worker = workers[bearer] || `unknown-${bearer}`;
     const key = JSON.stringify([worker, machine, instance]);
@@ -92,7 +106,7 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
   const answer = (res, r) => {
     if (r && r.ok) return reply(res, 200, r);
     const code = (r && r.code) || "internal";
-    return reply(res, STATUS_BY_CODE[code] || 500, { error: { code, message: (r && r.message) || code, ...(r && r.holder ? { holder: r.holder } : {}), ...(r && r.execution ? { execution: r.execution } : {}) } });
+    return reply(res, STATUS_BY_CODE[code] || 500, { error: { code, message: (r && r.message) || code, ...(r && r.holder ? { holder: r.holder } : {}), ...(r && r.execution ? { execution: r.execution } : {}), ...(r && r.run_id ? { run_id: r.run_id } : {}) } });
   };
 
   const server = http.createServer((req, res) => {
@@ -129,7 +143,26 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
             // names the node, which is how it differs from a route miss.
             if (body && body.node_id && !state.nodes.has(String(body.node_id))) return answer(res, { ok: false, code: "not_found", message: `no such work item '${body.node_id}'` });
             if (body && body.factory && !state.nodes.has(String(body.factory))) return answer(res, { ok: false, code: "not_found", message: `no such factory '${body.factory}'` });
-            return answer(res, await eng.open({ node_id: body && body.node_id, factory: body && body.factory, gates: body && body.gates, boundary: body && body.boundary, repo: body && body.repo, machine: body && body.machine, ttl_ms: body && body.ttl_ms }));
+            const pr = body && body.program_run;
+            const bound = boundRun(String(body && body.node_id));
+            if (!pr && bound) return answer(res, { ok: false, code: "admitted_to_run", run_id: bound.run_id, message: `'${body.node_id}' is admitted to program run ${bound.run_id} (${bound.state}); an execution opens on it only through the run's admission (program_run)` });
+            let run = null;
+            if (pr) {
+              run = state.programRuns.get(String(pr.run_id));
+              if (!run) return answer(res, { ok: false, code: "not_found", message: `no such program run '${pr.run_id}'` });
+              if (run.state !== "running") return answer(res, { ok: false, code: run.state === "paused" ? "run_paused" : "run_terminal", message: `run is ${run.state}` });
+              const o = run.owner;
+              const who = workers[bearer] || `unknown-${bearer}`;
+              if (!runLive(o) || o.worker !== who || o.machine !== (body.machine ?? null) || o.instance !== pr.instance) return answer(res, { ok: false, code: "not_owned", message: `run ${run.run_id} is not owned by this worker` });
+              if (o.fence !== pr.fence) return answer(res, { ok: false, code: "fence_stale", message: `fence ${pr.fence} is stale (run is at ${o.fence})` });
+              if (!run.admitted.includes(String(body.node_id))) return answer(res, { ok: false, code: "not_admitted", message: `'${body.node_id}' is not in run ${run.run_id}'s admitted cohort` });
+            }
+            const opened = await eng.open({ node_id: body && body.node_id, factory: body && body.factory, gates: body && body.gates, boundary: body && body.boundary, repo: body && body.repo, machine: body && body.machine, ttl_ms: body && body.ttl_ms });
+            if (run && opened && opened.ok) {
+              if (!run.children.includes(opened.execution.execution_id)) run.children.push(opened.execution.execution_id);
+              return answer(res, { ...opened, program_run: { run_id: run.run_id, admitted: true } });
+            }
+            return answer(res, opened);
           }
           if (req.method === "GET" && p === "/v1/executions") {
             return answer(res, await eng.list({ node_id: url.searchParams.get("node_id"), stage: url.searchParams.get("stage"), limit: url.searchParams.get("limit") || 50 }));
@@ -140,6 +173,28 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
           if (m && req.method === "POST" && m[2] === "renew") return answer(res, await eng.renew(decodeURIComponent(m[1]), { fence: body && body.fence, ttl_ms: body && body.ttl_ms }));
           if (m && req.method === "POST" && m[2] === "release") return answer(res, await eng.release(decodeURIComponent(m[1]), { fence: body && body.fence }));
           if (m && req.method === "POST" && m[2] === "events") return answer(res, await eng.event(decodeURIComponent(m[1]), { fence: body && body.fence, event: body && body.event }));
+          return reply(res, 404, { error: { code: "not_found", message: "no such route" } });
+        }
+        const pm = /^\/v1\/program-runs\/([^/]+)(?:\/(claim|release))?$/.exec(p);
+        if (pm) {
+          const run = state.programRuns.get(decodeURIComponent(pm[1]));
+          if (!run) return answer(res, { ok: false, code: "not_found", message: `no such program run '${pm[1]}'` });
+          const who = workers[bearer] || `unknown-${bearer}`;
+          const same = (o) => o && o.worker === who && o.machine === (body && body.machine) && o.instance === (body && body.instance);
+          if (req.method === "GET" && !pm[2]) return reply(res, 200, { ok: true, run: JSON.parse(JSON.stringify(run)) });
+          if (req.method === "POST" && pm[2] === "claim") {
+            if (run.state !== "running" && run.state !== "paused") return answer(res, { ok: false, code: "run_terminal", message: `run is ${run.state}` });
+            if (runLive(run.owner) && !same(run.owner)) return answer(res, { ok: false, code: "already_owned", message: `run is controlled by ${run.owner.worker} on ${run.owner.machine}`, holder: run.owner });
+            const fence = runLive(run.owner) ? run.owner.fence : run.fence + 1;
+            run.fence = fence;
+            run.owner = { worker: who, machine: body.machine, instance: body.instance, fence, lease_expires_at: new Date(Date.now() + 60000).toISOString() };
+            return reply(res, 200, { ok: true, run: JSON.parse(JSON.stringify(run)), fence });
+          }
+          if (req.method === "POST" && pm[2] === "release") {
+            if (!same(run.owner) || run.owner.fence !== body.fence) return answer(res, { ok: false, code: "not_owned", message: "not the run's owner" });
+            run.owner = null;
+            return reply(res, 200, { ok: true, run: JSON.parse(JSON.stringify(run)) });
+          }
           return reply(res, 404, { error: { code: "not_found", message: "no such route" } });
         }
         const n = /^\/v1\/nodes\/([^/]+)$/.exec(p);
@@ -193,6 +248,12 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
       }
     },
     record: (id) => executionStore.readRecord(home, tenant, id),
+    // Start a program run binding `admitted` (unowned, fence 0).
+    startProgramRun(runId, admitted, { state: runState = "running" } = {}) {
+      const run = { run_id: runId, state: runState, admitted: [...admitted], owner: null, fence: 0, children: [] };
+      state.programRuns.set(runId, run);
+      return run;
+    },
     events: (id) => executionStore.readEvents(home, tenant, id),
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
