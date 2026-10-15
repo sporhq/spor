@@ -12348,3 +12348,34 @@ test("the code stamp names the writer, not the fact: an occupant written by olde
   // What a worker LOADED never follows the checkout: one memoized object per process.
   assert.strictEqual(sporCli.workerCodeIdentity(), sporCli.workerCodeIdentity());
 });
+
+// issue-spor-controller-completion-without-implementation-block-never-submits-
+// candidate: `"completion": {"by": "controller"}` alone (§2.4 E10) armed the
+// controller's completion write but never pinned or submitted the candidate —
+// the pin was gated on a declared `implementation:` block — so the execution
+// store refused every gate verdict `no_candidate` and every completion
+// `execution_boundary`. The boundary alone now takes the stage's defaults, so
+// the candidate is pinned and SUBMITTED before gate 0 exactly as it is for
+// `"implementation": {}`, and an unpublished one is refused, never judged.
+test("controller completion WITHOUT an implementation block pins and submits the candidate before gate 0, exactly as `implementation: {}` does", async () => {
+  const gatesList = [{ id: "acceptance", kind: "command", command: "npm test" }];
+  for (const payload of [{ completion: { by: "controller" } }, { implementation: {} }]) {
+    const factory = factoryOf({ ...BASE, gates: gatesList, ...payload });
+    assert.strictEqual(factory.completion.by, "controller");
+    const pins = [];
+    const f = fakes();
+    f.deps.pinCandidate = async (args) => { pins.push(args.submittedBy); return { ok: true, change: "created", candidate: { candidate_id: "cand-a", reference: { verified_at: "2026-10-15" } } }; };
+    const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+    assert.strictEqual(result.state, "passed", JSON.stringify(payload));
+    assert.ok(pins.length >= 1, `${JSON.stringify(payload)}: the candidate is pinned (and so submitted) before any gate settles`);
+    assert.strictEqual(result.gates.find((g) => g.gate === "acceptance").candidate_id, "cand-a", "the gate verdict is bound to the submitted candidate");
+
+    // A candidate no reader could obtain is not a submission: the pipeline
+    // refuses it rather than judging gates the store would refuse.
+    const g = fakes();
+    g.deps.pinCandidate = async () => ({ ok: true, change: "created", candidate: { candidate_id: "cand-a" }, publish_pending: { reason: "bundle store unwritable" } });
+    const refused = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: g.deps });
+    assert.notStrictEqual(refused.state, "passed", `${JSON.stringify(payload)}: an unsubmitted candidate never passes`);
+    assert.deepStrictEqual(g.seen.suites, [], "no gate is judged without a submitted candidate");
+  }
+});

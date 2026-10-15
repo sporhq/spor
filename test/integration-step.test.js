@@ -5551,3 +5551,55 @@ test("buildCandidateTree labels its scratch dir, stamps owner.json, and sweeps a
     first.cleanup();
   }
 });
+
+// issue-spor-controller-completion-without-implementation-block-never-submits-
+// candidate, END TO END: a factory declaring ONLY `"completion": {"by":
+// "controller", "after": "integration"}` — no `implementation:` block (§2.4
+// E10) — driven through the real `spor work` CLI, the real local execution
+// store and a real local-mode integration. Before the fix the candidate was
+// never pinned or submitted, so the store refused every `gate.settled`
+// `no_candidate` and, after integration landed, the completion
+// `execution_boundary`: the item never completed. The oracle is the
+// execution's own ordered event log reaching `completion.written`, plus the
+// graph side (the completion resolver, the terminal status, the hold gone).
+test("end to end, local mode: controller completion WITHOUT an implementation block submits the candidate, lands through integration, and reaches completion.written", () => {
+  const { home, repo, nodes, outfile } = integrationCliFixture({
+    integration: { mode: "local", command: `"${process.execPath}" test/acceptance.js`, strategy: "merge" },
+    completion: { by: "controller", after: "integration" },
+  });
+  const before = git(repo, "rev-parse", "main").trim();
+  const r = cli(["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--worktree", "--factory", "factory-demo"], {
+    SPOR_HOME: home,
+    XDG_CONFIG_HOME: home,
+    OUTFILE: outfile,
+    PATH: pathWithOnlyGitAndNode(),
+  });
+  const out = `${r.stderr}\n${r.stdout}`;
+  assert.strictEqual(r.status, 0, out);
+  assert.match(r.stdout, /integration landed on main/, out);
+  assert.notStrictEqual(git(repo, "rev-parse", "main").trim(), before, "main really moved");
+  assert.doesNotMatch(out, /no_candidate|execution_boundary|boundary_not_reached|refused permanently/, "the store refused nothing");
+
+  // The execution's ordered event log: the candidate is submitted before any
+  // gate settles, the integration lands, and the completion is written.
+  const execRoot = path.join(home, "journal", "executions");
+  const logs = [];
+  const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (e.name.endsWith(".events.jsonl")) logs.push(p); } };
+  if (fs.existsSync(execRoot)) walk(execRoot);
+  assert.strictEqual(logs.length, 1, `one execution was opened for the item: ${logs.join(", ")}\n${out}`);
+  const types = fs.readFileSync(logs[0], "utf8").trim().split("\n").map((l) => JSON.parse(l).type);
+  const at = (t) => types.indexOf(t);
+  assert.ok(at("candidate.submitted") >= 0, `candidate.submitted is in the log: ${types.join(", ")}`);
+  assert.ok(at("gate.settled") > at("candidate.submitted"), `a gate settles only after the candidate is submitted: ${types.join(", ")}`);
+  assert.ok(at("completion.written") > at("gate.settled"), `the log reaches completion.written after the gates: ${types.join(", ")}\n${out}`);
+  assert.strictEqual(types[types.length - 1], "completion.written", `completion.written is the terminal event: ${types.join(", ")}`);
+
+  // The graph side of the same completion: the controller's resolver retires
+  // the item, its status is terminal, and the execution hold is gone.
+  const item = fs.readFileSync(path.join(nodes, "task-ready.md"), "utf8");
+  assert.match(item, /^status: done$/m, item);
+  assert.doesNotMatch(item, /^execution:/m, "the hold was cleared by the completion write");
+  const resolvers = fs.readdirSync(nodes).filter((f) => f.startsWith("art-completion-"));
+  assert.strictEqual(resolvers.length, 1, `one completion resolver: ${fs.readdirSync(nodes)}`);
+  assert.match(fs.readFileSync(path.join(nodes, resolvers[0]), "utf8"), /- \{type: resolves, to: task-ready\}/);
+});

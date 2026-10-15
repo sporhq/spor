@@ -990,7 +990,18 @@ test("the §2.4 validation table: a mistyped stage refuses the factory, and a le
   const reachable = stageFactory({ completion: { after: "integration" }, integration: INTEGRATION });
   assert.deepStrictEqual(reachable.errors, [], "E7 fires only when the boundary is genuinely unreachable");
   assert.strictEqual(reachable.factory.completion.after, "integration");
-  assert.deepStrictEqual(stageFactory({ completion: { by: "controller" } }).factory.implementation, null, "E10: the boundary alone, with no stage");
+  // E10 takes the stage's DEFAULTS, not no stage: every controller-contract
+  // consumer (the candidate pin + submission, publication, the attempt
+  // ledger) keys on the block, and a null one never submitted the candidate
+  // the completion write is gated on
+  // (issue-spor-controller-completion-without-implementation-block-never-submits-candidate).
+  const boundaryAlone = stageFactory({ completion: { by: "controller" } }).factory;
+  const emptyStage = stageFactory({ implementation: {} }).factory;
+  assert.deepStrictEqual(boundaryAlone.implementation, emptyStage.implementation, "E10: the boundary alone takes exactly what `implementation: {}` parses to");
+  assert.ok(boundaryAlone.implementation, "E10: the boundary alone still carries a stage");
+  assert.deepStrictEqual(boundaryAlone.definition, emptyStage.definition, "E10: same normalized definition, same digest, as the explicit empty block");
+  assert.strictEqual(stageFactory({ completion: { by: "agent" } }).factory.implementation, null, "an agent boundary adopts no stage");
+  assert.strictEqual(stageFactory({}).factory.implementation, null, "a factory declaring neither key adopts no stage");
   assert.strictEqual(stageFactory({ completion: { by: "controller" } }).factory.completion.by, "controller");
   // E5/E6: a bounded count CLAMPS, the convention `cycles` and `reruns` keep —
   // it is not an error, and it is never unbounded.

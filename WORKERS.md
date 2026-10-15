@@ -4328,9 +4328,18 @@ The two blocks are adoptable separately. `"implementation": {}` is valid and
 takes every default above (and moves completion to the controller);
 `"completion": {"by": "controller"}` with no `implementation` block is valid
 too, and deliberately so — an operator may adopt the boundary alone, leaving
-routing, budget and publication at their defaults. It is NOT byte-identical:
-it changes the contract's step 5 to a candidate submission and arms the
-controller's completion write.
+routing, budget and publication at their defaults. The parser normalizes it to
+EXACTLY the stage `"implementation": {}` declares (same shape, same definition
+digest), because every controller-contract consumer — the candidate pin and its
+`candidate.submitted` event, the publication check at startup, the attempt
+ledger — reads the stage: a boundary with no stage once armed the controller's
+completion write while never submitting the candidate the execution store gates
+that write on, so every gate verdict was refused `no_candidate` and every
+completion `execution_boundary`
+(issue-spor-controller-completion-without-implementation-block-never-submits-candidate).
+It is NOT byte-identical to declaring neither key: it changes the contract's
+step 3 to the default `author_checks` (none — the suites are withheld) and step
+5 to a candidate submission, and arms the controller's completion write.
 
 Like every other factory error, a mistyped stage **refuses to start the
 worker** (§10.1's fatal list). A stage that parsed wrong must never produce a
