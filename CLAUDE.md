@@ -1007,6 +1007,14 @@ SAME `dispatch.agent` opt-in, throttled by `dispatch.heartbeatIntervalMs`
 (`SPOR_HEARTBEAT_INTERVAL`, default 5min), bounded by `dispatch.heartbeatTimeoutMs`
 (`SPOR_HEARTBEAT_TIMEOUT`, default 3s), and disabled by `SPOR_HEARTBEAT=0`
 (`dispatch.heartbeat:false`).
+A headless `spor work` fires neither hook between dispatches, so the loop
+keeps the same presence itself (`lib/shell/fleet-presence.js`,
+issue-spor-work-does-not-publish-capabilities-or-heartbeat): remote mode with
+an agent identity (`--as`, else `dispatch.agent`) publishes at startup, then
+heartbeats on an unref'd `dispatch.heartbeatIntervalMs` timer (a 404 or an
+unlanded publish re-publishes next tick), and stops at the first signal so
+the agent goes stale on the server's clock — same config switches, in-memory
+only, fail-open.
 **Autonomous re-routing (task-spor-fleet-autoroute-auto-tier-consumer):** the
 FORK B refusal — this box cannot satisfy the resolved profile — has a second,
 opt-in tier above the shipped human one. `spor dispatch --auto-route`

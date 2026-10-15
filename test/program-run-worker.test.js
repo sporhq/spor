@@ -1123,6 +1123,10 @@ function e2eServer(server, { members }) {
           res.writeHead(status, { "Content-Type": "application/json" });
           res.end(JSON.stringify(payload));
         };
+        if (req.url.startsWith("/v1/agents/")) {
+          (server.agentCalls || (server.agentCalls = [])).push({ method: req.method, url: req.url, body: json });
+          return send(200, { agent: req.url.split("/")[3], last_seen: new Date().toISOString() });
+        }
         if (req.url.startsWith("/v1/program/")) return send(200, program);
         if (req.url.startsWith("/v1/nodes/batch")) return send(200, { nodes: json.ids.map((id) => ({ id, type: "task", status: server.runs.values().next().value.done.has(id) ? "done" : "open" })) });
         if (req.url.startsWith("/v1/program-runs")) {
@@ -1137,7 +1141,7 @@ function e2eServer(server, { members }) {
   });
 }
 
-async function serveEndToEnd({ serverSeesDrift, values }) {
+async function serveEndToEnd({ serverSeesDrift, values, hostExtra = {} }) {
   // The real loop sleeps on the real clock, so the stub's leases read it too.
   const server = stubServer({ clock: { get now() { return Date.now(); } }, runs: [{ run_id: "prun-0000000000000001", admitted: ["task-a", "task-b"] }] });
   const srv = await e2eServer(server, { members: ["task-a", "task-b"] });
@@ -1189,6 +1193,7 @@ async function serveEndToEnd({ serverSeesDrift, values }) {
     reconcileWithdrawnExecutions: async () => {},
     replayAttestationDebts: async () => {},
     renewLiveExecutions: async () => {},
+    ...hostExtra,
   });
   try {
     const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: srv.base, SPOR_TOKEN: "tok-a", SPOR_MODE: "remote" } });
@@ -1225,4 +1230,19 @@ test("e2e (work.js): every pass re-binds the gates to the run's PINNED definitio
   assert.match(log, /sees NO drift from its pin; trusting it/);
   assert.match(log, /is pinned behind HEAD — judging its children by the pinned definition @ fffffffffff/);
   assert.strictEqual(server.runs.get("prun-0000000000000001").state, "running");
+}, { timeout: 60_000 });
+
+test("e2e (work.js): a serving worker with an agent identity publishes its capabilities before the loop and keeps a fleet presence (issue-spor-work-does-not-publish-capabilities-or-heartbeat)", async () => {
+  const caps = { harnesses: ["claude-code"], reachable_mcp: ["spor"], skills: [], plugins: [], deny: [] };
+  const { server, lines } = await serveEndToEnd({ serverSeesDrift: false, values: { once: true, as: "agent-probe" }, hostExtra: { fleetCapabilities: () => caps } });
+  const log = lines.out.join("\n");
+  const calls = server.agentCalls || [];
+  assert.deepStrictEqual(calls[0], { method: "POST", url: "/v1/agents/agent-probe/capabilities", body: caps }, log);
+  assert.match(log, /work: fleet presence for agent-probe — capabilities published, heartbeat every 300s until this worker stops/);
+}, { timeout: 60_000 });
+
+test("e2e (work.js): no agent identity -> no fleet calls at all (byte-identical to before)", async () => {
+  const { server, lines } = await serveEndToEnd({ serverSeesDrift: false, values: { once: true }, hostExtra: { fleetCapabilities: () => ({}) } });
+  assert.deepStrictEqual(server.agentCalls || [], []);
+  assert.doesNotMatch(lines.out.join("\n"), /fleet presence/);
 }, { timeout: 60_000 });
