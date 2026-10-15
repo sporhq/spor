@@ -18890,7 +18890,10 @@ function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {}, ref = null, 
       log(`work: --restart-on-land — leaving ${root} where it is (${r.why}); a restart will load its HEAD, not ${tip}`);
       return r;
     }
-    const co = gitSpawn(root, ["checkout", "-q", "--detach", r.target], { timeout: 30000, stdio: ["ignore", "pipe", "pipe"] });
+    // `--no-overwrite-ignore`: an ignored file the tip starts tracking is a
+    // person's local file, never ours to clobber (the reach check names it; this
+    // is the race-proof half if one appears between the check and the checkout).
+    const co = gitSpawn(root, ["checkout", "-q", "--no-overwrite-ignore", "--detach", r.target], { timeout: 30000, stdio: ["ignore", "pipe", "pipe"] });
     if (co.error || co.status !== 0) {
       const why = String((co.stderr || "") || (co.error && co.error.message) || `exit ${co.status}`).trim().split(/\r?\n/)[0];
       log(`work: --restart-on-land — could not move ${root} to ${tip}: ${why}; a restart will load ${loaded.commit} again`);
@@ -18931,6 +18934,21 @@ function codeCheckoutReach(loaded, tip, root = ROOT) {
   if (opPaths == null) return null;
   const busy = opPaths.split(/\r?\n/).filter(Boolean).map((p, i) => [ops[i], path.resolve(root, p)]).find(([, p]) => fs.existsSync(p));
   if (busy) return { state: "stuck", why: `a ${busy[0]} operation is in progress` };
+  // A path the tip tracks and HEAD does not, already on disk as an untracked
+  // or IGNORED file: the status read above cannot see it, a checkout would
+  // refuse it (untracked) or silently overwrite it (ignored), and either way
+  // the restart would not land on the tip cleanly — so it is stuck, named.
+  const added = codeGit(root, ["diff", "--name-only", "-z", "--no-renames", "--diff-filter=A", head, target]);
+  if (added == null) return null;
+  const clash = added.split("\0").filter(Boolean).find((f) => {
+    try {
+      fs.lstatSync(path.join(root, f));
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (clash) return { state: "stuck", why: `${clash} is an untracked or ignored file the landed commit tracks — a checkout would overwrite or refuse it` };
   return { state: "advance", target };
 }
 

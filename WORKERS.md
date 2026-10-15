@@ -2850,11 +2850,18 @@ there loaded the same code, saw the ref already past it, and drained again on
 every poll (issue-spor-local-integration-leaves-worker-checkout-stale-restart-loops).
 So a draining worker only drains once a restart can load the tip
 (`codeCheckoutReach`): the checkout's HEAD already IS it, or HEAD is DETACHED at
-the loaded commit, the tip descends from it, no tracked file is modified and no
-merge/rebase/cherry-pick/bisect is in progress. In that last case the worker,
-once its drain settles and just before it exits, fast-forwards the checkout
-(`git checkout --detach <tip>`, the ref's tip at exit) so the supervisor's
-restart loads the landed code. Anything else — local edits, HEAD on a branch,
+the loaded commit, the tip descends from it, no tracked file is modified, no
+merge/rebase/cherry-pick/bisect is in progress, and no path the tip starts
+tracking is already on disk as an untracked or ignored file (which the
+tracked-files status read cannot see, and a checkout would refuse or silently
+overwrite). In that last case the worker, once its drain settles and just
+before it exits, fast-forwards the checkout (`git checkout --no-overwrite-ignore
+--detach <tip>`, the ref's tip at exit) so the supervisor's restart loads the
+landed code. Exit 0 is the restart request, so it is made only when the
+checkout is at the land afterwards: an advance that fails (or finds the
+checkout stuck or unreadable at exit) logs `NOT exiting for a restart` and
+exits 1, which stops a `while spor work …; do …; done` supervisor loudly
+instead of relaunching the old commit into the same drain. Anything else — local edits, HEAD on a branch,
 a HEAD a person moved off the loaded commit — is never moved: the worker says
 once per tip that it is NOT draining and why, and keeps working; it drains as
 soon as a later pass finds the checkout reachable (e.g. after `git checkout

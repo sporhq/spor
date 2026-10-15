@@ -3707,6 +3707,61 @@ test("makeCodeMovedNotice reach: a detached checkout is advanced to the landed t
   assert.strictEqual(plainNotice(), g("rev-parse", "--short", "main"));
 });
 
+// Review F1/F2: a file the land starts tracking that is already on disk as an
+// UNTRACKED or IGNORED file is invisible to the tracked-files status read. A
+// checkout would refuse the untracked one (the restart loop again) and
+// silently overwrite the ignored one (a person's local file lost), so the
+// reach check names it as stuck and the drain is withheld; the file is never
+// touched, and removing it releases the owed land.
+test("makeCodeMovedNotice reach: an untracked or ignored file the land would track withholds the drain and is never overwritten", () => {
+  const { makeCodeMovedNotice, loadedCodeCommit, codeCheckoutReach } = require("../bin/spor.js");
+  const { execFileSync } = require("child_process");
+  const ident = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" };
+  for (const kind of ["untracked", "ignored"]) {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-reach-clash-"));
+    try {
+      const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), ...ident } }).trim();
+      g("init", "-q", "-b", "main");
+      fs.writeFileSync(path.join(repo, "package.json"), '{"name":"x","version":"0.0.1","files":["lib"]}\n');
+      fs.mkdirSync(path.join(repo, "lib"));
+      fs.writeFileSync(path.join(repo, "lib", "i.js"), "1\n");
+      fs.writeFileSync(path.join(repo, ".gitignore"), kind === "ignored" ? "lib/new.js\n" : "");
+      g("add", ".");
+      g("commit", "-q", "-m", "one");
+      g("checkout", "-q", "--detach", "main");
+      // A local-mode land ADDING lib/new.js, written to the ref only.
+      const base = g("rev-parse", "main");
+      const idx = path.join(repo, ".git", "land-index");
+      const env = { ...gitEnv(), ...ident, GIT_INDEX_FILE: idx };
+      g("read-tree", "--index-output=" + idx, base);
+      const blob = execFileSync("git", ["-C", repo, "hash-object", "-w", "--stdin"], { input: "landed\n", encoding: "utf8", env: gitEnv() }).trim();
+      execFileSync("git", ["-C", repo, "update-index", "--add", "--cacheinfo", `100644,${blob},lib/new.js`], { env });
+      const tree = execFileSync("git", ["-C", repo, "write-tree"], { encoding: "utf8", env }).trim();
+      const commit = execFileSync("git", ["-C", repo, "commit-tree", tree, "-p", base, "-m", "land"], { encoding: "utf8", env }).trim();
+      const loaded = loadedCodeCommit(repo);
+      g("update-ref", "refs/heads/main", commit, base);
+      fs.writeFileSync(path.join(repo, "lib", "new.js"), "mine\n");
+      assert.strictEqual(g("status", "--porcelain", "--untracked-files=no"), "", `${kind}: invisible to the tracked-files read`);
+      const r = codeCheckoutReach(loaded, "main", repo);
+      assert.strictEqual(r.state, "stuck", `${kind}: ${JSON.stringify(r)}`);
+      assert.match(r.why, /lib\/new\.js/);
+      const lines = [];
+      const notice = makeCodeMovedNotice(loaded, { root: repo, log: (l) => lines.push(l), ref: "main", reach: true });
+      assert.strictEqual(notice(), undefined, `${kind}: no drain while a restart cannot land cleanly`);
+      assert.ok(lines.some((l) => /NOT draining for/.test(l)), lines.join("\n"));
+      assert.strictEqual(notice.advance().state, "stuck");
+      assert.strictEqual(fs.readFileSync(path.join(repo, "lib", "new.js"), "utf8"), "mine\n", `${kind}: the local file is untouched`);
+      assert.strictEqual(g("rev-parse", "HEAD"), base);
+      fs.rmSync(path.join(repo, "lib", "new.js"));
+      assert.ok(notice(), `${kind}: once the file is gone the owed land drains`);
+      assert.strictEqual(notice.advance().state, "advanced");
+      assert.strictEqual(fs.readFileSync(path.join(repo, "lib", "new.js"), "utf8"), "landed\n");
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  }
+});
+
 // ------------------------------------------- program-scoped work (--program) --
 // task-spor-program-scoped-factory-execution: `spor work --program <id>` is a
 // SELECTION scope over this same loop — the candidate set is the program's
