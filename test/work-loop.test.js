@@ -3635,6 +3635,7 @@ test("makeCodeMovedNotice reach: a detached checkout is advanced to the landed t
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-reach-"));
   const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   g("init", "-q", "-b", "main");
+  g("config", "core.autocrlf", "false"); // the checkout's bytes are asserted; a Windows runner's global autocrlf would rewrite them to CRLF
   fs.writeFileSync(path.join(repo, "package.json"), '{"name":"x","version":"0.0.1","files":["lib"]}\n');
   fs.mkdirSync(path.join(repo, "lib"));
   fs.writeFileSync(path.join(repo, "lib", "i.js"), "1\n");
@@ -3722,6 +3723,7 @@ test("makeCodeMovedNotice reach: an untracked or ignored file the land would tra
     try {
       const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), ...ident } }).trim();
       g("init", "-q", "-b", "main");
+      g("config", "core.autocrlf", "false"); // the checkout's bytes are asserted; a Windows runner's global autocrlf would rewrite them to CRLF
       fs.writeFileSync(path.join(repo, "package.json"), '{"name":"x","version":"0.0.1","files":["lib"]}\n');
       fs.mkdirSync(path.join(repo, "lib"));
       fs.writeFileSync(path.join(repo, "lib", "i.js"), "1\n");
