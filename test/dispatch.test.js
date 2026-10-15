@@ -807,6 +807,20 @@ test("dispatch --dir inside a linked worktree: --force overrides the refusal", (
   assert.match(r.stdout, new RegExp(`dir:    ${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via --dir`));
 });
 
+test("dispatch --dir inside a linked worktree with --no-worktree: allowed, nothing to nest (review gate)", () => {
+  // issue-spor-review-gate-dispatch-refused-linked-worktree: the factory's
+  // review gate runs --no-worktree --read-only IN the candidate's linked
+  // worktree without --force; no worktree is cut, so the nesting guard must
+  // not refuse it.
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const wt = addLinkedWorktree(repo);
+  const r = run(["dispatch", "some free text task here", "--dir", wt, "--no-brief", "--print", "--no-worktree"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /is inside a linked git worktree of/);
+  assert.match(r.stdout, new RegExp(`dir:    ${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via --dir`));
+});
+
 test("dispatch <node>: a dispatch.repos mapping poisoned to a linked worktree self-heals to the main checkout", () => {
   const { home } = fixture(); // dec-x / task-rotate stamped repo: demo
   const { repo } = gitTargetRepo("demo");
