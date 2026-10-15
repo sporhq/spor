@@ -18752,7 +18752,7 @@ function worker() {
       loadedCodeCommit, makeCodeMovedNotice, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, makeFactoryAvailabilityCheck, pollWorkRuns,
       reconcileCompletions, reconcileWithdrawnExecutions, renewLiveExecutions, replayAttestationDebts,
       resolveDir, retryOneEscalation, runGateAndIntegration, takeProjectWarning,
-      targetRepoDispatchCfg, warnQueueProjectOnce, workerAlive, gcExecutionsDue, providerAttemptSweep,
+      targetRepoDispatchCfg, warnQueueProjectOnce, workerAlive, gcExecutionsDue, providerAttemptSweep, fleetCapabilities,
     });
   }
   return _worker;
@@ -19738,6 +19738,22 @@ function attemptDispatcher() {
 // manual-no-spor-seed). Remote-only, keyed on this machine's dispatch.agent.
 // Fail soft and loud — a missing agent, undeployed surface, or unreachable
 // server prints one clear line and exits non-zero, never throws.
+// The effective capabilities a publish sends, re-probed so the set reflects
+// this box NOW — shared by the manual publish below and `spor work`'s fleet
+// presence (lib/shell/fleet-presence.js), so the two publish byte-identical
+// maps. Remote-only callers: sporReachable is true by construction. The probe
+// is best-effort — on failure the cascade's in-memory map is published.
+function fleetCapabilities(cfg) {
+  const rawCap = cfg.get("dispatch.capabilities", {}) || {};
+  let probed = null;
+  try {
+    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: true, cfg });
+  } catch {
+    /* probe is best-effort; publish what the cascade already holds */
+  }
+  return sat.effectiveCapabilities(probed ? { ...rawCap, probed } : rawCap);
+}
+
 async function cmdCapabilitiesPublish(cfg, { json }) {
   if (!remote.isRemote(cfg)) {
     err(
@@ -19765,14 +19781,7 @@ async function cmdCapabilitiesPublish(cfg, { json }) {
   // then merge the fresh probe over the in-memory config (loaded before the
   // probe wrote) so the two publish paths agree byte-for-byte. The probe is
   // best-effort — on failure we fall back to the in-memory config below.
-  const rawCap = cfg.get("dispatch.capabilities", {}) || {};
-  let probed = null;
-  try {
-    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: true, cfg });
-  } catch {
-    /* probe is best-effort; publish what the cascade already holds */
-  }
-  const eff = sat.effectiveCapabilities(probed ? { ...rawCap, probed } : rawCap);
+  const eff = fleetCapabilities(cfg);
   const r = await remote.post(cfg, `/v1/agents/${encodeURIComponent(agent)}/capabilities`, eff, { timeoutMs: 6000 });
   if (r.transport) {
     err(`could not reach the server: ${r.error}`);
