@@ -554,6 +554,79 @@ test("bin/spor.js, remote mode against a server that does not serve /v1/executio
   }
 });
 
+test("bin/spor.js: a re-gate of a run whose execution an `unroutable` gate ENDED (§4.2 T1) opens the item's successor execution, re-stamps the hold and re-points the claim — never 'held by another worker'", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "task-y": itemNode("task-y"), "factory-t": itemNode("factory-t") } });
+  try {
+    const home = tmp("successor");
+    const cfg = remoteCfg(home, fake.base);
+    const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller" } });
+    const held = await spor.claimExecutionHold(cfg, { id: "task-x", project: "spor" }, factory, { home });
+    assert.equal(held.ok, true, held.reason);
+    const first = held.executionId;
+    const p = dispatchRuns.runPaths(home, "run-1");
+    fs.mkdirSync(path.dirname(p.record), { recursive: true });
+    fs.writeFileSync(p.record, JSON.stringify({ run_id: "run-1", node_id: "task-x", item_repo: "spor", ...held.recordFields, completion_execution_end: { execution_id: first, reason: "stale" } }));
+    // A LIVE execution is not succeeded: the re-gate's own claim decides.
+    const live = await spor.openSuccessorExecution(cfg, dispatchRuns.readJson(p.record), factory, { home });
+    assert.deepEqual(live, { ok: true, succeeded: false });
+    // T1: the unroutable gate ends the execution and clears the hold.
+    const withdrawn = await spor.withdrawHeldExecution(cfg, { nodeId: "task-x", executionId: first, fence: held.fence, store: "remote", reason: "dispatch refused", home });
+    assert.equal(withdrawn.ok, true, withdrawn.reason);
+    assert.equal(kernel.isTerminal(fake.record(first)), true);
+    assert.doesNotMatch(fake.state.nodes.get("task-x"), /^execution:/m);
+    // ...so the old claim is exactly what the issue reported.
+    const stuck = await spor.executionReporter(cfg, dispatchRuns.readJson(p.record), { home }).resume();
+    assert.equal(stuck.code, "execution_terminal");
+    const lines = [];
+    const next = await spor.openSuccessorExecution(cfg, dispatchRuns.readJson(p.record), factory, { home, log: (l) => lines.push(l) });
+    assert.equal(next.ok, true, next.reason);
+    assert.equal(next.succeeded, true);
+    assert.equal(next.prior, first);
+    assert.equal(next.executionId, kernel.executionIdFor({ tenant: "acme", node_id: "task-x", factory: "factory-t", pipeline_attempt: 2 }, sha256));
+    assert.match(fake.state.nodes.get("task-x"), new RegExp(`^execution: ${next.executionId}$`, "m"), "the hold names the successor");
+    const rec = dispatchRuns.readJson(p.record);
+    assert.equal(rec.impl_claim.execution_id, next.executionId);
+    assert.equal(rec.impl_claim.pipeline_attempt, 2);
+    assert.equal(rec.impl_claim.succeeds, first);
+    assert.equal(rec.impl_claim.fence, next.fence);
+    assert.equal(rec.completion_execution_end, null, "the ended execution's settled release debt is reconciled away");
+    assert.match(lines.join("\n"), /had ended .* successor/);
+    // The re-gate's reporter now owns what it judges under.
+    const reporter = spor.executionReporter(cfg, rec, { home });
+    const resumed = await reporter.resume();
+    assert.equal(resumed.ok, true, resumed.message);
+    reporter.leave();
+    // Idempotent: a re-driven re-gate finds the successor live and leaves it.
+    assert.deepEqual(await spor.openSuccessorExecution(cfg, rec, factory, { home }), { ok: true, succeeded: false });
+    // A crash after the open but before the claim stamp: the replayed open
+    // hands back the same successor and its hold re-stamps.
+    fs.writeFileSync(p.record, JSON.stringify({ run_id: "run-1", node_id: "task-x", item_repo: "spor", ...held.recordFields }));
+    const replay = await spor.openSuccessorExecution(cfg, dispatchRuns.readJson(p.record), factory, { home });
+    assert.equal(replay.ok, true, replay.reason);
+    assert.equal(replay.executionId, next.executionId, "the same successor, never a third execution");
+    assert.equal(dispatchRuns.readJson(p.record).impl_claim.execution_id, next.executionId);
+
+    // An item another execution now holds is never taken: the successor is
+    // ended and the re-gate refused, naming the holder.
+    const heldY = await spor.claimExecutionHold(cfg, { id: "task-y" }, factory, { home });
+    const py = dispatchRuns.runPaths(home, "run-2");
+    fs.mkdirSync(path.dirname(py.record), { recursive: true });
+    fs.writeFileSync(py.record, JSON.stringify({ run_id: "run-2", node_id: "task-y", ...heldY.recordFields }));
+    await spor.withdrawHeldExecution(cfg, { nodeId: "task-y", executionId: heldY.executionId, fence: heldY.fence, store: "remote", home });
+    const other = remoteCfg(tmp("successor-b"), fake.base, "tok-b");
+    const theirs = await spor.claimExecutionHold(other, { id: "task-y" }, factory, { home: tmp("successor-b-home") });
+    assert.equal(theirs.ok, true, theirs.reason);
+    const refused = await spor.openSuccessorExecution(cfg, dispatchRuns.readJson(py.record), factory, { home });
+    assert.equal(refused.ok, false);
+    assert.match(refused.reason, /held by execution/);
+    assert.match(fake.state.nodes.get("task-y"), new RegExp(`^execution: ${theirs.executionId}$`, "m"), "the newer hold stands");
+    assert.equal(dispatchRuns.readJson(py.record).impl_claim.execution_id, heldY.executionId, "the record is not re-pointed");
+  } finally {
+    spor.LIVE_EXECUTIONS.clear();
+    await fake.close();
+  }
+});
+
 test("reporter: a review gate's `reviewer-unavailable` verdict settles in the store as the infrastructure outage it is, never a skipped report", async () => {
   const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
   try {
