@@ -109,3 +109,102 @@ test("planWork refuses a factory that does not load, and a worker never starts u
   assert.equal(await createWorker(host).planWork(cfg, { values: { factory: "factory-bad" } }), 1);
   assert.match(lines.err.join("\n"), /cannot be used[\s\S]*gates: missing[\s\S]*does not run ungated/);
 });
+
+// issue-spor-local-integration-leaves-worker-checkout-stale-restart-loops: a
+// draining worker asks the notice to judge whether a restart can REACH the land
+// (`reach`), and once the drain exits it advances the code checkout onto it —
+// a worker that does not drain asks for neither.
+test("executeWork: a --restart-on-land exit advances the code checkout; a worker that does not drain never does", async () => {
+  const drive = async (values, advanceAs = { state: "advanced", target: "def5678" }) => {
+    const { home, cfg } = scratch();
+    const lines = [];
+    const seen = { opts: null, advanced: 0 };
+    const host = {};
+    for (const k of HOST_FUNCTIONS) host[k] = () => null;
+    Object.assign(host, {
+      out: (s) => lines.push(s),
+      err: (s) => lines.push(`ERR ${s}`),
+      isAgentId: () => false,
+      loadedCodeCommit: () => ({ commit: "abc1234", branch: null }),
+      codeWatchRef: () => "main",
+      workerCodeIdentity: () => ({ stamp: null, commit: null, branch: null, repo: null }),
+      makeCodeMovedNotice: (_loaded, opts) => {
+        seen.opts = opts;
+        const notice = () => "def5678";
+        notice.advance = () => {
+          seen.advanced += 1;
+          if (advanceAs === "throw") throw new Error("boom");
+          return advanceAs;
+        };
+        return notice;
+      },
+      dispatchableQueuePage: async () => [],
+      dispatchedAgents: () => new Map(),
+      annotateInFlight: (items) => ({ items }),
+      pollWorkRuns: async () => [],
+    });
+    try {
+      const worker = createWorker(host);
+      const plan = await worker.planWork(cfg, { values: { interval: "1", "max-interval": "1", ...values } });
+      assert.equal(typeof plan, "object", lines.join("\n"));
+      const code = await worker.bindWork(cfg, plan).executeWork();
+      return { code, lines, seen };
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  };
+  const draining = await drive({ "restart-on-land": true });
+  assert.equal(draining.code, 0);
+  assert.equal(draining.seen.opts.reach, true, "the drain asks whether a restart reaches the land");
+  assert.equal(draining.seen.advanced, 1, draining.lines.join("\n"));
+  assert.match(draining.lines.join("\n"), /exited for a restart \(--restart-on-land\)/);
+  const plain = await drive({ "no-restart-on-land": true, once: true });
+  assert.equal(plain.seen.opts.reach, undefined, "a worker that never drains reads nothing more");
+  assert.equal(plain.seen.advanced, 0);
+  assert.equal(plain.code, 0);
+  assert.equal((await drive({ "restart-on-land": true }, { state: "current" })).code, 0, "a checkout already at the land restarts");
+});
+
+// Review F2: exit 0 is the restart request (`while spor work …; do …; done`),
+// so a checkout the advance could not move onto the land — a failed checkout
+// (an untracked file the land adds), a stuck or unreadable one, a throw —
+// must not exit 0, or the supervisor relaunches the old commit and it drains
+// again every poll.
+test("executeWork: a --restart-on-land exit whose checkout did not reach the land exits non-zero and says so", async () => {
+  for (const advanceAs of [{ state: "failed", why: "untracked working tree file would be overwritten" }, { state: "stuck", why: "x" }, null, "throw"]) {
+    const { home, cfg } = scratch();
+    const lines = [];
+    const host = {};
+    for (const k of HOST_FUNCTIONS) host[k] = () => null;
+    Object.assign(host, {
+      out: (s) => lines.push(s),
+      err: (s) => lines.push(`ERR ${s}`),
+      isAgentId: () => false,
+      loadedCodeCommit: () => ({ commit: "abc1234", branch: null }),
+      codeWatchRef: () => "main",
+      workerCodeIdentity: () => ({ stamp: null, commit: null, branch: null, repo: null }),
+      makeCodeMovedNotice: () => {
+        const notice = () => "def5678";
+        notice.advance = () => {
+          if (advanceAs === "throw") throw new Error("boom");
+          return advanceAs;
+        };
+        return notice;
+      },
+      dispatchableQueuePage: async () => [],
+      dispatchedAgents: () => new Map(),
+      annotateInFlight: (items) => ({ items }),
+      pollWorkRuns: async () => [],
+    });
+    try {
+      const worker = createWorker(host);
+      const plan = await worker.planWork(cfg, { values: { interval: "1", "max-interval": "1", "restart-on-land": true } });
+      assert.equal(typeof plan, "object", lines.join("\n"));
+      const code = await worker.bindWork(cfg, plan).executeWork();
+      assert.equal(code, 1, `${JSON.stringify(advanceAs)}: ${lines.join("\n")}`);
+      assert.match(lines.join("\n"), /NOT exiting for a restart/);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  }
+});

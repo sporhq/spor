@@ -18809,39 +18809,147 @@ function codeWatchRef(loaded, { root = ROOT, targetRef = null } = {}) {
 // checkout, or a ref that has not moved, says nothing (byte-identical to
 // before the notice existed). Returns the new tip on the pass that says so,
 // undefined otherwise.
-function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {}, ref = null, requireCodeChange = false } = {}) {
+function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {}, ref = null, requireCodeChange = false, reach = false } = {}) {
   let noticed = loaded ? loaded.commit : null;
+  // `reach` (a `--restart-on-land` worker): a land is only handed to the drain
+  // once a RESTART would actually load it
+  // (issue-spor-local-integration-leaves-worker-checkout-stale-restart-loops).
+  // A local-mode integration moves the target REF, not the checkout the worker
+  // loaded from — a detached HEAD stays where it was — so a restart there
+  // loads the same old commit, sees the ref already past it, and exits again
+  // on every poll. `owed` is the tip the notice reported and the drain has not
+  // been handed yet; it is re-judged each pass (a person moving the checkout
+  // releases it with no new land) and said to be stuck once per tip. In-memory
+  // only, like `noticed`: a restarted worker re-derives it from git.
+  let owed = null;
+  let stuckSaid = null;
   const watch = ref || codeWatchRef(loaded, { root });
-  return () => {
+  const notice = () => {
     if (!loaded || !watch) return;
     const now = codeTip(watch, root);
-    if (!now || now === noticed) return;
-    // Only a DEFINITIVE ancestry answer settles this tip: exit 0 (descends)
-    // or exit 1 (does not). Anything else — a timeout, a spawn error, git's
-    // 128 on a momentarily unreadable object store mid-fetch — leaves the
-    // tip UNRECORDED so the next pass asks again; recording it first would
-    // turn one transient failure into a permanently silenced notice, and a
-    // never-draining `--restart-on-land`, for that tip (review finding F3).
-    // The record is a closure variable, not durable state: there is no
-    // write that can fail to land, no second flag to owe, and no other actor
-    // reading it.
-    const moved = codeMovedPast(loaded.commit, now, root);
-    if (moved === null) return;
-    // Remember the tip either way, so an unrelated tip is examined once and a
-    // later descendant tip is still noticed.
-    noticed = now;
-    if (!moved) return;
-    log(`work: ${watch} in ${root} moved to ${now} — this worker still runs the code it loaded at ${loaded.commit}; restart it to pick the new code up`);
-    // A defaulted `--restart-on-land` (`requireCodeChange`) acts only on a land
-    // that changed the PUBLISHED code paths — the same `codePathsChanged` read
-    // `--status` uses — so a docs-only land never drains the worker. Only a
-    // definitive "identical" withholds it; an unanswerable read still drains.
-    if (requireCodeChange && codePathsChanged(loaded.commit, now, root) === false) return;
+    if (now && now !== noticed) {
+      // Only a DEFINITIVE ancestry answer settles this tip: exit 0 (descends)
+      // or exit 1 (does not). Anything else — a timeout, a spawn error, git's
+      // 128 on a momentarily unreadable object store mid-fetch — leaves the
+      // tip UNRECORDED so the next pass asks again; recording it first would
+      // turn one transient failure into a permanently silenced notice, and a
+      // never-draining `--restart-on-land`, for that tip (review finding F3).
+      // The record is a closure variable, not durable state: there is no
+      // write that can fail to land, no second flag to owe, and no other actor
+      // reading it.
+      const moved = codeMovedPast(loaded.commit, now, root);
+      if (moved === null) return;
+      // Remember the tip either way, so an unrelated tip is examined once and a
+      // later descendant tip is still noticed.
+      noticed = now;
+      if (!moved) return;
+      log(`work: ${watch} in ${root} moved to ${now} — this worker still runs the code it loaded at ${loaded.commit}; restart it to pick the new code up`);
+      // A defaulted `--restart-on-land` (`requireCodeChange`) acts only on a land
+      // that changed the PUBLISHED code paths — the same `codePathsChanged` read
+      // `--status` uses — so a docs-only land never drains the worker. Only a
+      // definitive "identical" withholds it; an unanswerable read still drains.
+      if (requireCodeChange && codePathsChanged(loaded.commit, now, root) === false) return;
+      owed = now;
+    }
+    if (!owed) return;
+    if (reach) {
+      // A checkout a restart cannot move to the tip withholds the drain — the
+      // loud refusal instead of the loop. An unanswerable read still drains
+      // (the shipped behavior); advance() re-judges at exit.
+      const r = codeCheckoutReach(loaded, owed, root);
+      if (r && r.state === "stuck") {
+        if (stuckSaid !== owed) {
+          stuckSaid = owed;
+          log(`work: --restart-on-land — NOT draining for ${owed}: a restart would load ${root} at its HEAD again, not ${owed} (${r.why}); move that checkout to ${watch} (e.g. 'git -C ${root} checkout --detach ${watch}') — this worker drains once it can reach it`);
+        }
+        return;
+      }
+    }
     // The tip moved past, for a caller that acts on it (`--restart-on-land`);
     // every other return above is undefined, so a caller that ignores it
     // sees nothing new.
-    return now;
+    const tip = owed;
+    owed = null;
+    return tip;
   };
+  // The exit half of `reach`: once the drain has settled, fast-forward a
+  // clean, DETACHED checkout still at the loaded commit to the watched ref's
+  // CURRENT tip, so the supervisor's restart loads the landed code. Never over
+  // local edits, never a branch (moving one is not ours to do), never a HEAD a
+  // person moved off the loaded commit — those are reported and left alone.
+  notice.advance = () => {
+    if (!loaded || !watch) return null;
+    const tip = codeTip(watch, root);
+    const r = tip ? codeCheckoutReach(loaded, tip, root) : null;
+    if (!r) {
+      log(`work: --restart-on-land — could not read ${root} against ${watch}; leaving the checkout where it is`);
+      return null;
+    }
+    if (r.state === "current") return r;
+    if (r.state === "stuck") {
+      log(`work: --restart-on-land — leaving ${root} where it is (${r.why}); a restart will load its HEAD, not ${tip}`);
+      return r;
+    }
+    // `--no-overwrite-ignore`: an ignored file the tip starts tracking is a
+    // person's local file, never ours to clobber (the reach check names it; this
+    // is the race-proof half if one appears between the check and the checkout).
+    const co = gitSpawn(root, ["checkout", "-q", "--no-overwrite-ignore", "--detach", r.target], { timeout: 30000, stdio: ["ignore", "pipe", "pipe"] });
+    if (co.error || co.status !== 0) {
+      const why = String((co.stderr || "") || (co.error && co.error.message) || `exit ${co.status}`).trim().split(/\r?\n/)[0];
+      log(`work: --restart-on-land — could not move ${root} to ${tip}: ${why}; a restart will load ${loaded.commit} again`);
+      return { state: "failed", why };
+    }
+    log(`work: --restart-on-land — moved ${root} (detached) from ${loaded.commit} to ${tip} so the restart loads the landed code`);
+    return { state: "advanced", target: r.target };
+  };
+  return notice;
+}
+
+// Can a restart of a worker loaded at `loaded` reach `tip` in the checkout at
+// `root`? `current`: HEAD already IS that commit. `advance`: HEAD is DETACHED
+// at the loaded commit, `tip` descends from it, no tracked file is modified
+// and no merge/rebase/cherry-pick/bisect is in progress — a fast-forward is
+// safe and is all a restart needs (`target` is the full sha). `stuck`: none of
+// that (`why` says which); a restart would load the same HEAD again. null: git
+// gave no definitive answer.
+function codeCheckoutReach(loaded, tip, root = ROOT) {
+  if (!loaded || !tip) return null;
+  const full = (r) => (codeGit(root, ["rev-parse", "--verify", "-q", `${r}^{commit}`]) || "").trim();
+  const head = full("HEAD");
+  const target = full(tip);
+  if (!head || !target) return null;
+  if (head === target) return { state: "current" };
+  const sym = gitOracle(root, ["symbolic-ref", "-q", "HEAD"], { timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
+  if (sym.state === "error") return null;
+  if (sym.state === "hit") return { state: "stuck", why: `HEAD is on ${String(sym.result.stdout || "").trim().replace(/^refs\/heads\//, "branch ")}, not detached` };
+  if (head !== full(loaded.commit)) return { state: "stuck", why: `HEAD was moved off the loaded commit ${loaded.commit}` };
+  const anc = gitOracle(root, ["merge-base", "--is-ancestor", head, target], { timeout: 3000, stdio: "ignore" });
+  if (anc.state === "error") return null;
+  if (anc.state === "miss") return { state: "stuck", why: `${tip} does not descend from HEAD` };
+  const dirty = codeGit(root, ["status", "--porcelain", "--untracked-files=no"]);
+  if (dirty == null) return null;
+  if (dirty.trim()) return { state: "stuck", why: "it has uncommitted changes to tracked files" };
+  const ops = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply"];
+  const opPaths = codeGit(root, ["rev-parse", ...ops.flatMap((o) => ["--git-path", o])]);
+  if (opPaths == null) return null;
+  const busy = opPaths.split(/\r?\n/).filter(Boolean).map((p, i) => [ops[i], path.resolve(root, p)]).find(([, p]) => fs.existsSync(p));
+  if (busy) return { state: "stuck", why: `a ${busy[0]} operation is in progress` };
+  // A path the tip tracks and HEAD does not, already on disk as an untracked
+  // or IGNORED file: the status read above cannot see it, a checkout would
+  // refuse it (untracked) or silently overwrite it (ignored), and either way
+  // the restart would not land on the tip cleanly — so it is stuck, named.
+  const added = codeGit(root, ["diff", "--name-only", "-z", "--no-renames", "--diff-filter=A", head, target]);
+  if (added == null) return null;
+  const clash = added.split("\0").filter(Boolean).find((f) => {
+    try {
+      fs.lstatSync(path.join(root, f));
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (clash) return { state: "stuck", why: `${clash} is an untracked or ignored file the landed commit tracks — a checkout would overwrite or refuse it` };
+  return { state: "advance", target };
 }
 
 // The watched ref's current tip as a short commit, "" when it does not resolve.
@@ -22731,7 +22839,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { openSuccessorExecution, admitSuccessorThroughRun, resumeProviderAttempt, providerAttemptSweep, gcExecutionsDue, gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, replaceIfUnchanged, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess, createDispatchWorktree, removeDispatchWorktree };
+module.exports = { openSuccessorExecution, admitSuccessorThroughRun, resumeProviderAttempt, providerAttemptSweep, gcExecutionsDue, gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codeCheckoutReach, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, replaceIfUnchanged, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess, createDispatchWorktree, removeDispatchWorktree };
 
 if (require.main === module) {
   main()
