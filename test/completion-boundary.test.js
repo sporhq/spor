@@ -206,7 +206,7 @@ test("worker contract: a factory declaring NEITHER key — and a bare worker —
   assert.equal(workerContractLib.workerContract({ nodeId: "task-golden", factory: noInt }), fs.readFileSync(path.join(dir, "legacy-no-integration.txt"), "utf8"));
 });
 
-test("worker contract: `completion.by: controller` alone changes ONLY the completion step — submission, no resolves edge, no status flip, the CANDIDATE: form", () => {
+test("worker contract: `completion.by: controller` alone is the empty stage — submission, no resolves edge, no status flip, the CANDIDATE: form, default author_checks", () => {
   const base = { factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "npm test" }] };
   const legacy = workerContractLib.workerContract({ nodeId: "task-x", terminal: "done", factory: factoryOf(base) });
   const ctrl = workerContractLib.workerContract({ nodeId: "task-x", terminal: "done", factory: factoryOf({ ...base, completion: { by: "controller" } }) });
@@ -217,10 +217,13 @@ test("worker contract: `completion.by: controller` alone changes ONLY the comple
   assert.match(ctrl, /FIRST line of your final message exactly `CANDIDATE: <the resolver\n\s+node id> — <one-line reason>`/);
   assert.match(ctrl, /committed, clean, submitted on the graph/);
   assert.doesNotMatch(ctrl, /5\. Resolve the item on the graph LAST/);
-  // Step 3 is untouched by the completion key alone (E10): every command gate
-  // is still named, nothing is withheld.
-  assert.match(ctrl, /acceptance command \(`npm test`\), which the gate re-runs/);
-  assert.doesNotMatch(ctrl, /do NOT run/);
+  // The boundary alone takes the stage's defaults (E10,
+  // issue-spor-controller-completion-without-implementation-block-never-submits-candidate),
+  // so it is byte-identical to declaring `"implementation": {}` — including
+  // step 3's default author_checks of NONE: the suite is withheld, not named.
+  const emptyStage = workerContractLib.workerContract({ nodeId: "task-x", terminal: "done", factory: factoryOf({ ...base, implementation: {} }) });
+  assert.equal(ctrl, emptyStage);
+  assert.match(ctrl, /The factory runs `npm test` from the trusted ref's copy after you finish — do NOT run it here/);
   // The prescribed form is the form the kernel parses.
   assert.deepEqual(completion.parseCandidateReport("CANDIDATE: dec-my-change — the smallest fix\n\nmore"), { ok: true, resolver: "dec-my-change", reason: "the smallest fix" });
 });
