@@ -838,6 +838,95 @@ test("reporter: a gate verdict or integration start re-sent under the same journ
   }
 });
 
+// issue-spor-integration-landed-not-recorded-on-server-execution: a rescue
+// pass re-pinned the candidate and re-judged both gates passed, but the
+// store never heard those verdicts (one fact write timed out, which skipped
+// the report), so it refused `integration.started` — and the worker landed
+// anyway, after which `integration.settled` and every completion were refused.
+// The start is now CONFIRMED: the store's refusal of the caller's own event
+// is visible (not dropped behind an `ok`), a `gates_unsettled` refusal is
+// repaired from the pipeline's own results, and only a recorded start lets
+// the land run — after which the completion is accepted.
+test("reporter: after a rescue re-pin whose verdicts never reached the store, startIntegration repairs the unsettled gates and the execution reaches completion.written; a refusal it cannot repair fails closed", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const home = tmp("rescue-repair");
+    const cfg = remoteCfg(home, fake.base);
+    const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "review", kind: "command", command: "true" }, { id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller", after: "integration" }, integration: { target_ref: "main", strategy: "merge", command: "true" } });
+    const held = await spor.claimExecutionHold(cfg, { id: "task-x" }, factory, { home });
+    assert.equal(held.ok, true, held.reason);
+    const record = { run_id: "run-1", node_id: "task-x", ...held.recordFields };
+    const p = dispatchRuns.runPaths(home, "run-1");
+    fs.mkdirSync(path.dirname(p.record), { recursive: true });
+    fs.writeFileSync(p.record, JSON.stringify(record));
+    const lines = [];
+    const reporter = spor.executionReporter(cfg, record, { home, log: (l) => lines.push(l) });
+    assert.equal((await reporter.resume()).ok, true);
+    await reporter.candidateSubmitted(CAND);
+    await reporter.gateSettled("acceptance", "failed", { key: "art-gate-acc-0" });
+    await reporter.rescueStarted(1);
+    const FIX = { candidate_id: "cand-5555666677778888", commit: "c".repeat(40), tree: "e".repeat(40), provenance: { attempt: 1 }, supersedes: CAND.candidate_id, reference: { kind: "git", commit: "c".repeat(40), verified_at: T0 } };
+    await reporter.candidateSubmitted(FIX);
+    assert.equal(fake.record(reporter.id).candidate.candidate_id, FIX.candidate_id, "the rescue's re-pin is the store's tip");
+    // The rescue pass's verdicts never reached the store. A bare start is
+    // REFUSED, and the refusal is the caller's answer — never an `ok`.
+    const bare = await reporter.integrationStarted({ key: "probe" });
+    assert.equal(bare.ok, false);
+    assert.equal(bare.refused, true);
+    assert.equal(bare.code, "gates_unsettled");
+    // A pipeline whose results cannot vouch for every gate fails CLOSED.
+    const pass0 = { gate: "acceptance", kind: "command", verdict: "failed", candidate_id: CAND.candidate_id, fact: "art-gate-acc-0" };
+    const accX1 = { gate: "acceptance", kind: "command", verdict: "passed", rescue: 1, candidate_id: FIX.candidate_id, fact: "art-gate-acc-x1" };
+    const reviewX1 = { gate: "review", kind: "agent-review", verdict: "passed", rescue: 1, candidate_id: FIX.candidate_id, fact: null };
+    const refused = await reporter.startIntegration({ key: "run-1/pipeline/a0/integration/start", gates: [pass0, accX1] });
+    assert.equal(refused.ok, false, "review was never judged passed by this pipeline");
+    assert.equal(refused.code, "gates_unsettled");
+    assert.equal(fake.record(reporter.id).integration, null, "no integration is in flight");
+    assert.equal(fake.record(reporter.id).gate_results.find((g) => g.id === "acceptance").state, "passed", "the verdict it could vouch for was repaired");
+    // With the rescue pass's results the gates are repaired and the start lands.
+    const started = await reporter.startIntegration({ key: "run-1/pipeline/a0/integration/start/p1", gates: [pass0, { gate: "rescue", kind: "rescue", verdict: "passed", rescue: 1 }, reviewX1, accX1] });
+    assert.equal(started.ok, true, started.reason);
+    assert.deepEqual(started.repaired, ["review"], "acceptance was already repaired by the refused attempt; only review was still owed");
+    const rec = fake.record(reporter.id);
+    assert.ok(rec.gate_results.every((g) => g.state === "passed" && g.candidate_id === FIX.candidate_id), JSON.stringify(rec.gate_results));
+    assert.equal(rec.integration.state, "running");
+    assert.equal((await reporter.integrationSettled("landed", { commit: "d".repeat(40), key: "run-1/pipeline/a0/integration/stamp" })).ok, true);
+    assert.equal((await reporter.completionWritten("art-completion-x")).ok, true, "the completion is accepted at the integration boundary");
+    assert.ok(fake.events(reporter.id).some((e) => e.type === "completion.written"));
+    // A repeated repair is recorded once (its key names the candidate judged).
+    const repairs = fake.events(reporter.id).filter((e) => e.type === "gate.settled" && /:repair:/.test(e.idempotency_key || ""));
+    assert.equal(repairs.length, 2);
+    reporter.leave();
+  } finally {
+    spor.LIVE_EXECUTIONS.clear();
+    await fake.close();
+  }
+});
+
+test("remote adapter: the caller's own event refused permanently is answered `refused`, while the backlog ahead of it still lands", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const home = tmp("own-refused");
+    const logs = [];
+    const st = store.openExecutionStore(remoteCfg(home, fake.base), { home, log: (l) => logs.push(l) });
+    const o = await st.open({ node_id: "task-x", factory: "factory-t", gates: [{ id: "acceptance" }], boundary: "gates" });
+    const id = o.execution.execution_id;
+    fake.state.down = true;
+    await st.event(id, { fence: 1, event: { type: "candidate.submitted", candidate: CAND } });
+    fake.state.down = false;
+    const r = await st.event(id, { fence: 1, event: { type: "integration.started", attempt: 1 } });
+    assert.equal(r.ok, false);
+    assert.equal(r.refused, true);
+    assert.equal(r.code, "gates_unsettled");
+    assert.equal(fake.record(id).candidate.candidate_id, CAND.candidate_id, "the spooled backlog ahead of it landed");
+    assert.deepEqual(st.outbox(id), [], "the refused event is dropped, not left owed");
+    const ok = await st.event(id, { fence: 1, event: { type: "gate.settled", gate_id: "acceptance", attempt: 1, state: "passed" } });
+    assert.equal(ok.ok, true);
+  } finally {
+    await fake.close();
+  }
+});
+
 test("legacy and pre-adapter records report nothing: no impl_claim, or an impl_claim without a store, yields no reporter and byte-identical completion deps", () => {
   const cfg = loadConfig({ cwd: os.tmpdir(), env: { SPOR_HOME: tmp("legacy") } });
   assert.equal(spor.executionReporter(cfg, { run_id: "r", node_id: "task-x" }), null);

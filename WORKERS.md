@@ -4541,14 +4541,26 @@ seams the pipeline already has, wrapped in `bin/spor.js`
 (`reportingGateDeps`) so gate-runner.js and integration-runner.js learn
 nothing about the store: `stage.started` at the claim, `stage.observed`
 with the run id at launch, `candidate.submitted` on a created/superseded pin,
-`gate.settled` per recorded gate fact (verdict → state: passed, skipped,
+`gate.settled` per settled gate verdict — reported even when its fact's graph
+write failed, keyed on the fact's minted id (verdict → state: passed, skipped,
 failed/fail-closed/dirty-tree/scoped → `failed`, unrun/infrastructure/unroutable → `infrastructure`;
 `blocked` is not settled; a synthetic scoping gate is not in the pinned list
 and is not reported), `rescue.started` per rescue fact, `escalation.filed`
 for a gate escalation and a human-gate approval item (never `terminal`: a
 refusal leaves the item HELD under the same execution, which is what
 `--regate` re-judges), `integration.started`/`.settled` around the
-integration stage, and `completion.written` after the completion CAS. A
+integration stage, and `completion.written` after the completion CAS. Every
+report is fail-soft EXCEPT `integration.started`, which the land is gated on
+(issue-spor-integration-landed-not-recorded-on-server-execution): a start the
+store did not RECORD — refused, spooled but not yet on the record, or under a
+lost fence — lands nothing; the pipeline yields (`…/integration/start/p<n>`)
+and asks again next pass, and the re-offer cap turns a refusal that never
+clears into a person's item. A `gates_unsettled` refusal is first repaired:
+every pinned gate the store's record does not accept on the tip is re-sent
+from the pipeline's own latest passing result for it (the rescue pass's
+included), and the start is sent once more. A remote event the server refuses
+permanently is answered `refused` to the caller that sent it — the backlog
+ahead of it still lands — never an `ok` beside a dropped line. A
 withdrawn, consumed or person-released completion ENDS the execution the same
 way the refused hold does. The lease is renewed once per `spor work` pass
 for every execution this process holds (`renewLiveExecutions`, the same slot

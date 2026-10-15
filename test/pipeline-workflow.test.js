@@ -34,7 +34,7 @@ function fakes(script = {}) {
     gates: (args) => { calls.push(["gates", args.stage, args.pass]); return next("gates", { state: "passed", gates: ["acceptance"], facts: ["art-gate-1"], head: "h1" }); },
     stampGatesState: (args) => { calls.push(["stampGatesState", args.state]); return { ok: true }; },
     completeAtGates: () => { calls.push(["completeAtGates"]); return { ok: true, settled: "written" }; },
-    integrationStart: () => { calls.push(["integrationStart"]); return { ok: true }; },
+    integrationStart: (args) => { calls.push(["integrationStart", args.pass, args.gates]); return next("integrationStart", { ok: true }); },
     integration: (args) => {
       calls.push(["integration", args.stage, args.pass, args.regate]);
       return next("integration", { intResult: { state: "passed", facts: ["art-merge-1"], landed_sha: "l1", target_ref: "main", target_sha: "t0" }, gateResult: args.gateResult, gateFacts: args.gateFacts });
@@ -133,6 +133,33 @@ test("a child's INTERRUPTED hand-up is a durable yield: the parent journals it, 
   assert.equal(second.result.state, "passed");
   assert.deepEqual(calls.filter((c) => c[0] === "gates").map((c) => c[2]), [0, 1], "pass 0 interrupted, pass 1 judged — the implementation stage was not re-run");
   assert.equal(calls.filter((c) => c[0] === "implementation").length, 1);
+});
+
+// issue-spor-integration-landed-not-recorded-on-server-execution: the land is
+// FAIL-CLOSED on the execution store's integration start.
+test("an integration start the execution store did not record yields the pipeline and lands nothing; the re-drive asks again under the next pass's key and only then integrates", async () => {
+  const clock = fakeClock(1000);
+  const { deps, calls } = fakes({ integrationStart: [{ ok: false, code: "gates_unsettled", reason: "gates_unsettled: integration cannot start before every pinned gate has settled passed/skipped" }, { ok: true }] });
+  const journal = [];
+  const first = await driveOnce({ journal, deps, clock });
+  assert.equal(first.status, "suspended");
+  assert.equal(first.detail.meta.parked.state, "interrupted");
+  assert.match(first.detail.meta.parked.reason, /did not record the integration start \(gates_unsettled/);
+  assert.deepEqual(first.detail.meta.parked.facts, ["art-gate-1"]);
+  assert.ok(!calls.some((c) => c[0] === "integration"), "nothing is landed while the store refuses the start");
+  assert.deepEqual(calls.find((c) => c[0] === "integrationStart")[2], ["acceptance"], "the gate results ride the start, for the store's repair");
+  const parked = stageProjection.projectJournal(journal, stageProjection.parseStageName("pipeline-a0"));
+  assert.equal(parked.status, "parked");
+  assert.match(parked.parked.reason, /integration start/);
+  clock.advanceBy(5);
+  const second = await driveOnce({ journal, deps, clock });
+  assert.equal(second.status, "completed");
+  assert.equal(second.result.state, "passed");
+  assert.deepEqual(calls.filter((c) => c[0] === "integrationStart").map((c) => c[1]), [0, 1]);
+  const keys = journal.filter((e) => e.kind === "effect" && /integration\/start/.test(e.key)).map((e) => e.key.replace(/^.*\/pipeline\/a0\//, ""));
+  assert.deepEqual(keys, ["integration/start", "integration/start/p0/yield", "integration/start/p1"], "pass 0 keeps the key earlier journals recorded");
+  assert.deepEqual(calls.filter((c) => c[0] === "integration" || c[0] === "completeAtIntegration").map((c) => c[0]), ["integration", "completeAtIntegration"]);
+  assert.equal(calls.filter((c) => c[0] === "gates").length, 1, "the gate list is not re-judged");
 });
 
 test("an INTERRUPTED implementation stage is handed up in the pipeline's refusal shape; an UNROUTABLE one withdraws the hold and settles failed without a gate", async () => {
