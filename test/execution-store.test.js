@@ -903,6 +903,37 @@ test("reporter: after a rescue re-pin whose verdicts never reached the store, st
   }
 });
 
+// F1 of the review: at the `gates` boundary completion.written makes the
+// execution terminal, so a later integration.started is refused
+// execution_terminal by design — which is why the pipeline's start activity
+// reports it best-effort there instead of failing the land closed.
+test("reporter: after completion.written at the 'gates' boundary the store refuses integration.started as execution_terminal", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
+  try {
+    const home = tmp("gates-boundary-start");
+    const cfg = remoteCfg(home, fake.base);
+    const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller", after: "gates" }, integration: { target_ref: "main", strategy: "merge", command: "true" } });
+    const held = await spor.claimExecutionHold(cfg, { id: "task-x" }, factory, { home });
+    assert.equal(held.ok, true, held.reason);
+    const record = { run_id: "run-1", node_id: "task-x", ...held.recordFields };
+    const p = dispatchRuns.runPaths(home, "run-1");
+    fs.mkdirSync(path.dirname(p.record), { recursive: true });
+    fs.writeFileSync(p.record, JSON.stringify(record));
+    const reporter = spor.executionReporter(cfg, record, { home });
+    assert.equal((await reporter.resume()).ok, true);
+    await reporter.candidateSubmitted(CAND);
+    assert.equal((await reporter.gateSettled("acceptance", "passed", { key: "art-gate-acc" })).ok, true);
+    assert.equal((await reporter.completionWritten("art-completion-x")).ok, true);
+    const started = await reporter.integrationStarted({ key: "run-1/pipeline/a0/integration/start" });
+    assert.equal(started.ok, false);
+    assert.equal(started.code, "execution_terminal");
+    reporter.leave();
+  } finally {
+    spor.LIVE_EXECUTIONS.clear();
+    await fake.close();
+  }
+});
+
 test("remote adapter: the caller's own event refused permanently is answered `refused`, while the backlog ahead of it still lands", async () => {
   const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") } });
   try {

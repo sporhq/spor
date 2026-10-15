@@ -16964,9 +16964,16 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     // on-server-execution): the land waits on a start the store recorded —
     // see the reporter's startIntegration. `pass` keys a re-try after the
     // pipeline yielded on a refusal; `gates` is what a repair re-sends.
-    integrationStart: async ({ pass = 0, gates = [] } = {}) => {
+    // `completedBeforeIntegration`: the completion was already written at the
+    // `gates` boundary, so the execution is terminal and refuses the start by
+    // design (execution_terminal) — the start is reported best-effort and the
+    // land proceeds; the store's boundary was the gates, and it was reached.
+    integrationStart: async ({ pass = 0, gates = [], completedBeforeIntegration = false } = {}) => {
       assertOwner();
-      if (reporter) {
+      if (reporter && completedBeforeIntegration) {
+        const r = await reporter.integrationStarted({ key: `${item.run_id}/pipeline/a${Math.max(0, Number(item.attempt) || 0)}/integration/start${pass ? `/p${pass}` : ""}` });
+        if (!(r && r.ok)) ctx.log(`work: ${entry.node_id} — the execution store did not record the integration start (${(r && r.code) || "store"}); the item was completed at the 'gates' boundary, so the land proceeds`);
+      } else if (reporter) {
         const key = `${item.run_id}/pipeline/a${Math.max(0, Number(item.attempt) || 0)}/integration/start${pass ? `/p${pass}` : ""}`;
         const started = await reporter.startIntegration({ key, gates });
         if (!started.ok) {

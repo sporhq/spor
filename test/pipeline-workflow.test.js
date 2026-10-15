@@ -162,6 +162,28 @@ test("an integration start the execution store did not record yields the pipelin
   assert.equal(calls.filter((c) => c[0] === "gates").length, 1, "the gate list is not re-judged");
 });
 
+// F1 of the review: a completion at the `gates` boundary made the execution
+// terminal, so the store refuses every later event — the start must not gate
+// the land there. The journaled reading rides the start activity.
+test("after a completion at the 'gates' boundary the integration start is told so, and the pipeline integrates without a yield", async () => {
+  const { deps, calls } = fakes();
+  const seen = [];
+  const inner = deps.integrationStart;
+  deps.integrationStart = (args) => { seen.push(args.completedBeforeIntegration); return inner(args); };
+  const journal = [];
+  const r = await driveOnce({ journal, deps, clock: fakeClock(1000), binding: { ...BINDING, boundary: "gates" } });
+  assert.equal(r.status, "completed");
+  assert.deepEqual(seen, [true]);
+  assert.deepEqual(calls.map((c) => c[0]), ["open", "implementation", "gates", "stampGatesState", "completeAtGates", "integrationStart", "integration", "stampIntegrationState", "reconcileLanded", "leave"]);
+  // At the integration boundary the start is still the fail-closed one.
+  const other = fakes();
+  const flags = [];
+  const inner2 = other.deps.integrationStart;
+  other.deps.integrationStart = (args) => { flags.push(args.completedBeforeIntegration); return inner2(args); };
+  await driveOnce({ journal: [], deps: other.deps, clock: fakeClock(1000) });
+  assert.deepEqual(flags, [false]);
+});
+
 test("an INTERRUPTED implementation stage is handed up in the pipeline's refusal shape; an UNROUTABLE one withdraws the hold and settles failed without a gate", async () => {
   const stopped = fakes({ implementation: [{ state: "interrupted", reason: "the worker was asked to stop", attempts: [] }] });
   const r = await driveOnce({ journal: [], deps: stopped.deps, clock: fakeClock(1000) });

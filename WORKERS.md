@@ -4558,7 +4558,11 @@ and asks again next pass, and the re-offer cap turns a refusal that never
 clears into a person's item. A `gates_unsettled` refusal is first repaired:
 every pinned gate the store's record does not accept on the tip is re-sent
 from the pipeline's own latest passing result for it (the rescue pass's
-included), and the start is sent once more. A remote event the server refuses
+included), and the start is sent once more. The one exception is a
+completion already written at the `gates` boundary: `completion.written` made
+the execution terminal, so the store refuses the start (`execution_terminal`)
+by design — the store's boundary was reached at the gates — and the start is
+reported fail-soft there, never gating the land. A remote event the server refuses
 permanently is answered `refused` to the caller that sent it — the backlog
 ahead of it still lands — never an `ok` beside a dropped line. A
 withdrawn, consumed or person-released completion ENDS the execution the same
