@@ -6,8 +6,6 @@ schema_version: 2026.08.21.1
 title: Schema for member-of-program edges
 summary: Edge schema for dedicated program membership — this node is a member of the target program umbrella, independent of whether it also gates it.
 date: 2026-08-21
-edges:
-  - {type: derived-from, to: dec-spor-program-membership-dedicated-edge-type}
 ---
 
 Program membership as its own edge type, so membership and gating are

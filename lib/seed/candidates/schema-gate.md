@@ -2,22 +2,19 @@
 id: schema-gate
 type: schema
 kind: node-schema
-schema_version: 2026.10.05.1
+schema_version: 2026.10.15.1
 title: Shareable factory gate
 summary: One reusable gate — command, agent-review or human — that any factory definition can reference by id, so an org vets a gate once (a `gate-security-review`) and reuses it product-wide instead of copying it into every factory.
 date: 2026-08-26
-edges:
-  - {type: derived-from, to: dec-spor-software-factory-substrate}
-  - {type: relates-to, to: schema-factory}
 ---
 
 A `gate` node is ONE gate, standing on its own so more than one factory can use
 it: org governance writes a vetted `gate-security-review` once, and every
 factory references it (`{"ref": "gate-security-review"}`) rather than carrying a
-divergent copy. A factory may also write its gates inline; the runner
-(lib/shell/gate-runner.js) treats the two shapes identically — a referenced gate
-is unwrapped into exactly the object an inline one would have been, with any
-keys written beside the `ref` overriding it.
+divergent copy. A factory may also write its gates inline; the runner treats
+the two shapes identically — a referenced gate is unwrapped into exactly the
+object an inline one would have been, with any keys written beside the `ref`
+overriding it.
 
 The body carries the gate as a fenced ```json payload:
 
@@ -29,112 +26,57 @@ The body carries the gate as a fenced ```json payload:
       "instructions": "Hunt for correctness defects; ignore style."
     }
 
-Keys by kind:
+Keys by kind (the full contract is WORKERS.md §10.3-§10.5 in the spor repo):
 
 - **command** — `command` (the declared suite, run from the factory's TRUSTED
-  ref), `timeout_ms`, optional `dir`, optional `serialize`, and optional
-  `reruns` (default 0, at most 3): how many times a FAILED suite is run again
-  on the SAME prepared tree before the failure is charged to a fix cycle, a
-  rescue or a person. A rerun is the same command on the one checkout the
-  declared run failed in (the tree is prepared once for the whole loop), it
-  costs a suite run and never a fix dispatch, and a pass on a rerun PASSES
-  but its `art-gate-*` fact names the rerun and carries the first failure as
-  evidence, so a flaky suite stays countable in the telemetry instead of
-  laundering into clean passes. Optional `rejudge_on_repin` (default true) is
-  read only by a factory whose completion is controller-written
-  (FACTORY-IMPLEMENTATION-STAGE.md §3.3): acceptance is a property of the tip,
-  so when the candidate moves under the pipeline (a fix cycle, a rescue, an
-  integration fix) a command gate whose pass is on an ancestor tree is re-run
-  on the tip before the item completes — a suite run, never a dispatch. An
-  explicit `false` is the startup-logged opt-out for a suite the operator
-  accepts standing on an ancestor for; anything else reads as `true`. It is a
-  command gate's knob only: on an agent-review gate it is an error either way
-  (a review always re-judges a moved tip — independent review of what is
-  accepted is not an operator's to relax), and on a human gate too. There is
-  deliberately no way to name a ref or a protected path here: those are the
-  FACTORY's, so one shared gate cannot quietly relax another team's trusted
-  boundary.
-  Optionally `isolate` — a command template
-  carrying a `{files}` token (`node --test {files}`) — which, when a failure
-  names only files the change does NOT touch, re-runs those test files alone
-  on that same tree: passing there makes the whole-suite failure an off-diff
-  FLAKE, so the gate passes and each failing file is filed as its own
-  convergent `issue-flake-*` instead of costing a fix cycle, a rescue or a
-  person. Off-diff is a reason
-  to look, never to pass, and the bar is deliberately high: every failed run
-  must have named only files off the diff, those tests must REFERENCE nothing
-  the change edits (they are read to check), and they must pass alone. A
-  failure that names or references a changed file, one that fails alone too,
-  and one the runner could not read enough to judge are all charged exactly
-  as before.
-  Optionally `ci` — `{"workflow": "test.yaml"}` — runs the suite on the
-  repo's CI instead of the worker box (dec-spor-command-gate-ci-mode): the
-  runner pushes the candidate commit (the judged head with the protected paths
-  forced to the trusted copy) to `spor/candidate/<node>` on `remote` (default
-  `origin`), waits up to `timeout_ms` for the named workflow's run for that
-  exact commit through `gh`, and reads its conclusion — `success` passes,
-  `failure`/`timed_out` fails, and anything else (cancelled, skipped, no run
-  within `discover_ms`, gh/git unreachable) is an OUTAGE: never a pass, never
-  a fix cycle, paid from the implementation retry pool and otherwise failed
-  closed. A rerun re-runs the same CI run. The branch is deleted once the
-  verdict is read. `.github/**` is protected on top of the factory's paths,
-  so a candidate is never judged by a workflow it wrote. Optional `repo`
-  (`owner/name`), `poll_ms` (default 30s) and `local_fallback` (default
-  false: run the suite on this box only when CI cannot be reached). `isolate`
-  cannot be combined with it. The workflow must trigger on a push to
-  `spor/candidate/**`, and the worker box needs `gh` plus push credentials
-  for the remote.
+  ref), `timeout_ms`, optional `dir` and `serialize`. There is deliberately no
+  way to name a ref or a protected path here: those are the FACTORY's, so one
+  shared gate cannot relax another team's trusted boundary.
+  - `reruns` (default 0, max 3) — re-run a failed suite on the SAME tree before
+    the failure is charged; a rerun-rescued pass keeps the first failure as
+    evidence on its `art-gate-*` fact, so flakes stay countable.
+  - `isolate` — a command template with a `{files}` token. When every failed
+    run names only test files off the diff that reference nothing the change
+    edits, those files are re-run alone; passing there is an off-diff FLAKE —
+    the gate passes and each file is filed as its own `issue-flake-*`.
+    Anything the runner cannot judge is charged as before.
+  - `ci` — `{"workflow": "test.yaml"}` runs the suite on the repo's CI: the
+    candidate is pushed to `spor/candidate/<node>`, the workflow's run for that
+    exact commit is the verdict, and a CI that never judges it is an OUTAGE
+    (never a pass or a fix cycle) unless `local_fallback: true`. Optional
+    `repo`, `remote`, `poll_ms`, `discover_ms`. `.github/**` is protected on
+    top of the factory's paths; `isolate` cannot be combined with it; the box
+    needs `gh` and push credentials.
+  - `rejudge_on_repin` (default true; read only under controller completion) —
+    a pass on an ancestor of the completing candidate is re-run on the tip. An
+    explicit `false` opts out; on any other gate kind the key is an error.
 - **agent-review** — `profile` (required: the review lane, cross-model by
-  convention; the machine's declared binding decides what that actually
-  executes), `instructions`, `await_ms`, and `risk`. The reviewer answers with a
-  fenced JSON verdict which the runner parses in code — an unreadable verdict is
-  a failure, never a pass. Three optional keys (2026.09.27.1, task-spor-review-
-  gate-quota-outage-reset-aware-pause-and-fallback-reviewer) govern a review
-  that produced NO verdict because its backend was out: `pause_max_ms` (default
-  48h) bounds how far ahead the outage's own stated reset ("try again at
-  <date>", `Retry-After`) may park the pipeline — slot freed, nothing settled —
-  before the gate refuses instead; `fallback_profile` names a second review
-  lane the runner routes to after `fallback_after` (default 1, max 5)
-  no-verdict readings under `profile`, and only when that lane's declared
-  `model_family` differs from the implementer's (unknown or equal refuses it —
-  the gate then pauses or refuses as if none were declared). The fallback is
-  never a satisfiability-time substitution; each dispatch after a pause or
-  under the fallback is charged to the factory's shared
-  `implementation.retry.attempts` pool (a pool of zero authorizes none), and
-  every verdict it gives names it on the gate fact and the attested step.
-  Omitted, none of the three changes the gate's definition digest.
-  `reviewer_retries` (2026.10.05.1, 0..3, dec-spor-review-gate-no-verdict-is-
-  an-outage-not-a-rejection) is the gate's OWN allowance of re-asks after a
-  no-verdict reading, in place of that pool's cap and backoff: it waits 5m,
-  15m, then 45m and asks the same reviewer at the same cycle again (`0`
-  escalates on the first reading). Each re-ask still lands on the shared
-  count, but is paid by the ladder, never from the pool's headroom. An exhausted ladder escalates with the verdict `reviewer-unavailable`
-  and the reviewer's log tail as evidence, and `spor work --status` shows
-  "no verdict n/N, asking again at <time>" while it waits. Omitted, the pool
-  alone decides, as before, and the digest does not move.
-- **human** — `approval_timeout_ms`, `poll_ms`, `instructions`, and `risk`.
+  convention), `instructions`, `await_ms`. The reviewer answers with a fenced
+  JSON verdict parsed in code — unreadable is a failure, never a pass; only
+  demonstrated blocking findings block. For a review that got NO verdict
+  because its backend was out: `pause_max_ms` (default 48h) bounds how far a
+  stated reset may park the pipeline; `fallback_profile` routes to a second
+  lane after `fallback_after` (default 1, max 5) no-verdicts when its
+  `model_family` differs from the implementer's; `reviewer_retries` (0..3)
+  re-asks at 5m/15m/45m before escalating `reviewer-unavailable`. Pause is free;
+  re-asks and fallback dispatches count against the factory's
+  `implementation.retry` pool.
+- **human** — `approval_timeout_ms`, `poll_ms`, `instructions`. Files an
+  approval item and blocks until a resolving edge approves it or a terminal
+  status refuses it; a timeout reports `blocked`, never decides.
 
-`risk` is common to all three kinds: the factory-declared risk classes that ARM
-the gate, an empty list meaning always. Unarmed, the gate records `skipped` and
-runs nothing — no suite, no reviewer dispatch, no approval item. Naming a class
-the factory never declared is a load error, because a gate that can never arm
-reads exactly like one that passed.
+Common to all three kinds:
 
-`cycles` is common to all three: how many implementer fix cycles a failure gets
-before the runner escalates to a human queue item. Reruns come BEFORE fix
-cycles: a command gate spends its `reruns` budget on one tree first, then its
-`isolate` pass, and only a suite still failing after both is charged a cycle.
+- `risk` — factory-declared risk classes that ARM the gate (empty = always).
+  Unarmed, the gate records `skipped` and runs nothing. An undeclared class is
+  a load error: a gate that can never arm reads exactly like one that passed.
+- `cycles` — implementer fix cycles a failure gets before the runner escalates
+  to a human queue item (default 0). A command gate spends `reruns`, then its
+  `isolate` pass, before a cycle is charged.
 
-`resolution` (2026.09.06.1, issue-spor-offline-check-get-hook-resolution-proxy):
-the attestation path for this type's completion, DECLARED as registry data.
-`verified_by: status` — a gate's own terminal status retires it; no inbound
-resolving edge attests it. Readers (remote dispatch's terminal-state verify,
-`spor schema`) used to infer this from the ABSENCE of a `get()` hook on this
-schema, which is the general-purpose read-time enrichment verb and says
-nothing about resolution — so adopting one here for any other purpose would
-have silently flipped this type to edge-verified and read genuinely
-status-retired work as unattested. Declaration only — enforcement stays in the
-hooks — no stored-shape change, no upgrade chain.
+`resolution` declares `verified_by: status`: a gate's own terminal status
+retires it; no inbound resolving edge attests it. Declaration only — no
+stored-shape change, no upgrade chain.
 
 ```json
 {

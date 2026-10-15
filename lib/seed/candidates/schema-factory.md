@@ -2,36 +2,27 @@
 id: schema-factory
 type: schema
 kind: node-schema
-schema_version: 2026.10.10.1
+schema_version: 2026.10.15.1
 title: Software-factory definition
 summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, the repos it may judge, protected test paths, test-change lane, risk classes those gates key on, an optional integration (merge-queue landing) stage, an optional rescue lane (a strong-model step before any human escalation), an optional implementation stage and the completion boundary that says who writes the resolving edge. Candidate pack; adopt it into a graph to use `spor work --factory`.
 date: 2026-08-26
-edges:
-  - {type: derived-from, to: dec-spor-software-factory-substrate}
-  - {type: relates-to, to: task-spor-work-gate-pipeline}
-  - {type: derived-from, to: dec-spor-factory-integration-step}
-  - {type: relates-to, to: task-spor-factory-rescue-lane}
-  - {type: derived-from, to: dec-spor-factory-implementation-stage-contract}
 ---
 
-A `factory` node is a team's bespoke factory as DATA (dec-spor-software-factory-
-substrate): what must be true before a piece of work counts as done here. The
-runner (`spor work --factory <id>`, lib/shell/gate-runner.js) enforces it in
-code; nothing in this node is an instruction to an orchestrator agent, and
+A `factory` node is a team's bespoke factory as DATA: what must be true before
+a piece of work counts as done here. The runner (`spor work --factory <id>`)
+enforces it in code; nothing in this node is an instruction to an agent, and
 nothing in it names a command line a machine must execute beyond the declared
-acceptance suite — an agent-review gate routes by PROFILE, so the machine's own
-declared binding still decides what actually runs (dec-spor-declarative-harness-
-machine-binds-execution).
+acceptance suite — review and implementation lanes route by PROFILE, so the
+machine's own declared harness binding decides what actually runs.
 
 It ships in the CANDIDATE pack rather than the seed: a factory changes what a
 worker will accept, so it arrives by deliberate adoption (`spor schema adopt
-schema-factory`, landing `status: proposed` for a second identity to activate),
-never active-everywhere-instantly.
+schema-factory`, landing `status: proposed` for a second identity to
+activate), never active-everywhere-instantly.
 
-The gate list is ordered and each entry is one of three kinds — `command`,
-`agent-review`, `human` — written either INLINE or as `{"ref": "gate-<id>"}`
-pointing at a shareable `type: gate` node (schema-gate), so an org can vet one
-gate and reuse it product-wide. The runner treats the two shapes identically;
+The gate list is ordered; each entry is a `command`, `agent-review` or `human`
+gate, written INLINE or as `{"ref": "gate-<id>"}` pointing at a shareable
+`type: gate` node (schema-gate). The runner treats the two shapes identically;
 keys written beside a `ref` override the referenced gate's own.
 
 The body carries the definition as a fenced ```json payload, the same
@@ -46,7 +37,7 @@ convention schema nodes use:
       "risk_classes": { "touches:auth": ["lib/auth.js", "**/auth/**"] },
       "gates": [
         {"id": "typecheck", "kind": "command", "command": "npm run typecheck", "timeout_ms": 120000},
-        {"id": "acceptance", "kind": "command", "command": "npm test", "timeout_ms": 900000, "rejudge_on_repin": true},
+        {"id": "acceptance", "kind": "command", "command": "npm test", "timeout_ms": 900000},
         {"ref": "gate-adversarial-review", "cycles": 2},
         {"id": "security-approval", "kind": "human", "risk": ["touches:auth"]}
       ],
@@ -57,173 +48,62 @@ convention schema nodes use:
         "author_checks": ["typecheck"],
         "budget": {"run_max_ms": 5400000, "run_idle_ms": 2700000, "attempts": 1},
         "retry": {"attempts": 1, "backoff_ms": 60000},
-        "candidate": {"require_clean": true, "publish": "bundle", "bundle_store": "file:///srv/spor/candidates"}
+        "candidate": {"require_clean": true, "publish": "bundle"}
       },
       "completion": {"by": "controller", "after": "integration"}
     }
 
-- `trusted_ref` — the ref a command gate's suite is taken from (default `main`).
-  **The implementer branch's copy of the tests is never what runs.**
-- `repos` — the repos this factory may judge. A worker's `--project` token
-  does NOT bound it: a bare repo slug unions its whole home-project grouping,
-  so without this a factory is handed sibling repos' items and gates them with
-  a suite authored for another checkout (issue-spor-work-scope-union-factory-
-  mismatch). Undeclared, the factory node's own `repo:` stamp is the scope; a
-  factory with neither is unscoped. An item outside the scope is skipped
-  visibly, never gated. Declaring it EMPTY is an error, not "judge anything".
-- `protected_paths` — test paths the implementer may not touch. A change that
-  touches one fails its command gate CLOSED (unrun) and routes to
-  `test_lane_profile`; declaring paths without a lane is an error, because
-  "fails closed" must never mean "dropped on the floor".
-- `risk_classes` — named path predicates a gate of ANY kind keys on to ARM
-  itself (command, agent-review, human). A gate naming an undeclared class is
-  an error: a gate that can never arm reads exactly like an approved one.
-- `gates[].cycles` — how many implementer fix cycles a failing gate gets before
-  the runner escalates by filing a human queue item. Default 0.
-- `gates[].reruns` (command gates) and `integration.reruns` — how many times a
-  failed suite is run again on the SAME tree before the failure is charged
-  (default 0, at most 3; the `gate` candidate node documents the rule). The
-  integration candidate suite gets the same budget on the one candidate
-  worktree — a rerun never rebuilds the candidate — and a rerun-rescued pass
-  lands (or, in `propose` mode, opens its PR) with the first failure kept as
-  evidence on the `art-merge-*` fact; a suite that fails every run is charged
-  ONE failure whose outcome says how many runs it failed.
-- `gates[].isolate` (command gates) — a command template carrying a `{files}`
-  token. After the reruns, a failure naming only files the change does NOT
-  touch has those test files re-run alone on the same tree; passing there
-  makes it an off-diff FLAKE, so the gate passes and the flake is filed as
-  its own `issue-flake-*` rather than costing a fix cycle, the rescue lane
-  and finally a person (WORKERS.md §10.3). Declaring nothing keeps the prior
-  behaviour; either way a charged command-gate failure now records WHICH
-  files it failed in, so flakes are countable per file.
-- `gates[].ci` (command gates) and `integration.ci` — `{"workflow": "<file>"}`
-  moves the suite off the worker box onto the repo's CI
-  (dec-spor-command-gate-ci-mode): the candidate commit is pushed to
-  `spor/candidate/<node>` (the integration candidate to
-  `spor/candidate/<node>-integration`), the named workflow's run for that
-  commit is the verdict, and a CI that never judges it is an outage that fails
-  closed unless `local_fallback: true`. `.github/**` joins the protected paths
-  for that suite. The `gate` candidate node documents the keys.
-- `rescue` (optional, WORKERS.md §10.10) — the rescue lane: when any gate has
-  spent its fix cycles, BEFORE the human escalation, the runner dispatches
-  `rescue.profile` (a strong model by intent; profile-routed only, like a
-  review) into the run's own checkout with the item, the diff, every fix
-  cycle's commits and the finding ledger — to diagnose (`reviewer-drift` /
-  `real-defect` / `stale-premise` / `environment`), fix and commit, and file
-  factory-improvement tasks `derived-from` the gate fact — then re-runs the
-  whole gate list on what it left under a fresh cycle budget, carrying the
-  ledger. Only if that also refuses is the person paged, with the diagnosis
-  first. `attempts` (default 1, max 3), `await_ms` (default 1h),
-  `instructions`. Absent, the factory is byte-identical to one without a lane.
-- `implementation` (optional, FACTORY-IMPLEMENTATION-STAGE.md §2) — the stage
-  that PRODUCES the candidate the gates then judge, declared beside them rather
-  than left as the one step of the pipeline a factory could not describe. It
-  routes by PROFILE only: no `command`/`args`/`argv`/`bin`/`exec`/`entrypoint`/
-  `env`/`report`/`session`/`launch_mode`/`identity_mode` key (or its camelCase
-  twin) is declarable, and
-  one present is an error naming it — a graph write must never define what a
-  machine executes (dec-spor-declarative-harness-machine-binds-execution), so a
-  bespoke implementer is a `dispatch.harness.<id>` declaration on the machine.
-  `profile` is the LOWEST-precedence router (an explicit `--profile`, the item's
-  own `profile:` and its assigned agent all still win). `instructions` is
-  APPENDED to the worker contract, never a replacement for it. `author_checks`
-  names the command gate ids the implementer is asked to run itself — default
-  NONE, because the gate re-runs the suite from the trusted ref regardless and
-  an author run of the same suite is duplicate spend; naming a cheap gate (a
-  typecheck, a lint) buys an early failure, and a name that is not a declared
-  command gate is an error. `budget.run_max_ms`/`run_idle_ms` default to
-  INHERITING the worker's own ceilings (a factory that says nothing must not
-  silently shorten a watchdog; `run_idle_ms: 0` disables idle detection),
-  `budget.attempts` (default 1, max 3) is the re-implementation pool and
-  `retry` (default 1 attempt, 60s backoff, max 3) the separate INFRASTRUCTURE
-  pool an outage spends instead of the code's; a count out of range clamps to the
-  bound and a fractional one floors (the convention `cycles`/`reruns` keep), but
-  one that is not readable as a number at all (a blank, a `null`, a `false`, a
-  list) takes the DEFAULT — a typo must never be read as "no
-  retries" or "retry in a second". `candidate.require_clean`
-  (default true) refuses a dirty tree at submission rather than inside the
-  first gate, and `candidate.publish` (`bundle`|`branch`|`both`, default
-  `bundle`) is how the pinned commit is made reachable to a controller that does
-  not share a filesystem with the implementer. A candidate ALWAYS carries a
-  portable reference — there is no `none`, and writing it is an error (the
-  machine-local workspace path is recorded as provenance, never as the
-  reference). `bundle` is the default because it needs no credential and no
-  network: a `git bundle` of the candidate's commits into
-  `candidate.bundle_store`, a URI PREFIX that is `file://` (the default is
-  machine-local state under the user config home — a THIRD home, separate
-  from the shared graph home — `file://<userConfigHome>/candidates`; a
-  shared filesystem reaches further) or `https://` (the server's candidate
-  door, the remote-mode default) and nothing else — a zero-dependency client
-  cannot sign an object-store request, so `s3://` and its kin are refused at
-  parse rather than at the first publish; an `https://` store in LOCAL mode has
-  no candidate door behind it and is refused at worker startup once the
-  publisher lands. `branch` pushes an
-  immutable candidate ref to `candidate.remote` (the git remote name, resolved
-  to its URL at publish; default `origin`), `both` publishes both forms. A
-  `branch` publish with no remote is NOT a parse error (a parse cannot read a
-  checkout): it belongs at worker startup beside the `gh` capability check
-  `integration.mode: propose` makes, and lands with the publisher.
-  `gates[].rejudge_on_repin` (command gates only, default true; the `gate`
-  candidate node documents it) is the per-gate
-  half of this stage: acceptance is a property of the TIP, so a command gate
-  whose pass is on an ancestor of the candidate the item completes with is
-  re-run on the tip unless the operator explicitly opts that gate out.
-- `completion` (optional) — WHO writes the resolving edge that retires the work
-  item, and WHEN. `by: agent` is today's behavior (the implementer writes the
-  edge and flips the status), and stays the default for a factory that declares
-  no `implementation` block. `by: controller` moves both onto the runner: the
-  implementer submits a candidate and writes NO resolving edge, so a pending or
-  refused pipeline releases none of the item's dependents — queue liveness is
-  edge-derived, which is why a claim written before any gate ran released them
-  all. `after` is the boundary — `gates` or `integration` — defaulting to the
-  LAST stage the factory actually declares, so it is reachable by construction;
-  declaring `integration` without an `integration` block is an error, because a
-  boundary that can never be reached leaves every item unresolved forever.
-  Declaring an `implementation` block that PARSES defaults `by` to `controller`:
-  the block is the opt-in, and controller-written completion is the semantics it
-  asks for. A block that refuses the factory adopted nothing and leaves the
-  boundary on the agent, so a typo in the stage never moves who completes.
-  The boundary is adoptable ALONE, with the stage left at its defaults.
-  `screenshots: optional|required` is an optional policy under controller
-  completion (undeclared means optional). The controller verifies the candidate
-  account's digest-pinned assets before writing its completion; missing required
-  evidence retains the execution hold and completion write debt. Optional upload
-  failures are text in the completion report. Images never attest gate success.
-- **What of this the runner executes.** All of it is PARSED and validated — a
-  mistyped stage refuses to start the worker (2026.09.05.1 read the earlier
-  `none`|`branch`|`bundle` publish vocabulary, which is why a `publish: none`
-  factory now refuses) — and as of `schema_version` 2026.09.06.1 the completion
-  half RUNS: `completion.by: controller` arms the execution hold on the item,
-  turns the worker contract's resolve step into a candidate submission, pins the
-  candidate the gates judge and has the runner write the resolving edge and the
-  terminal status at `completion.after` (WORKERS.md §10.12-§10.14). So do
-  `implementation.author_checks` and `.instructions`, which shape that contract.
-  Candidate publication also runs: `candidate.publish`/`remote`/`bundle_store`
-  govern how the pinned commit is made reachable (`bundle` | `branch` | `both`),
-  `spor work` refuses to start a factory this box cannot publish from, and a
-  publish failure owes `publish_pending` rather than refusing the pin.
-  `candidate.require_clean` also runs (issue-spor-candidate-require-clean-
-  parsed-never-read): the pin itself refuses, with its own reason, on a
-  checkout with uncommitted tracked changes — moved to submission rather than
-  left to the first command gate's own (still-unconditional) dirty-tree
-  refusal. The rest of the stage — `profile` routing, `budget`, `retry` and
-  `gates[].rejudge_on_repin` — is validated but not yet spent: the stage's own
-  dispatch loop lands with the remaining items of FACTORY-IMPLEMENTATION-
-  STAGE.md §8 (task-spor-factory-implementation-stage-runner,
-  task-spor-factory-execution-outcome-classifier). Declaring those keys today
-  is a DECLARATION of intent the runner already validates; it changes nothing
-  about what a worker does now.
+Keys (the full contract is WORKERS.md §10 in the spor repo; every block is
+parsed fail-closed, so a mistyped factory refuses to start the worker rather
+than running it ungated):
 
-`resolution` (2026.09.06.2, issue-spor-offline-check-get-hook-resolution-proxy):
-the attestation path for this type's completion, DECLARED as registry data.
-`verified_by: status` — a factory's own terminal status retires it; no inbound
-resolving edge attests it. Readers (remote dispatch's terminal-state verify,
-`spor schema`) used to infer this from the ABSENCE of a `get()` hook on this
-schema, which is the general-purpose read-time enrichment verb and says
-nothing about resolution — so adopting one here for any other purpose would
-have silently flipped this type to edge-verified and read genuinely
-status-retired work as unattested. Declaration only — enforcement stays in the
-hooks — no stored-shape change, no upgrade chain.
+- `trusted_ref` (default `main`) — where a command gate's suite is taken from.
+  The implementer branch's copy of the tests is never what runs (§10.3).
+- `repos` — the repos this factory may judge; undeclared, the factory node's
+  own `repo:` stamp, else unscoped. Out-of-scope items are skipped visibly,
+  never gated. Declaring it EMPTY is an error (§10.1).
+- `protected_paths` + `test_lane_profile` — a change touching a protected path
+  fails its command gate CLOSED, unrun, and the test change is filed to the
+  lane. Paths without a lane is an error (§10.3).
+- `risk_classes` — named path predicates a gate of any kind keys on to ARM
+  itself. A gate naming an undeclared class is an error (§10.5).
+- `gates` — the ordered list; per-gate keys (`cycles`, `reruns`, `isolate`,
+  `ci`, `rejudge_on_repin`, review fallbacks) are documented on schema-gate.
+- `integration` (optional) — the merge-queue landing stage after every gate
+  passes: a candidate merge of the branch into `target_ref` (`strategy`
+  merge/squash/rebase), the suite run on it with protected paths forced to the
+  trusted copy, and a compare-and-swap land — or `mode: propose`, which opens a
+  PR via `gh` and parks the item. Accepts `reruns` and `ci` like a command gate
+  (§10.9).
+- `rescue` (optional) — `profile` (required), `attempts` (1..3, default 1),
+  `await_ms` (default 1h), `instructions`. Before any human escalation, a
+  strong-model lane diagnoses and fixes in the run's checkout, then the whole
+  gate list is re-run under a fresh cycle budget (§10.10).
+- `implementation` (optional) — the stage that PRODUCES the candidate. Routes
+  by `profile` only (lowest precedence); any launch key (`command`, `args`,
+  `argv`, `bin`, `exec`, `entrypoint`, `env`, `report`, `session`,
+  `launch_mode`, `identity_mode`) is refused by name. `instructions` is
+  appended to the worker contract; `author_checks` names command gate ids the
+  implementer runs itself (default none). `budget` (`run_max_ms`/`run_idle_ms`
+  inherit the worker's ceilings; `attempts` 1..3) is the code pool, `retry`
+  (1 attempt, 60s backoff, max 3) the infrastructure pool. An unreadable count
+  takes the default, never zero. `candidate.require_clean` (default true)
+  refuses a dirty tree at submission; `candidate.publish` is `bundle` (default;
+  `bundle_store` a `file://` or `https://` prefix), `branch` (to
+  `candidate.remote`, default `origin`) or `both` — there is no `none`
+  (§10.12, §10.14, §10.16).
+- `completion` (optional) — who writes the resolving edge, and when. `by:
+  agent` (default without an `implementation` block) leaves it to the
+  implementer; `by: controller` (default when an implementation block parses)
+  holds the item and has the runner write the edge and terminal status at
+  `after: gates|integration`, defaulting to the last declared stage. Naming
+  `integration` without the block is an error. `screenshots:
+  optional|required` sets evidence policy under controller completion
+  (§10.13, §10.14.1).
+
+`resolution` declares `verified_by: status`: a factory's own terminal status
+retires it; no inbound resolving edge attests it. Declaration only — no
+stored-shape change, no upgrade chain.
 
 ```json
 {

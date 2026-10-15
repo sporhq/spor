@@ -6,9 +6,6 @@ schema_version: 2026.10.09.1
 title: Schema for uses-asset edges
 summary: Edge schema for asset inclusion — this document embeds the target asset descriptor (an artifact naming immutable bytes held outside graph Git), so retention, history and briefings can see what a document shows.
 date: 2026-10-09
-edges:
-  - {type: derived-from, to: art-spor-chatgpt-workspace-plan-2026-10-08}
-  - {type: derived-from, to: dec-spor-chatgpt-asset-storage-contract-2026-10-08}
 ---
 
 Asset inclusion as its own edge type (task-spor-chatgpt-content-contracts). The

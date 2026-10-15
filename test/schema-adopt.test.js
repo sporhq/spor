@@ -135,6 +135,26 @@ test("schema adopt (local) writes a proposed resident with provenance stamps, by
   assert.ok(!reg.edge_types.some((e) => e.type === "member-of-program"), "proposed resident stays out of the registry");
 });
 
+test("every candidate fits the server body cap and links nothing outside the pack", () => {
+  // Adopt writes a candidate VERBATIM into someone else's graph — a fresh
+  // standalone graph, or a tenant through the server's write door. So a
+  // candidate body over the server's 8192B cap is a write the server rejects
+  // (and a validate warning locally), and an edge to a node in the graph the
+  // candidate was AUTHORED in (a dec-/task- provenance link) dangles in every
+  // graph that adopts it. Cite provenance in prose, never as an edge.
+  const packIds = new Set([
+    ...CANDS.map((c) => c.id),
+    ...fs.readdirSync(path.join(__dirname, "..", "lib", "seed")).filter((f) => f.endsWith(".md")).map((f) => f.slice(0, -3)),
+  ]);
+  for (const c of CANDS) {
+    const bytes = Buffer.byteLength(c.node.body || "", "utf8");
+    assert.ok(bytes <= 8192, `${c.file}: body is ${bytes}B, over the server's 8192B cap`);
+    for (const e of c.node.edges || []) {
+      assert.ok(packIds.has(e.to), `${c.file}: edge ${e.type} -> ${e.to} leaves the shipped pack and dangles in an adopting graph`);
+    }
+  }
+});
+
 test("schema adopt --activate (local) registers the type and clears the overview footer", () => {
   const { home, nodes } = fixtureGraph();
   // Before adoption the overview footers the unadopted candidate (both the
