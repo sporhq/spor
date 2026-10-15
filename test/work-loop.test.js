@@ -3623,6 +3623,90 @@ test("makeCodeMovedNotice requireCodeChange: a docs-only land does not drain a d
   assert.strictEqual(defaulted(), g("rev-parse", "--short", "HEAD"), "a land under the published paths drains");
 });
 
+// issue-spor-local-integration-leaves-worker-checkout-stale-restart-loops: a
+// local-mode integration moves the target REF (`git update-ref`), not the
+// detached checkout the worker loaded from, so a restart there loaded the
+// same old commit and drained again every poll. A `reach` notice drains only
+// when a restart can load the tip, and `advance()` fast-forwards a clean
+// detached checkout at the drain's exit.
+test("makeCodeMovedNotice reach: a detached checkout is advanced to the landed tip; one a restart cannot move withholds the drain", () => {
+  const { makeCodeMovedNotice, loadedCodeCommit, codeWatchRef, codeCheckoutReach } = require("../bin/spor.js");
+  const { execFileSync } = require("child_process");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-reach-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...gitEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "package.json"), '{"name":"x","version":"0.0.1","files":["lib"]}\n');
+  fs.mkdirSync(path.join(repo, "lib"));
+  fs.writeFileSync(path.join(repo, "lib", "i.js"), "1\n");
+  g("add", "."); g("commit", "-q", "-m", "one");
+  g("checkout", "-q", "--detach", "main"); // land.sh keeps the worker checkout detached
+  // A local-mode land: a commit on top of main, written to the REF only.
+  const land = (content) => {
+    const blob = execFileSync("git", ["-C", repo, "hash-object", "-w", "--stdin"], { input: content, encoding: "utf8", env: gitEnv() }).trim();
+    const base = g("rev-parse", "main");
+    g("read-tree", "--index-output=" + path.join(repo, ".git", "land-index"), base);
+    const env = { ...gitEnv(), GIT_INDEX_FILE: path.join(repo, ".git", "land-index"), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" };
+    execFileSync("git", ["-C", repo, "update-index", "--cacheinfo", `100644,${blob},lib/i.js`], { env });
+    const tree = execFileSync("git", ["-C", repo, "write-tree"], { encoding: "utf8", env }).trim();
+    const commit = execFileSync("git", ["-C", repo, "commit-tree", tree, "-p", base, "-m", "land"], { encoding: "utf8", env }).trim();
+    g("update-ref", "refs/heads/main", commit, base);
+    return g("rev-parse", "--short", commit);
+  };
+  const loaded = loadedCodeCommit(repo);
+  assert.deepStrictEqual(loaded, { commit: g("rev-parse", "--short", "HEAD"), branch: null });
+  const watch = codeWatchRef(loaded, { root: repo, targetRef: "main" });
+  assert.strictEqual(watch, "main");
+  const lines = [];
+  const notice = makeCodeMovedNotice(loaded, { root: repo, log: (l) => lines.push(l), ref: watch, reach: true });
+  assert.strictEqual(notice(), undefined, "nothing landed");
+  const two = land("2\n");
+  assert.strictEqual(g("rev-parse", "--short", "HEAD"), loaded.commit, "the land left the detached checkout behind (the bug's premise)");
+  assert.strictEqual(codeCheckoutReach(loaded, two, repo).state, "advance");
+  assert.strictEqual(notice(), two, "a clean detached checkout at the loaded commit can reach the land: drain");
+  const adv = notice.advance();
+  assert.strictEqual(adv.state, "advanced");
+  assert.strictEqual(g("rev-parse", "--short", "HEAD"), two, "the checkout now sits on the landed commit");
+  assert.strictEqual(g("status", "--porcelain"), "", "and its tree is the landed tree, clean");
+  assert.strictEqual(fs.readFileSync(path.join(repo, "lib", "i.js"), "utf8"), "2\n");
+  assert.ok(lines.some((l) => /moved .* \(detached\) from .* to /.test(l)), lines.join("\n"));
+  // The relaunched worker loads the landed commit and has nothing to drain for:
+  // no restart loop.
+  const relaunched = loadedCodeCommit(repo);
+  assert.strictEqual(relaunched.commit, two);
+  const again = makeCodeMovedNotice(relaunched, { root: repo, log: () => {}, ref: "main", reach: true });
+  assert.strictEqual(again(), undefined, "the restarted worker is current — no exit on its first poll");
+
+  // Local edits: never advanced over. The drain is WITHHELD (said once) rather
+  // than looping, and released on a later pass once the checkout can reach it.
+  const lines2 = [];
+  const n2 = makeCodeMovedNotice(relaunched, { root: repo, log: (l) => lines2.push(l), ref: "main", reach: true });
+  fs.writeFileSync(path.join(repo, "lib", "i.js"), "local edit\n");
+  const three = land("3\n");
+  assert.strictEqual(n2(), undefined, "a dirty checkout cannot reach the land: no drain");
+  assert.strictEqual(n2(), undefined);
+  assert.strictEqual(lines2.filter((l) => /NOT draining for/.test(l)).length, 1, "said once per tip: " + lines2.join("\n"));
+  assert.match(lines2.find((l) => /NOT draining/.test(l)), /uncommitted changes/);
+  assert.strictEqual(n2.advance().state, "stuck", "advance refuses over local edits");
+  assert.strictEqual(fs.readFileSync(path.join(repo, "lib", "i.js"), "utf8"), "local edit\n", "the edit is untouched");
+  g("checkout", "-q", "--", "lib/i.js");
+  assert.strictEqual(n2(), three, "once clean, the owed land drains with no new land");
+
+  // A checkout on a branch other than the watched ref is not ours to move.
+  const head3 = loadedCodeCommit(repo);
+  g("checkout", "-q", "-b", "side");
+  const n3 = makeCodeMovedNotice({ commit: g("rev-parse", "--short", "HEAD"), branch: "side" }, { root: repo, log: () => {}, ref: "main", reach: true });
+  land("4\n");
+  assert.strictEqual(n3(), undefined, "HEAD on another branch: a restart would load it again");
+  assert.match(codeCheckoutReach({ commit: head3.commit, branch: "side" }, "main", repo).why, /branch side, not detached/);
+  // A person moved HEAD off the loaded commit: left alone.
+  g("checkout", "-q", "--detach", "main~1");
+  assert.match(codeCheckoutReach({ commit: head3.commit, branch: null }, "main", repo).why, /moved off the loaded commit/);
+  // Without `reach` (a worker that does not drain) the notice is unchanged: a
+  // land is returned whatever state the checkout is in.
+  const plainNotice = makeCodeMovedNotice({ commit: head3.commit, branch: null }, { root: repo, log: () => {}, ref: "main" });
+  assert.strictEqual(plainNotice(), g("rev-parse", "--short", "main"));
+});
+
 // ------------------------------------------- program-scoped work (--program) --
 // task-spor-program-scoped-factory-execution: `spor work --program <id>` is a
 // SELECTION scope over this same loop — the candidate set is the program's

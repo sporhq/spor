@@ -109,3 +109,54 @@ test("planWork refuses a factory that does not load, and a worker never starts u
   assert.equal(await createWorker(host).planWork(cfg, { values: { factory: "factory-bad" } }), 1);
   assert.match(lines.err.join("\n"), /cannot be used[\s\S]*gates: missing[\s\S]*does not run ungated/);
 });
+
+// issue-spor-local-integration-leaves-worker-checkout-stale-restart-loops: a
+// draining worker asks the notice to judge whether a restart can REACH the land
+// (`reach`), and once the drain exits it advances the code checkout onto it —
+// a worker that does not drain asks for neither.
+test("executeWork: a --restart-on-land exit advances the code checkout; a worker that does not drain never does", async () => {
+  const drive = async (values) => {
+    const { home, cfg } = scratch();
+    const lines = [];
+    const seen = { opts: null, advanced: 0 };
+    const host = {};
+    for (const k of HOST_FUNCTIONS) host[k] = () => null;
+    Object.assign(host, {
+      out: (s) => lines.push(s),
+      err: (s) => lines.push(`ERR ${s}`),
+      isAgentId: () => false,
+      loadedCodeCommit: () => ({ commit: "abc1234", branch: null }),
+      codeWatchRef: () => "main",
+      workerCodeIdentity: () => ({ stamp: null, commit: null, branch: null, repo: null }),
+      makeCodeMovedNotice: (_loaded, opts) => {
+        seen.opts = opts;
+        const notice = () => "def5678";
+        notice.advance = () => {
+          seen.advanced += 1;
+        };
+        return notice;
+      },
+      dispatchableQueuePage: async () => [],
+      dispatchedAgents: () => new Map(),
+      annotateInFlight: (items) => ({ items }),
+      pollWorkRuns: async () => [],
+    });
+    try {
+      const worker = createWorker(host);
+      const plan = await worker.planWork(cfg, { values: { interval: "1", "max-interval": "1", ...values } });
+      assert.equal(typeof plan, "object", lines.join("\n"));
+      const code = await worker.bindWork(cfg, plan).executeWork();
+      return { code, lines, seen };
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  };
+  const draining = await drive({ "restart-on-land": true });
+  assert.equal(draining.code, 0);
+  assert.equal(draining.seen.opts.reach, true, "the drain asks whether a restart reaches the land");
+  assert.equal(draining.seen.advanced, 1, draining.lines.join("\n"));
+  assert.match(draining.lines.join("\n"), /exited for a restart \(--restart-on-land\)/);
+  const plain = await drive({ "no-restart-on-land": true, once: true });
+  assert.equal(plain.seen.opts.reach, undefined, "a worker that never drains reads nothing more");
+  assert.equal(plain.seen.advanced, 0);
+});
