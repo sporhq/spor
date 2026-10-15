@@ -2606,6 +2606,27 @@ before it died did produce work, and that work is judged like any other fix. A
 fix REFUSED before any run record existed is `unroutable`, spends neither pool
 and — like a review outage — is never handed to the rescue lane.
 
+Under controller completion an `unroutable` gate dispatch also ENDS the
+execution and clears the item's hold (§4.2 T1 — nothing is judging the item),
+so the run's own execution can never be claimed again. `spor work --regate
+<run>` is still the escalation's door back: when the store authoritatively
+reads the run's execution as ended (and not `completed`), the re-gate opens
+the item's SUCCESSOR execution (the next pipeline attempt), re-stamps the hold
+to it, and re-points the run record's `impl_claim` (`succeeds: <old id>`)
+before judging the same run and candidate under it
+(`openSuccessorExecution`, bin/spor.js). A hold some OTHER execution now
+carries is a newer owner: the successor is ended and the re-gate refused. Each
+step is idempotent, so an interrupted re-gate is re-driven by running it
+again. A pipeline that resumes under an ended execution reports it as
+terminal, never as "held by another worker". A member still bound to a live
+program run opens only through that run's admission (the server refuses an
+unbound open `admitted_to_run`), so the successor is re-opened carrying the
+run's binding (`admitSuccessorThroughRun`): an unowned or lapsed run lease is
+taken for the open and released straight after; a run controlled by a `spor
+work` worker live on THIS box (same principal) admits through that worker's
+binding; a run controlled anywhere else is refused naming its holder — never
+stolen.
+
 The same reading is what the loop's own surfaces report: a terminal run whose
 class is not `completed` carries `execution_class` on its `spor work --status`
 entry (and in `--status --json`), so a box whose runs are all dying on credit

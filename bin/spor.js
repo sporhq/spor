@@ -15591,6 +15591,163 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
   return { ok: true, executionId, fence, store: store.mode, recordFields };
 }
 
+// The `--regate` door back from an ENDED execution
+// (issue-spor-unroutable-gate-terminally-refuses-execution-blocks-regate).
+// §4.2 T1 ends the execution and clears the hold when a gate's dispatch is
+// refused before it starts (`unroutable` — nothing is judging the item), so
+// the run's own execution is terminal and a re-gate cannot claim it. The
+// escalation T1 files still names `spor work --regate` as the way back, so
+// this opens the item's NEXT execution (the store addresses it by the next
+// pipeline attempt), re-stamps the item's hold to it, and re-points the run
+// record's claim — the re-gate then judges the same run and candidate under
+// an execution it owns. Only an execution the store AUTHORITATIVELY reads as
+// ended and not `completed` is succeeded; anything else returns `{ok: true,
+// succeeded: false}` and the re-gate proceeds exactly as before.
+//
+// Every step is idempotent, so a crash anywhere is re-driven by the next
+// --regate: the open replays the live successor to its owner, the hold
+// re-stamps as `restamped`, and the claim stamp is a plain overwrite. The
+// ended execution's settled debts are reconciled first, never acted on: a
+// `completion_execution_end` naming it is cleared (its release is done — the
+// store says so), and a hold still naming it (a withdrawal whose last step
+// was owed) is cleared by CAS on that exact id. A hold naming any OTHER
+// execution is a newer owner: the successor is ended and the re-gate refused.
+async function openSuccessorExecution(cfg, record, factory, { home = cfg.userConfigHome(), log = () => {}, own } = {}) {
+  if (!completionKernel.isControllerRecord(record)) return { ok: true, succeeded: false };
+  const claim = record.impl_claim;
+  if (!claim.store || !claim.execution_id) return { ok: true, succeeded: false };
+  const store = openExecutionStoreFor(cfg, { home, mode: claim.store, log });
+  let seen;
+  try {
+    seen = await store.get(claim.execution_id);
+  } catch (e) {
+    seen = { ok: false, message: String((e && e.message) || e) };
+  }
+  // A cached copy or a failed read is not evidence the execution ended: the
+  // re-gate's own claim then decides, as it always has.
+  if (!seen || !seen.ok || seen.cached || !seen.execution || !executionKernel.isTerminal(seen.execution)) return { ok: true, succeeded: false };
+  if (seen.execution.stage === "completed") return { ok: true, succeeded: false };
+  const prior = claim.execution_id;
+  if (record.completion_execution_end && record.completion_execution_end.execution_id === prior) {
+    const cleared = dispatchRuns.stampCompletionState(home, record.run_id, { completion_execution_end: null }, { own });
+    if (!cleared || cleared.owner_refused) return { ok: false, reason: `the ended execution's release debt could not be cleared${cleared && cleared.owner_refused ? ` (${cleared.owner_refused})` : ""}` };
+  }
+  const deps = makeCompletionDeps(cfg, { home });
+  const stale = await completionShell.clearHold({ nodeId: record.node_id, executionId: prior, deps });
+  if (!stale.ok && !stale.foreign) return { ok: false, reason: `the hold of ended execution ${prior} could not be cleared from ${record.node_id}: ${stale.reason}` };
+  const gates = (factory.gates || []).map((g) => ({ id: g.id, node_id: g.source && g.source !== "inline" ? String(g.source) : null, rejudge_on_repin: g.rejudgeOnRepin !== false }));
+  const boundary = (claim.completion && claim.completion.after) || (factory.completion && factory.completion.after) || "gates";
+  const openArgs = { node_id: record.node_id, factory: factory.id, gates, boundary, repo: record.item_repo || null };
+  let opened = await store.open(openArgs);
+  // A member still bound to a live PROGRAM RUN opens only through that run's
+  // admission (the server's openGuard refuses an unbound open
+  // `admitted_to_run`), so the successor is re-opened carrying the run's
+  // binding — the same door the run's controller admitted the first one
+  // through, which also records the successor as the run's child.
+  if (!opened.ok && opened.code === "admitted_to_run" && store.mode === "remote") {
+    const admitted = await admitSuccessorThroughRun(cfg, store, openArgs, opened, { home, log });
+    if (!admitted.ok) return { ok: false, reason: `the successor of ended execution ${prior} could not be opened on ${record.node_id}: ${admitted.reason}` };
+    opened = admitted.opened;
+  }
+  if (!opened.ok) return { ok: false, reason: `the successor of ended execution ${prior} could not be opened on ${record.node_id} (${opened.code}: ${opened.message})` };
+  let fence = opened.fence;
+  let execution = opened.execution;
+  if (fence == null) {
+    // The item already has a live execution this caller does not own: a
+    // re-gate never takes an item another execution is working.
+    const claimed = await store.claim(execution.execution_id, {});
+    if (!claimed.ok) return { ok: false, reason: `${record.node_id} is held by execution ${execution.execution_id} (${claimed.code}: ${claimed.message}); this re-gate does not take it` };
+    fence = claimed.fence;
+    execution = claimed.execution;
+  }
+  const next = execution.execution_id;
+  const held = await completionShell.stampHold({ nodeId: record.node_id, executionId: next, deps });
+  if (!held.ok) {
+    try {
+      await store.terminate(next, { fence, reason: held.reason });
+    } catch {
+      /* best effort — the lease lapses on its own */
+    }
+    return { ok: false, reason: `the hold for successor execution ${next} was refused: ${held.reason}` };
+  }
+  const stamped = dispatchRuns.stampImplState(home, record.run_id, {
+    impl_claim: {
+      ...claim,
+      execution_id: next,
+      claimed_at: held.pins.claimed_at,
+      factory: { node_id: factory.id, revision: factory.revision || null },
+      item_revision: held.pins.revision,
+      resolving_snapshot: held.pins.resolving_snapshot,
+      status_snapshot: held.pins.status_snapshot,
+      store: store.mode,
+      tenant: execution.tenant,
+      pipeline_attempt: execution.pipeline_attempt,
+      fence,
+      lease_expires_at: execution.owner ? execution.owner.lease_expires_at : null,
+      worker: execution.owner ? execution.owner.worker : null,
+      machine: execution.owner ? execution.owner.machine : null,
+      gates: gates.map((g) => g.id),
+      succeeds: prior,
+    },
+  }, { own });
+  if (!stamped || stamped.owner_refused) return { ok: false, reason: `the run record could not be re-pointed at successor execution ${next}${stamped && stamped.owner_refused ? ` (${stamped.owner_refused})` : ""}` };
+  log(`work: ${record.node_id} — execution ${prior} had ended (${seen.execution.stage}); re-gating under its successor ${next} (attempt ${execution.pipeline_attempt}, ${store.mode} store, fence ${fence})`);
+  return { ok: true, succeeded: true, prior, executionId: next, fence };
+}
+
+// The successor open of a member bound to a live program run
+// (openSuccessorExecution): the open must carry the run's admission binding
+// {run_id, fence, instance}, which only the run lease's holder can present.
+// Two holders qualify, and nothing else is ever borrowed or stolen:
+//   - nobody (no owner, or a lapsed/released lease): this re-gate claims the
+//     run lease under its own process instance, admits the successor, and
+//     releases the lease again (a release is not terminal on the server — it
+//     only frees the run for the next worker, keeping its fence counter);
+//   - a `spor work` worker LIVE on THIS box under the same principal: the
+//     re-gate admits through that worker's binding, since the run's controller
+//     is this box's own worker and the server checks principal, machine,
+//     instance and fence (a lost or advanced lease refuses `fence_stale`/
+//     `not_owned`, never a silent admission).
+// A run another machine (or a dead/foreign process) controls is refused,
+// naming the holder — the re-gate then runs where the run is controlled, or
+// after its lease lapses. A run that is not admitting (paused, draining,
+// terminal) refuses with the server's own reason.
+async function admitSuccessorThroughRun(cfg, store, openArgs, refusal, { home = cfg.userConfigHome(), log = () => {}, client: clientOverride = null } = {}) {
+  const programRuns = require(path.join(ROOT, "lib", "shell", "program-runs.js"));
+  const named = /program run (\S+?)[\s(;,]/.exec(String(refusal.message || ""));
+  const runId = refusal.run_id || (named ? named[1] : null);
+  if (!runId) return { ok: false, reason: `it is bound to a program run this client cannot name (${refusal.code}: ${refusal.message})` };
+  const machine = os.hostname();
+  const client = clientOverride || programRuns.createProgramRunClient(cfg, { remote, machine, instance: `regate-${executionInstance()}` });
+  const read = await client.get(runId);
+  if (!read.ok || !read.run) return { ok: false, reason: `program run ${runId} binds it and could not be read (${read.code}: ${read.message})` };
+  const owner = read.run.owner || null;
+  const leaseLive = !!(owner && owner.lease_expires_at && Date.parse(owner.lease_expires_at) > Date.now());
+  let binding = null;
+  let claimed = null;
+  if (leaseLive) {
+    const ours = owner.machine === machine && workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner.instance);
+    if (!ours) return { ok: false, reason: `it is admitted to program run ${runId}, controlled by ${owner.worker || "another worker"} on ${owner.machine || "another machine"} until ${owner.lease_expires_at}; re-gate it on that machine, or once the run's lease lapses` };
+    binding = { run_id: runId, fence: owner.fence, instance: String(owner.instance) };
+  } else {
+    const c = await client.claim(runId, {});
+    if (!c.ok) return { ok: false, reason: `program run ${runId} binds it and its lease could not be taken for the re-admission (${c.code}: ${c.message})` };
+    claimed = c.fence;
+    binding = { run_id: runId, fence: c.fence, instance: String(client.instance) };
+  }
+  try {
+    const opened = await store.open({ ...openArgs, program_run: binding });
+    if (!opened.ok) return { ok: false, reason: `program run ${runId} refused its re-admission (${opened.code}: ${opened.message})` };
+    log(`work: ${openArgs.node_id} — re-admitted through program run ${runId} (${claimed != null ? `lease taken at fence ${claimed} for the open` : `this box's worker ${binding.instance} controls it`})`);
+    return { ok: true, opened, run_id: runId };
+  } finally {
+    if (claimed != null) {
+      const r = await client.release(runId, { fence: claimed });
+      if (!r.ok) log(`work: program run ${runId} — the re-gate's release was not confirmed (${r.code}: ${r.message}); the lease lapses on its own`);
+    }
+  }
+}
+
 // ---- the execution store's CLI wiring (task-spor-client-execution-store-adapter) ----
 
 // The worker PRINCIPAL a local execution is owned by: this box's default
@@ -16504,8 +16661,13 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       // completion — is theirs. This pass judges nothing, files nothing, and
       // settles `blocked` naming the holder, so the record says why and a
       // person (or that worker's own completion) decides what happens next.
+      // ...or the execution has ENDED, which no worker holds: say that, not
+      // "held by another worker" (issue-spor-unroutable-gate-terminally-
+      // refuses-execution-blocks-regate).
       const h = resumed.holder;
-      const reason = `execution ${reporter.id} is held by ${h ? `${h.worker}${h.machine ? ` on ${h.machine}` : ""} until ${h.lease_expires_at}` : "another worker"} (${resumed.code}); this worker does not judge an execution it does not own`;
+      const reason = resumed.code === "execution_terminal"
+        ? `execution ${reporter.id} is terminal in the store (${resumed.message || resumed.code}); nothing is judged under an ended execution`
+        : `execution ${reporter.id} is held by ${h ? `${h.worker}${h.machine ? ` on ${h.machine}` : ""} until ${h.lease_expires_at}` : "another worker"} (${resumed.code}); this worker does not judge an execution it does not own`;
       ctx.log(`work: ${entry.node_id} — ${reason}`);
       return { state: "blocked", reason, facts: [], gates: [], demoted: false, noRescue: true };
     }
@@ -18014,11 +18176,23 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     if (!ownedReopen(dispatchRuns.stampImplState(home, record.run_id, { impl_state: "running", impl_attempt: 1 }, { force: true, own: gateClaim.token }), "reopening the implementation stage")) return 1;
     out(`work: re-gating ${record.node_id} — its implementation stage had settled '${record.impl_state}'; re-judging the run under attempt ${attempt}`);
   }
+  // An execution that already ENDED (a gate dispatch refused `unroutable`
+  // ends it under §4.2 T1) cannot be claimed again, so the re-gate opens the
+  // item's successor execution and judges under that
+  // (issue-spor-unroutable-gate-terminally-refuses-execution-blocks-regate).
+  let judged = record;
+  const successor = await openSuccessorExecution(cfg, record, factory, { home, log: (line) => out(line), own: gateClaim.token });
+  if (!successor.ok) {
+    try { dispatchRuns.releasePipeline(home, record.run_id, gateClaim.token); } catch { /* lapses on its TTL */ }
+    err(`spor work --regate: ${successor.reason}; no judgement started`);
+    return 1;
+  }
+  if (successor.succeeded) judged = dispatchRuns.readJson(dispatchRuns.runPaths(home, record.run_id).record) || record;
   const entry = { run_id: record.run_id, node_id: record.node_id, harness: record.harness || null, project, attempt };
   if (report) report.judged = true;
   let res;
   try {
-    res = await runGateAndIntegration(cfg, entry, record, {
+    res = await runGateAndIntegration(cfg, entry, judged, {
       factory, slug, passthrough, warn, runMaxMs, home,
       workerId, gateClaim,
       log: (line) => out(line),
@@ -22557,7 +22731,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { resumeProviderAttempt, providerAttemptSweep, gcExecutionsDue, gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, replaceIfUnchanged, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess, createDispatchWorktree, removeDispatchWorktree };
+module.exports = { openSuccessorExecution, admitSuccessorThroughRun, resumeProviderAttempt, providerAttemptSweep, gcExecutionsDue, gateNodeEquivalent, dispatchThrough, regateStageName, stageWorkflowJournal, launchedRunNamed, withdrawHeldExecution, reconcileWithdrawnExecutions, spawnCaptureSync, forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, cmdWorkRegateFlakes, flakeSweepPlan, coveringFlakeNodes, casFlakeRegateReservation, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, programQueueEntries, ladderWidth, extractOrgFlag, isCredentialAcquisition, isCredentialStoreAccess, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, codeTip, codeMovedPast, codePathsChanged, workerCodeIdentity, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, splitNodeDocuments, resolverFirstOrder, chunkPutEntries, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, escalateParkedPipeline, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, replaceIfUnchanged, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, executionInstance, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, HELD_REPORTERS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig, ACCESS_CLASSES, AUTH_SUBCOMMANDS, commandAccess, createDispatchWorktree, removeDispatchWorktree };
 
 if (require.main === module) {
   main()
