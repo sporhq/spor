@@ -12379,3 +12379,23 @@ test("controller completion WITHOUT an implementation block pins and submits the
     assert.deepStrictEqual(g.seen.suites, [], "no gate is judged without a submitted candidate");
   }
 });
+
+// issue-spor-integration-landed-not-recorded-on-server-execution: a gate
+// whose fact write failed (a server timeout) still has a verdict that stands,
+// and the execution store must hear it — keyed on the fact's deterministic id
+// — or it refuses the integration start and every completion after it.
+test("a gate verdict whose fact could not be written is still reported to the execution store, keyed on the fact's minted id", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const f = fakes();
+  const minted = [];
+  f.deps.recordFact = async (args) => { minted.push(args.id); return { ok: false, reason: "server did not answer (timed out after 15000ms)" }; };
+  const reported = [];
+  f.deps.gateEvidenceRecorded = async (args) => { reported.push(args); return { ok: true }; };
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+  assert.equal(result.state, "passed");
+  assert.deepEqual(result.facts, [], "no fact landed");
+  assert.equal(reported.length, 1);
+  assert.equal(reported[0].gate.id, "acceptance");
+  assert.equal(reported[0].verdict, "passed");
+  assert.equal(reported[0].fact, minted[0], "the idempotency identity is the fact id the write would have used");
+});

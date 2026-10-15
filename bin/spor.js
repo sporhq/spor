@@ -16202,6 +16202,62 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
       integrationAttempt += 1;
       return send({ type: "integration.started", attempt: integrationAttempt, ...(key ? { idempotency_key: `${id}:integration:started:${key}` } : {}) });
     },
+    // The integration start the LAND is gated on (issue-spor-integration-
+    // landed-not-recorded-on-server-execution): fail CLOSED. Only a start the
+    // store RECORDED confirms; a permanent refusal, a deferred (spooled, not
+    // yet on the record) or held one, or a lost fence does not — a landing
+    // the store never saw start leaves an execution that can refuse
+    // `integration.settled` and every completion forever. A `gates_unsettled`
+    // refusal is first REPAIRED: the store's rows that are not accepted on the
+    // tip are re-sent from `gates` (the pipeline's own final per-gate results,
+    // the latest rescue pass winning), keyed on the candidate they judged so a
+    // repeated repair is recorded once, and the start is sent once more.
+    // Returns {ok:true} or {ok:false, code, reason}.
+    async startIntegration({ key = null, gates = [] } = {}) {
+      const why = (r) => `${(r && r.code) || "store"}: ${(r && r.message) || "the store did not record the integration start"}${r && (r.deferred || r.held) ? " (not yet on the store's record)" : ""}`;
+      let r = await reporter.integrationStarted({ key });
+      if (r && r.ok) return { ok: true };
+      if (!(r && r.code === "gates_unsettled")) return { ok: false, code: (r && r.code) || "store", reason: why(r) };
+      const repaired = await reporter.repairGates(gates);
+      if (!repaired.sent) return { ok: false, code: r.code, reason: `${why(r)}; ${repaired.reason}` };
+      r = await reporter.integrationStarted({ key: key ? `${key}/repaired` : null });
+      if (r && r.ok) {
+        log(`work: ${record.node_id} — execution ${id}: re-sent ${repaired.sent} gate verdict(s) the store had not accepted (${repaired.gates.join(", ")}); integration start recorded`);
+        return { ok: true, repaired: repaired.gates };
+      }
+      return { ok: false, code: (r && r.code) || "store", reason: `${why(r)} (after re-sending ${repaired.gates.join(", ")})` };
+    },
+    // Re-send the verdicts the store's record does not accept, from the
+    // pipeline's own per-gate results (see startIntegration). Reads the
+    // record fresh — a cached copy is no evidence of what the store holds.
+    async repairGates(gates = []) {
+      let g;
+      try {
+        g = await st.get(id);
+      } catch (e) {
+        g = { ok: false, message: String((e && e.message) || e) };
+      }
+      const rec = g && g.ok && !g.cached ? g.execution : null;
+      if (!rec) return { sent: 0, gates: [], reason: `the store's record could not be read (${(g && g.message) || "no answer"})` };
+      last = rec;
+      const latest = new Map();
+      for (const res of Array.isArray(gates) ? gates : []) {
+        if (!res || !res.gate || res.kind === "rescue") continue;
+        const cur = latest.get(String(res.gate));
+        if (!cur || (Number(res.rescue) || 0) >= (Number(cur.rescue) || 0)) latest.set(String(res.gate), res);
+      }
+      const sent = [];
+      for (const row of Array.isArray(rec.gate_results) ? rec.gate_results : []) {
+        if (!row || !row.id || executionKernel.gateAccepted(rec, row)) continue;
+        const res = latest.get(String(row.id));
+        const state = res ? GATE_VERDICT_TO_STATE[String(res.verdict || "")] : null;
+        if (state !== "passed" && state !== "skipped") continue;
+        const candidateId = res.candidate_id || (rec.candidate && rec.candidate.candidate_id) || null;
+        const r = await reporter.gateSettled(row.id, res.verdict, { candidateId, key: `repair:${candidateId || "tip"}:${res.fact || `r${Number(res.rescue) || 0}`}` });
+        if (r && r.ok && !r.skipped) sent.push(String(row.id));
+      }
+      return sent.length ? { sent: sent.length, gates: sent } : { sent: 0, gates: [], reason: "no passing verdict this pipeline holds could be re-sent for the store's unsettled gates" };
+    },
     // `key` (optional): the journaled identity of the pipeline step that
     // settles it. With one, the settle never takes the derived
     // `<x>:integration:<attempt>` key — whose attempt label a deduped start
@@ -16223,7 +16279,9 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
       LIVE_EXECUTIONS.delete(id);
       if (debt.phase !== "release") {
         const r = await send(debt.event);
-        if (!r.ok) return r;
+        // A permanently refused observation is settled (nothing re-sending it
+        // could change); the release it precedes is still owed.
+        if (!r.ok && !r.refused) return r;
         if (!stamp({ ...debt, phase: "release" })) return { ok: false, code: "conflict", message: "could not persist execution release phase" };
       }
       const released = await st.release(id, { fence });
@@ -16902,9 +16960,28 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       if (!completed.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the gates boundary (${completed.reason}); the debt stands and the next pass retries it`);
       return { ok: !!completed.ok, settled: completed.settled || null, reason: completed.reason || null };
     },
-    integrationStart: async () => {
+    // Fail CLOSED on the store (issue-spor-integration-landed-not-recorded-
+    // on-server-execution): the land waits on a start the store recorded —
+    // see the reporter's startIntegration. `pass` keys a re-try after the
+    // pipeline yielded on a refusal; `gates` is what a repair re-sends.
+    // `completedBeforeIntegration`: the completion was already written at the
+    // `gates` boundary, so the execution is terminal and refuses the start by
+    // design (execution_terminal) — the start is reported best-effort and the
+    // land proceeds; the store's boundary was the gates, and it was reached.
+    integrationStart: async ({ pass = 0, gates = [], completedBeforeIntegration = false } = {}) => {
+      assertOwner();
+      if (reporter && completedBeforeIntegration) {
+        const r = await reporter.integrationStarted({ key: `${item.run_id}/pipeline/a${Math.max(0, Number(item.attempt) || 0)}/integration/start${pass ? `/p${pass}` : ""}` });
+        if (!(r && r.ok)) ctx.log(`work: ${entry.node_id} — the execution store did not record the integration start (${(r && r.code) || "store"}); the item was completed at the 'gates' boundary, so the land proceeds`);
+      } else if (reporter) {
+        const key = `${item.run_id}/pipeline/a${Math.max(0, Number(item.attempt) || 0)}/integration/start${pass ? `/p${pass}` : ""}`;
+        const started = await reporter.startIntegration({ key, gates });
+        if (!started.ok) {
+          ctx.log(`work: ${entry.node_id} — the execution store did not record the integration start (${started.reason}); nothing is landed this pass`);
+          return { ok: false, code: started.code || null, reason: started.reason };
+        }
+      }
       stampOwned({ integration_state: "running" });
-      if (reporter) await reporter.integrationStarted({ key: `${item.run_id}/pipeline/a${Math.max(0, Number(item.attempt) || 0)}/integration/start` });
       return { ok: true };
     },
     integration: async ({ stage, regate: regateKey, completedBeforeIntegration, gateResult: gateIn, gateFacts: factsIn }) => {
