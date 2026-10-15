@@ -28,6 +28,7 @@ const completionKernel = require("../lib/kernel/completion.js");
 const store = require("../lib/shell/execution-store.js");
 const completionShell = require("../lib/shell/completion.js");
 const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+const workLoopLib = require("../lib/shell/work-loop.js");
 const gates = require("../lib/kernel/gates.js");
 const { loadConfig } = require("../lib/config.js");
 const spor = require("../bin/spor.js");
@@ -923,6 +924,70 @@ test("bin/spor.js callers stop at an execution THIS process lost: the gate pipel
     assert.equal(claims(), before, "neither caller re-claimed the lost execution");
     assert.equal(fake.record(id).owner.instance, "p-other-process");
     assert.equal(fake.record(id).stage === "refused" || !!fake.record(id).released_at, false, "nothing ended on the winner's behalf");
+  } finally {
+    spor.LIVE_EXECUTIONS.clear();
+    await fake.close();
+  }
+});
+
+// Two `spor work` workers on one box share its run journal
+// (issue-spor-work-workers-ping-pong-execution-fence): the per-pass completion
+// reconciler re-claimed EVERY owed controller record, and the kernel admits a
+// different instance of one (worker, machine) owner against a live lease and
+// advances the fence — so each worker re-took the other's execution every poll
+// and the fence ping-ponged. The sweep is scoped to the worker's own factory,
+// and never re-claims an execution a LIVE sibling process holds; a dead
+// sibling's is still taken over.
+test("two workers on one box: the completion reconciler never re-claims another factory's execution or one a live sibling process holds, and still takes over a dead sibling's", async () => {
+  const fake = await startFakeExecutionServer({ nodes: { "task-ping": itemNode("task-ping"), "factory-t": itemNode("factory-t") } });
+  try {
+    const home = tmp("ping-pong");
+    const cfg = remoteCfg(home, fake.base);
+    const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller", after: "gates" } });
+    const held = await spor.claimExecutionHold(cfg, { id: "task-ping" }, factory, { home });
+    assert.equal(held.ok, true, held.reason);
+    const record = { run_id: "run-ping", node_id: "task-ping", state: "done", ...held.recordFields };
+    const rp = dispatchRuns.runPaths(home, "run-ping");
+    fs.mkdirSync(path.dirname(rp.record), { recursive: true });
+    fs.writeFileSync(rp.record, JSON.stringify(record));
+    const id = record.impl_claim.execution_id;
+    const claims = () => fake.state.requests.filter((r) => r.path.endsWith("/claim")).length;
+    const reads = () => fake.state.requests.filter((r) => r.method === "GET" && r.path.startsWith(`/v1/executions/${id}`)).length;
+
+    // The other factory's worker: its sweep never touches this record at all.
+    const before = { claims: claims(), reads: reads(), fence: fake.record(id).owner.fence };
+    await spor.reconcileCompletions(cfg, { home, factory: "factory-other" });
+    assert.equal(claims(), before.claims, "a worker armed with another factory sends no claim");
+    assert.equal(reads(), before.reads, "...and does not even read the execution");
+    assert.equal(fake.record(id).owner.fence, before.fence);
+    // A renamed-from id is the factory's own.
+    assert.equal(workLoopLib.foreignFactoryRecord(record, "factory-new", ["factory-t"]), false);
+    assert.equal(workLoopLib.foreignFactoryRecord(record, "factory-other"), true);
+    assert.equal(workLoopLib.foreignFactoryRecord(record, null), false, "no factory: the box-wide sweep");
+    assert.equal(workLoopLib.foreignFactoryRecord({ run_id: "r" }, "factory-other"), false, "a record naming no factory is never foreign");
+
+    // A LIVE sibling process of this same owner (the test runner's parent pid
+    // stands in for it) holds the execution: even this factory's sweep leaves it.
+    const sibling = store.openExecutionStore(remoteCfg(tmp("ping-pong-sib"), fake.base), { machine: os.hostname(), instance: `${process.ppid}-sibling` });
+    const took = await sibling.claim(id, {});
+    assert.equal(took.ok, true, took.message);
+    const siblingFence = fake.record(id).owner.fence;
+    const lines = [];
+    const claimsLive = claims();
+    for (let pass = 0; pass < 3; pass++) await spor.reconcileCompletions(cfg, { home, log: (l) => lines.push(l), factory: "factory-t" });
+    assert.equal(claims(), claimsLive, "no pass re-claims a live sibling's execution");
+    assert.equal(fake.record(id).owner.fence, siblingFence, "the fence stays the sibling's");
+    assert.equal(fake.record(id).owner.instance, `${process.ppid}-sibling`);
+    assert.equal(lines.filter((l) => /held by another live process on this box/.test(l)).length, 1, `noted once: ${lines.join("\n")}`);
+
+    // A sibling whose process is GONE: its unexpired lease is still taken over
+    // (a restarted worker's takeover of its dead predecessor is unchanged).
+    const dead = store.openExecutionStore(remoteCfg(tmp("ping-pong-dead"), fake.base), { machine: os.hostname(), instance: `${Number(require("node:child_process").spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout)}-gone` });
+    assert.equal((await dead.claim(id, {})).ok, true);
+    const deadFence = fake.record(id).owner.fence;
+    await spor.reconcileCompletions(cfg, { home, factory: "factory-t" });
+    assert.equal(fake.record(id).owner.fence, deadFence + 1, "the dead sibling's lease is taken over");
+    assert.equal(fake.record(id).owner.instance, spor.executionInstance());
   } finally {
     spor.LIVE_EXECUTIONS.clear();
     await fake.close();

@@ -15912,6 +15912,33 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
       return held.length;
     },
     flushHeld: async () => (await flushHeld()) == null,
+    // The holder, when the execution is held RIGHT NOW by another live process
+    // of this same (worker, machine) owner — a sibling `spor work` on this box
+    // sharing its run journal. The kernel admits a different instance of one
+    // owner against a live lease and advances the fence (that is how a
+    // restarted process takes over its dead predecessor's execution), so a
+    // per-pass SWEEP that re-claims every owed record on the box would steal a
+    // live sibling's lease every poll and the two would ping-pong the fence
+    // (issue-spor-work-workers-ping-pong-execution-fence). The sweeps ask this
+    // first and leave the execution to its holder. Null whenever it cannot be
+    // shown — no answer, no lease, an expired one, another machine (the kernel
+    // refuses that itself), no instance on the owner, our own instance, or a
+    // holder pid that is not alive here — so the claim then runs as before.
+    async liveSibling() {
+      let r;
+      try {
+        r = await st.get(id);
+      } catch {
+        return null;
+      }
+      const o = r && r.ok && !r.cached && r.execution && r.execution.owner;
+      if (!o || o.instance == null || st.instance == null || String(o.instance) === String(st.instance)) return null;
+      if ((o.machine ?? null) !== (st.machine ?? null)) return null;
+      if (!o.lease_expires_at || !(Date.parse(o.lease_expires_at) > Date.now())) return null;
+      const pid = Number(String(o.instance).split("-")[0]);
+      if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return null;
+      return processIdentity.isOurProcess(pid, null).reallyAlive ? { ...o } : null;
+    },
     // Re-take the lease at the start of every pipeline pass (a fresh launch,
     // a resumed orphan, a re-gate): a same-owner claim keeps its fence, an
     // expired dead worker's lease advances it, a live foreign lease refuses.
@@ -16239,14 +16266,23 @@ async function candidateResolverFromReport(cfg, producer, nodeId, fallback) {
 // boundary is its landed fact, exactly checkProposals' own evidence. Bounded
 // per pass and fail-soft: an unreadable graph leaves every debt owed.
 const COMPLETION_RECONCILE_MAX = 10;
-async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = () => {} } = {}) {
-  const records = dispatchRuns.readRunRecords(home).filter((r) => completionKernel.isControllerRecord(r) && (r.completion_execution_end || (!r.completion_written_at && !r.completion_withdrawn_at && !r.completion_consumed_at)));
+//
+// `factory`/`factoryAliases`: the worker's own factory (and the ids it was
+// renamed from). A record another factory's pipeline owns is left to a worker
+// armed with THAT factory — the rule openPipelines applies to resumption —
+// because two workers on one box share this run journal, and re-claiming the
+// other's execution here advanced its fence under it every poll
+// (issue-spor-work-workers-ping-pong-execution-fence). Unset keeps the
+// box-wide sweep.
+async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = () => {}, factory = null, factoryAliases = [] } = {}) {
+  const records = dispatchRuns.readRunRecords(home).filter((r) => completionKernel.isControllerRecord(r) && (r.completion_execution_end || (!r.completion_written_at && !r.completion_withdrawn_at && !r.completion_consumed_at)) && !workLoop.foreignFactoryRecord(r, factory, factoryAliases));
   let worked = 0;
   for (const r of records) {
     if (worked >= COMPLETION_RECONCILE_MAX) break;
     worked += 1; // every EXAMINED record counts — a pass is bounded in reads, not in writes
     if (r.completion_execution_end) {
       const ending = executionReporter(cfg, r, { home, log });
+      if (ending && (await yieldsToLiveSibling(ending, r, log))) continue;
       try {
         const result = ending && await ending.retryEnd(r.completion_execution_end);
         if (result?.handed_off) log(`work: ${r.node_id} — execution ${ending.id} was handed to another process; its release is that holder's, not this process's`);
@@ -16279,6 +16315,7 @@ async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = ()
     let reporter = null;
     if (!running && completionKernel.isControllerRecord(r) && r.impl_claim.store) {
       reporter = executionReporter(cfg, r, { home, log });
+      if (reporter && (await yieldsToLiveSibling(reporter, r, log))) continue;
       if (reporter) {
         const resumed = await reporter.resume();
         if (resumed.handed_off) {
@@ -16324,6 +16361,20 @@ async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = ()
       if (reporter) reporter.leave();
     }
   }
+}
+
+// A sweep's check before it re-claims `reporter`'s execution: when a live
+// sibling process on this box holds it, the sweep leaves it (and whatever it
+// owes) to that holder this pass. Noted once per execution per process.
+const SIBLING_HELD_NOTED = new Set();
+async function yieldsToLiveSibling(reporter, record, log) {
+  const holder = await reporter.liveSibling();
+  if (!holder) return false;
+  if (!SIBLING_HELD_NOTED.has(reporter.id)) {
+    SIBLING_HELD_NOTED.add(reporter.id);
+    log(`work: ${record.node_id} — execution ${reporter.id} is held by another live process on this box (instance ${holder.instance}, until ${holder.lease_expires_at}); this process does not re-claim it`);
+  }
+  return true;
 }
 
 // The not-run result for a controller record whose execution this process
@@ -17414,6 +17465,10 @@ async function restoreProposal(cfg, { blockerId, nodeId, record = null, home = c
     // as the reconciler does, never on the record's word alone.
     const reporter = executionReporter(cfg, record, { home, log: () => {} });
     if (reporter) {
+      // A live sibling process on this box holds it: never re-claim it out
+      // from under that holder (issue-spor-work-workers-ping-pong-execution-fence).
+      const sibling = await reporter.liveSibling();
+      if (sibling) return { ok: false, reason: `execution ${reporter.id} is held by another live process on this box (instance ${sibling.instance}); the completion is left owed` };
       const resumed = await reporter.resume();
       if (!resumed.ok) return { ok: false, reason: `execution ${reporter.id} is not held by this worker (${resumed.code}); the completion is left owed` };
     }
@@ -17521,13 +17576,16 @@ async function proposalSettledMeanwhile(cfg, r, blockerId) {
   }
 }
 
-async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {} } = {}) {
+async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}, factory = null, factoryAliases = [] } = {}) {
   // Requires only gate_proposal_number — NOT gate_proposal_blocker too — so a
   // proposal whose tracking-node write failed (leaving the blocker field
   // stamped but the node itself missing, or on an older run record from
   // before both fields were stamped together) is still discovered rather than
-  // silently skipped forever.
-  const records = dispatchRuns.readRunRecords(home).filter((r) => r.gate_state === "parked" && r.gate_proposal_number);
+  // silently skipped forever. A proposal another factory parked is left to a
+  // worker armed with that factory (`factory`/`factoryAliases`, the
+  // completion reconciler's rule — issue-spor-work-workers-ping-pong-
+  // execution-fence); unset keeps the box-wide sweep.
+  const records = dispatchRuns.readRunRecords(home).filter((r) => r.gate_state === "parked" && r.gate_proposal_number && !workLoop.foreignFactoryRecord(r, factory, factoryAliases));
   for (const r of records) {
     const healed = await healProposalTracking(cfg, r);
     if (!healed.ok) {
