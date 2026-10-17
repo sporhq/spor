@@ -9076,7 +9076,12 @@ test("whole-record writers take the record lock: a held lock makes them wait, a 
   const t1 = Date.now();
   const closed = dispatchRuns.closeRun(paths.record, { state: "failed", terminal_state: "failed" });
   assert.strictEqual(closed.state, "failed");
-  assert.ok(Date.now() - t1 < 400, "no wait on a stale lock");
+  // Bounded by the stale window, not a wall-clock guess: a writer that WAITED
+  // would spend the whole attempt window (> RECORD_LOCK_STALE_MS), while the
+  // break itself is immediate — but closeRun's own replace can ride a Windows
+  // delete-pending retry, which blew a fixed 400ms bound on a CI runner.
+  const brokeIn = Date.now() - t1;
+  assert.ok(brokeIn < dispatchRuns.RECORD_LOCK_STALE_MS / 10, `no wait on a stale lock (${brokeIn}ms)`);
   assert.strictEqual(closed.gate_attestation, "art-attest-x");
   assert.ok(!fs.existsSync(lock), "the corpse is gone");
   // closeRun refuses a record that is already terminal; mergeTerminalOutcome adds to it.
